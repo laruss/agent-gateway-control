@@ -1,0 +1,43 @@
+# yaml-language-server: $schema=../schemas/organization.schema.json
+schema_version: 1
+organization:
+  id: autonomous-lab
+  display_name: Autonomous Lab
+  global_goal: >-
+    Исследовать и строить законные системы, способные создать устойчивый доход,
+    соблюдая бюджет, безопасность, права третьих лиц и обязательные approvals.
+  constitution_file: prompts/examples/organization-constitution.md
+
+  # Humans allowed to approve high-risk actions; resolved to user ids at bootstrap.
+  owner_mattermost_usernames:
+    - owner
+
+  # The only agent allowed to hold finance tools; every finance action still needs a human.
+  finance_agent_id: finance
+
+  rules:
+    - id: finance-through-finance-agent
+      text: Все финансовые действия маршрутизируются через @finance.
+    - id: no-unapproved-external-send
+      text: Отправка email и публикация наружу требуют human approval.
+    - id: no-secret-sharing
+      text: Секреты не публикуются в Mattermost и не включаются в prompts.
+
+  default_limits:
+    max_agent_hops: 8
+    max_turns_per_cascade: 20
+    max_runs_per_agent_per_hour: 30
+    default_run_timeout_seconds: 1800
+
+mattermost:
+  team: autonomous-lab
+  channels:
+    - hq
+    - research
+    - engineering
+    - finance
+    - mail
+    - approvals
+    - gateway-alerts
+  approvals_channel: approvals
+  alerts_channel: gateway-alerts

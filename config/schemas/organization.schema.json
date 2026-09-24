@@ -1,0 +1,140 @@
+{
+  "$comment": "Structural schema generated from the Zod contracts in @agent-gateway/contracts for editors and tooling. Cross-field rules are not expressed here: validate with the Zod schema (ADR-010).",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "number",
+      "const": 1
+    },
+    "organization": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]*$"
+        },
+        "display_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "global_goal": {
+          "type": "string",
+          "minLength": 1
+        },
+        "constitution_file": {
+          "type": "string",
+          "pattern": "^prompts(\\/[a-z0-9][a-z0-9_-]*)+\\.md$"
+        },
+        "owner_mattermost_usernames": {
+          "minItems": 1,
+          "maxItems": 16,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"
+          }
+        },
+        "finance_agent_id": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 32,
+          "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+        },
+        "rules": {
+          "maxItems": 100,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9-]*$"
+              },
+              "text": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2000
+              }
+            },
+            "required": ["id", "text"],
+            "additionalProperties": false
+          }
+        },
+        "default_limits": {
+          "type": "object",
+          "properties": {
+            "max_agent_hops": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 64
+            },
+            "max_turns_per_cascade": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500
+            },
+            "max_runs_per_agent_per_hour": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000
+            },
+            "default_run_timeout_seconds": {
+              "type": "integer",
+              "minimum": 10,
+              "maximum": 86400
+            }
+          },
+          "required": [
+            "max_agent_hops",
+            "max_turns_per_cascade",
+            "max_runs_per_agent_per_hour",
+            "default_run_timeout_seconds"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "id",
+        "display_name",
+        "global_goal",
+        "constitution_file",
+        "owner_mattermost_usernames",
+        "finance_agent_id",
+        "rules",
+        "default_limits"
+      ],
+      "additionalProperties": false
+    },
+    "mattermost": {
+      "type": "object",
+      "properties": {
+        "team": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"
+        },
+        "channels": {
+          "minItems": 1,
+          "maxItems": 100,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"
+          }
+        },
+        "approvals_channel": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"
+        },
+        "alerts_channel": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"
+        }
+      },
+      "required": ["team", "channels", "approvals_channel", "alerts_channel"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["schema_version", "organization", "mattermost"],
+  "additionalProperties": false
+}

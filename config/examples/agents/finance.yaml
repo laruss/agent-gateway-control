@@ -1,0 +1,40 @@
+# yaml-language-server: $schema=../../schemas/agent.schema.json
+schema_version: 1
+id: finance
+display_name: Finance
+enabled: true
+
+mattermost:
+  username: finance
+  token_secret_file: /run/secrets/mm_finance_token
+  allowed_channels: [hq, finance, approvals]
+
+runtime:
+  adapter: claude-code
+  profile: default
+  session_policy: resumable-if-available
+  timeout_seconds: 900
+
+prompts:
+  role_file: prompts/examples/agents/finance.md
+
+wake_rules:
+  - event_type: mattermost.agent.mentioned
+    target_agent_id: finance
+  - event_type: agent.wait.matched
+    target_agent_id: finance
+  - event_type: agent.wait.timeout
+    target_agent_id: finance
+
+concurrency:
+  max_active_runs: 1
+  while_running: enqueue-and-coalesce
+
+permissions:
+  tools_allow: [mattermost.post, finance.read]
+  tools_require_human_approval: [finance.payment.create, finance.subscription.create]
+  tools_deny: [deploy.*, mail.*, workspace.write]
+
+memory:
+  private_namespace: agents/finance
+  shared_namespaces: [organization/decisions, organization/finance]

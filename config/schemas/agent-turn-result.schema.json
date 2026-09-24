@@ -1,0 +1,609 @@
+{
+  "$comment": "Structural schema generated from the Zod contracts in @agent-gateway/contracts for editors and tooling. Cross-field rules are not expressed here: validate with the Zod schema (ADR-010).",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "publicMessages": {
+      "maxItems": 10,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "channelId": {
+            "type": "string",
+            "pattern": "^[a-z0-9]{26}$"
+          },
+          "rootPostId": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[a-z0-9]{26}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "markdown": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 15000,
+            "pattern": "\\S"
+          },
+          "targetAgentIds": {
+            "maxItems": 8,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 2,
+              "maxLength": 32,
+              "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+            }
+          },
+          "attachments": {
+            "maxItems": 10,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "artifactId": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "artifactKey": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": ["artifactId", "artifactKey"],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": ["channelId", "rootPostId", "markdown", "targetAgentIds", "attachments"],
+        "additionalProperties": false
+      }
+    },
+    "nextState": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "idle"
+            }
+          },
+          "required": ["kind"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "waiting"
+            },
+            "waits": {
+              "minItems": 1,
+              "maxItems": 8,
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "eventType": {
+                    "type": "string",
+                    "enum": [
+                      "mattermost.thread.reply",
+                      "mattermost.agent.mentioned",
+                      "approval.granted",
+                      "approval.denied",
+                      "google.gmail.message.received",
+                      "timer.fired"
+                    ]
+                  },
+                  "correlationId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "expectedSenderAgentIds": {
+                    "maxItems": 8,
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "minLength": 2,
+                      "maxLength": 32,
+                      "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+                    }
+                  },
+                  "expectedSenderUserIds": {
+                    "maxItems": 8,
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "pattern": "^[a-z0-9]{26}$"
+                    }
+                  },
+                  "requireTargetAgentId": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 2,
+                        "maxLength": 32,
+                        "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "timeoutAt": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                  }
+                },
+                "required": [
+                  "eventType",
+                  "correlationId",
+                  "expectedSenderAgentIds",
+                  "expectedSenderUserIds",
+                  "requireTargetAgentId",
+                  "timeoutAt"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": ["kind", "waits"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "needs_human"
+            },
+            "approvalRequest": {
+              "type": "object",
+              "properties": {
+                "actionType": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)+$"
+                },
+                "actionParams": {
+                  "minItems": 1,
+                  "maxItems": 32,
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "name": {
+                        "type": "string",
+                        "pattern": "^[a-z][a-z0-9_]{0,63}$"
+                      },
+                      "value": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 2000,
+                        "pattern": "\\S"
+                      }
+                    },
+                    "required": ["name", "value"],
+                    "additionalProperties": false
+                  }
+                },
+                "actionSummary": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 2000,
+                  "pattern": "\\S"
+                }
+              },
+              "required": ["actionType", "actionParams", "actionSummary"],
+              "additionalProperties": false
+            }
+          },
+          "required": ["kind", "approvalRequest"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "failed"
+            },
+            "publicError": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2000,
+              "pattern": "\\S"
+            },
+            "retryable": {
+              "type": "boolean"
+            }
+          },
+          "required": ["kind", "publicError", "retryable"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "publicSummary": {
+      "type": "object",
+      "properties": {
+        "assigned": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "pattern": "\\S"
+        },
+        "facts": {
+          "maxItems": 20,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500,
+            "pattern": "\\S"
+          }
+        },
+        "decisions": {
+          "maxItems": 20,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500,
+            "pattern": "\\S"
+          }
+        },
+        "done": {
+          "maxItems": 20,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500,
+            "pattern": "\\S"
+          }
+        },
+        "remaining": {
+          "maxItems": 20,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500,
+            "pattern": "\\S"
+          }
+        },
+        "waitingFor": {
+          "maxItems": 20,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500,
+            "pattern": "\\S"
+          }
+        },
+        "risks": {
+          "maxItems": 20,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500,
+            "pattern": "\\S"
+          }
+        }
+      },
+      "required": ["assigned", "facts", "decisions", "done", "remaining", "waitingFor", "risks"],
+      "additionalProperties": false
+    },
+    "memoryProposals": {
+      "maxItems": 20,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "namespace": {
+            "type": "string",
+            "pattern": "^(agents\\/[a-z][a-z0-9-]{1,31}|organization(\\/[a-z][a-z0-9-]{0,63}){1,4})$"
+          },
+          "key": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._/-]{0,255}$"
+          },
+          "content": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 10000,
+            "pattern": "\\S"
+          },
+          "visibility": {
+            "type": "string",
+            "enum": ["private", "shared", "public"]
+          }
+        },
+        "required": ["namespace", "key", "content", "visibility"],
+        "additionalProperties": false
+      }
+    },
+    "artifacts": {
+      "maxItems": 50,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"
+          },
+          "kind": {
+            "type": "string",
+            "enum": ["file", "diff", "commit", "report", "link"]
+          },
+          "workspacePath": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 2048,
+                "format": "uri"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "sha256": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "mimeType": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 255
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "sizeBytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "visibility": {
+            "type": "string",
+            "enum": ["private", "shared", "public"]
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1000,
+                "pattern": "\\S"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "key",
+          "kind",
+          "workspacePath",
+          "url",
+          "sha256",
+          "mimeType",
+          "sizeBytes",
+          "visibility",
+          "description"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "schemaVersion": {
+      "type": "number",
+      "const": 1
+    },
+    "runId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+    },
+    "usage": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "inputTokens": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "outputTokens": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "cachedInputTokens": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "costUsd": {
+              "anyOf": [
+                {
+                  "type": "number",
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "durationMs": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "model": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 255
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "inputTokens",
+            "outputTokens",
+            "cachedInputTokens",
+            "costUsd",
+            "durationMs",
+            "model"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "session": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "adapter": {
+              "type": "string",
+              "enum": ["mock", "codex", "claude-code", "grok", "kiro", "opencode-go", "hermes"]
+            },
+            "providerSessionId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "runtimeVersion": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "expiresAt": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time",
+                  "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": ["adapter", "providerSessionId", "runtimeVersion", "expiresAt"],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "publicMessages",
+    "nextState",
+    "publicSummary",
+    "memoryProposals",
+    "artifacts",
+    "schemaVersion",
+    "runId",
+    "usage",
+    "session"
+  ],
+  "additionalProperties": false
+}

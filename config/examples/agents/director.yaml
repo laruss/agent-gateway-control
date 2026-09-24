@@ -1,0 +1,40 @@
+# yaml-language-server: $schema=../../schemas/agent.schema.json
+schema_version: 1
+id: director
+display_name: Director
+enabled: true
+
+mattermost:
+  username: director
+  token_secret_file: /run/secrets/mm_director_token
+  allowed_channels: [hq, research, engineering, finance, approvals]
+
+runtime:
+  adapter: claude-code
+  profile: default
+  session_policy: resumable-if-available
+  timeout_seconds: 1800
+
+prompts:
+  role_file: prompts/examples/agents/director.md
+
+wake_rules:
+  - event_type: mattermost.agent.mentioned
+    target_agent_id: director
+  - event_type: agent.wait.matched
+    target_agent_id: director
+  - event_type: agent.wait.timeout
+    target_agent_id: director
+
+concurrency:
+  max_active_runs: 1
+  while_running: enqueue-and-coalesce
+
+permissions:
+  tools_allow: [mattermost.post, memory.read, memory.write]
+  tools_require_human_approval: []
+  tools_deny: [finance.*, deploy.*, mail.send]
+
+memory:
+  private_namespace: agents/director
+  shared_namespaces: [organization/decisions]

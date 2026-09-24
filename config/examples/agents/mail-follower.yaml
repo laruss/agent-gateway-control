@@ -1,0 +1,41 @@
+# yaml-language-server: $schema=../../schemas/agent.schema.json
+schema_version: 1
+id: mail-follower
+display_name: Mail Follower
+enabled: true
+
+mattermost:
+  username: mail-follower
+  token_secret_file: /run/secrets/mm_mail_follower_token
+  allowed_channels: [hq, mail]
+
+runtime:
+  adapter: claude-code
+  profile: default
+  session_policy: resumable-if-available
+  timeout_seconds: 900
+
+prompts:
+  role_file: prompts/examples/agents/mail-follower.md
+
+wake_rules:
+  - event_type: mattermost.agent.mentioned
+    target_agent_id: mail-follower
+  - event_type: agent.wait.matched
+    target_agent_id: mail-follower
+  - event_type: agent.wait.timeout
+    target_agent_id: mail-follower
+  - event_type: google.gmail.message.received
+
+concurrency:
+  max_active_runs: 1
+  while_running: enqueue-and-coalesce
+
+permissions:
+  tools_allow: [mattermost.post, mail.read]
+  tools_require_human_approval: [mail.send, mail.forward]
+  tools_deny: [finance.*, deploy.*]
+
+memory:
+  private_namespace: agents/mail-follower
+  shared_namespaces: [organization/customers, organization/decisions]

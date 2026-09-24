@@ -1,0 +1,40 @@
+# yaml-language-server: $schema=../../schemas/agent.schema.json
+schema_version: 1
+id: research
+display_name: Research
+enabled: true
+
+mattermost:
+  username: research
+  token_secret_file: /run/secrets/mm_research_token
+  allowed_channels: [hq, research]
+
+runtime:
+  adapter: grok
+  profile: default
+  session_policy: resumable-if-available
+  timeout_seconds: 900
+
+prompts:
+  role_file: prompts/examples/agents/research.md
+
+wake_rules:
+  - event_type: mattermost.agent.mentioned
+    target_agent_id: research
+  - event_type: agent.wait.matched
+    target_agent_id: research
+  - event_type: agent.wait.timeout
+    target_agent_id: research
+
+concurrency:
+  max_active_runs: 1
+  while_running: enqueue-and-coalesce
+
+permissions:
+  tools_allow: [mattermost.post, web.search, web.fetch]
+  tools_require_human_approval: []
+  tools_deny: [finance.*, deploy.*, mail.*, workspace.write]
+
+memory:
+  private_namespace: agents/research
+  shared_namespaces: [organization/decisions, organization/market]

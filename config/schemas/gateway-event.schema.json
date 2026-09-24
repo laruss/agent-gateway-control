@@ -1,0 +1,325 @@
+{
+  "$comment": "Structural schema generated from the Zod contracts in @agent-gateway/contracts for editors and tooling. Cross-field rules are not expressed here: validate with the Zod schema (ADR-010).",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "specversion": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "mattermost.post.created",
+        "mattermost.post.edited",
+        "mattermost.post.deleted",
+        "mattermost.agent.mentioned",
+        "mattermost.thread.reply",
+        "agent.run.requested",
+        "agent.run.started",
+        "agent.run.completed",
+        "agent.run.failed",
+        "agent.wait.created",
+        "agent.wait.matched",
+        "agent.wait.timeout",
+        "agent.message.requested",
+        "agent.message.posted",
+        "approval.requested",
+        "approval.granted",
+        "approval.denied",
+        "google.gmail.notification.received",
+        "google.gmail.message.received",
+        "timer.fired",
+        "gateway.control.pause",
+        "gateway.control.resume",
+        "gateway.control.kill_all"
+      ]
+    },
+    "time": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+    },
+    "subject": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024
+    },
+    "datacontenttype": {
+      "type": "string",
+      "const": "application/json"
+    },
+    "correlationid": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "causationid": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "traceparent": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$"
+    },
+    "trustlevel": {
+      "type": "string",
+      "enum": ["system-trusted", "human-trusted", "internal-untrusted", "external-untrusted"]
+    },
+    "hop": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1000
+    },
+    "data": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/__schema0"
+      }
+    }
+  },
+  "required": [
+    "specversion",
+    "id",
+    "source",
+    "type",
+    "time",
+    "datacontenttype",
+    "correlationid",
+    "causationid",
+    "trustlevel",
+    "hop",
+    "data"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "__schema0": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/__schema0"
+          }
+        },
+        {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/__schema0"
+          }
+        }
+      ]
+    }
+  },
+  "anyOf": [
+    {
+      "properties": {
+        "type": {
+          "enum": [
+            "agent.run.requested",
+            "agent.run.started",
+            "agent.run.completed",
+            "agent.run.failed",
+            "agent.wait.created",
+            "agent.wait.matched",
+            "agent.wait.timeout",
+            "agent.message.requested",
+            "agent.message.posted",
+            "approval.requested",
+            "approval.granted",
+            "approval.denied",
+            "google.gmail.notification.received",
+            "google.gmail.message.received",
+            "timer.fired",
+            "gateway.control.pause",
+            "gateway.control.resume",
+            "gateway.control.kill_all"
+          ]
+        }
+      }
+    },
+    {
+      "properties": {
+        "type": {
+          "enum": [
+            "mattermost.post.created",
+            "mattermost.post.edited",
+            "mattermost.post.deleted",
+            "mattermost.agent.mentioned"
+          ]
+        },
+        "trustlevel": {
+          "enum": ["human-trusted", "internal-untrusted"]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "post_id": {
+              "type": "string",
+              "pattern": "^[a-z0-9]{26}$"
+            },
+            "root_id": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "pattern": "^[a-z0-9]{26}$"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "channel_id": {
+              "type": "string",
+              "pattern": "^[a-z0-9]{26}$"
+            },
+            "user_id": {
+              "type": "string",
+              "pattern": "^[a-z0-9]{26}$"
+            },
+            "sender_agent_id": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 2,
+                  "maxLength": 32,
+                  "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "target_agent_ids": {
+              "maxItems": 8,
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 32,
+                "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+              }
+            },
+            "message": {
+              "type": "string",
+              "maxLength": 16383
+            }
+          },
+          "required": [
+            "post_id",
+            "root_id",
+            "channel_id",
+            "user_id",
+            "sender_agent_id",
+            "target_agent_ids",
+            "message"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "mattermost.thread.reply"
+        },
+        "trustlevel": {
+          "enum": ["human-trusted", "internal-untrusted"]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "post_id": {
+              "type": "string",
+              "pattern": "^[a-z0-9]{26}$"
+            },
+            "root_id": {
+              "type": "string",
+              "pattern": "^[a-z0-9]{26}$"
+            },
+            "channel_id": {
+              "type": "string",
+              "pattern": "^[a-z0-9]{26}$"
+            },
+            "user_id": {
+              "type": "string",
+              "pattern": "^[a-z0-9]{26}$"
+            },
+            "sender_agent_id": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 2,
+                  "maxLength": 32,
+                  "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "target_agent_ids": {
+              "maxItems": 8,
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 32,
+                "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+              }
+            },
+            "message": {
+              "type": "string",
+              "maxLength": 16383
+            }
+          },
+          "required": [
+            "post_id",
+            "root_id",
+            "channel_id",
+            "user_id",
+            "sender_agent_id",
+            "target_agent_ids",
+            "message"
+          ],
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

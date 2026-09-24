@@ -1,0 +1,40 @@
+# yaml-language-server: $schema=../../schemas/agent.schema.json
+schema_version: 1
+id: developer
+display_name: Developer
+enabled: true
+
+mattermost:
+  username: developer
+  token_secret_file: /run/secrets/mm_developer_token
+  allowed_channels: [hq, engineering]
+
+runtime:
+  adapter: codex
+  profile: default
+  session_policy: resumable-if-available
+  timeout_seconds: 1800
+
+prompts:
+  role_file: prompts/examples/agents/developer.md
+
+wake_rules:
+  - event_type: mattermost.agent.mentioned
+    target_agent_id: developer
+  - event_type: agent.wait.matched
+    target_agent_id: developer
+  - event_type: agent.wait.timeout
+    target_agent_id: developer
+
+concurrency:
+  max_active_runs: 1
+  while_running: enqueue-and-coalesce
+
+permissions:
+  tools_allow: [mattermost.post, repository.read, workspace.write, tests.run]
+  tools_require_human_approval: []
+  tools_deny: [finance.*, deploy.*, mail.*]
+
+memory:
+  private_namespace: agents/developer
+  shared_namespaces: [organization/decisions, organization/engineering]

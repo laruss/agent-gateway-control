@@ -1,0 +1,912 @@
+{
+  "$comment": "Structural schema generated from the Zod contracts in @agent-gateway/contracts for editors and tooling. Cross-field rules are not expressed here: validate with the Zod schema (ADR-010).",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schemaVersion": {
+      "type": "number",
+      "const": 1
+    },
+    "runId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+    },
+    "agent": {
+      "type": "object",
+      "properties": {
+        "agentId": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 32,
+          "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "mattermostUsername": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rolePrompt": {
+          "type": "string",
+          "minLength": 1
+        },
+        "configVersion": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": ["agentId", "displayName", "mattermostUsername", "rolePrompt", "configVersion"],
+      "additionalProperties": false
+    },
+    "organization": {
+      "type": "object",
+      "properties": {
+        "organizationId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "globalGoal": {
+          "type": "string",
+          "minLength": 1
+        },
+        "constitution": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9-]*$"
+              },
+              "text": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2000
+              }
+            },
+            "required": ["id", "text"],
+            "additionalProperties": false
+          }
+        },
+        "limits": {
+          "type": "object",
+          "properties": {
+            "max_agent_hops": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 64
+            },
+            "max_turns_per_cascade": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500
+            },
+            "max_runs_per_agent_per_hour": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000
+            },
+            "default_run_timeout_seconds": {
+              "type": "integer",
+              "minimum": 10,
+              "maximum": 86400
+            }
+          },
+          "required": [
+            "max_agent_hops",
+            "max_turns_per_cascade",
+            "max_runs_per_agent_per_hour",
+            "default_run_timeout_seconds"
+          ],
+          "additionalProperties": false
+        },
+        "directory": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "agentId": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 32,
+                "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+              },
+              "displayName": {
+                "type": "string",
+                "minLength": 1
+              },
+              "summary": {
+                "type": "string"
+              }
+            },
+            "required": ["agentId", "displayName", "summary"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["organizationId", "globalGoal", "constitution", "rules", "limits", "directory"],
+      "additionalProperties": false
+    },
+    "trigger": {
+      "type": "object",
+      "properties": {
+        "specversion": {
+          "type": "string",
+          "const": "1.0"
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "mattermost.post.created",
+            "mattermost.post.edited",
+            "mattermost.post.deleted",
+            "mattermost.agent.mentioned",
+            "mattermost.thread.reply",
+            "agent.run.requested",
+            "agent.run.started",
+            "agent.run.completed",
+            "agent.run.failed",
+            "agent.wait.created",
+            "agent.wait.matched",
+            "agent.wait.timeout",
+            "agent.message.requested",
+            "agent.message.posted",
+            "approval.requested",
+            "approval.granted",
+            "approval.denied",
+            "google.gmail.notification.received",
+            "google.gmail.message.received",
+            "timer.fired",
+            "gateway.control.pause",
+            "gateway.control.resume",
+            "gateway.control.kill_all"
+          ]
+        },
+        "time": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+        },
+        "subject": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "datacontenttype": {
+          "type": "string",
+          "const": "application/json"
+        },
+        "correlationid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "causationid": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "traceparent": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$"
+        },
+        "trustlevel": {
+          "type": "string",
+          "enum": ["system-trusted", "human-trusted", "internal-untrusted", "external-untrusted"]
+        },
+        "hop": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000
+        },
+        "data": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/__schema0"
+          }
+        }
+      },
+      "required": [
+        "specversion",
+        "id",
+        "source",
+        "type",
+        "time",
+        "datacontenttype",
+        "correlationid",
+        "causationid",
+        "trustlevel",
+        "hop",
+        "data"
+      ],
+      "additionalProperties": false
+    },
+    "durableState": {
+      "type": "object",
+      "properties": {
+        "previousRunId": {
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "previousSummary": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "assigned": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 2000,
+                  "pattern": "\\S"
+                },
+                "facts": {
+                  "maxItems": 20,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 500,
+                    "pattern": "\\S"
+                  }
+                },
+                "decisions": {
+                  "maxItems": 20,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 500,
+                    "pattern": "\\S"
+                  }
+                },
+                "done": {
+                  "maxItems": 20,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 500,
+                    "pattern": "\\S"
+                  }
+                },
+                "remaining": {
+                  "maxItems": 20,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 500,
+                    "pattern": "\\S"
+                  }
+                },
+                "waitingFor": {
+                  "maxItems": 20,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 500,
+                    "pattern": "\\S"
+                  }
+                },
+                "risks": {
+                  "maxItems": 20,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 500,
+                    "pattern": "\\S"
+                  }
+                }
+              },
+              "required": [
+                "assigned",
+                "facts",
+                "decisions",
+                "done",
+                "remaining",
+                "waitingFor",
+                "risks"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "resolvedWaits": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "waitId": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+              },
+              "outcome": {
+                "type": "string",
+                "enum": ["matched", "timeout"]
+              },
+              "condition": {
+                "type": "object",
+                "properties": {
+                  "eventType": {
+                    "type": "string",
+                    "enum": [
+                      "mattermost.thread.reply",
+                      "mattermost.agent.mentioned",
+                      "approval.granted",
+                      "approval.denied",
+                      "google.gmail.message.received",
+                      "timer.fired"
+                    ]
+                  },
+                  "correlationId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "expectedSenderAgentIds": {
+                    "maxItems": 8,
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "minLength": 2,
+                      "maxLength": 32,
+                      "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+                    }
+                  },
+                  "expectedSenderUserIds": {
+                    "maxItems": 8,
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "pattern": "^[a-z0-9]{26}$"
+                    }
+                  },
+                  "requireTargetAgentId": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 2,
+                        "maxLength": 32,
+                        "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "timeoutAt": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                  }
+                },
+                "required": [
+                  "eventType",
+                  "correlationId",
+                  "expectedSenderAgentIds",
+                  "expectedSenderUserIds",
+                  "requireTargetAgentId",
+                  "timeoutAt"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": ["waitId", "outcome", "condition"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["previousRunId", "previousSummary", "resolvedWaits"],
+      "additionalProperties": false
+    },
+    "channels": {
+      "minItems": 1,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "channelId": {
+            "type": "string",
+            "pattern": "^[a-z0-9]{26}$"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          }
+        },
+        "required": ["channelId", "name"],
+        "additionalProperties": false
+      }
+    },
+    "threadContext": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "channelId": {
+              "type": "string",
+              "pattern": "^[a-z0-9]{26}$"
+            },
+            "rootPostId": {
+              "type": "string",
+              "pattern": "^[a-z0-9]{26}$"
+            },
+            "rootPost": {
+              "type": "object",
+              "properties": {
+                "postId": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9]{26}$"
+                },
+                "authorUserId": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9]{26}$"
+                },
+                "authorAgentId": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "minLength": 2,
+                      "maxLength": 32,
+                      "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "createdAt": {
+                  "type": "string",
+                  "format": "date-time",
+                  "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "trustLevel": {
+                  "type": "string",
+                  "enum": [
+                    "system-trusted",
+                    "human-trusted",
+                    "internal-untrusted",
+                    "external-untrusted"
+                  ]
+                }
+              },
+              "required": [
+                "postId",
+                "authorUserId",
+                "authorAgentId",
+                "createdAt",
+                "message",
+                "trustLevel"
+              ],
+              "additionalProperties": false
+            },
+            "recentPosts": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "postId": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9]{26}$"
+                  },
+                  "authorUserId": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9]{26}$"
+                  },
+                  "authorAgentId": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 2,
+                        "maxLength": 32,
+                        "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "createdAt": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                  },
+                  "message": {
+                    "type": "string"
+                  },
+                  "trustLevel": {
+                    "type": "string",
+                    "enum": [
+                      "system-trusted",
+                      "human-trusted",
+                      "internal-untrusted",
+                      "external-untrusted"
+                    ]
+                  }
+                },
+                "required": [
+                  "postId",
+                  "authorUserId",
+                  "authorAgentId",
+                  "createdAt",
+                  "message",
+                  "trustLevel"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "summary": {
+              "type": ["string", "null"]
+            },
+            "participantAgentIds": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 32,
+                "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+              }
+            },
+            "omittedPostCount": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            }
+          },
+          "required": [
+            "channelId",
+            "rootPostId",
+            "rootPost",
+            "recentPosts",
+            "summary",
+            "participantAgentIds",
+            "omittedPostCount"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "memories": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "namespace": {
+            "type": "string",
+            "pattern": "^(agents\\/[a-z][a-z0-9-]{1,31}|organization(\\/[a-z][a-z0-9-]{0,63}){1,4})$"
+          },
+          "key": {
+            "type": "string",
+            "minLength": 1
+          },
+          "content": {
+            "type": "string"
+          },
+          "visibility": {
+            "type": "string",
+            "enum": ["private", "shared", "public"]
+          },
+          "sourceRunId": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+          }
+        },
+        "required": ["id", "namespace", "key", "content", "visibility", "sourceRunId", "createdAt"],
+        "additionalProperties": false
+      }
+    },
+    "pendingInbox": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "specversion": {
+            "type": "string",
+            "const": "1.0"
+          },
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "source": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "mattermost.post.created",
+              "mattermost.post.edited",
+              "mattermost.post.deleted",
+              "mattermost.agent.mentioned",
+              "mattermost.thread.reply",
+              "agent.run.requested",
+              "agent.run.started",
+              "agent.run.completed",
+              "agent.run.failed",
+              "agent.wait.created",
+              "agent.wait.matched",
+              "agent.wait.timeout",
+              "agent.message.requested",
+              "agent.message.posted",
+              "approval.requested",
+              "approval.granted",
+              "approval.denied",
+              "google.gmail.notification.received",
+              "google.gmail.message.received",
+              "timer.fired",
+              "gateway.control.pause",
+              "gateway.control.resume",
+              "gateway.control.kill_all"
+            ]
+          },
+          "time": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+          },
+          "subject": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          },
+          "datacontenttype": {
+            "type": "string",
+            "const": "application/json"
+          },
+          "correlationid": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "causationid": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "traceparent": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$"
+          },
+          "trustlevel": {
+            "type": "string",
+            "enum": ["system-trusted", "human-trusted", "internal-untrusted", "external-untrusted"]
+          },
+          "hop": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1000
+          },
+          "data": {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {
+              "$ref": "#/$defs/__schema0"
+            }
+          }
+        },
+        "required": [
+          "specversion",
+          "id",
+          "source",
+          "type",
+          "time",
+          "datacontenttype",
+          "correlationid",
+          "causationid",
+          "trustlevel",
+          "hop",
+          "data"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "workspace": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "format": "starts_with",
+              "pattern": "^\\/.*"
+            },
+            "repository": {
+              "type": "string",
+              "minLength": 1
+            },
+            "baseCommitSha": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{40}$"
+            },
+            "branch": {
+              "type": "string",
+              "minLength": 1
+            },
+            "writable": {
+              "type": "boolean"
+            }
+          },
+          "required": ["path", "repository", "baseCommitSha", "branch", "writable"],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "toolPolicy": {
+      "type": "object",
+      "properties": {
+        "policyVersion": {
+          "type": "string",
+          "minLength": 1
+        },
+        "allow": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)*\\.([a-z][a-z0-9-]*|\\*)$"
+          }
+        },
+        "requireHumanApproval": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)*\\.([a-z][a-z0-9-]*|\\*)$"
+          }
+        },
+        "deny": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)*\\.([a-z][a-z0-9-]*|\\*)$"
+          }
+        }
+      },
+      "required": ["policyVersion", "allow", "requireHumanApproval", "deny"],
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/__schema0"
+      }
+    },
+    "deadline": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "runId",
+    "agent",
+    "organization",
+    "trigger",
+    "durableState",
+    "channels",
+    "threadContext",
+    "memories",
+    "pendingInbox",
+    "workspace",
+    "toolPolicy",
+    "outputSchema",
+    "deadline"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "__schema0": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/__schema0"
+          }
+        },
+        {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/__schema0"
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,215 @@
+{
+  "$comment": "Structural schema generated from the Zod contracts in @agent-gateway/contracts for editors and tooling. Cross-field rules are not expressed here: validate with the Zod schema (ADR-010).",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "number",
+      "const": 1
+    },
+    "id": {
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 32,
+      "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+    },
+    "display_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "enabled": {
+      "type": "boolean"
+    },
+    "mattermost": {
+      "type": "object",
+      "properties": {
+        "username": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"
+        },
+        "token_secret_file": {
+          "type": "string",
+          "pattern": "^\\/run\\/secrets\\/[a-z0-9_]+$"
+        },
+        "allowed_channels": {
+          "minItems": 1,
+          "maxItems": 32,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"
+          }
+        }
+      },
+      "required": ["username", "token_secret_file", "allowed_channels"],
+      "additionalProperties": false
+    },
+    "runtime": {
+      "type": "object",
+      "properties": {
+        "adapter": {
+          "type": "string",
+          "enum": ["mock", "codex", "claude-code", "grok", "kiro", "opencode-go", "hermes"]
+        },
+        "profile": {
+          "default": "default",
+          "type": "string",
+          "minLength": 1
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "session_policy": {
+          "type": "string",
+          "enum": ["stateless", "resumable-if-available"]
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 10,
+          "maximum": 86400
+        }
+      },
+      "required": ["adapter", "session_policy", "timeout_seconds"],
+      "additionalProperties": false
+    },
+    "prompts": {
+      "type": "object",
+      "properties": {
+        "role_file": {
+          "type": "string",
+          "pattern": "^prompts(\\/[a-z0-9][a-z0-9_-]*)+\\.md$"
+        }
+      },
+      "required": ["role_file"],
+      "additionalProperties": false
+    },
+    "wake_rules": {
+      "maxItems": 32,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "event_type": {
+            "type": "string",
+            "enum": [
+              "mattermost.post.created",
+              "mattermost.post.edited",
+              "mattermost.post.deleted",
+              "mattermost.agent.mentioned",
+              "mattermost.thread.reply",
+              "agent.run.requested",
+              "agent.run.started",
+              "agent.run.completed",
+              "agent.run.failed",
+              "agent.wait.created",
+              "agent.wait.matched",
+              "agent.wait.timeout",
+              "agent.message.requested",
+              "agent.message.posted",
+              "approval.requested",
+              "approval.granted",
+              "approval.denied",
+              "google.gmail.notification.received",
+              "google.gmail.message.received",
+              "timer.fired",
+              "gateway.control.pause",
+              "gateway.control.resume",
+              "gateway.control.kill_all"
+            ]
+          },
+          "target_agent_id": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 32,
+            "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+          }
+        },
+        "required": ["event_type"],
+        "additionalProperties": false
+      }
+    },
+    "concurrency": {
+      "type": "object",
+      "properties": {
+        "max_active_runs": {
+          "default": 1,
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8
+        },
+        "while_running": {
+          "type": "string",
+          "enum": ["enqueue", "enqueue-and-coalesce"]
+        }
+      },
+      "required": ["while_running"],
+      "additionalProperties": false
+    },
+    "permissions": {
+      "type": "object",
+      "properties": {
+        "tools_allow": {
+          "maxItems": 64,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)*\\.([a-z][a-z0-9-]*|\\*)$"
+          }
+        },
+        "tools_require_human_approval": {
+          "maxItems": 64,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)*\\.([a-z][a-z0-9-]*|\\*)$"
+          }
+        },
+        "tools_deny": {
+          "maxItems": 64,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)*\\.([a-z][a-z0-9-]*|\\*)$"
+          }
+        }
+      },
+      "required": ["tools_allow", "tools_require_human_approval", "tools_deny"],
+      "additionalProperties": false
+    },
+    "memory": {
+      "type": "object",
+      "properties": {
+        "private_namespace": {
+          "type": "string",
+          "pattern": "^(agents\\/[a-z][a-z0-9-]{1,31}|organization(\\/[a-z][a-z0-9-]{0,63}){1,4})$"
+        },
+        "shared_namespaces": {
+          "maxItems": 16,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^(agents\\/[a-z][a-z0-9-]{1,31}|organization(\\/[a-z][a-z0-9-]{0,63}){1,4})$"
+          }
+        }
+      },
+      "required": ["private_namespace", "shared_namespaces"],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "schema_version",
+    "id",
+    "display_name",
+    "enabled",
+    "mattermost",
+    "runtime",
+    "prompts",
+    "wake_rules",
+    "concurrency",
+    "permissions",
+    "memory"
+  ],
+  "additionalProperties": false
+}

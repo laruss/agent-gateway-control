@@ -1,0 +1,394 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "publicMessages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "channelId": {
+            "type": "string",
+            "pattern": "^[a-z0-9]{26}$"
+          },
+          "rootPostId": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[a-z0-9]{26}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "markdown": {
+            "type": "string",
+            "pattern": "\\S"
+          },
+          "targetAgentIds": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+            }
+          },
+          "attachments": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "artifactId": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "artifactKey": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": ["artifactId", "artifactKey"],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": ["channelId", "rootPostId", "markdown", "targetAgentIds", "attachments"],
+        "additionalProperties": false
+      }
+    },
+    "nextState": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "idle"
+            }
+          },
+          "required": ["kind"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "waiting"
+            },
+            "waits": {
+              "minItems": 1,
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "eventType": {
+                    "type": "string",
+                    "enum": [
+                      "mattermost.thread.reply",
+                      "mattermost.agent.mentioned",
+                      "approval.granted",
+                      "approval.denied",
+                      "google.gmail.message.received",
+                      "timer.fired"
+                    ]
+                  },
+                  "correlationId": {
+                    "type": "string"
+                  },
+                  "expectedSenderAgentIds": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+                    }
+                  },
+                  "expectedSenderUserIds": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "pattern": "^[a-z0-9]{26}$"
+                    }
+                  },
+                  "requireTargetAgentId": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "timeoutAt": {
+                    "type": "string",
+                    "format": "date-time"
+                  }
+                },
+                "required": [
+                  "eventType",
+                  "correlationId",
+                  "expectedSenderAgentIds",
+                  "expectedSenderUserIds",
+                  "requireTargetAgentId",
+                  "timeoutAt"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": ["kind", "waits"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "needs_human"
+            },
+            "approvalRequest": {
+              "type": "object",
+              "properties": {
+                "actionType": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)+$"
+                },
+                "actionParams": {
+                  "minItems": 1,
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      },
+                      "value": {
+                        "type": "string",
+                        "pattern": "\\S"
+                      }
+                    },
+                    "required": ["name", "value"],
+                    "additionalProperties": false
+                  }
+                },
+                "actionSummary": {
+                  "type": "string",
+                  "pattern": "\\S"
+                }
+              },
+              "required": ["actionType", "actionParams", "actionSummary"],
+              "additionalProperties": false
+            }
+          },
+          "required": ["kind", "approvalRequest"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "failed"
+            },
+            "publicError": {
+              "type": "string",
+              "pattern": "\\S"
+            },
+            "retryable": {
+              "type": "boolean"
+            }
+          },
+          "required": ["kind", "publicError", "retryable"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "publicSummary": {
+      "type": "object",
+      "properties": {
+        "assigned": {
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "facts": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "\\S"
+          }
+        },
+        "decisions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "\\S"
+          }
+        },
+        "done": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "\\S"
+          }
+        },
+        "remaining": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "\\S"
+          }
+        },
+        "waitingFor": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "\\S"
+          }
+        },
+        "risks": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "\\S"
+          }
+        }
+      },
+      "required": ["assigned", "facts", "decisions", "done", "remaining", "waitingFor", "risks"],
+      "additionalProperties": false
+    },
+    "memoryProposals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "namespace": {
+            "type": "string"
+          },
+          "key": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string",
+            "pattern": "\\S"
+          },
+          "visibility": {
+            "type": "string",
+            "enum": ["private", "shared", "public"]
+          }
+        },
+        "required": ["namespace", "key", "content", "visibility"],
+        "additionalProperties": false
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": ["file", "diff", "commit", "report", "link"]
+          },
+          "workspacePath": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "sha256": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "mimeType": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "sizeBytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "visibility": {
+            "type": "string",
+            "enum": ["private", "shared", "public"]
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "\\S"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "key",
+          "kind",
+          "workspacePath",
+          "url",
+          "sha256",
+          "mimeType",
+          "sizeBytes",
+          "visibility",
+          "description"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["publicMessages", "nextState", "publicSummary", "memoryProposals", "artifacts"],
+  "additionalProperties": false
+}
