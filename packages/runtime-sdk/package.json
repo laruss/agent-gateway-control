@@ -1,0 +1,14 @@
+{
+  "name": "@agent-gateway/runtime-sdk",
+  "version": "0.0.0",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": "./src/index.ts",
+    "./contract-suite": "./src/contract-suite.ts"
+  },
+  "dependencies": {
+    "@agent-gateway/contracts": "workspace:*",
+    "@agent-gateway/logging": "workspace:*"
+  }
+}

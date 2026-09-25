@@ -21,10 +21,6 @@ prompts:
 wake_rules:
   - event_type: mattermost.agent.mentioned
     target_agent_id: research
-  - event_type: agent.wait.matched
-    target_agent_id: research
-  - event_type: agent.wait.timeout
-    target_agent_id: research
 
 concurrency:
   max_active_runs: 1

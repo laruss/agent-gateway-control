@@ -1,0 +1,24 @@
+{
+  "name": "@agent-gateway/cli",
+  "version": "0.0.0",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "gateway": "./src/main.ts"
+  },
+  "dependencies": {
+    "@agent-gateway/contracts": "workspace:*",
+    "@agent-gateway/core": "workspace:*",
+    "@agent-gateway/db": "workspace:*",
+    "@agent-gateway/events": "workspace:*",
+    "@agent-gateway/logging": "workspace:*",
+    "@agent-gateway/queue": "workspace:*",
+    "@agent-gateway/service": "workspace:*",
+    "pg": "8.23.0",
+    "pg-boss": "12.34.0",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/pg": "8.23.1"
+  }
+}

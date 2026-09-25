@@ -9,47 +9,55 @@ Packages are created in the phase where they get code. Progress is tracked in
 ```text
 agent-gateway-control/
 ├── apps/
-│   ├── controller/          # ingest, routing, context, admin API, outbox        (Phase 1)
-│   ├── worker/              # generic worker host for runtime adapters           (Phase 1)
-│   └── cli/                 # `gateway` admin and bootstrap CLI                  (Phase 1)
+│   ├── controller/          # report/timeout/outbox consumers, health endpoints     (done)
+│   ├── worker/              # generic worker host for one runtime adapter           (done)
+│   └── cli/                 # `gateway` admin CLI                                    (done)
 ├── packages/
-│   ├── contracts/           # Zod schemas: config, events, turn input/result     (done)
-│   ├── testkit/             # Testcontainers PostgreSQL, test helpers            (done)
-│   ├── core/                # state machine, routing, use cases                  (Phase 1)
-│   ├── db/                  # Drizzle schema and migrations                      (Phase 1)
-│   ├── queue/               # pg-boss queues and retry policies                  (Phase 1)
-│   ├── events/              # normalization, dedupe, CloudEvents envelope        (Phase 1)
-│   ├── outbox/              # side effects and idempotency                       (Phase 1)
-│   ├── runtime-sdk/         # adapter contract and shared contract test suite    (Phase 1)
-│   ├── runtime-mock/        # scenario-driven mock runtime                       (Phase 1)
-│   ├── mattermost/          # WebSocket listener, REST client, reconciliation    (Phase 2)
-│   ├── context/             # context assembly and compaction                    (Phase 3)
-│   ├── runtime-codex/       #                                                    (Phase 4)
-│   ├── runtime-claude/      #                                                    (Phase 4)
-│   ├── runtime-grok/        #                                                    (Phase 5)
-│   ├── runtime-kiro/        #                                                    (Phase 5)
-│   ├── runtime-opencode/    #                                                    (Phase 5)
-│   ├── runtime-hermes/      #                                                    (Phase 5)
-│   ├── connector-gmail/     #                                                    (Phase 6)
-│   ├── policy/              # tool permissions and approvals                     (Phase 7)
-│   └── connector-webhook/   #                                                    (later)
+│   ├── contracts/           # Zod schemas: config, events, turn, queue payloads      (done)
+│   ├── testkit/             # Testcontainers PostgreSQL, test helpers                (done)
+│   ├── core/                # state machine, routing, wait matching, use cases       (done)
+│   ├── db/                  # Drizzle schema and migrations                          (done)
+│   ├── queue/               # pg-boss queues, retry/DLQ policies, transactional send (done)
+│   ├── events/              # canonical JSON, hashes, CloudEvents helpers            (done)
+│   ├── outbox/              # leased, idempotent side-effect delivery                (done)
+│   ├── logging/             # JSON logs with mandatory redaction                     (done)
+│   ├── service/             # settings (`X_FILE` secrets), health server, shutdown   (done)
+│   ├── runtime-sdk/         # adapter contract, turn execution, contract suite       (done)
+│   ├── runtime-mock/        # scenario-driven mock runtime                           (done)
+│   ├── mattermost/          # WebSocket listener, REST client, reconciliation        (Phase 2)
+│   ├── context/             # context assembly and compaction                        (Phase 3)
+│   ├── runtime-codex/       #                                                        (Phase 4)
+│   ├── runtime-claude/      #                                                        (Phase 4)
+│   ├── runtime-grok/        #                                                        (Phase 5)
+│   ├── runtime-kiro/        #                                                        (Phase 5)
+│   ├── runtime-opencode/    #                                                        (Phase 5)
+│   ├── runtime-hermes/      #                                                        (Phase 5)
+│   ├── connector-gmail/     #                                                        (Phase 6)
+│   ├── policy/              # tool permissions and approvals                         (Phase 7)
+│   └── connector-webhook/   #                                                        (later)
 ├── config/
 │   ├── examples/            # organization.yaml and agents/*.yaml
 │   └── schemas/             # JSON Schema, generated from contracts
 ├── prompts/examples/        # constitution and agent roles
-├── deploy/                  # dev and home-server Compose                        (Phase 1+)
-├── docs/                    # about, assumptions, adr/, security/
+├── deploy/dev/              # development Compose (PostgreSQL)
+├── docs/                    # about, assumptions, adr/, operations/, security/
 ├── scripts/                 # maintenance scripts (JSON Schema generation)
 └── .github/workflows/       # CI
 ```
 
 ## Dependency boundaries
 
-- `contracts` depends on no internal package and performs no IO.
-- `core` depends on `contracts` but not on transports (Mattermost, pg-boss, runtimes).
-- The controller never imports runtime adapters; workers never import the Mattermost client.
+- `contracts` depends on no internal package and performs no IO. It also owns the queue names,
+  queue payload schemas and the `JobSink` port.
+- `events` and `logging` depend at most on `contracts` and perform no IO.
+- `core` depends on `contracts`, `events`, `db` and `logging`, never on transports: it sends
+  jobs only through `JobSink`, not pg-boss, and knows no Mattermost client or runtime.
+- `queue` is the only package that talks to pg-boss directly (apps use its `createBoss`).
+- The controller never imports runtime adapters; workers never import `core`, `db` or the
+  Mattermost client, and read no domain state.
 - Every runtime adapter depends only on `runtime-sdk` and `contracts`.
-- `testkit` is used only by tests.
+- `testkit` is used only by tests. Integration tests may compose the controller and a worker
+  in one process; production code may not.
 
 ## Conventions
 
@@ -62,4 +70,9 @@ agent-gateway-control/
   next to the code.
 - **JSON Schema.** Generated by `bun run schemas:generate`; a test fails when files are stale.
   The files are structural only; Zod is the validator ([ADR-010](adr/010-zod-is-the-validator.md)).
+- **Migrations.** Generated by `bun run db:generate` from `packages/db/src/schema.ts`; a
+  committed migration is never edited. Hand-written SQL (triggers, seed rows) goes into a
+  `--custom` migration.
+- **Time.** Use cases take the clock from their deps; database defaults are not relied on for
+  timestamps that guards compare.
 - **Validation.** `bun run fix`, then `bun run test` and `bun run test:integration`.

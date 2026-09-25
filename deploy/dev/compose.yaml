@@ -1,0 +1,24 @@
+# Development infrastructure only. The credentials below are local development values, bound
+# to the loopback interface; production uses secret files (see docs/operations/local-development.md).
+name: agent-gateway-dev
+
+services:
+  postgres:
+    # Same exact tag as the integration tests (packages/testkit/src/postgres.ts).
+    image: postgres:17.6-alpine
+    environment:
+      POSTGRES_DB: gateway
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: gateway-dev
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  postgres-data:

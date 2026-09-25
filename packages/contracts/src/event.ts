@@ -36,6 +36,20 @@ export const GatewayEventTypeSchema = z.enum([
 ]);
 export type GatewayEventType = z.infer<typeof GatewayEventTypeSchema>;
 
+/**
+ * Event types only the Gateway itself emits (lifecycle, waits, approvals, timers, control).
+ * External ingest rejects them: a forged `approval.granted` or `agent.wait.timeout` must never
+ * resume an agent.
+ */
+export function isReservedEventType(type: GatewayEventType): boolean {
+	return (
+		type.startsWith("agent.") ||
+		type.startsWith("approval.") ||
+		type.startsWith("gateway.control.") ||
+		type === "timer.fired"
+	);
+}
+
 /** Event types carrying a Mattermost post in `data`. */
 export const MATTERMOST_POST_EVENT_TYPES: Readonly<GatewayEventType[]> = [
 	"mattermost.post.created",

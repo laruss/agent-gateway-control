@@ -131,6 +131,14 @@ function providerOutputSchema(schema: JsonObject): JsonObject {
 	return isJsonObject(reduced) ? reduced : schema;
 }
 
+/**
+ * JSON Schema of `AgentTurnModelOutput` in the provider strict subset; the controller passes it
+ * to runtimes as `AgentTurnInput.outputSchema`.
+ */
+export function modelOutputJsonSchema(): JsonObject {
+	return providerOutputSchema(generateJsonSchema(AgentTurnModelOutputSchema, "output"));
+}
+
 export const PUBLISHED_SCHEMAS: Readonly<PublishedSchema[]> = [
 	{ fileName: "organization.schema.json", schema: OrganizationConfigSchema, io: "input" },
 	{ fileName: "agent.schema.json", schema: AgentConfigSchema, io: "input" },

@@ -8,7 +8,7 @@ import {
 	ToolPatternSchema,
 	toolPatternOverlaps,
 } from "./common.ts";
-import { GatewayEventTypeSchema } from "./event.ts";
+import { GatewayEventTypeSchema, isReservedEventType } from "./event.ts";
 
 export const SessionPolicySchema = z.enum(["stateless", "resumable-if-available"]);
 export type SessionPolicy = z.infer<typeof SessionPolicySchema>;
@@ -26,8 +26,15 @@ export const AgentRuntimeConfigSchema = z.strictObject({
 });
 export type AgentRuntimeConfig = z.infer<typeof AgentRuntimeConfigSchema>;
 
+/**
+ * An event type that wakes the agent. Gateway-reserved types (lifecycle, waits, approvals,
+ * timers, control) never wake by rule: waits resume their own agent without one.
+ */
 export const WakeRuleSchema = z.strictObject({
-	event_type: GatewayEventTypeSchema,
+	event_type: GatewayEventTypeSchema.refine(
+		(type) => !isReservedEventType(type),
+		"Gateway-reserved event types cannot be wake rules",
+	),
 	target_agent_id: AgentIdSchema.optional(),
 });
 export type WakeRule = z.infer<typeof WakeRuleSchema>;

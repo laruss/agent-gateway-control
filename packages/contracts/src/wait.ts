@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { AgentIdSchema, MattermostIdSchema, TimestampSchema } from "./common.ts";
+import { AgentIdSchema, MattermostIdSchema, TimestampSchema, UuidSchema } from "./common.ts";
 
 /** Events an agent may wait for. Control and lifecycle events are never waitable. */
 export const WaitableEventTypeSchema = z.enum([
@@ -48,3 +48,10 @@ export const WaitConditionSchema = z
 		}
 	});
 export type WaitCondition = z.infer<typeof WaitConditionSchema>;
+
+/** `data` of an `agent.wait.timeout` event, emitted by the controller when a wait expires. */
+export const WaitTimeoutDataSchema = z.strictObject({
+	agent_id: AgentIdSchema,
+	wait_id: UuidSchema,
+});
+export type WaitTimeoutData = z.infer<typeof WaitTimeoutDataSchema>;

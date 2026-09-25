@@ -1,0 +1,30 @@
+{
+  "name": "@agent-gateway/controller",
+  "version": "0.0.0",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "bun src/main.ts"
+  },
+  "dependencies": {
+    "@agent-gateway/contracts": "workspace:*",
+    "@agent-gateway/core": "workspace:*",
+    "@agent-gateway/db": "workspace:*",
+    "@agent-gateway/logging": "workspace:*",
+    "@agent-gateway/outbox": "workspace:*",
+    "@agent-gateway/queue": "workspace:*",
+    "@agent-gateway/service": "workspace:*",
+    "pg-boss": "12.34.0",
+    "pg": "8.23.0",
+    "@agent-gateway/events": "workspace:*",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/pg": "8.23.1",
+    "@agent-gateway/testkit": "workspace:*",
+    "@agent-gateway/worker": "workspace:*"
+  }
+}

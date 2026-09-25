@@ -20,7 +20,12 @@
     "test:integration": "bun --bun vitest run --project integration",
     "test:all": "bun --bun vitest run",
     "test:watch": "bun --bun vitest --project unit",
-    "schemas:generate": "bun scripts/generate-json-schemas.ts && biome format --write config/schemas"
+    "schemas:generate": "bun scripts/generate-json-schemas.ts && biome format --write config/schemas",
+    "gateway": "bun apps/cli/src/main.ts",
+    "dev": "bun run --filter '@agent-gateway/controller' --filter '@agent-gateway/worker' start",
+    "dev:infra": "docker compose -f deploy/dev/compose.yaml up -d --wait",
+    "dev:infra:down": "docker compose -f deploy/dev/compose.yaml down",
+    "db:generate": "cd packages/db && bun --bun drizzle-kit generate --config drizzle.config.ts"
   },
   "devDependencies": {
     "@agent-gateway/contracts": "workspace:*",

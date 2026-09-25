@@ -16,3 +16,4 @@ rewritten in substance: a changed decision gets a new ADR that references the ol
 | [008](008-bun-biome-typescript7.md) | Bun as runtime and package manager, Biome, TypeScript 7 | Accepted |
 | [009](009-model-output-vs-turn-result.md) | Model output is separate from the turn result and fits strict structured output | Accepted |
 | [010](010-zod-is-the-validator.md) | Zod is the only validator; published JSON Schemas are structural | Accepted |
+| [011](011-run-execution-protocol.md) | Run execution protocol between controller and workers | Accepted |

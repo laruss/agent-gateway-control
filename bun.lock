@@ -15,11 +15,157 @@
         "vitest": "5.0.1",
       },
     },
+    "apps/cli": {
+      "name": "@agent-gateway/cli",
+      "version": "0.0.0",
+      "bin": {
+        "gateway": "./src/main.ts",
+      },
+      "dependencies": {
+        "@agent-gateway/contracts": "workspace:*",
+        "@agent-gateway/core": "workspace:*",
+        "@agent-gateway/db": "workspace:*",
+        "@agent-gateway/events": "workspace:*",
+        "@agent-gateway/logging": "workspace:*",
+        "@agent-gateway/queue": "workspace:*",
+        "@agent-gateway/service": "workspace:*",
+        "pg": "8.23.0",
+        "pg-boss": "12.34.0",
+        "zod": "4.6.5",
+      },
+      "devDependencies": {
+        "@types/pg": "8.23.1",
+      },
+    },
+    "apps/controller": {
+      "name": "@agent-gateway/controller",
+      "version": "0.0.0",
+      "dependencies": {
+        "@agent-gateway/contracts": "workspace:*",
+        "@agent-gateway/core": "workspace:*",
+        "@agent-gateway/db": "workspace:*",
+        "@agent-gateway/events": "workspace:*",
+        "@agent-gateway/logging": "workspace:*",
+        "@agent-gateway/outbox": "workspace:*",
+        "@agent-gateway/queue": "workspace:*",
+        "@agent-gateway/service": "workspace:*",
+        "pg": "8.23.0",
+        "pg-boss": "12.34.0",
+        "zod": "4.6.5",
+      },
+      "devDependencies": {
+        "@agent-gateway/testkit": "workspace:*",
+        "@agent-gateway/worker": "workspace:*",
+        "@types/pg": "8.23.1",
+      },
+    },
+    "apps/worker": {
+      "name": "@agent-gateway/worker",
+      "version": "0.0.0",
+      "dependencies": {
+        "@agent-gateway/contracts": "workspace:*",
+        "@agent-gateway/logging": "workspace:*",
+        "@agent-gateway/queue": "workspace:*",
+        "@agent-gateway/runtime-mock": "workspace:*",
+        "@agent-gateway/runtime-sdk": "workspace:*",
+        "@agent-gateway/service": "workspace:*",
+        "pg-boss": "12.34.0",
+      },
+    },
     "packages/contracts": {
       "name": "@agent-gateway/contracts",
       "version": "0.0.0",
       "dependencies": {
         "zod": "4.6.5",
+      },
+    },
+    "packages/core": {
+      "name": "@agent-gateway/core",
+      "version": "0.0.0",
+      "dependencies": {
+        "@agent-gateway/contracts": "workspace:*",
+        "@agent-gateway/db": "workspace:*",
+        "@agent-gateway/events": "workspace:*",
+        "@agent-gateway/logging": "workspace:*",
+        "drizzle-orm": "0.45.3",
+        "pg": "8.23.0",
+        "zod": "4.6.5",
+      },
+      "devDependencies": {
+        "@types/pg": "8.23.1",
+      },
+    },
+    "packages/db": {
+      "name": "@agent-gateway/db",
+      "version": "0.0.0",
+      "dependencies": {
+        "@agent-gateway/contracts": "workspace:*",
+        "drizzle-orm": "0.45.3",
+        "pg": "8.23.0",
+        "zod": "4.6.5",
+      },
+      "devDependencies": {
+        "@types/pg": "8.23.1",
+      },
+    },
+    "packages/events": {
+      "name": "@agent-gateway/events",
+      "version": "0.0.0",
+      "dependencies": {
+        "@agent-gateway/contracts": "workspace:*",
+      },
+    },
+    "packages/logging": {
+      "name": "@agent-gateway/logging",
+      "version": "0.0.0",
+    },
+    "packages/outbox": {
+      "name": "@agent-gateway/outbox",
+      "version": "0.0.0",
+      "dependencies": {
+        "@agent-gateway/contracts": "workspace:*",
+        "@agent-gateway/db": "workspace:*",
+        "@agent-gateway/logging": "workspace:*",
+        "drizzle-orm": "0.45.3",
+        "pg": "8.23.0",
+      },
+      "devDependencies": {
+        "@types/pg": "8.23.1",
+      },
+    },
+    "packages/queue": {
+      "name": "@agent-gateway/queue",
+      "version": "0.0.0",
+      "dependencies": {
+        "@agent-gateway/contracts": "workspace:*",
+        "pg": "8.23.0",
+        "pg-boss": "12.34.0",
+      },
+      "devDependencies": {
+        "@types/pg": "8.23.1",
+      },
+    },
+    "packages/runtime-mock": {
+      "name": "@agent-gateway/runtime-mock",
+      "version": "0.0.0",
+      "dependencies": {
+        "@agent-gateway/contracts": "workspace:*",
+        "@agent-gateway/runtime-sdk": "workspace:*",
+      },
+    },
+    "packages/runtime-sdk": {
+      "name": "@agent-gateway/runtime-sdk",
+      "version": "0.0.0",
+      "dependencies": {
+        "@agent-gateway/contracts": "workspace:*",
+        "@agent-gateway/logging": "workspace:*",
+      },
+    },
+    "packages/service": {
+      "name": "@agent-gateway/service",
+      "version": "0.0.0",
+      "dependencies": {
+        "@agent-gateway/logging": "workspace:*",
       },
     },
     "packages/testkit": {
@@ -37,9 +183,33 @@
     },
   },
   "packages": {
+    "@agent-gateway/cli": ["@agent-gateway/cli@workspace:apps/cli"],
+
     "@agent-gateway/contracts": ["@agent-gateway/contracts@workspace:packages/contracts"],
 
+    "@agent-gateway/controller": ["@agent-gateway/controller@workspace:apps/controller"],
+
+    "@agent-gateway/core": ["@agent-gateway/core@workspace:packages/core"],
+
+    "@agent-gateway/db": ["@agent-gateway/db@workspace:packages/db"],
+
+    "@agent-gateway/events": ["@agent-gateway/events@workspace:packages/events"],
+
+    "@agent-gateway/logging": ["@agent-gateway/logging@workspace:packages/logging"],
+
+    "@agent-gateway/outbox": ["@agent-gateway/outbox@workspace:packages/outbox"],
+
+    "@agent-gateway/queue": ["@agent-gateway/queue@workspace:packages/queue"],
+
+    "@agent-gateway/runtime-mock": ["@agent-gateway/runtime-mock@workspace:packages/runtime-mock"],
+
+    "@agent-gateway/runtime-sdk": ["@agent-gateway/runtime-sdk@workspace:packages/runtime-sdk"],
+
+    "@agent-gateway/service": ["@agent-gateway/service@workspace:packages/service"],
+
     "@agent-gateway/testkit": ["@agent-gateway/testkit@workspace:packages/testkit"],
+
+    "@agent-gateway/worker": ["@agent-gateway/worker@workspace:apps/worker"],
 
     "@balena/dockerignore": ["@balena/dockerignore@1.0.2", "", {}, "sha512-wMue2Sy4GAVTk6Ic4tJVcnfdau+gx2EnG7S+uAEe+TWJFqE4YoWN4/H8MSLj4eYJKxGg26lZwboEniNiNwZQ6Q=="],
 

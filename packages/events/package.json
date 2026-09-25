@@ -1,0 +1,12 @@
+{
+  "name": "@agent-gateway/events",
+  "version": "0.0.0",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@agent-gateway/contracts": "workspace:*"
+  }
+}

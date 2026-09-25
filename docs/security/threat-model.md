@@ -35,13 +35,22 @@
 - Routing only through structured `targetAgentIds` and HMAC-signed props.
 - Hop, cascade and rate limits, a pairwise circuit breaker, a duplicate payload guard, `kill-all`.
 - Status (Phase 0): limits in `OrganizationConfig`; unique targets, no self-targeting, no
-  `@all/@here/@channel` in agent messages. Guards in Phase 2.
+  `@all/@here/@channel` in agent messages.
+- Status (Phase 1): routing enforces self-post, hop, cascade (fan-out counted per run), hourly
+  per-agent rate, duplicate normalized payload and pairwise guards on every wake-up; a blocked
+  wake-up stops the cascade and posts an alert; `kill-all` pauses every agent and blocks new
+  runs. Cascade budgets are serialized per correlation. Lifecycle, wait, approval, timer and
+  control events cannot be ingested from outside the Gateway. HMAC-signed props arrive with the
+  Mattermost bridge (Phase 2).
 
 ### T3. Credential leakage
 
 - Docker secrets/files with `0600`; separate secrets per worker; log redaction.
 - Tokens are not passed as command arguments when a file/stdin alternative exists, and never
   reach models.
+- Status (Phase 1): every setting `X` can be read from `X_FILE`; JSON logs redact secret field
+  names, bearer/API tokens, private keys and URL credentials; stored error details are redacted
+  and truncated.
 - Status: `token_secret_file` is restricted to `/run/secrets/`; `.gitignore` excludes
   `secrets/`, `*.pem`, `*.key`.
 
@@ -49,7 +58,11 @@
 
 - Unprivileged user, read-only rootfs, `cap_drop: [ALL]`, `no-new-privileges`, no Docker socket.
 - Bounded workspace mount, egress policy, resource limits, process timeout.
-- Status: Phase 4 (adapters) and Phase 8 (hardening).
+- Status (Phase 1): workers get the complete turn in the job and connect as a role limited to
+  their adapter's queue tables (`gateway db grant-worker`), so they cannot touch domain tables,
+  other adapters' jobs or timeouts; reports count only for runs of the reporting adapter; every report is re-validated by the controller, checked against the authority and
+  run scope fixed at scheduling, and ignored when it is stale or names another agent's run
+  ([ADR-011](../adr/011-run-execution-protocol.md)). Container hardening in Phase 4 and 8.
 
 ### T5. Supply chain
 
@@ -80,6 +93,5 @@
 
 ## Open questions
 
-- JSON canonicalization for `immutableActionHash` (numbers, key order): decide in Phase 7.
 - Storage of provider session ids: encrypted in the database or a reference to a secret store,
   decide in Phase 4.
