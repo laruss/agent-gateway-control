@@ -6,6 +6,14 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ### Added
 
+- Turn context (`@agent-gateway/context`): the turn's Mattermost thread assembled from stored
+  events within a budget, thread summaries compacted from run summaries (`thread_summaries`),
+  the agent's memory from its own namespaces; a turn resumed by a timeout keeps its thread.
+- Memory review: private proposals are accepted at once, shared ones wait for
+  `gateway memory accept|reject`; waits may name only thread participants or owners.
+- `renderTurnPrompt` in the runtime SDK: prompt layers in trust order with delimited data;
+  ADR-013; mock scenarios `wait-asker` and `remember`.
+
 - Mattermost bridge (`@agent-gateway/mattermost`): WebSocket listener with per-channel cursors,
   REST catch-up after reconnects, restarts and sequence gaps; exact mention parsing; posts by
   each agent's own bot with HMAC-signed routing props; alerts and approval cards by the

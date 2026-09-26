@@ -74,6 +74,7 @@ export function contractTurnInput(init: ContractInputInit): AgentTurnInput {
 		channels: [{ channelId: CONTRACT_IDS.channel, name: "engineering" }],
 		threadContext: null,
 		memories: [],
+		memoryNamespaces: { private: "agents/developer", shared: [] },
 		pendingInbox: [],
 		workspace: null,
 		toolPolicy: {

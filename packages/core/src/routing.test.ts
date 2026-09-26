@@ -38,6 +38,7 @@ function wait(overrides: Partial<ActiveWait> = {}): ActiveWait {
 		id: "7f6c1b3e-2f55-4f7c-9c38-0b1f8a2b9d01",
 		agentId: "developer",
 		timeoutAt: new Date(NOW.getTime() + 60_000),
+		threadRootIds: new Set([ROOT]),
 		condition: {
 			eventType: "mattermost.thread.reply",
 			correlationId: `thread:${ROOT}`,
@@ -154,7 +155,15 @@ describe("routing", () => {
 			correlation: "thread:other",
 		});
 		const noTarget = postEvent({ sender: "finance", targets: [] });
-		for (const event of [wrongThread, noTarget]) {
+		// Same conversation (correlation), but another thread than the one the question was asked in.
+		const otherThreadSameCascade = postEvent({
+			sender: "finance",
+			targets: ["developer"],
+			rootId: "o".repeat(26),
+			correlation: `thread:${ROOT}`,
+		});
+		expect(waitMatches(wait({ threadRootIds: null }), otherThreadSameCascade, NOW)).toBe(true);
+		for (const event of [wrongThread, noTarget, otherThreadSameCascade]) {
 			expect(route(event, { waits: [wait()] }).some((r) => r.decision === "wait-match")).toBe(
 				false,
 			);

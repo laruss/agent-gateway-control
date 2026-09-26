@@ -190,6 +190,19 @@ export async function loadTeamChannels(db: Db): Promise<Map<string, MattermostId
 	return teams.has(config.organization.mattermost.team) ? loadDirectory(db, "channel") : new Map();
 }
 
+/** The organization's owners resolved to Mattermost user ids; they decide approvals. */
+export async function loadOwnerUserIds(db: Db): Promise<MattermostId[]> {
+	const config = await loadActiveConfig(db);
+	const users = await loadDirectory(db, "user");
+	const ids = (config?.organization.organization.owner_mattermost_usernames ?? []).flatMap(
+		(name) => {
+			const id = users.get(name);
+			return id === undefined ? [] : [id];
+		},
+	);
+	return [...new Set(ids)];
+}
+
 type EventRow = typeof events.$inferSelect;
 
 /** Rebuilds the envelope of a stored event; stored events were validated on ingest. */

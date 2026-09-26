@@ -9,6 +9,7 @@ import type {
 	OrganizationConfig,
 	RuntimeAdapterId,
 	RuntimeUsage,
+	ThreadSummary,
 	TurnAuthorityContext,
 	WaitCondition,
 	WorkingSummary,
@@ -183,8 +184,17 @@ export const events = pgTable(
 		index("events_correlation").on(t.correlationId),
 		index("events_content_hash").on(t.contentHash, t.receivedAt),
 		index("events_sender_agent").on(t.senderAgentId, t.receivedAt),
+		/** Finds the posts a run published (`run:<id>`). */
+		index("events_causation").on(t.causationId).where(sql`${t.causationId} is not null`),
 		/** Finds the events of one Mattermost post (`channel/<id>/post/<id>`). */
 		index("events_subject").on(t.source, t.subject),
+		/** Finds the posts of one Mattermost thread: channel, then root (a root is its own). */
+		index("events_thread")
+			.on(
+				sql`(${t.payload}->>'channel_id')`,
+				sql`coalesce(${t.payload}->>'root_id', ${t.payload}->>'post_id')`,
+			)
+			.where(sql`${t.payload} ? 'post_id'`),
 	],
 );
 
@@ -324,6 +334,11 @@ export const waitSubscriptions = pgTable(
 		correlationId: text("correlation_id").notNull(),
 		/** The condition as requested, with `timeoutAt` clamped by policy. */
 		condition: jsonb("condition").$type<WaitCondition>().notNull(),
+		/**
+		 * Thread roots a reply must be in: the threads of the waiting run's conversation. Replies in
+		 * threads the run itself started count too. Null for waits not bound to a thread.
+		 */
+		threadRootIds: jsonb("thread_root_ids").$type<MattermostId[]>(),
 		timeoutAt: timestamp("timeout_at", { withTimezone: true }).notNull(),
 		matchedEventId: uuid("matched_event_id").references(() => events.id),
 		createdAt: createdAt(),
@@ -371,9 +386,26 @@ export const memoryItems = pgTable(
 	},
 	(t) => [
 		index("memory_items_namespace").on(t.namespace, t.key),
+		index("memory_items_status").on(t.status, t.namespace, t.createdAt),
+		/** At most one accepted item per key: accepting a newer one supersedes the older. */
+		uniqueIndex("memory_items_accepted_key")
+			.on(t.namespace, t.key)
+			.where(sql`${t.status} = 'accepted'`),
 		check("memory_items_status", oneOf("status", MEMORY_STATUSES)),
 		check("memory_items_visibility", oneOf("visibility", VISIBILITIES)),
 	],
+);
+
+/** The durable summary of a Mattermost thread, from the public summaries of its runs. */
+export const threadSummaries = pgTable(
+	"thread_summaries",
+	{
+		channelId: text("channel_id").$type<MattermostId>().notNull(),
+		rootPostId: text("root_post_id").$type<MattermostId>().notNull(),
+		summary: jsonb("summary").$type<ThreadSummary>().notNull(),
+		updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+	},
+	(t) => [primaryKey({ columns: [t.channelId, t.rootPostId] })],
 );
 
 export const artifacts = pgTable(

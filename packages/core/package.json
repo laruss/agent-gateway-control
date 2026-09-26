@@ -7,6 +7,7 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
+    "@agent-gateway/context": "workspace:*",
     "@agent-gateway/contracts": "workspace:*",
     "@agent-gateway/db": "workspace:*",
     "@agent-gateway/events": "workspace:*",

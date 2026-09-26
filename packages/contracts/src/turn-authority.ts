@@ -18,6 +18,11 @@ export type TurnAuthorityContext = Readonly<{
 	/** Namespaces the agent may propose memory writes to. */
 	writableMemoryNamespaces: Readonly<MemoryNamespace[]>;
 	/**
+	 * Humans a wait may name as expected senders: people who posted in the run's threads, and the
+	 * organization's owners. A wait on anyone else would never be answered by that thread.
+	 */
+	waitableUserIds: Readonly<MattermostId[]>;
+	/**
 	 * Existing artifacts the agent may attach to a post: shared or public ones it can see.
 	 * The controller never lists private artifacts here.
 	 */
@@ -126,6 +131,14 @@ export function checkTurnResultAuthority(
 		nextState.waits.forEach((wait, i) => {
 			wait.expectedSenderAgentIds.forEach((sender, j) => {
 				addressableChannels(`nextState.waits.${i}.expectedSenderAgentIds.${j}`, sender);
+			});
+			wait.expectedSenderUserIds.forEach((userId, j) => {
+				if (!context.waitableUserIds.includes(userId)) {
+					push(
+						`nextState.waits.${i}.expectedSenderUserIds.${j}`,
+						`user '${userId}' is neither a participant of the run's threads nor an owner`,
+					);
+				}
 			});
 			if (wait.requireTargetAgentId !== null && wait.requireTargetAgentId !== context.agentId) {
 				push(

@@ -74,6 +74,13 @@
         "pg-boss": "12.34.0",
       },
     },
+    "packages/context": {
+      "name": "@agent-gateway/context",
+      "version": "0.0.0",
+      "dependencies": {
+        "@agent-gateway/contracts": "workspace:*",
+      },
+    },
     "packages/contracts": {
       "name": "@agent-gateway/contracts",
       "version": "0.0.0",
@@ -85,6 +92,7 @@
       "name": "@agent-gateway/core",
       "version": "0.0.0",
       "dependencies": {
+        "@agent-gateway/context": "workspace:*",
         "@agent-gateway/contracts": "workspace:*",
         "@agent-gateway/db": "workspace:*",
         "@agent-gateway/events": "workspace:*",
@@ -198,6 +206,8 @@
   },
   "packages": {
     "@agent-gateway/cli": ["@agent-gateway/cli@workspace:apps/cli"],
+
+    "@agent-gateway/context": ["@agent-gateway/context@workspace:packages/context"],
 
     "@agent-gateway/contracts": ["@agent-gateway/contracts@workspace:packages/contracts"],
 

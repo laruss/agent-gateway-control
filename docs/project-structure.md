@@ -25,7 +25,7 @@ agent-gateway-control/
 │   ├── runtime-sdk/         # adapter contract, turn execution, contract suite       (done)
 │   ├── runtime-mock/        # scenario-driven mock runtime                           (done)
 │   ├── mattermost/          # WebSocket listener, REST client, deliverers, bootstrap (done)
-│   ├── context/             # context assembly and compaction                        (Phase 3)
+│   ├── context/             # thread folding, run summary compaction, memory budget  (done)
 │   ├── runtime-codex/       #                                                        (Phase 4)
 │   ├── runtime-claude/      #                                                        (Phase 4)
 │   ├── runtime-grok/        #                                                        (Phase 5)
@@ -49,9 +49,9 @@ agent-gateway-control/
 
 - `contracts` depends on no internal package and performs no IO. It also owns the queue names,
   queue payload schemas and the `JobSink` port.
-- `events` and `logging` depend at most on `contracts` and perform no IO.
-- `core` depends on `contracts`, `events`, `db` and `logging`, never on transports: it sends
-  jobs only through `JobSink`, not pg-boss, and knows no Mattermost client or runtime.
+- `events`, `logging` and `context` depend at most on `contracts` and perform no IO.
+- `core` depends on `contracts`, `events`, `context`, `db` and `logging`, never on transports:
+  it sends jobs only through `JobSink`, not pg-boss, and knows no Mattermost client or runtime.
 - `queue` is the only package that talks to pg-boss directly (apps use its `createBoss`).
 - The controller never imports runtime adapters; workers never import `core`, `db` or the
   Mattermost client, and read no domain state.

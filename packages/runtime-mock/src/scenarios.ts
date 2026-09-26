@@ -14,6 +14,8 @@ export const MOCK_SCENARIOS = [
 	"mention",
 	"wait",
 	"wait-open",
+	"wait-asker",
+	"remember",
 	"invalid",
 	"invalid-once",
 	"slow",
@@ -47,12 +49,19 @@ export function mockDirective(input: AgentTurnInput): MockDirective {
 
 type ReplyPlace = Readonly<{ channelId: MattermostId; rootPostId: MattermostId | null }>;
 
-/** Replies go to the trigger's thread when it is a post in an allowed channel. */
+/**
+ * Replies go to the trigger's thread when it is a post in an allowed channel, else to the turn's
+ * thread (a turn resumed by a timeout carries no post).
+ */
 function replyPlace(input: AgentTurnInput): ReplyPlace {
 	const post = MattermostPostDataSchema.safeParse(input.trigger.data);
 	const allowed = input.channels.map((c) => c.channelId);
 	if (post.success && allowed.includes(post.data.channel_id)) {
 		return { channelId: post.data.channel_id, rootPostId: post.data.root_id ?? post.data.post_id };
+	}
+	const thread = input.threadContext;
+	if (thread !== null && allowed.includes(thread.channelId)) {
+		return { channelId: thread.channelId, rootPostId: thread.rootPostId };
 	}
 	const first = input.channels[0];
 	if (first === undefined) {
@@ -140,6 +149,57 @@ export function scenarioOutput(
 						},
 					],
 				},
+			};
+		}
+		case "wait-asker": {
+			// Waits for the human who asked: an answer in the thread, addressed or not.
+			const post = MattermostPostDataSchema.safeParse(input.trigger.data);
+			if (!post.success || input.trigger.trustlevel !== "human-trusted") {
+				return { ...base(input, "Nobody to ask"), publicMessages: [] };
+			}
+			return {
+				...base(input, "Asked the requester"),
+				publicMessages: [message(input, "could you answer in this thread?")],
+				nextState: {
+					kind: "waiting",
+					waits: [
+						{
+							eventType: "mattermost.thread.reply",
+							correlationId: input.trigger.correlationid,
+							expectedSenderAgentIds: [],
+							expectedSenderUserIds: [post.data.user_id],
+							requireTargetAgentId: null,
+							timeoutAt: new Date(now.getTime() + 3600_000).toISOString(),
+						},
+					],
+				},
+			};
+		}
+		case "remember": {
+			// Proposes one item to the private namespace and one to the first shared namespace.
+			const shared = input.memoryNamespaces.shared[0];
+			const note = `noted from ${input.trigger.id}`;
+			return {
+				...base(input, "Remembered a note"),
+				publicMessages: [message(input, `Remembered (${input.memories.length} known).`)],
+				memoryProposals: [
+					{
+						namespace: input.memoryNamespaces.private,
+						key: "mock-note",
+						content: note,
+						visibility: "private",
+					},
+					...(shared === undefined
+						? []
+						: [
+								{
+									namespace: shared,
+									key: "mock-note",
+									content: note,
+									visibility: "shared" as const,
+								},
+							]),
+				],
 			};
 		}
 		case "artifact":

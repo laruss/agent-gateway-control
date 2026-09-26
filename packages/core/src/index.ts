@@ -4,6 +4,7 @@ export * from "./services/admin.ts";
 export * from "./services/deps.ts";
 export * from "./services/ingest.ts";
 export * from "./services/mattermost-bridge.ts";
+export { decideMemory, listMemory, MEMORY_REVIEW_STATUSES } from "./services/memory.ts";
 export * from "./services/reconcile.ts";
 export * from "./services/runs.ts";
 export * from "./services/scheduler.ts";

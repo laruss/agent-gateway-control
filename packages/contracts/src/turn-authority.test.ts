@@ -11,6 +11,8 @@ import type { AgentTurnResult, ArtifactDescriptor } from "./turn.ts";
 import { checkTurnResultAuthority, type TurnAuthorityContext } from "./turn-authority.ts";
 
 const ARTIFACT_ID = "3f0c1f5e-8a47-4f6a-9d0b-2b8d7d1c9e11";
+const PARTICIPANT_ID = "p1a2r3t4i5c6i7p8a9n0t1u2s3";
+const STRANGER_ID = "s1t2r3a4n5g6e7r8i9d0a1b2c3";
 
 const context: TurnAuthorityContext = {
 	runId: RUN_ID,
@@ -20,6 +22,7 @@ const context: TurnAuthorityContext = {
 	addressableAgents: { finance: [CHANNEL_ID], reviewer: [CHANNEL_ID, OTHER_CHANNEL_ID] },
 	writableMemoryNamespaces: ["agents/developer", "organization/decisions"],
 	attachableArtifactIds: [ARTIFACT_ID],
+	waitableUserIds: [PARTICIPANT_ID],
 	toolPolicy: {
 		policyVersion: "test",
 		allow: ["repository.read", "mattermost.post"],
@@ -226,6 +229,23 @@ describe("checkTurnResultAuthority", () => {
 			"nextState.waits.0.expectedSenderAgentIds.0",
 			"nextState.waits.1.requireTargetAgentId",
 		]);
+	});
+
+	it("accepts waits for thread participants and rejects waits for anyone else", () => {
+		const result: AgentTurnResult = {
+			...idleResult(),
+			nextState: {
+				kind: "waiting",
+				waits: [
+					financeReplyWait({ expectedSenderAgentIds: [], expectedSenderUserIds: [PARTICIPANT_ID] }),
+					financeReplyWait({
+						expectedSenderAgentIds: [],
+						expectedSenderUserIds: [PARTICIPANT_ID, STRANGER_ID],
+					}),
+				],
+			},
+		};
+		expect(paths(result)).toEqual(["nextState.waits.1.expectedSenderUserIds.1"]);
 	});
 
 	it("rejects memory writes to another agent's namespace", () => {

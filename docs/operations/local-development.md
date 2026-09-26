@@ -93,6 +93,8 @@ behaviour from a directive in the post text:
 | `[mock:mention <agent>]` | address another agent, idle |
 | `[mock:wait <agent>]` | ask the agent and wait for its reply in the thread, addressed to it |
 | `[mock:wait-open <agent>]` | the same, but any reply of that agent in the thread counts |
+| `[mock:wait-asker]` | ask the human who wrote the post and wait for their answer in the thread |
+| `[mock:remember]` | propose a note to the agent's private namespace and its first shared one |
 | `[mock:artifact]` | publish a link artifact and attach it |
 | `[mock:approval <tool>]` | request human approval for a tool action |
 | `[mock:fail]` | report a failure (agent becomes FAILED) |
@@ -113,7 +115,14 @@ bun run gateway kill-all --release
 bun run gateway dlq list
 bun run gateway outbox list --status dead
 bun run gateway outbox redrive <outbox-id>
+bun run gateway memory list --status proposed   # shared memory waiting for review
+bun run gateway memory accept <id>              # or: memory reject <id>
 ```
+
+A memory proposal to an agent's private namespace (`agents/<id>`) is accepted at once; a
+proposal to a shared namespace reaches other agents only after `memory accept`
+([ADR-013](../adr/013-turn-context.md)). Each run's context snapshot (`context_snapshots.input`)
+holds exactly what the runtime received: thread, memory and durable state.
 
 A FAILED agent keeps its failure through pause, disable/enable and kill-all; `runs redrive`
 is the only way out. Disabling an agent cancels its waits and expires its pending approvals.

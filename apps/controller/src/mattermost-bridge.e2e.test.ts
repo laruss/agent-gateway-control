@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { JsonObject, JsonValue } from "@agent-gateway/contracts";
+import type { AgentTurnInput, JsonObject, JsonValue } from "@agent-gateway/contracts";
 import {
 	applyConfig,
 	type ControlPlaneDeps,
@@ -249,6 +249,37 @@ describe("Mattermost bridge against a real server", () => {
 
 	/** Give routing a moment, then prove nothing ran. */
 	const settle = () => Bun.sleep(3000);
+
+	const agentState = async (agentId: string) =>
+		(await query<{ state: string }>("select state from agents where id = $1", [agentId]))[0]?.state;
+
+	const waitingAgent = (agentId: string) =>
+		eventually(async () => (await agentState(agentId)) === "waiting", 60_000, `${agentId} waits`);
+
+	const inputOf = async (runId: string) => {
+		const [row] = await query<{ input: AgentTurnInput }>(
+			"select input from context_snapshots where run_id = $1",
+			[runId],
+		);
+		if (row === undefined) {
+			throw new Error(`run ${runId} has no snapshot`);
+		}
+		return row.input;
+	};
+
+	const idOf = (post: JsonObject) => {
+		const id = post.id;
+		if (typeof id !== "string") {
+			throw new Error("post has no id");
+		}
+		return id;
+	};
+
+	const waitsIn = (root: string) =>
+		query<{ agent_id: string; status: string }>(
+			"select agent_id, status from wait_subscriptions where correlation_id = $1 order by created_at",
+			[`thread:${root}`],
+		);
 
 	it("bootstraps bots, memberships and tokens, and reconcile finds nothing to fix", async () => {
 		expect(bootstrapReport.filter((line) => line.includes("token issued"))).toHaveLength(6);
@@ -655,6 +686,103 @@ describe("Mattermost bridge against a real server", () => {
 				await query("select 1 from events where subject like $1", [`channel/%/post/${postId}`]),
 			).toEqual([]);
 		}
+	});
+
+	it("developer waits for finance and resumes once on its reply in the thread", async () => {
+		const root = await say("hq", "@developer ask finance about the budget [mock:wait finance]");
+		const asked = await finishedRun((await eventOf(root)).id, "developer asks finance");
+		expect(asked).toMatchObject({ agent_id: "developer", status: "succeeded" });
+		const question = await publishedPost(asked.id);
+		expect(question.root_id).toBe(root);
+		expect(await waitsIn(root)).toEqual([{ agent_id: "developer", status: "active" }]);
+
+		const financeRun = await finishedRun((await eventOf(idOf(question))).id, "finance answers");
+		const answer = await publishedPost(financeRun.id);
+		expect(answer).toMatchObject({ user_id: await botUserId("finance"), root_id: root });
+		const answerEvent = await eventOf(idOf(answer));
+		const resumed = await finishedRun(answerEvent.id, "developer resumes");
+		expect(resumed).toMatchObject({ agent_id: "developer", status: "succeeded" });
+		const input = await inputOf(resumed.id);
+		expect(input.durableState.resolvedWaits.map((w) => w.outcome)).toEqual(["matched"]);
+		expect(input.threadContext?.rootPost?.postId).toBe(root);
+		expect(input.threadContext?.recentPosts.map((p) => p.postId)).toEqual([idOf(question)]);
+		const closing = await publishedPost(resumed.id);
+		expect(closing).toMatchObject({
+			user_id: await botUserId("developer"),
+			root_id: root,
+			message: "Thanks, continuing.",
+		});
+
+		// The same reply delivered again (a restart catches up over it) resumes nobody.
+		await gateway.stopController();
+		await gateway.startController();
+		await gateway.controller().listener?.sync();
+		await settle();
+		expect(await runsOf(answerEvent.id)).toHaveLength(1);
+		expect(await waitsIn(root)).toEqual([{ agent_id: "developer", status: "matched" }]);
+	});
+
+	it("does not resume a waiting agent with a reply in another thread", async () => {
+		const deps = gateway.deps();
+		await pauseAgent(deps, "finance", "e2e");
+		// Queued first, so finance handles it first: a handover to developer in another thread.
+		const elsewhere = await say(
+			"hq",
+			"@finance brief developer on invoices [mock:mention developer]",
+		);
+		const root = await say("hq", "@developer ask finance about taxes [mock:wait finance]");
+		const asked = await finishedRun((await eventOf(root)).id, "developer asks finance");
+		await waitingAgent("developer");
+		// The question is in finance's inbox too; finance takes both in one turn and, told to hand
+		// over elsewhere, leaves the question unanswered.
+		await eventOf(idOf(await publishedPost(asked.id)));
+		await resumeAgent(deps, "finance", "e2e");
+
+		const financeRun = await finishedRun((await eventOf(elsewhere)).id, "finance hands over");
+		const handover = await publishedPost(financeRun.id);
+		expect(handover.root_id).toBe(elsewhere);
+		const handoverEvent = await eventOf(idOf(handover));
+		await settle();
+		expect(await agentState("developer")).toBe("waiting");
+		expect(await runsOf(handoverEvent.id)).toEqual([]);
+		expect(await waitsIn(root)).toEqual([{ agent_id: "developer", status: "active" }]);
+
+		// Finance's answer in the right thread resumes developer.
+		const nudge = await say("hq", "@finance answer developer here [mock:mention developer]", {
+			rootId: root,
+		});
+		const answerRun = await finishedRun((await eventOf(nudge)).id, "finance answers in thread");
+		const answer = await publishedPost(answerRun.id);
+		expect(answer.root_id).toBe(root);
+		const resumed = await finishedRun((await eventOf(idOf(answer))).id, "developer resumes");
+		expect(resumed.agent_id).toBe("developer");
+		const input = await inputOf(resumed.id);
+		expect(input.durableState.resolvedWaits.map((w) => w.outcome)).toEqual(["matched"]);
+		expect(input.threadContext?.rootPost?.postId).toBe(root);
+		expect(await waitsIn(root)).toEqual([{ agent_id: "developer", status: "matched" }]);
+	});
+
+	it("keeps a wait across a restart and resumes once on an answer posted meanwhile", async () => {
+		const root = await say("hq", "@developer confirm with me first [mock:wait-asker]");
+		await finishedRun((await eventOf(root)).id, "developer asks the human");
+		await waitingAgent("developer");
+
+		await gateway.stopWorker();
+		await gateway.stopController();
+		const answer = await say("hq", "yes, go ahead", { rootId: root });
+		expect(await creationOf(answer)).toEqual([]);
+		await gateway.startController();
+		await gateway.startWorker();
+
+		const answerEvent = await eventOf(answer);
+		const resumed = await finishedRun(answerEvent.id, "developer resumes after the restart");
+		expect(resumed).toMatchObject({ agent_id: "developer", status: "succeeded" });
+		const input = await inputOf(resumed.id);
+		expect(input.durableState.resolvedWaits.map((w) => w.outcome)).toEqual(["matched"]);
+		await gateway.controller().listener?.sync();
+		await settle();
+		expect(await runsOf(answerEvent.id)).toHaveLength(1);
+		expect(await waitsIn(root)).toEqual([{ agent_id: "developer", status: "matched" }]);
 	});
 
 	it("retires the bot of an agent removed from the configuration", async () => {

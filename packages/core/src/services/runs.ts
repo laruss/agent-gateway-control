@@ -29,6 +29,7 @@ import {
 	waitSubscriptions,
 	withTransaction,
 } from "@agent-gateway/db";
+import { mattermostPost } from "@agent-gateway/events";
 import { redactForStorage } from "@agent-gateway/logging";
 import { and, eq } from "drizzle-orm";
 import {
@@ -42,14 +43,16 @@ import {
 	runScope,
 } from "../outcome.ts";
 import { requireTransition } from "../state-machine.ts";
-import { clampWaitTimeout } from "../waits.ts";
+import { clampWaitTimeout, isThreadBound } from "../waits.ts";
+import { parseThreadRef, recordThreadSummary, threadCorrelationOf } from "./context-store.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
+import { lockMemoryKey, supersedeMemory } from "./memory.ts";
 import { enqueueAttempt, enqueueRunDeadline, scheduleAgent } from "./scheduler.ts";
 import {
 	audit,
 	enqueueOutbox,
 	loadActiveConfig,
-	loadDirectory,
+	loadOwnerUserIds,
 	loadTeamChannels,
 	lockAgent,
 	lockCascade,
@@ -309,6 +312,30 @@ function issuesDetail(issues: Readonly<OutcomeIssue[]>): string {
 	return issues.map((issue) => `${issue.path}: ${issue.message}`).join("; ");
 }
 
+type SnapshotRow = typeof contextSnapshots.$inferSelect;
+
+/**
+ * What the run may reply to and wait on: its own events, and the thread its context was
+ * assembled from. A turn resumed by a timeout carries no post, yet it may still answer in the
+ * thread it was waiting in.
+ */
+async function completionScope(uow: UnitOfWork, snapshot: SnapshotRow): Promise<RunScope> {
+	const scope = runScope([snapshot.input.trigger, ...snapshot.input.pendingInbox]);
+	const ref = parseThreadRef(snapshot.threadRef);
+	if (ref === null || scope.threadRoots.has(ref.rootPostId)) {
+		return scope;
+	}
+	const correlationId = await threadCorrelationOf(uow.tx.db, ref);
+	return {
+		correlationIds: new Set([...scope.correlationIds, correlationId]),
+		threadRoots: new Map([
+			...scope.threadRoots,
+			[ref.rootPostId, { channelId: ref.channelId, correlationId }],
+		]),
+		maxHop: scope.maxHop,
+	};
+}
+
 async function applyCompletion(
 	uow: UnitOfWork,
 	run: RunRow,
@@ -348,7 +375,7 @@ async function applyCompletion(
 	if (snapshot === undefined) {
 		throw new Error(`run '${run.id}' has no context snapshot`);
 	}
-	const scope = runScope([snapshot.input.trigger, ...snapshot.input.pendingInbox]);
+	const scope = await completionScope(uow, snapshot);
 	const issues = [
 		...checkTurnResultAuthority(result, snapshot.authority),
 		...checkRunScope(result, scope),
@@ -384,7 +411,7 @@ async function applyCompletion(
 
 	let approvers: MattermostId[] = [];
 	if (result.nextState.kind === "needs_human") {
-		approvers = await resolveApprovers(uow);
+		approvers = await loadOwnerUserIds(uow.tx.db);
 		if (approvers.length === 0) {
 			return applyFailure(
 				uow,
@@ -403,8 +430,27 @@ async function applyCompletion(
 
 	const artifactIds = await persistArtifacts(uow, run, result);
 	await persistMessages(uow, run, agent, result, artifactIds, scope);
-	await persistMemory(uow, run, result);
+	await persistMemory(uow, run, agent, result);
 	await persistSession(uow, agent.id, result);
+	// A thread's summary is read by every agent working in that thread's channel: a run that also
+	// saw posts of another channel keeps its summary to itself.
+	const threadRef = parseThreadRef(snapshot.threadRef);
+	const carriedChannels = new Set(
+		[snapshot.input.trigger, ...snapshot.input.pendingInbox].flatMap((event) => {
+			const post = mattermostPost(event);
+			return post === null ? [] : [post.channel_id];
+		}),
+	);
+	if (
+		threadRef !== null &&
+		[...carriedChannels].every((channelId) => channelId === threadRef.channelId)
+	) {
+		await recordThreadSummary(uow, threadRef, {
+			id: run.id,
+			agentId: agent.id,
+			summary: result.publicSummary,
+		});
+	}
 
 	const outcome: RunOutcome = result.nextState.kind;
 	let runStatus: "succeeded" | "failed" = "succeeded";
@@ -421,7 +467,7 @@ async function applyCompletion(
 			);
 			break;
 		case "waiting":
-			await createWaits(uow, run, agent.id, result.nextState.waits);
+			await createWaits(uow, run, agent.id, result.nextState.waits, scope);
 			await setAgentState(
 				uow,
 				agent.id,
@@ -555,15 +601,30 @@ async function persistMessages(
 	}
 }
 
-async function persistMemory(uow: UnitOfWork, run: RunRow, result: AgentTurnResult): Promise<void> {
+/**
+ * Stores the run's memory proposals. The agent's own private namespace is its own business: a
+ * proposal there is accepted at once and supersedes the item with the same key. A shared
+ * namespace reaches other agents' turns, so its proposals wait for an operator's review.
+ */
+async function persistMemory(
+	uow: UnitOfWork,
+	run: RunRow,
+	agent: AgentRow,
+	result: AgentTurnResult,
+): Promise<void> {
 	for (const proposal of result.memoryProposals) {
+		const own = proposal.namespace === agent.config.memory.private_namespace;
+		if (own) {
+			await lockMemoryKey(uow, proposal.namespace, proposal.key);
+			await supersedeMemory(uow, proposal.namespace, proposal.key);
+		}
 		await uow.tx.db.insert(memoryItems).values({
 			namespace: proposal.namespace,
 			key: proposal.key,
 			content: proposal.content,
 			sourceEventId: run.triggerEventId,
 			sourceRunId: run.id,
-			status: "proposed",
+			status: own ? "accepted" : "proposed",
 			visibility: proposal.visibility,
 			createdAt: uow.now,
 		});
@@ -603,6 +664,7 @@ async function insertWait(
 	agentId: string,
 	condition: WaitCondition,
 	timeoutAt: Date,
+	threadRootIds: Readonly<MattermostId[]> | null,
 ): Promise<void> {
 	const clamped = { ...condition, timeoutAt: timeoutAt.toISOString() };
 	const [wait] = await uow.tx.db
@@ -614,6 +676,7 @@ async function insertWait(
 			eventType: condition.eventType,
 			correlationId: condition.correlationId,
 			condition: clamped,
+			threadRootIds: threadRootIds === null ? null : [...threadRootIds],
 			timeoutAt,
 			createdAt: uow.now,
 		})
@@ -624,34 +687,30 @@ async function insertWait(
 	await uow.jobs.send(QUEUES.waitTimeout, { waitId: wait.id }, { startAfter: timeoutAt });
 }
 
+/**
+ * Creates the waits of a run. A wait on a reply is bound to the run's threads of the waited-on
+ * conversation (and, when matching, to the threads the run itself starts).
+ */
 async function createWaits(
 	uow: UnitOfWork,
 	run: RunRow,
 	agentId: string,
 	waits: Readonly<WaitCondition[]>,
+	scope: RunScope,
 ): Promise<void> {
 	for (const condition of waits) {
+		const roots = [...scope.threadRoots]
+			.filter(([, thread]) => thread.correlationId === condition.correlationId)
+			.map(([rootId]) => rootId);
 		await insertWait(
 			uow,
 			run,
 			agentId,
 			condition,
 			clampWaitTimeout(new Date(condition.timeoutAt), uow.now),
+			isThreadBound(condition) ? roots : null,
 		);
 	}
-}
-
-/** Owners resolved to Mattermost user ids; only they may decide approvals. */
-async function resolveApprovers(uow: UnitOfWork): Promise<MattermostId[]> {
-	const config = await loadActiveConfig(uow.tx.db);
-	const users = await loadDirectory(uow.tx.db, "user");
-	const ids = (config?.organization.organization.owner_mattermost_usernames ?? []).flatMap(
-		(name) => {
-			const id = users.get(name);
-			return id === undefined ? [] : [id];
-		},
-	);
-	return [...new Set(ids)];
 }
 
 /**
@@ -728,6 +787,7 @@ async function createApproval(
 				timeoutAt: expiresAt.toISOString(),
 			},
 			expiresAt,
+			null,
 		);
 	}
 	await audit(uow, "system", "approval.requested", "approval", approval.id, {

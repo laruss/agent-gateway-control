@@ -264,6 +264,7 @@ describe("AgentTurnInput", () => {
 		channels: [{ channelId: CHANNEL_ID, name: "mail" }],
 		threadContext: null,
 		memories: [],
+		memoryNamespaces: { private: "agents/mail-follower", shared: ["organization/customers"] },
 		pendingInbox: [],
 		workspace: null,
 		toolPolicy: { policyVersion: "1", allow: ["mail.read"], requireHumanApproval: [], deny: [] },

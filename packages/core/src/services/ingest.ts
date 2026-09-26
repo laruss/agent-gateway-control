@@ -36,7 +36,7 @@ import {
 	raiseAlert,
 	toRoutingAgent,
 } from "./store.ts";
-import { resolveWait } from "./wait-store.ts";
+import { resolveWait, toActiveWaits } from "./wait-store.ts";
 
 /**
  * Lifecycle, wait, approval, timer and control events, the Gateway source and the
@@ -306,10 +306,5 @@ async function candidateWaits(uow: UnitOfWork, event: GatewayEvent): Promise<Act
 					: eq(waitSubscriptions.correlationId, event.correlationid),
 			),
 		);
-	return rows.map((row) => ({
-		id: row.id,
-		agentId: row.agentId,
-		condition: row.condition,
-		timeoutAt: row.timeoutAt,
-	}));
+	return toActiveWaits(uow.tx.db, rows);
 }

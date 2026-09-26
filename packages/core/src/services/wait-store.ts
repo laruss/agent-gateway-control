@@ -1,8 +1,10 @@
 import type { GatewayEvent, Uuid } from "@agent-gateway/contracts";
 import { agentInbox, agentRuns, eventRoutes, events, waitSubscriptions } from "@agent-gateway/db";
-import { and, eq, gte, inArray, ne, or } from "drizzle-orm";
+import { mattermostPost } from "@agent-gateway/events";
+import { and, eq, gte, inArray, isNotNull, ne, or, sql } from "drizzle-orm";
 import { routeEvent } from "../routing.ts";
 import { type ActiveWait, waitMatches } from "../waits.ts";
+import { deletedPosts } from "./context-store.ts";
 import type { UnitOfWork } from "./deps.ts";
 import { loopStats, type StoredEventPosition } from "./loop-stats.ts";
 import {
@@ -16,6 +18,60 @@ import {
 
 /** Inbox priority of an entry that resolved a wait. */
 export const WAIT_PRIORITY = 10;
+
+type WaitRow = typeof waitSubscriptions.$inferSelect;
+type Db = UnitOfWork["tx"]["db"];
+
+/**
+ * Waits as the matcher sees them. A thread-bound wait admits replies in the threads it was
+ * asked in, and in threads its run started (root posts the run published, found by causation):
+ * those roots exist only after delivery, so they are looked up each time.
+ */
+export async function toActiveWaits(db: Db, rows: Readonly<WaitRow[]>): Promise<ActiveWait[]> {
+	const runIds = [
+		...new Set(rows.filter((row) => row.threadRootIds !== null).map((r) => r.createdByRunId)),
+	];
+	const started = new Map<string, string[]>();
+	if (runIds.length > 0) {
+		const roots = await db
+			.select({
+				causationId: events.causationId,
+				senderAgentId: events.senderAgentId,
+				postId: sql<string>`${events.payload}->>'post_id'`,
+			})
+			.from(events)
+			.where(
+				and(
+					inArray(
+						events.causationId,
+						runIds.map((id) => `run:${id}`),
+					),
+					// Only a new Mattermost root post by an agent: the signed post of the run's own bot.
+					inArray(events.type, ["mattermost.post.created", "mattermost.agent.mentioned"]),
+					isNotNull(events.senderAgentId),
+					sql`${events.payload} ? 'post_id'`,
+					sql`(${events.payload}->>'root_id') is null`,
+				),
+			);
+		const runAgent = new Map(rows.map((row) => [`run:${row.createdByRunId}`, row.agentId]));
+		for (const root of roots) {
+			const key = root.causationId ?? "";
+			if (runAgent.get(key) === root.senderAgentId) {
+				started.set(key, [...(started.get(key) ?? []), root.postId]);
+			}
+		}
+	}
+	return rows.map((row) => ({
+		id: row.id,
+		agentId: row.agentId,
+		condition: row.condition,
+		timeoutAt: row.timeoutAt,
+		threadRootIds:
+			row.threadRootIds === null
+				? null
+				: new Set([...row.threadRootIds, ...(started.get(`run:${row.createdByRunId}`) ?? [])]),
+	}));
+}
 
 /**
  * Consumes a wait atomically: only an active wait changes, so two events racing for the same
@@ -122,10 +178,15 @@ export async function cancelActiveWaits(uow: UnitOfWork, agentId: string): Promi
  * Catches answers that arrived before the agent's wait existed, or while the wait was being
  * committed: pending inbox entries of the agent, and every event of a waited-on correlation
  * received since the waiting run was queued (an untargeted thread reply is stored without an
- * inbox entry). The first match resolves its wait and becomes the resuming inbox entry.
+ * inbox entry). The first match resolves its wait and becomes the resuming inbox entry. Posts of
+ * channels outside `allowed` (the agent's channels now) answer nothing.
  * Call with the agent row locked. Returns whether a wait was resolved.
  */
-export async function matchMissedAnswers(uow: UnitOfWork, agentId: string): Promise<boolean> {
+export async function matchMissedAnswers(
+	uow: UnitOfWork,
+	agentId: string,
+	allowed: ReadonlySet<string>,
+): Promise<boolean> {
 	const { db } = uow.tx;
 	const waitRows = await db
 		.select({ wait: waitSubscriptions, runQueuedAt: agentRuns.queuedAt })
@@ -135,12 +196,10 @@ export async function matchMissedAnswers(uow: UnitOfWork, agentId: string): Prom
 	if (waitRows.length === 0) {
 		return false;
 	}
-	const waits: ActiveWait[] = waitRows.map(({ wait }) => ({
-		id: wait.id,
-		agentId,
-		condition: wait.condition,
-		timeoutAt: wait.timeoutAt,
-	}));
+	const waits = await toActiveWaits(
+		db,
+		waitRows.map(({ wait }) => wait),
+	);
 	const since = new Date(Math.min(...waitRows.map((row) => row.runQueuedAt.getTime())));
 	const correlations = [...new Set(waitRows.map(({ wait }) => wait.correlationId))];
 
@@ -194,12 +253,18 @@ export async function matchMissedAnswers(uow: UnitOfWork, agentId: string): Prom
 			),
 		);
 	const seen = new Set([...handled, ...refused].map((row) => row.eventId));
+	// A post deleted before the wait saw it answers nothing.
+	const deleted = await deletedPosts(db, candidates.map(toGatewayEvent));
 
 	for (const row of candidates) {
 		if (seen.has(row.id)) {
 			continue;
 		}
 		const event = toGatewayEvent(row);
+		const post = mattermostPost(event);
+		if (post !== null && (deleted.has(post.post_id) || !allowed.has(post.channel_id))) {
+			continue;
+		}
 		const wait = waits.find((w) => waitMatches(w, event, uow.now));
 		if (wait === undefined) {
 			continue;

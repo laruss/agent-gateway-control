@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import {
+	type AgentTurnInput,
+	type GatewayEvent,
 	type JsonValue,
+	MattermostPostDataSchema,
 	QUEUES,
 	type RunQueueName,
 	reportQueue,
@@ -10,6 +14,7 @@ import {
 import {
 	afterChannelStart,
 	applyConfig,
+	decideMemory,
 	deleteDirectoryEntry,
 	deleteUnmanagedChannelCursors,
 	enqueueOutbox,
@@ -34,6 +39,7 @@ import {
 	whileAgentMayPost,
 } from "@agent-gateway/core";
 import { createPool, grantWorkerRole, withTransaction } from "@agent-gateway/db";
+import { newPostEventType } from "@agent-gateway/events";
 import { silentLogger } from "@agent-gateway/logging";
 import {
 	type Deliverer,
@@ -126,6 +132,72 @@ describe("durable core with the mock runtime", () => {
 	const idle = (agentId: string) =>
 		eventually(async () => (await agentState(agentId)) === "idle", 30_000, `${agentId} idle`);
 
+	/** The turn input of an agent's latest run in a correlation. */
+	const latestInput = async (correlationId: string, agentId: string) => {
+		const [row] = await query<{ input: AgentTurnInput; thread_ref: string | null }>(
+			`select s.input, s.thread_ref from context_snapshots s join agent_runs r on r.id = s.run_id
+			  where r.correlation_id = $1 and r.agent_id = $2 order by r.queued_at desc limit 1`,
+			[correlationId, agentId],
+		);
+		if (row === undefined) {
+			throw new Error(`no run of ${agentId} in ${correlationId}`);
+		}
+		return row;
+	};
+
+	let postCounter = 0;
+	/** A post of a thread in #hq, as the listener would normalize it. */
+	const threadEvent = (
+		init: Readonly<{
+			rootId: string | null;
+			message: string;
+			targets?: Readonly<string[]>;
+			userId?: string;
+		}>,
+	): GatewayEvent => {
+		postCounter += 1;
+		const postId = `thrp0st${String(postCounter).padStart(19, "0")}`;
+		const targets = init.targets ?? [];
+		return {
+			specversion: "1.0",
+			id: `mattermost:post:${postId}`,
+			source: "mattermost://test",
+			type: newPostEventType(init.rootId, targets),
+			time: new Date().toISOString(),
+			subject: `channel/${IDS.channel("hq")}/post/${postId}`,
+			datacontenttype: "application/json",
+			correlationid: `thread:${init.rootId ?? postId}`,
+			causationid: null,
+			trustlevel: "human-trusted",
+			hop: 0,
+			data: {
+				post_id: postId,
+				root_id: init.rootId,
+				channel_id: IDS.channel("hq"),
+				user_id: init.userId ?? IDS.human,
+				sender_agent_id: null,
+				target_agent_ids: [...targets],
+				message: init.message,
+			},
+		};
+	};
+
+	/** A later change (edit or deletion) of a stored post event. */
+	const changeOf = (
+		event: GatewayEvent,
+		change: "edited" | "deleted",
+		message: string,
+	): GatewayEvent => {
+		const post = MattermostPostDataSchema.parse(event.data);
+		return {
+			...event,
+			id: change === "edited" ? `${event.id}:edited:${Date.now()}` : `${event.id}:deleted`,
+			type: change === "edited" ? "mattermost.post.edited" : "mattermost.post.deleted",
+			time: new Date().toISOString(),
+			data: { ...post, target_agent_ids: [], message: change === "deleted" ? "" : message },
+		};
+	};
+
 	it("creates exactly one run for a duplicated event, also under concurrency", async () => {
 		const event = humanPost("@developer status please", ["developer"]);
 		const results = await Promise.all([
@@ -199,6 +271,335 @@ describe("durable core with the mock runtime", () => {
 			[event.correlationid],
 		);
 		expect(resumed?.input.durableState.resolvedWaits.map((w) => w.outcome)).toEqual(["matched"]);
+
+		// The resumed turn sees its thread: the human root, its own question, and the summaries of
+		// the runs before it. Finance's answer is the trigger and is not repeated.
+		const { input, thread_ref: threadRef } = await latestInput(event.correlationid, "developer");
+		const rootId = MattermostPostDataSchema.parse(event.data).post_id;
+		expect(threadRef).toBe(`channel/${IDS.channel("hq")}/thread/${rootId}`);
+		const thread = input.threadContext;
+		expect(thread?.rootPost).toMatchObject({ postId: rootId, trustLevel: "human-trusted" });
+		expect(thread?.recentPosts.map((p) => [p.authorAgentId, p.message])).toEqual([
+			["developer", "@finance could you answer in this thread?"],
+		]);
+		expect(thread?.participantAgentIds).toEqual(["developer", "finance"]);
+		expect(thread?.summary).toContain("@developer at");
+		expect(thread?.summary).toContain("@finance at");
+		expect(input.durableState.previousSummary?.done).toEqual(["Asked a question"]);
+		const [summary] = await query<{ summary: { entries: { agentId: string }[] } }>(
+			"select summary from thread_summaries where channel_id = $1 and root_post_id = $2",
+			[IDS.channel("hq"), rootId],
+		);
+		expect(summary?.summary.entries.map((e) => e.agentId)).toEqual([
+			"developer",
+			"finance",
+			"developer",
+		]);
+	});
+
+	it("assembles the thread with edits applied and deleted posts left out", async () => {
+		const root = threadEvent({ rootId: null, message: "Release plan for Friday" });
+		const rootId = MattermostPostDataSchema.parse(root.data).post_id;
+		const kept = threadEvent({ rootId, message: "first draft", userId: IDS.owner });
+		const dropped = threadEvent({ rootId, message: "wrong channel, sorry" });
+		for (const event of [
+			root,
+			kept,
+			dropped,
+			changeOf(kept, "edited", "final draft"),
+			changeOf(dropped, "deleted", ""),
+		]) {
+			await ingestEvent(gateway.deps(), event);
+		}
+		const ask = threadEvent({
+			rootId,
+			message: "@developer please review",
+			targets: ["developer"],
+		});
+		await ingestEvent(gateway.deps(), ask);
+		await finishedRun(ask.id, "developer run in the thread");
+
+		const { input } = await latestInput(root.correlationid, "developer");
+		expect(input.threadContext?.rootPost?.message).toBe("Release plan for Friday");
+		expect(input.threadContext?.recentPosts.map((p) => [p.authorUserId, p.message])).toEqual([
+			[IDS.owner, "final draft"],
+		]);
+		expect(input.threadContext?.omittedPostCount).toBe(0);
+		expect(input.memoryNamespaces).toEqual({
+			private: "agents/developer",
+			shared: ["organization/decisions", "organization/engineering"],
+		});
+	});
+
+	it("waits for the human who asked and resumes on their answer in the thread", async () => {
+		const ask = threadEvent({
+			rootId: null,
+			message: "@developer check with me first [mock:wait-asker]",
+			targets: ["developer"],
+		});
+		await ingestEvent(gateway.deps(), ask);
+		await eventually(
+			async () => (await agentState("developer")) === "waiting",
+			30_000,
+			"developer waiting",
+		);
+		const [wait] = await query<{ condition: { expectedSenderUserIds: string[] } }>(
+			"select condition from wait_subscriptions where correlation_id = $1 and status = 'active'",
+			[ask.correlationid],
+		);
+		expect(wait?.condition.expectedSenderUserIds).toEqual([IDS.human]);
+
+		// Someone else's answer does not resolve it; the asker's does, without a mention.
+		const rootId = MattermostPostDataSchema.parse(ask.data).post_id;
+		const other = threadEvent({ rootId, message: "not me", userId: IDS.owner });
+		await ingestEvent(gateway.deps(), other);
+		await Bun.sleep(500);
+		expect(await agentState("developer")).toBe("waiting");
+		const answer = threadEvent({ rootId, message: "go ahead" });
+		await ingestEvent(gateway.deps(), answer);
+		const run = await finishedRun(answer.id, "resumed developer run");
+		expect(run).toMatchObject({ agent_id: "developer", status: "succeeded" });
+		const { input } = await latestInput(ask.correlationid, "developer");
+		expect(input.durableState.resolvedWaits.map((w) => w.outcome)).toEqual(["matched"]);
+		await idle("developer");
+	});
+
+	it("resumes only on a reply in the thread the question was asked in", async () => {
+		const deps = gateway.deps();
+		await pauseAgent(deps, "finance", "test");
+		const ask = threadEvent({
+			rootId: null,
+			message: "@developer ask finance [mock:wait finance]",
+			targets: ["developer"],
+		});
+		await ingestEvent(deps, ask);
+		await eventually(
+			async () => (await agentState("developer")) === "waiting",
+			30_000,
+			"developer waiting",
+		);
+		const rootId = MattermostPostDataSchema.parse(ask.data).post_id;
+		// A finance post addressed to developer in another thread of the same conversation (a thread
+		// some other run of the cascade started): the same correlation, but not where it was asked.
+		const elsewhere = {
+			...threadEvent({ rootId: "e1sewherer00t0000000000000", message: "@developer done" }),
+			correlationid: ask.correlationid,
+			causationid: `run:${randomUUID()}`,
+			trustlevel: "internal-untrusted" as const,
+			hop: 2,
+		};
+		const elsewherePost = MattermostPostDataSchema.parse(elsewhere.data);
+		await ingestEvent(deps, {
+			...elsewhere,
+			data: {
+				...elsewherePost,
+				sender_agent_id: "finance",
+				user_id: "f1nancebot0000000000000000",
+				target_agent_ids: ["developer"],
+			},
+		});
+		await Bun.sleep(500);
+		expect(await agentState("developer")).toBe("waiting");
+
+		// Finance answers the question in its thread: that resumes developer.
+		await resumeAgent(deps, "finance", "test");
+		await eventually(
+			async () => {
+				const rows = await query<{ status: string }>(
+					"select status from wait_subscriptions where correlation_id = $1",
+					[ask.correlationid],
+				);
+				return rows.length === 1 && rows[0]?.status === "matched";
+			},
+			30_000,
+			"wait matched in its thread",
+		);
+		await idle("developer");
+		const { input } = await latestInput(ask.correlationid, "developer");
+		expect(input.threadContext?.rootPostId).toBe(rootId);
+		expect(input.durableState.resolvedWaits.map((w) => w.outcome)).toEqual(["matched"]);
+		const trigger = MattermostPostDataSchema.parse(input.trigger.data);
+		expect([trigger.root_id, trigger.sender_agent_id]).toEqual([rootId, "finance"]);
+	});
+
+	it("binds reply waits created before thread binding to their run's threads", async () => {
+		const [run] = await query<{ id: string; agent_id: string; correlation: string; root: string }>(
+			`select r.id, r.agent_id, s.input->'trigger'->>'correlationid' as correlation,
+			        coalesce(s.input->'trigger'->'data'->>'root_id', s.input->'trigger'->'data'->>'post_id') as root
+			   from agent_runs r join context_snapshots s on s.run_id = r.id
+			  where s.input->'trigger'->'data' ? 'post_id' order by r.queued_at limit 1`,
+		);
+		if (run === undefined) {
+			throw new Error("no run with a post trigger");
+		}
+		const condition = {
+			eventType: "mattermost.thread.reply",
+			correlationId: run.correlation,
+			expectedSenderAgentIds: ["finance"],
+			expectedSenderUserIds: [],
+			requireTargetAgentId: null,
+			timeoutAt: new Date(Date.now() + 3600_000).toISOString(),
+		};
+		const insert = (correlation: string) =>
+			query<{ id: string }>(
+				`insert into wait_subscriptions
+				   (agent_id, created_by_run_id, status, event_type, correlation_id, condition, timeout_at)
+				 values ($1, $2, 'active', 'mattermost.thread.reply', $3, $4::jsonb, now() + interval '1 hour')
+				 returning id`,
+				[
+					run.agent_id,
+					run.id,
+					correlation,
+					JSON.stringify({ ...condition, correlationId: correlation }),
+				],
+			);
+		const [bound] = await insert(run.correlation);
+		const [orphan] = await insert("thread:nothingknown000000000000");
+		const migration = readFileSync(
+			new URL("../../../packages/db/migrations/0006_bind_reply_waits.sql", import.meta.url),
+			"utf8",
+		);
+		await gateway.pool.query(migration);
+		const roots = await query<{ id: string; thread_root_ids: string[] }>(
+			"select id, thread_root_ids from wait_subscriptions where id = any($1::uuid[]) order by id",
+			[`{${bound?.id},${orphan?.id}}`],
+		);
+		expect(Object.fromEntries(roots.map((r) => [r.id, r.thread_root_ids]))).toEqual({
+			[bound?.id ?? ""]: [run.root],
+			[orphan?.id ?? ""]: [],
+		});
+		await query("update wait_subscriptions set status = 'cancelled' where id = any($1::uuid[])", [
+			`{${bound?.id},${orphan?.id}}`,
+		]);
+	});
+
+	it("drops deleted posts from the inbox and shows edited ones as they are now", async () => {
+		const deps = gateway.deps();
+		await pauseAgent(deps, "developer", "test");
+		const withdrawn = threadEvent({
+			rootId: null,
+			message: "@developer the password is hunter2",
+			targets: ["developer"],
+		});
+		const edited = threadEvent({
+			rootId: null,
+			message: "@developer deploy X",
+			targets: ["developer"],
+		});
+		for (const event of [
+			withdrawn,
+			changeOf(withdrawn, "deleted", ""),
+			edited,
+			changeOf(edited, "edited", "@developer do NOT deploy X"),
+		]) {
+			await ingestEvent(deps, event);
+		}
+		await resumeAgent(deps, "developer", "test");
+		const run = await finishedRun(edited.id, "developer run on the edited post");
+		expect(run.status).toBe("succeeded");
+		await idle("developer");
+		const { input } = await latestInput(edited.correlationid, "developer");
+		expect(MattermostPostDataSchema.parse(input.trigger.data).message).toBe(
+			"@developer do NOT deploy X",
+		);
+		expect(input.pendingInbox).toEqual([]);
+		expect(await runsFor(withdrawn.id)).toEqual([]);
+		const [entry] = await query<{ status: string }>(
+			`select i.status from agent_inbox i join events e on e.id = i.event_id
+			  where e.external_id = $1 and i.agent_id = 'developer'`,
+			[withdrawn.id],
+		);
+		expect(entry?.status).toBe("dead");
+	});
+
+	it("does not resume on an answer deleted before the wait existed", async () => {
+		await idle("developer");
+		await gateway.stopWorker();
+		const ask = threadEvent({
+			rootId: null,
+			message: "@developer check with me [mock:wait-asker]",
+			targets: ["developer"],
+		});
+		await ingestEvent(gateway.deps(), ask);
+		const rootId = MattermostPostDataSchema.parse(ask.data).post_id;
+		const early = threadEvent({ rootId, message: "yes" });
+		await ingestEvent(gateway.deps(), early);
+		await ingestEvent(gateway.deps(), changeOf(early, "deleted", ""));
+		await gateway.startWorker();
+		await eventually(
+			async () => (await agentState("developer")) === "waiting",
+			30_000,
+			"developer waiting",
+		);
+		await Bun.sleep(500);
+		expect(await agentState("developer")).toBe("waiting");
+		const answer = threadEvent({ rootId, message: "yes, really" });
+		await ingestEvent(gateway.deps(), answer);
+		await finishedRun(answer.id, "developer resumed by the live answer");
+		await idle("developer");
+	});
+
+	it("lets an agent wait for a human in a thread whose root was never recorded", async () => {
+		const ask = threadEvent({
+			rootId: "unrec0rdedr00t000000000000",
+			message: "@developer confirm with me [mock:wait-asker]",
+			targets: ["developer"],
+		});
+		await ingestEvent(gateway.deps(), ask);
+		await eventually(
+			async () => (await agentState("developer")) === "waiting",
+			30_000,
+			"developer waiting",
+		);
+		const { input } = await latestInput(ask.correlationid, "developer");
+		expect(input.threadContext).toMatchObject({ rootPost: null, recentPosts: [] });
+		const answer = threadEvent({ rootId: "unrec0rdedr00t000000000000", message: "confirmed" });
+		await ingestEvent(gateway.deps(), answer);
+		await finishedRun(answer.id, "developer resumed");
+		await idle("developer");
+	});
+
+	it("keeps memory within namespaces and shares a proposal only once an operator accepts it", async () => {
+		const remember = async (agentId: string) => {
+			const event = humanPost(`@${agentId} note this [mock:remember]`, [agentId]);
+			await ingestEvent(gateway.deps(), event);
+			await finishedRun(event.id, `${agentId} remember run`);
+			await idle(agentId);
+			return (await latestInput(event.correlationid, agentId)).input;
+		};
+		const memory = () =>
+			query<{ id: string; namespace: string; status: string }>(
+				`select id, namespace, status from memory_items where key = 'mock-note' order by namespace, created_at`,
+			);
+
+		const first = await remember("developer");
+		expect(first.memories).toEqual([]);
+		expect(await memory()).toMatchObject([
+			{ namespace: "agents/developer", status: "accepted" },
+			{ namespace: "organization/decisions", status: "proposed" },
+		]);
+
+		// The private note is the agent's own at once; the shared proposal is invisible so far.
+		const second = await remember("developer");
+		expect(second.memories.map((m) => m.namespace)).toEqual(["agents/developer"]);
+		const afterSecond = await memory();
+		expect(afterSecond.filter((m) => m.status === "accepted")).toHaveLength(1);
+		expect(afterSecond.filter((m) => m.status === "superseded")).toHaveLength(1);
+
+		const shared = afterSecond.find((m) => m.namespace === "organization/decisions");
+		if (shared === undefined) {
+			throw new Error("no shared proposal");
+		}
+		await decideMemory(gateway.deps(), shared.id, "accept", "test");
+		await expect(decideMemory(gateway.deps(), shared.id, "accept", "test")).rejects.toThrow(
+			"is not proposed",
+		);
+
+		// finance reads organization/decisions too, but never developer's private namespace.
+		const finance = await remember("finance");
+		expect(finance.memories.map((m) => [m.namespace, m.key])).toEqual([
+			["organization/decisions", "mock-note"],
+		]);
 	});
 
 	it("fails a permanent runtime error and redrives it on request", async () => {
@@ -252,6 +653,21 @@ describe("durable core with the mock runtime", () => {
 		if (wait === undefined) {
 			throw new Error("no active wait");
 		}
+		// Let the question reach the thread before the wait times out.
+		await eventually(
+			async () =>
+				(
+					await query(
+						"select 1 from events where correlation_id = $1 and sender_agent_id = 'director'",
+						[event.correlationid],
+					)
+				).length > 0,
+			30_000,
+			"director's question posted",
+		);
+		// Unrelated work of another thread waits in the inbox and joins the resumed turn.
+		const unrelated = humanPost("@director unrelated question", ["director"]);
+		await ingestEvent(gateway.deps(), unrelated);
 		expect(await handleWaitTimeout(gateway.deps(), { waitId: wait.id })).toBe("not_due");
 		const later = { ...gateway.deps(), clock: () => new Date(Date.now() + 2 * 3600_000) };
 		expect(await handleWaitTimeout(later, { waitId: wait.id })).toBe("timed_out");
@@ -266,6 +682,23 @@ describe("durable core with the mock runtime", () => {
 			[event.correlationid],
 		);
 		expect(resumed?.input.durableState.resolvedWaits.map((w) => w.outcome)).toEqual(["timeout"]);
+
+		// Resumed without a post, the turn still gets the thread it waited in (not the thread of the
+		// inbox post it also carries) and may answer there.
+		const rootId = MattermostPostDataSchema.parse(event.data).post_id;
+		const { input } = await latestInput(event.correlationid, "director");
+		expect(input.pendingInbox.map((e) => e.id)).toEqual([unrelated.id]);
+		expect(input.threadContext?.rootPostId).toBe(rootId);
+		expect(input.threadContext?.recentPosts.map((p) => p.authorAgentId)).toEqual(["director"]);
+		const posts = await query<{ payload: { rootPostId: string | null; message: string } }>(
+			`select o.payload from outbox o join agent_runs r on r.id = o.run_id
+			  where r.correlation_id = $1 and r.agent_id = 'director' order by o.created_at`,
+			[event.correlationid],
+		);
+		expect(posts.map((p) => [p.payload.rootPostId, p.payload.message])).toEqual([
+			[rootId, "@research could you answer in this thread?"],
+			[rootId, "Thanks, continuing."],
+		]);
 	});
 
 	it("does not let a reply blocked by a loop guard resume a waiting agent", async () => {

@@ -41,7 +41,7 @@ import {
 } from "./store.ts";
 import { cancelActiveWaits } from "./wait-store.ts";
 
-async function inTransaction<T>(
+export async function inTransaction<T>(
 	deps: ControlPlaneDeps,
 	work: (uow: UnitOfWork) => Promise<T>,
 ): Promise<T> {

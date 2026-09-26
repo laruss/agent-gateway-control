@@ -14,11 +14,22 @@ export type ActiveWait = Readonly<{
 	condition: WaitCondition;
 	/** Clamped timeout; the condition's own `timeoutAt` is what the agent asked for. */
 	timeoutAt: Date;
+	/**
+	 * Thread roots a matching reply must be in; null when the wait is not bound to a thread. A
+	 * correlation can span several threads (threads an agent starts inherit its cascade), so a
+	 * reply elsewhere in the conversation is not an answer to the question asked here.
+	 */
+	threadRootIds: ReadonlySet<string> | null;
 }>;
 
+/** Waits on replies are bound to the threads they were asked in. */
+export function isThreadBound(condition: WaitCondition): boolean {
+	return condition.eventType === "mattermost.thread.reply";
+}
+
 /**
- * True when `event` satisfies every condition of `wait`: type, correlation, sender, target
- * and expiry. An agent's own post never satisfies its wait.
+ * True when `event` satisfies every condition of `wait`: type, correlation, thread, sender,
+ * target and expiry. An agent's own post never satisfies its wait.
  */
 export function waitMatches(wait: ActiveWait, event: GatewayEvent, now: Date): boolean {
 	const { condition } = wait;
@@ -41,6 +52,9 @@ export function waitMatches(wait: ActiveWait, event: GatewayEvent, now: Date): b
 		return !namesSender && condition.requireTargetAgentId === null;
 	}
 	if (post.sender_agent_id === wait.agentId) {
+		return false;
+	}
+	if (wait.threadRootIds !== null && !wait.threadRootIds.has(post.root_id ?? post.post_id)) {
 		return false;
 	}
 	// A user id names a human: webhooks, plugins and bots posting under that account (recorded

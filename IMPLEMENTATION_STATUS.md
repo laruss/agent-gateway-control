@@ -62,8 +62,8 @@ Known gaps, deferred:
 - [x] `PublicMessage.rootPostId` must be a thread of the run's own events. Phase 1.
 - [x] Canonical JSON for `immutableActionHash` (sorted keys, parameters sorted by name).
   Phase 1.
-- [ ] Check `WaitCondition.expectedSenderUserIds` against the thread participants (needs thread
-  context, Phase 3).
+- [x] Check `WaitCondition.expectedSenderUserIds` against the thread participants (and the
+  owners). Phase 3.
 - [ ] Typed parameter sets per financial action (Phase 7).
 - [ ] Phase 4: verify each provider actually accepts `agent-turn-model-output.schema.json` (the
   linter only checks the documented subset locally).
@@ -195,8 +195,8 @@ Known gaps, deferred:
 - An outbox item on its last attempt is marked dead when its lease expires even if the slow
   delivery later succeeds; `outbox redrive` recovers it (deliverers are idempotent). The lease
   must stay longer than a deliverer's own timeout.
-- Context assembly is minimal: no thread context, memories or workspace (Phase 3). Memory
-  proposals are stored as `proposed` and not reviewed yet.
+- Context assembly was minimal: no thread context, memories or workspace. Threads, summaries
+  and memory came in Phase 3; workspaces come with the coding runtimes.
 - Approval decisions (grant/deny) arrive with the Mattermost approval flow (Phase 7); until then
   an approval request expires and resumes the agent with a timeout.
 - `/metrics` is served but empty; metrics come with observability work.
@@ -417,7 +417,8 @@ Known gaps, deferred:
   unaffected; a delivery retry whose own scan hits that limit adopts no earlier post and posts
   afresh, since a deletion it cannot see might be the original's.
 - The approval card is informational; decisions from Mattermost (buttons) come in Phase 7.
-- Thread context (root, recent messages, participants) is not assembled yet (Phase 3).
+- Thread context (root, recent messages, participants) was not assembled yet; it came in
+  Phase 3.
 - The Mattermost image is amd64 only; on Apple silicon the e2e suite and the development
   Compose run it emulated.
 
@@ -668,3 +669,120 @@ Findings per round (P1 / P2):
 | 27 (Codex only) | 2 / 0 | - | fixed |
 | 28 (Codex only) | 1 / 1 | - | fixed |
 | 29 (Codex only) | 0 / 0 (one P2 re-rated P3) | - | closed |
+
+## Phase 3 - Durable waits and context
+
+Status: **done** (review closed: Codex round 7 found no P1/P2)
+
+| Item | State | Evidence |
+|------|-------|----------|
+| Wait subscriptions, atomic matching, timeout events (from Phase 1) | done | `runs.ts`, `wait-store.ts`, `wait-timeouts.ts` |
+| Waits name only humans who posted in the run's threads, or owners | done | `turn-authority.ts` (`waitableUserIds`) |
+| Context assembler: thread of the turn from stored events (edits applied, deletions left out, budget), memory, durable state | done | `packages/context`, `core/src/services/context-store.ts`, `scheduler.ts` |
+| A turn resumed by a timeout gets the thread it waited in and may reply there | done | `scheduler.ts`, `runs.ts` (`completionScope`) |
+| Thread summaries: run public summaries merged per thread, older runs compacted deterministically | done | `context/src/summary.ts`, `thread_summaries` (migration 0005) |
+| Reply waits bound to the threads they were asked in (a correlation can span threads) | done | `waits.ts`, `wait-store.ts` (`toActiveWaits`), migrations 0005-0006 |
+| Queued posts shown as they are now: edits applied, deleted posts and revoked channels dropped | done | `context-store.ts` (`withCurrentPosts`, `retireInbox`) |
+| Durable public run summaries: previous summary of the waiting run, the conversation, or the agent | done | `scheduler.ts` (`previousRun`) |
+| Memory namespace boundaries: own namespaces only; private accepted at once, shared reviewed by an operator; one accepted item per key | done | `context/src/memory.ts`, `services/memory.ts`, `gateway memory list/accept/reject` |
+| Prompt rendering in trust order with delimited untrusted data | done | `runtime-sdk/src/prompt.ts` |
+| Mock scenarios `wait-asker`, `remember`; mock replies in the turn's thread after a timeout | done | `runtime-mock/src/scenarios.ts` |
+
+Acceptance (`apps/controller/src/mattermost-bridge.e2e.test.ts`, real Mattermost 11.7.11, and
+`durable-core.integration.test.ts`):
+
+- [x] Developer asks finance and enters WAITING.
+- [x] Finance's reply in the correct thread resumes developer, which sees the thread.
+- [x] A finance reply addressed to developer in another thread does not resume it.
+- [x] A duplicate delivery of the reply (restart and catch-up) resumes once.
+- [x] A restart while waiting preserves the wait; an answer posted while the Gateway was down
+  resumes the agent once.
+- [x] Also covered: thread context with edits and deletions, a human's answer resolving a wait
+  on their user id, memory boundaries and review, thread summaries across a cascade, a timeout
+  resume replying in its thread.
+
+Known gaps, deferred:
+
+- Memory has no relevance ranking: the newest accepted items within the budget are included.
+- A thread with more than 1000 replies is read from its newest 1000.
+- `DirectoryEntry.summary` (what other agents do) stays empty: agents' latest summaries may come
+  from channels the reader cannot see.
+- Workspaces are not assembled (coding runtimes, Phase 4).
+
+Deliberate choices in this phase ([ADR-013](docs/adr/013-turn-context.md)):
+
+- Thread context is read from the Gateway's own events, not from Mattermost: assembly needs no
+  network call inside the scheduling transaction and is reproducible.
+- Thread summaries are compacted without a model: no cost, no failure mode, nothing to inject.
+- Proposals to shared memory need an operator's acceptance; private memory does not.
+
+### Phase 3 review log
+
+- Round 1 (Codex + Opus subagent): Codex 4 P1 + 2 P2, Opus 0 P1 + 5 P2 + 3 P3, overlapping.
+  Re-rated by impact: Codex's queued-content findings (revoked channel, edits/deletions of
+  queued posts) and the durable-state label to P2, memory list paging to P3. Fixed: waits on
+  replies are bound to the threads they were asked in plus threads the waiting run started
+  (a correlation spans several threads); a timeout turn takes the thread of its wait, not of an
+  inbox post; carried posts show their latest edit, deleted posts and posts of channels no
+  longer allowed are dropped from the inbox; a run that saw posts of several channels adds
+  nothing to a thread summary; a thread without a recorded root keeps its replies and the
+  authors of carried posts may be waited on; the durable state is labelled internal-untrusted
+  in the prompt; summary rendering budgets the newest runs first; the wait creator comes from
+  the trigger's own wait; `memory list` pages (`--limit`, `--offset`, proposals oldest first).
+  Not taken: tolerating snapshots without `waitableUserIds` (pre-release, no stored runs).
+
+- Round 2 (Codex + Opus subagent): Codex 1 P1 + 3 P2 + 1 P3, Opus 0 P1/P2 + 3 P3; round 1
+  fixes confirmed. Re-rated: a revoked channel's post in a wait-resolving entry to P2 (needs a
+  channel revocation while the resume is deferred). Fixed: such a post reaches the turn without
+  its text; the missed-answer scan skips posts deleted since; stale inbox entries are retired
+  before the scan, and not at all while no channel is resolved (Opus P3: an unresolved team
+  would have dropped every queued post); thread summaries keep each recent run's facts and
+  risks; the summary header says how many runs are not shown. Not taken: binding a wait to one
+  of several threads its own run started (P3: the model cannot name a root that does not exist
+  yet, and both threads are its own); a real-server test of two threads in one cascade (P3, the
+  integration test covers it); re-matching when a started root arrives after its reply (P3, the
+  listener ingests roots first).
+
+- Round 3 (Codex + Opus subagent): Codex 1 P1 + 1 P2 + 1 P3, Opus 0 P1/P2 + 1 P3; round 2
+  fixes confirmed. Re-rated: a previous summary from a channel the agent lost to P2 (needs a
+  revocation). Fixed: the previous summary comes from the wait's run or the same conversation
+  only, and only from a thread the agent may still read (the latest-run-anywhere fallback is
+  gone); missed answers are not matched while no channel is resolved, nor from channels no
+  longer allowed; a root the turn carries is not repeated as `rootPost`; an unreadable stored
+  thread summary is left alone instead of being overwritten.
+
+- Round 4 (Codex + Opus subagent): Codex 1 P1 + 2 P2, Opus nothing; round 3 fixes confirmed.
+  Fixed: the previous-summary lookup filters readable threads in SQL before limiting; a thread
+  window counts reply creations only, and their edits and deletions are loaded separately, so
+  edits cannot push replies out. Re-rated P3 and not taken: tracking which channels contributed
+  to a summary across later runs. An agent allowed in several channels can move information
+  between them in its posts and private memory anyway; the boundary is what the Gateway
+  assembles (ADR-013, consequences).
+
+- Round 5 (Codex + Opus subagent): Codex 1 P1 + 1 P2, Opus nothing; round 4 fixes confirmed.
+  Re-rated: unbound reply waits after an upgrade to P2 (only waits active during the upgrade;
+  nothing is deployed yet). Fixed: migration 0006 binds active reply waits to their run's
+  threads of the waited-on conversation (none found: no thread, fail closed), tested on stored
+  data; inbox retirement touches Mattermost post events only, not a connector event that
+  happens to carry a `post_id`.
+- Round 6 (Codex only, by the owner's request): 0 P1 + 2 P2; round 5 fixes confirmed. Fixed:
+  roots a waiting run started count only when they are new Mattermost root posts of the run's
+  own agent (not any event naming the run as its cause), also in the 0006 backfill; a thread's
+  reply window takes the newest replies by post time, so a late catch-up of older replies
+  cannot push newer ones out.
+- Round 7 (Codex only): 0 P1 + 1 P2; round 6 fixes confirmed. Re-rated P3: a timeout turn of
+  a wait created by a run without a thread (only connector-started runs, which arrive in
+  Phase 6) got no thread. Fixed anyway: such a turn takes the single new root its creating run
+  opened in the wait's conversation (none or several: no thread). Review closed.
+
+Findings per round (P1 / P2):
+
+| Round | Codex | Opus | Outcome |
+|-------|-------|------|---------|
+| 1 | 4 / 2 | 0 / 5 | fixed |
+| 2 | 1 / 3 (P1 re-rated P2) | 0 / 0 | fixed |
+| 3 | 1 / 1 (P1 re-rated P2) | 0 / 0 | fixed |
+| 4 | 1 / 2 (P1 re-rated P3) | 0 / 0 | fixed |
+| 5 | 1 / 1 (P1 re-rated P2) | 0 / 0 | fixed |
+| 6 (Codex only) | 0 / 2 | - | fixed |
+| 7 (Codex only) | 0 / 0 (one P2 re-rated P3) | - | closed |

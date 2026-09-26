@@ -320,13 +320,26 @@ export const ThreadPostSchema = z
 	});
 export type ThreadPost = z.infer<typeof ThreadPostSchema>;
 
+/**
+ * The thread a turn belongs to, as the Gateway recorded it: edits applied, deleted posts left out
+ * (a deleted root keeps its author with an empty message). The triggering post and the pending
+ * inbox posts are not repeated here; they carry their current text themselves.
+ */
 export const ThreadContextSchema = z.strictObject({
 	channelId: MattermostIdSchema,
 	rootPostId: MattermostIdSchema,
-	rootPost: ThreadPostSchema,
+	/**
+	 * Null when the turn carries the root itself (as its trigger or an inbox event), or when the
+	 * root was posted before the channel became managed (never recorded).
+	 */
+	rootPost: ThreadPostSchema.nullable(),
+	/** The newest posts that fit the context budget, oldest first. */
 	recentPosts: z.array(ThreadPostSchema),
+	/** Public summaries of earlier runs in this thread, compacted; null before the first run. */
 	summary: z.string().nullable(),
+	/** Agents that posted in the thread or were addressed in it. */
 	participantAgentIds: z.array(AgentIdSchema),
+	/** Older posts left out of `recentPosts` by the budget. */
 	omittedPostCount: z.int().min(0),
 });
 export type ThreadContext = z.infer<typeof ThreadContextSchema>;
@@ -375,6 +388,15 @@ export const ToolPolicySnapshotSchema = z
 	});
 export type ToolPolicySnapshot = z.infer<typeof ToolPolicySnapshotSchema>;
 
+/** Where the agent's memory proposals may go; `memories` come from the same namespaces. */
+export const MemoryNamespacesSchema = z.strictObject({
+	/** `agents/<id>`: accepted as proposed, visible to this agent only. */
+	private: MemoryNamespaceSchema,
+	/** `organization/<topic>`: proposals wait for an operator's review before anyone sees them. */
+	shared: z.array(MemoryNamespaceSchema),
+});
+export type MemoryNamespaces = z.infer<typeof MemoryNamespacesSchema>;
+
 /** A channel the agent may post to, as resolved by bootstrap. */
 export const ChannelRefSchema = z.strictObject({
 	channelId: MattermostIdSchema,
@@ -392,7 +414,9 @@ export const AgentTurnInputSchema = z.strictObject({
 	/** Channels the agent may post to; turns without a thread pick their channel from here. */
 	channels: z.array(ChannelRefSchema).min(1),
 	threadContext: ThreadContextSchema.nullable(),
+	/** Accepted memory of the agent's namespaces, newest first, within the context budget. */
 	memories: z.array(MemoryItemSchema),
+	memoryNamespaces: MemoryNamespacesSchema,
 	pendingInbox: z.array(GatewayEventSchema),
 	workspace: WorkspaceDescriptorSchema.nullable(),
 	toolPolicy: ToolPolicySnapshotSchema,

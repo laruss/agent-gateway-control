@@ -30,6 +30,12 @@
 - Status (Phase 0): `trustlevel` on events; model output cannot carry side-effect receipts or a
   risk level; `checkTurnResultAuthority` bounds channels, targets, memory and attachments;
   prompt paths are restricted to `prompts/**.md`. Policy engine in Phase 7.
+- Status (Phase 3): the prompt renderer puts every piece of user, agent and connector content
+  into a `<data>` block with its trust label, after the trusted layers; content cannot close
+  its block. Shared memory, which reaches other agents' turns, is accepted only by an operator,
+  so an injected agent cannot plant instructions for others; a turn reads only its own
+  namespaces. Waits can name only humans who posted in the run's threads or owners
+  ([ADR-013](../adr/013-turn-context.md)).
 
 ### T2. Infinite agent loops
 

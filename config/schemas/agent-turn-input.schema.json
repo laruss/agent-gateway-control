@@ -475,56 +475,63 @@
               "pattern": "^[a-z0-9]{26}$"
             },
             "rootPost": {
-              "type": "object",
-              "properties": {
-                "postId": {
-                  "type": "string",
-                  "pattern": "^[a-z0-9]{26}$"
-                },
-                "authorUserId": {
-                  "type": "string",
-                  "pattern": "^[a-z0-9]{26}$"
-                },
-                "authorAgentId": {
-                  "anyOf": [
-                    {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "postId": {
                       "type": "string",
-                      "minLength": 2,
-                      "maxLength": 32,
-                      "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+                      "pattern": "^[a-z0-9]{26}$"
                     },
-                    {
-                      "type": "null"
+                    "authorUserId": {
+                      "type": "string",
+                      "pattern": "^[a-z0-9]{26}$"
+                    },
+                    "authorAgentId": {
+                      "anyOf": [
+                        {
+                          "type": "string",
+                          "minLength": 2,
+                          "maxLength": 32,
+                          "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "createdAt": {
+                      "type": "string",
+                      "format": "date-time",
+                      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "trustLevel": {
+                      "type": "string",
+                      "enum": [
+                        "system-trusted",
+                        "human-trusted",
+                        "internal-untrusted",
+                        "external-untrusted"
+                      ]
                     }
-                  ]
+                  },
+                  "required": [
+                    "postId",
+                    "authorUserId",
+                    "authorAgentId",
+                    "createdAt",
+                    "message",
+                    "trustLevel"
+                  ],
+                  "additionalProperties": false
                 },
-                "createdAt": {
-                  "type": "string",
-                  "format": "date-time",
-                  "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
-                },
-                "message": {
-                  "type": "string"
-                },
-                "trustLevel": {
-                  "type": "string",
-                  "enum": [
-                    "system-trusted",
-                    "human-trusted",
-                    "internal-untrusted",
-                    "external-untrusted"
-                  ]
+                {
+                  "type": "null"
                 }
-              },
-              "required": [
-                "postId",
-                "authorUserId",
-                "authorAgentId",
-                "createdAt",
-                "message",
-                "trustLevel"
-              ],
-              "additionalProperties": false
+              ]
             },
             "recentPosts": {
               "type": "array",
@@ -661,6 +668,24 @@
         "required": ["id", "namespace", "key", "content", "visibility", "sourceRunId", "createdAt"],
         "additionalProperties": false
       }
+    },
+    "memoryNamespaces": {
+      "type": "object",
+      "properties": {
+        "private": {
+          "type": "string",
+          "pattern": "^(agents\\/[a-z][a-z0-9-]{1,31}|organization(\\/[a-z][a-z0-9-]{0,63}){1,4})$"
+        },
+        "shared": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^(agents\\/[a-z][a-z0-9-]{1,31}|organization(\\/[a-z][a-z0-9-]{0,63}){1,4})$"
+          }
+        }
+      },
+      "required": ["private", "shared"],
+      "additionalProperties": false
     },
     "pendingInbox": {
       "type": "array",
@@ -871,6 +896,7 @@
     "channels",
     "threadContext",
     "memories",
+    "memoryNamespaces",
     "pendingInbox",
     "workspace",
     "toolPolicy",

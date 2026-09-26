@@ -36,6 +36,20 @@
       "when": 1790418282528,
       "tag": "0004_config_generation",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1790424816624,
+      "tag": "0005_thread_context",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1790427644419,
+      "tag": "0006_bind_reply_waits",
+      "breakpoints": true
     }
   ]
 }

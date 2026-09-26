@@ -16,13 +16,16 @@ import {
 	type ControlPlaneDeps,
 	cancelRun,
 	configBundleProblems,
+	decideMemory,
 	ingestEvent,
 	killAll,
 	listAgents,
 	listApprovals,
+	listMemory,
 	listOutbox,
 	listRuns,
 	listWaits,
+	MEMORY_REVIEW_STATUSES,
 	pauseAgent,
 	redriveOutbox,
 	redriveRun,
@@ -86,6 +89,9 @@ export const USAGE = `gateway <command>
   dlq list | redrive <dlq-name> <job-id>
   outbox list [--status <status>] | redrive <outbox-id>
   approvals list [--status <status>]
+  memory list [--status <status>] [--namespace <ns>] [--limit <n>] [--offset <n>]
+  memory accept <id> | reject <id>    review memory proposals to shared namespaces
+                                      (proposed items are listed oldest first)
   mattermost bootstrap --secrets-dir <dir> [--rotate-tokens]
                                       resolve team, channels and owners, create the bots and
                                       their memberships, store tokens in <dir> (needs
@@ -404,6 +410,37 @@ async function runSessionCommand(
 			await redriveOutbox(deps, arg(args, 2, "outbox-id"), who);
 			out.print("outbox item redriven");
 			return 0;
+		case "memory list": {
+			const status = flag(args, "status");
+			const valid = MEMORY_REVIEW_STATUSES.find((s) => s === status);
+			if (status !== null && valid === undefined) {
+				throw new UsageError(`--status must be one of ${MEMORY_REVIEW_STATUSES.join(", ")}`);
+			}
+			const count = (name: string, fallback: number, max: number) => {
+				const raw = flag(args, name);
+				const value = raw === null ? fallback : Number(raw);
+				if (!Number.isInteger(value) || value < 0 || value > max) {
+					throw new UsageError(`--${name} must be an integer from 0 to ${max}`);
+				}
+				return value;
+			};
+			const entries = await listMemory(deps, {
+				status: valid ?? null,
+				namespace: flag(args, "namespace"),
+				oldestFirst: valid === "proposed",
+				limit: count("limit", 100, 1000),
+				offset: count("offset", 0, 1_000_000),
+			});
+			out.print(json(entries));
+			return 0;
+		}
+		case "memory accept":
+		case "memory reject": {
+			const decision = args[1] === "accept" ? "accept" : "reject";
+			await decideMemory(deps, arg(args, 2, "id"), decision, who);
+			out.print(`memory item ${decision === "accept" ? "accepted" : "rejected"}`);
+			return 0;
+		}
 		case "approvals list":
 			out.print(json(await listApprovals(deps, flag(args, "status"))));
 			return 0;

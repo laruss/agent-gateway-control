@@ -6,9 +6,11 @@ import {
 	type ChannelRef,
 	type GatewayEvent,
 	type MattermostId,
+	type MemoryItem,
 	modelOutputJsonSchema,
 	type OrganizationConfig,
 	type ResolvedWait,
+	type ThreadContext,
 	type TurnAuthorityContext,
 	type Uuid,
 	type WorkingSummary,
@@ -37,6 +39,12 @@ export type TurnContextSources = Readonly<{
 	pendingInbox: Readonly<GatewayEvent[]>;
 	previousRun: Readonly<{ id: Uuid; summary: WorkingSummary | null }> | null;
 	resolvedWaits: Readonly<ResolvedWait[]>;
+	/** The turn's thread, assembled from stored events; null for turns outside a thread. */
+	threadContext: ThreadContext | null;
+	/** Accepted memory of the agent's own namespaces. */
+	memories: Readonly<MemoryItem[]>;
+	/** Humans who posted in the run's threads, and the owners. */
+	waitableUserIds: Readonly<MattermostId[]>;
 	now: Date;
 }>;
 
@@ -62,7 +70,7 @@ function resolveChannels(
 /**
  * Assembles the turn input and the authority its result is checked against. Both come from the
  * same sources at the same moment, so the runtime is told exactly what it is allowed to do.
- * Thread context, memories and workspaces are not assembled yet (empty/null). Pure.
+ * Workspaces are not assembled yet (null). Pure.
  */
 export function buildTurnContext(sources: TurnContextSources): TurnContextResult {
 	const { agent, organization, now } = sources;
@@ -104,8 +112,9 @@ export function buildTurnContext(sources: TurnContextSources): TurnContextResult
 			resolvedWaits: sources.resolvedWaits,
 		},
 		channels,
-		threadContext: null,
-		memories: [],
+		threadContext: sources.threadContext,
+		memories: sources.memories,
+		memoryNamespaces: { private: memory.private_namespace, shared: memory.shared_namespaces },
 		pendingInbox: sources.pendingInbox,
 		workspace: null,
 		toolPolicy,
@@ -140,6 +149,7 @@ export function buildTurnContext(sources: TurnContextSources): TurnContextResult
 				addressableAgents,
 				writableMemoryNamespaces: [memory.private_namespace, ...memory.shared_namespaces],
 				attachableArtifactIds: [],
+				waitableUserIds: [...new Set(sources.waitableUserIds)].sort(),
 				toolPolicy,
 			},
 		},
