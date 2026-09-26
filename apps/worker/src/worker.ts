@@ -143,7 +143,14 @@ export async function startWorker(options: WorkerOptions): Promise<RunningWorker
 						job.data,
 						controller.signal,
 					);
-					const entry = { controller, running: running.then(() => undefined) };
+					// Settles either way; the job's own failure still reaches pg-boss below.
+					const entry = {
+						controller,
+						running: running.then(
+							() => undefined,
+							() => undefined,
+						),
+					};
 					inFlight.add(entry);
 					try {
 						await running;
