@@ -43,10 +43,13 @@ export function waitMatches(wait: ActiveWait, event: GatewayEvent, now: Date): b
 	if (post.sender_agent_id === wait.agentId) {
 		return false;
 	}
+	// A user id names a human: webhooks, plugins and bots posting under that account (recorded
+	// as internal-untrusted) are not that human's answer.
 	const senderMatches =
 		(post.sender_agent_id !== null &&
 			condition.expectedSenderAgentIds.includes(post.sender_agent_id)) ||
-		condition.expectedSenderUserIds.includes(post.user_id);
+		(event.trustlevel === "human-trusted" &&
+			condition.expectedSenderUserIds.includes(post.user_id));
 	if (namesSender && !senderMatches) {
 		return false;
 	}

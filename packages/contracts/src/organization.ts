@@ -1,5 +1,11 @@
 import { z } from "zod";
-import { AgentIdSchema, MattermostNameSchema, PromptPathSchema } from "./common.ts";
+import {
+	AgentIdSchema,
+	BROADCAST_MENTIONS,
+	MattermostNameSchema,
+	PromptPathSchema,
+	SecretFileSchema,
+} from "./common.ts";
 
 export const OrganizationRuleSchema = z.strictObject({
 	id: z.string().regex(/^[a-z][a-z0-9-]*$/),
@@ -25,6 +31,17 @@ export const OrganizationMattermostSchema = z
 		channels: z.array(MattermostNameSchema).min(1).max(100),
 		approvals_channel: MattermostNameSchema,
 		alerts_channel: MattermostNameSchema,
+		/**
+		 * The Gateway's own bot: it listens to every managed channel and posts alerts and approval
+		 * cards. Its posts never route.
+		 */
+		listener: z.strictObject({
+			username: MattermostNameSchema.refine(
+				(name) => !BROADCAST_MENTIONS.includes(name),
+				"reserved Mattermost mention name",
+			),
+			token_secret_file: SecretFileSchema,
+		}),
 	})
 	.check((ctx) => {
 		const { channels, approvals_channel, alerts_channel } = ctx.value;

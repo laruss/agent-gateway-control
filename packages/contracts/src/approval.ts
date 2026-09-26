@@ -34,13 +34,46 @@ export type ActionParams = z.infer<typeof ActionParamsSchema>;
  * What an agent asks a human to approve. Returned inside `needs_human`.
  * Risk level is assigned by policy, never by the model.
  */
-export const ApprovalRequestDraftSchema = z.strictObject({
-	actionType: ToolNameSchema,
-	/** Every parameter that defines the action; all of them go into the immutable hash. */
-	actionParams: ActionParamsSchema,
-	/** Prose; the approval card must render it apart from the hashed parameters. */
-	actionSummary: safeText(2000, "text"),
-});
+/**
+ * Most characters the variable part of an approval card may take (summary and parameters in
+ * their code blocks, fences included), so the whole card fits one Mattermost post (16 383
+ * characters) with its fixed lines around it.
+ */
+export const APPROVAL_TEXT_MAX = 15_000;
+
+/** A code block's fence: longer than any backtick run inside, at least three. */
+function fenceLength(text: string): number {
+	return Math.max(3, 1 + Math.max(0, ...[...text.matchAll(/`+/g)].map((m) => m[0].length)));
+}
+
+/** The parameters as the card shows them, one `name = value` line each. */
+export function approvalParamLines(params: Readonly<ActionParam[]>): string {
+	return params.map((param) => `${param.name} = ${param.value}`).join("\n");
+}
+
+/** Characters the summary and parameter blocks of an approval card take, fences included. */
+export function approvalBlocksLength(
+	draft: Readonly<{ actionSummary: string; actionParams: Readonly<ActionParam[]> }>,
+): number {
+	const params = approvalParamLines(draft.actionParams);
+	return [draft.actionSummary, params].reduce(
+		(sum, block) => sum + block.length + 2 * fenceLength(block) + 2,
+		0,
+	);
+}
+
+export const ApprovalRequestDraftSchema = z
+	.strictObject({
+		actionType: ToolNameSchema,
+		/** Every parameter that defines the action; all of them go into the immutable hash. */
+		actionParams: ActionParamsSchema,
+		/** Prose; the approval card must render it apart from the hashed parameters. */
+		actionSummary: safeText(2000, "text"),
+	})
+	.refine((draft) => approvalBlocksLength(draft) <= APPROVAL_TEXT_MAX, {
+		message: `summary and parameters together must fit ${APPROVAL_TEXT_MAX} characters (one approval card)`,
+		path: ["actionParams"],
+	});
 export type ApprovalRequestDraft = z.infer<typeof ApprovalRequestDraftSchema>;
 
 export const ApprovalStatusSchema = z.enum(["pending", "granted", "denied", "expired", "executed"]);

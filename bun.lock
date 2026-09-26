@@ -27,6 +27,7 @@
         "@agent-gateway/db": "workspace:*",
         "@agent-gateway/events": "workspace:*",
         "@agent-gateway/logging": "workspace:*",
+        "@agent-gateway/mattermost": "workspace:*",
         "@agent-gateway/queue": "workspace:*",
         "@agent-gateway/service": "workspace:*",
         "pg": "8.23.0",
@@ -46,6 +47,7 @@
         "@agent-gateway/db": "workspace:*",
         "@agent-gateway/events": "workspace:*",
         "@agent-gateway/logging": "workspace:*",
+        "@agent-gateway/mattermost": "workspace:*",
         "@agent-gateway/outbox": "workspace:*",
         "@agent-gateway/queue": "workspace:*",
         "@agent-gateway/service": "workspace:*",
@@ -119,6 +121,17 @@
       "name": "@agent-gateway/logging",
       "version": "0.0.0",
     },
+    "packages/mattermost": {
+      "name": "@agent-gateway/mattermost",
+      "version": "0.0.0",
+      "dependencies": {
+        "@agent-gateway/contracts": "workspace:*",
+        "@agent-gateway/events": "workspace:*",
+        "@agent-gateway/logging": "workspace:*",
+        "@agent-gateway/outbox": "workspace:*",
+        "zod": "4.6.5",
+      },
+    },
     "packages/outbox": {
       "name": "@agent-gateway/outbox",
       "version": "0.0.0",
@@ -176,6 +189,7 @@
         "drizzle-orm": "0.45.3",
         "pg": "8.23.0",
         "pg-boss": "12.34.0",
+        "testcontainers": "12.1.0",
       },
       "devDependencies": {
         "@types/pg": "8.23.1",
@@ -196,6 +210,8 @@
     "@agent-gateway/events": ["@agent-gateway/events@workspace:packages/events"],
 
     "@agent-gateway/logging": ["@agent-gateway/logging@workspace:packages/logging"],
+
+    "@agent-gateway/mattermost": ["@agent-gateway/mattermost@workspace:packages/mattermost"],
 
     "@agent-gateway/outbox": ["@agent-gateway/outbox@workspace:packages/outbox"],
 

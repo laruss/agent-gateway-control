@@ -1,0 +1,16 @@
+{
+  "name": "@agent-gateway/mattermost",
+  "version": "0.0.0",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@agent-gateway/contracts": "workspace:*",
+    "@agent-gateway/events": "workspace:*",
+    "@agent-gateway/logging": "workspace:*",
+    "@agent-gateway/outbox": "workspace:*",
+    "zod": "4.6.5"
+  }
+}

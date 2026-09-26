@@ -176,12 +176,12 @@ CLI commands: `health`, `doctor`, `db migrate|grant-worker`, `config validate|ap
 `directory set`, `outbox list|redrive`,
 `agents list|show|enable|disable|pause|resume`, `runs list|show|cancel|redrive`, `waits list`,
 `events show|ingest`, `dlq list|redrive`, `approvals list`, `kill-all [--release]`. Not yet:
-`events replay`, `runtime doctor`, `mattermost bootstrap|reconcile`, `backup check`.
+`events replay`, `runtime doctor`, `backup check` (`mattermost bootstrap|reconcile` came in
+Phase 2).
 
 Known gaps, deferred:
 
-- Outbox delivery is `dry-run` or `loopback` (explicit, refused in production); real Mattermost
-  posting is Phase 2.
+- Outbox delivery was `dry-run` or `loopback` only; real Mattermost delivery came in Phase 2.
 - Hourly per-agent rate limits and the pairwise sender->target limit are read without a lock
   across cascades; concurrent events of different cascades can overshoot by the number of
   concurrent ingests (cascade budgets and duplicate checks are serialized per cascade).
@@ -349,4 +349,322 @@ Findings per round (P1 / P2):
 | 10 (Codex only) | 0 / 1 | - | fixed |
 | 11 (Codex only) | 0 / 2 | - | fixed |
 | 12 (Codex only) | 1 / 2 | - | fixed |
+| 13 (Codex only) | 2 / 2 | - | fixed |
+| 14 (Codex only) | 1 / 1 | - | fixed |
+| 15 (Codex only) | 1 / 1 | - | fixed |
+| 16 (Codex only) | 2 / 1 | - | fixed |
+| 17 (Codex only) | 1 / 0 | - | fixed |
+| 18 (Codex only) | 1 / 0 | - | fixed |
+| 19 (Codex only) | 0 / 1 | - | fixed |
+| 20 (Codex only) | 1 / 0 | - | fixed |
+| 21 (Codex only) | 1 / 3 | - | fixed |
+| 22 (Codex only) | 1 / 0 | - | fixed |
+| 23 (Codex only) | 2 / 0 | - | fixed |
+| 24 (Codex only) | 1 / 1 | - | fixed |
+| 25 (Codex only) | 0 / 1 | - | fixed |
+| 26 (Codex only) | 0 / 2 | - | fixed |
+| 27 (Codex only) | 2 / 0 | - | fixed |
+| 28 (Codex only) | 1 / 1 | - | fixed |
+| 29 (Codex only) | 0 / 0 (one P2 re-rated P3) | - | closed |
 | 13 (Codex only) | 0 / 0 | - | closed |
+
+## Phase 2 - Mattermost bridge
+
+Status: **done** (review closed: Codex round 29 found no P1/P2)
+
+| Item | State | Evidence |
+|------|-------|----------|
+| REST client (typed subset of API v4, error classes, timeouts, no credentials in URLs or errors) | done | `packages/mattermost/src/client.ts` |
+| Listener bot WebSocket: authentication, ping, sequence gaps, reconnect with backoff and jitter | done | `packages/mattermost/src/listener.ts` |
+| Channel allowlist: only managed channels are read; system posts and the listener's own are skipped | done | `normalize.ts` |
+| Exact mention parser: code blocks, inline code, quotes and lazy continuations ignored | done | `mentions.ts`, `mentions.test.ts` |
+| Identity by user id; integrations (webhook, bot, plugin props) record-only | done | `normalize.ts`, `normalize.test.ts` |
+| Per-agent bot posting through the outbox, idempotent (earlier post lookup, `pending_post_id`) | done | `deliver.ts` |
+| HMAC routing props bound to channel, thread and text; unsigned agent-bot posts audited and alerted | done | `routing-props.ts`, `recordImpersonation` |
+| Threads: correlation by thread root, replies bound to the thread's channel | done | `normalize.ts`, `outcome.ts` |
+| Reconnect/backfill: per-channel cursors, sync after hello, timer, gaps and failures; since-limit paging | done | `backfill.ts`, `listener.ts` |
+| Loop protections: thread activity guard; edits and deletions record-only; alerts and approval cards posted by the listener bot | done | `routing.ts`, `render.ts` |
+| `gateway mattermost bootstrap` / `reconcile` | done | `packages/mattermost/src/bootstrap.ts`, `apps/cli/src/mattermost-commands.ts` |
+| Secret files: atomic 0600 writes, no symlinks, `SECRETS_DIR` for development | done | `packages/service/src/secrets.ts` |
+| Mattermost 11.7.11 in the development Compose; `bun run dev` runs both processes in parallel | done | `deploy/dev/compose.yaml`, `package.json` |
+| End-to-end suite against a real Mattermost (Testcontainers), `e2e` workflow | done | `apps/controller/src/mattermost-bridge.e2e.test.ts`, `.github/workflows/e2e.yml` |
+
+Acceptance (`apps/controller/src/mattermost-bridge.e2e.test.ts`, real Mattermost 11.7.11):
+
+- [x] A human `@developer` triggers exactly one developer run.
+- [x] A non-mentioned ambient message triggers none; neither do mentions in code, quotes, edits
+  or in a channel the agent is not allowed in.
+- [x] A code-block mention triggers none.
+- [x] An agent post to `@finance` wakes finance (signed routing props).
+- [x] A controller restart and a WebSocket loss do not lose posts and do not duplicate runs
+  (repeated syncs included).
+- [x] The reply is posted under the correct bot identity and thread root.
+- [x] Also covered: bootstrap creates bots as plain members and keeps working tokens on a
+  second run; reconcile reports nothing; an agent-bot post without a valid signature (or with
+  props copied from a genuine post) is not ingested, is audited and alerted, and the alert is
+  posted by the listener bot in `#gateway-alerts`.
+
+Known gaps, deferred:
+
+- Artifact attachments are not uploaded to Mattermost; posts carry only their text.
+- The routing key has no rotation window: agent posts signed with an old key that are synced
+  after the change are rejected (and alerted).
+- A channel's history from before it became managed is not replayed (by design); run
+  bootstrap whenever a channel is added.
+- When a catch-up gap exceeds 1000 changes, edits and deletions of posts beyond the newest
+  1000 are not seen, and neither is a post created and deleted within the gap; posts that still
+  exist are recovered (a warning is logged). Edits and deletions are record-only, so routing is
+  unaffected; a delivery retry whose own scan hits that limit adopts no earlier post and posts
+  afresh, since a deletion it cannot see might be the original's.
+- The approval card is informational; decisions from Mattermost (buttons) come in Phase 7.
+- Thread context (root, recent messages, participants) is not assembled yet (Phase 3).
+- The Mattermost image is amd64 only; on Apple silicon the e2e suite and the development
+  Compose run it emulated.
+
+### Phase 2 review log
+
+- Round 1 (Codex + Opus subagent): Codex 3 P1 + 4 P2, Opus 0 P1 + 2 P2 + 5 P3, overlapping.
+  Fixed: a signed agent post's event id is its signed idempotency key, so an exact replay with a
+  leaked token (or a duplicate create) never routes and is alerted as a replay; sync replays
+  only creations inside its window (a reply bumps an old root's `update_at`), checks whether a
+  post is already stored before verifying it (index on `(source, subject)`, new migration) and
+  records a creation first seen after an edit without routing; other bot accounts are
+  recognized by user id and address nobody; untargeted wake rules on Mattermost types are
+  rejected and never route; the deliverer checks that a token belongs to the agent's bot;
+  bootstrap removes bots from managed channels they are not configured for and reconcile
+  reports such memberships; link destinations, autolinks, URLs and fences inside list items
+  name no one; a rejected post is audited once; sync failures are tracked per channel with
+  backoff; `stop()` during a pending connect opens no socket. The e2e suite covers exact
+  replays, old roots bumped by a reply, a post edited while the controller was down, a foreign
+  bot, link mentions and a stale membership (the replay and old-root cases fail without the
+  fixes).
+- Round 2 (Codex + Opus subagent): Codex 3 P1 + 4 P2 + 1 P3, Opus 1 P1 + 2 P3; round 1 fixes
+  confirmed. Fixed: a creation first seen after an edit is its own record-only type
+  (`mattermost.post.recovered`: no wake-up, no wait match), and for an agent's bot it is
+  rejected (an unsigned reply could otherwise resolve a wait after an edit; e2e reproduces it
+  with an open wait); edits and deletions of an agent-bot post the Gateway did not accept are
+  not recorded; edits, deletions and recovered posts never start a new cascade; catch-up pages
+  are anchored at post ids, so deletions while paging cannot hide a post; bots of agents
+  removed from the configuration are taken out of every managed channel and deactivated;
+  a retry accepts an earlier post only when its signature, place and text match; the listener
+  and the alert/card deliverer refuse a token that is not the bootstrapped listener's; link
+  destinations are cut at the next whitespace (parentheses inside URLs); the privacy note
+  lists what is not stored; a directory failure on a live post marks the channel for a resync;
+  the sync window (10 min) is longer than the periodic sync (5 min). Not taken: an unaddressed
+  human reply keeps starting a new cascade (Codex asked to exclude it). It is the human's own
+  answer, possibly to a wait for a human, and agent loops stay bounded by the hop limit, which
+  a human post does not reset for agent-to-agent posts, and by the thread activity guard.
+- Round 3 (Codex + Opus subagent): Codex 3 P1 + 5 P2 + 1 P3, Opus 0 P1 + 1 P2 + 2 P3; round 2
+  fixes confirmed by Opus. Fixed: a signed post counts only as the exact post the outbox
+  delivered with its key (a copy made after deleting an unseen original is a replay, and a key
+  the Gateway never issued is rejected); bootstrap starts each newly managed channel at its
+  newest post by server time, nothing created before that is replayed, the listener only
+  advances existing cursors and drops the state of unmanaged channels (e2e: a pre-bootstrap
+  mention in a new channel stays silent, a post made while the listener still saw the channel
+  as unmanaged is caught once); every Gateway bot leaves channels that are no longer managed
+  and a listener bot of an earlier configuration is retired; removed agents are out of the
+  live directory, so their bots are inert; an existing bot is adopted only with plain member
+  roles; a renamed channel or user moves its directory entry instead of failing bootstrap;
+  "not a bot" is looked up again after a minute (accounts can be converted into bots); a wait
+  for a human's user id is satisfied only by that human's own post, not by an integration
+  under the account; the WebSocket-loss test posts only after the socket is closed. Docs:
+  in local development controller and worker share a user, so the secret boundary holds only
+  in a deployment (the worker gets no secrets mount there).
+- Round 4 (Codex + Opus subagent): Codex 3 P1 + 1 P2, Opus 0 P1 + 1 P2 + 3 P3; round 1-3
+  fixes confirmed by both. Fixed: a reply in a thread an agent started takes that root's
+  stored correlation, so a human's answer reaches the agent's wait; a catch-up from an empty
+  channel's zero cursor asks `since=1` (zero is not a since query to the server); the routing
+  key file is reserved in the configuration check; bootstrap removes team and channel admin
+  rights, takes each bot out of every other channel of its team and out of other teams, and
+  reconcile reports admin rights, extra channels and extra teams (e2e covers both); sync leaves
+  the creation of a post whose live frame is queued to that frame (a quick edit no longer turns
+  it into a record-only post); blockquotes inside list items name no one; bootstrap resets the
+  catch-up of a channel that leaves the configuration, so re-adding it starts afresh.
+- Round 5 (Codex + Opus subagent, final): Codex 3 P1 + 2 P2 + 1 P3, Opus 0 P1 + 1 P2 + 1 P3;
+  round 1-4 fixes confirmed by Opus. Fixed after the round (no sixth review, by the 5-round
+  cap): bootstrap revokes every token of a bot it adopts for the first time and of every bot
+  whose tokens are rotated (e2e: the stored and a foreign token are rejected afterwards); a
+  routing mention drops only trailing dots, so `@developer_` addresses no agent; the channel
+  and agent allowlist is read fresh for every post instead of from a 5-second cache; a link
+  title names no one; a rejected listener token makes the listener reconnect with the
+  current one; catch-up handles creations in creation order (a root before its replies, so
+  they take its correlation), and live changes of a channel with a failed change wait for the
+  resync; the unmanaged-channel cleanup reads the directory at delete time; the known gaps
+  mention missed deletions past the since limit, which is logged.
+
+
+- Round 6 (Codex only, continuing until zero P1/P2 at the owner's request): 2 P1 + 2 P2.
+  Fixed: routing itself drops a Mattermost post for an agent not allowed in the post's channel
+  (`channel_not_allowed`), inside the ingest transaction, so a permission revoked during a long
+  catch-up or between normalization and ingest no longer routes; a recorded bot account that
+  was renamed or replaced in Mattermost is retired (out of every channel, tokens revoked,
+  deactivated) before its replacement takes over; bootstrap removes admin rights in every
+  channel a bot stays in, the default channel included, and reconcile reports those and
+  elevated system roles; link reference definitions (`[label]: /@x "title"`) name no one. The
+  e2e suite covers a town-square admin role and a bot renamed in Mattermost.
+- Round 7 (Codex only): 2 P1 + 3 P2; round 6 fixes confirmed. Fixed: token revocation reads the
+  paged token list again until it is empty (more than 200 tokens); a 401 during delivery is
+  retried within the attempt limit, and the next attempt reads the current secret (a rotation
+  mid-delivery no longer kills a post); link reference definitions inside list items and
+  backslash-escaped `\@` name no one; edits and deletions are recorded only for posts whose
+  creation the Gateway has (an edit of a post from before its channel was managed is not
+  imported; e2e fails without it); reconcile reports a bot account that was renamed.
+- Round 8 (Codex only): 2 P1 + 1 P2. Fixed: catch-up paging anchors each page at the oldest
+  post of a later millisecond, because the server's `before` means "created strictly earlier"
+  and anchoring at the oldest post skipped others of its millisecond (unit test with three
+  posts per millisecond fails without it); names inside paths (`example.com/@developer`) and
+  multi-line link reference definitions name no one; bootstrap stores a channel's catch-up
+  start before publishing the channel as managed, and the start records the ids of the posts of
+  its millisecond, so a later post of the same millisecond is not excluded.
+- Round 9 (Codex only): 3 P1 + 2 P2. Fixed: bootstrap starts and publishes a channel in one
+  transaction, and the listener's cleanup of unmanaged channels is one statement against the
+  active configuration and the directory, so it cannot erase a channel bootstrap just started;
+  a directory entry is forgotten only while it still names the old id (a channel replaced under
+  the same name stays managed; e2e); accounts the current plan uses are never retired (a removed
+  agent's bot may become the listener); a page that lies wholly in one millisecond is completed
+  by offset pages (unit test fails without it); bootstrap refuses a symlinked token file,
+  replaces a token whose file others could read, and refuses an exposed routing key file;
+  reconcile reports such files.
+- Round 10 (Codex only): 3 P1 + 1 P2. Fixed: a run's posts take the correlation of the thread
+  they reply in and build on the highest hop among all the run's events, so coalesced inbox
+  events cannot reset the hop or cascade; bootstrap collects every post of a channel's newest
+  millisecond for its start (more than 200 included); offset catch-up passes repeat until one
+  adds nothing, and an unsettled scan keeps the cursor and retries (unit test fails with one
+  pass); an agent post is delivered only while the active configuration still has the agent and
+  allows it in that channel (otherwise it is settled as dead).
+- Round 11 (Codex only): 2 P1 + 3 P2. Fixed: the listener's directory and bootstrap's plan are
+  read in one transaction holding the configuration row in share mode, so a config apply
+  cannot commit between their reads; an agent post is authorized and created while that row is
+  held, so a config apply revoking the permission waits for a post already authorized
+  (integration test); a bot not resolved yet and a 403 from Mattermost (bot not yet in the
+  channel) are retried within the attempt limit, only a revoked permission is final; catch-up
+  reads the directory for each post; within one millisecond a root is handled before its
+  replies.
+- Round 12 (Codex only): 1 P1 + 2 P2 + 1 P3. Fixed: channel names resolve within the team
+  bootstrap recorded (new directory kind `team`, migration 0003), recorded last, so after a team
+  change the bridge manages nothing until bootstrap resolves the new team (integration test);
+  bootstraps are serialized by an advisory lock and rerun when the configuration version
+  changed meanwhile, so an in-flight bootstrap cannot restore a revoked membership; a channel's
+  start is scanned until two scans agree (deletions during paging; unit test fails with one
+  scan); the known gap says a post created and deleted within a large gap is not recovered.
+- Round 13 (Codex only): 2 P1 + 2 P2. Fixed: channel ids count only within the configured
+  team everywhere (routing in the ingest transaction, late wait matches, turn channels, alert
+  and approval destinations), so a post in flight across a team change wakes no one; alerts
+  and approval cards go to the channel the active configuration names at delivery time, under
+  the configuration lock, never to a channel recorded earlier; a config apply that changes the
+  team deletes every channel's catch-up state in the same transaction, and cursor cleanup also
+  requires the team (integration test); a signed post whose delivery has no receipt yet waits
+  for it (read again a second later), a key of a dead delivery is rejected, and a delivery retry
+  adopts an earlier post only if it is the one intact post with the key and the bot deleted
+  nothing, otherwise it posts afresh. `directory set` accepts `team` for development without
+  Mattermost.
+- Round 14 (Codex only): 1 P1 + 1 P2. Fixed: whether an author is a bot is looked up for every
+  post of a non-agent account (only bots are cached; a human account can be converted at any
+  moment); a delivery retry whose channel scan hit the since limit adopts no earlier post.
+- Round 15 (Codex only): 1 P1 + 1 P2 + 1 P3. Fixed: bootstrap scans for a channel's start only
+  when it has none (a busy managed channel could otherwise hold up bootstrap and token
+  rotation); image alt text names no one; a trailing blank line.
+- Round 16 (Codex only): 2 P1 + 1 P2. Fixed: bootstrap revokes every token of an adopted bot
+  (and of one whose token file others could read, or whose tokens are rotated) before granting
+  any membership, and issues the new token after; a config apply that drops a channel deletes
+  its catch-up state in the same transaction (integration test), so a quick re-add starts
+  afresh; image alt text with nested or escaped brackets names no one.
+- Round 17 (Codex only): 1 P1. Fixed: a new post is admitted only after its channel's current
+  start, checked inside the ingest transaction under the cascade lock and the configuration row
+  in share mode (`ingestEventIf` with `afterChannelStart`), so a queued live frame or a scan in
+  flight across a channel's removal, re-adding and bootstrap cannot store an older post
+  (integration test).
+- Round 18 (Codex only): 1 P1 + 1 P3. Fixed: retiring a bot revokes its tokens and deactivates
+  it before any channel removal, and removals skip the team's default channel (which Mattermost
+  lets no member leave), so a managed `town-square` can no longer stop a retirement halfway; an
+  unsigned agent-bot post from before its channel's current start raises no impersonation
+  alert.
+- Round 19 (Codex only): 0 P1 + 1 P2 + 2 P3. Fixed: edits and deletions are admitted against
+  their channel's current start inside the ingest transaction too, so after a channel's removal
+  and re-adding an edit of a post from its earlier managed period is not imported; the second
+  bootstrap assertion checks the report count; the threat model states that `human-trusted`
+  marks any human account's post, and that owners are recognized by user id.
+- Round 20 (Codex only): 1 P1. Fixed: bootstrap records the team, its channels and their
+  catch-up starts in one transaction, and cursor cleanup no longer depends on the team being
+  recorded (a team change already clears all channel state in the config apply), so starts
+  staged for a new team cannot be deleted before the team is recorded (integration test).
+- Round 21 (Codex only): 1 P1 + 3 P2. Fixed: the listener's fallback start of a channel checks
+  that the channel is still managed and writes all three start records in one transaction under
+  the configuration lock; admission (and the impersonation alert) also requires the channel to
+  be managed now (configured team, name in the configuration), so a replaced channel's
+  surviving start admits nothing (integration test); the periodic REST catch-up runs whenever
+  the listener is authenticated, also while the WebSocket cannot connect; an approval request's
+  summary and parameters together must fit one card (refined in round 25).
+- Round 22 (Codex only): 1 P1. Fixed: every config apply increments a configuration generation
+  (`gateway_controls.config_generation`, migration 0004); bootstrap and the listener's fallback
+  start record the generation before scanning a channel's start and install it only under the
+  configuration lock, and bootstrap's rerun check compares generations, not versions (refined in
+  round 23).
+- Round 23 (Codex only): 2 P1. Fixed: bootstrap takes the generation its plan was read in; if a
+  configuration was applied since, it publishes nothing and the CLI reloads the plan and runs
+  again (no stale plan under a new generation); a config apply records the generation in which
+  channels left management (per channel, or all of them on a team change), and the listener's
+  fallback start is installed unless its channel left after the scan's generation, so
+  re-applying a configuration no longer voids it; a voided start is scanned again a second
+  later (integration test covers both a harmless re-apply and a drop and re-add).
+- Round 24 (Codex only): 1 P1 + 1 P2. Fixed: a config apply takes the configuration row for
+  update before reading the configuration it replaces, so concurrent applies are serialized and
+  each sees its true predecessor (a removal can no longer be missed; integration test); URIs
+  without `//` (`mailto:`) and bare domains with a path, query or fragment name no one.
+- Round 25 (Codex only): 0 P1 + 1 P2. Fixed: an approval request is bounded by the size its
+  card's summary and parameter blocks really take, fences included (a long backtick run makes
+  its fence long), so every valid request renders within one Mattermost post (unit test at the
+  limit with long backtick runs fails under the old bound).
+- Round 26 (Codex only): 0 P1 + 2 P2. Fixed: a link target is masked whole, to the last `)` of
+  its line (a title with escaped quotes names no one; doubtful text is dropped, not read); a
+  channel Mattermost will not let an account leave (another team's default channel after a team
+  change) is reported instead of aborting bootstrap.
+- Round 27 (Codex only): 2 P1. Fixed: a config apply makes sure the configuration row exists
+  before locking it (a missing row would lock nothing and let first applies race); a signed post
+  by an account that is no longer the agent's bot (replaced between delivery and catch-up) is
+  still recognized by its signature and counts only as the exact post its delivery receipt
+  names, so a delivered handoff is not lost (unit test).
+- Round 28 (Codex only): 1 P1 + 1 P2. Fixed: a link target is masked across line endings, to the
+  last `)` of its paragraph (and an unclosed one through its next word, on the next line too);
+  an indented line starts a code block only where a paragraph could start, otherwise it
+  continues the paragraph and stays inside an open code span.
+- Round 29 (Codex only): no P1; one finding Codex rated P2, re-rated P3 by agreement with the
+  owner: a multi-line image description could name an agent. A Markdown edge case like this only
+  lets a human wake an agent they could mention directly, so it grants nothing; it was fixed
+  anyway (image descriptions are masked across line endings). No P1/P2 remains: review closed.
+  From round 28 on, parser findings of this kind are rated by their real impact, not the
+  reviewer's label.
+
+Findings per round (P1 / P2):
+
+| Round | Codex | Opus | Outcome |
+|-------|-------|------|---------|
+| 1 | 3 / 4 | 0 / 2 | fixed |
+| 2 | 3 / 4 | 1 / 0 | fixed (one item declined, see above) |
+| 3 | 3 / 5 | 0 / 1 | fixed |
+| 4 | 3 / 1 | 0 / 1 | fixed |
+| 5 | 3 / 2 | 0 / 1 | fixed |
+| 6 (Codex only) | 2 / 2 | - | fixed |
+| 7 (Codex only) | 2 / 3 | - | fixed |
+| 8 (Codex only) | 2 / 1 | - | fixed |
+| 9 (Codex only) | 3 / 2 | - | fixed |
+| 10 (Codex only) | 3 / 1 | - | fixed |
+| 11 (Codex only) | 2 / 3 | - | fixed |
+| 12 (Codex only) | 1 / 2 | - | fixed |
+| 13 (Codex only) | 2 / 2 | - | fixed |
+| 14 (Codex only) | 1 / 1 | - | fixed |
+| 15 (Codex only) | 1 / 1 | - | fixed |
+| 16 (Codex only) | 2 / 1 | - | fixed |
+| 17 (Codex only) | 1 / 0 | - | fixed |
+| 18 (Codex only) | 1 / 0 | - | fixed |
+| 19 (Codex only) | 0 / 1 | - | fixed |
+| 20 (Codex only) | 1 / 0 | - | fixed |
+| 21 (Codex only) | 1 / 3 | - | fixed |
+| 22 (Codex only) | 1 / 0 | - | fixed |
+| 23 (Codex only) | 2 / 0 | - | fixed |
+| 24 (Codex only) | 1 / 1 | - | fixed |
+| 25 (Codex only) | 0 / 1 | - | fixed |
+| 26 (Codex only) | 0 / 2 | - | fixed |
+| 27 (Codex only) | 2 / 0 | - | fixed |
+| 28 (Codex only) | 1 / 1 | - | fixed |
+| 29 (Codex only) | 0 / 0 (one P2 re-rated P3) | - | closed |

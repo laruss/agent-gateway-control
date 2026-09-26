@@ -1,0 +1,1 @@
+ALTER TABLE "gateway_controls" ADD COLUMN "config_generation" bigint DEFAULT 0 NOT NULL;

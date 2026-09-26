@@ -3,6 +3,7 @@ export * from "./routing.ts";
 export * from "./services/admin.ts";
 export * from "./services/deps.ts";
 export * from "./services/ingest.ts";
+export * from "./services/mattermost-bridge.ts";
 export * from "./services/reconcile.ts";
 export * from "./services/runs.ts";
 export * from "./services/scheduler.ts";

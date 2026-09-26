@@ -6,6 +6,15 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ### Added
 
+- Mattermost bridge (`@agent-gateway/mattermost`): WebSocket listener with per-channel cursors,
+  REST catch-up after reconnects, restarts and sequence gaps; exact mention parsing; posts by
+  each agent's own bot with HMAC-signed routing props; alerts and approval cards by the
+  listener bot; `gateway mattermost bootstrap` and `gateway mattermost reconcile`.
+- Thread activity guard (30 wake-ups per thread per 10 minutes); edits and deletions are
+  record-only; replies are bound to their thread's channel.
+- Mattermost 11.7.11 in the development Compose; end-to-end tests against a real Mattermost
+  (`bun run test:e2e`, `e2e` workflow); ADR-012; Mattermost operations guide; privacy notes.
+
 - Durable core on the mock runtime: Drizzle schema and migrations, event ingest with dedupe,
   deterministic routing with loop guards, agent state machine and inbox, durable waits and
   timeouts, pg-boss queues with dead letter queues, transactional outbox, approval requests.
@@ -23,3 +32,7 @@ All notable changes are documented here. The project follows Semantic Versioning
 - Turn result authority check and a provider strict-mode compatible model output schema.
 - ADR-001 ... ADR-010, assumptions, project structure, threat model draft.
 - CI workflow skeleton.
+
+### Fixed
+
+- `bun run dev` started the controller only after the worker exited.

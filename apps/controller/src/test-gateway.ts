@@ -19,6 +19,7 @@ import { type RunningWorker, startWorker } from "@agent-gateway/worker";
 import type pg from "pg";
 import { type RunningController, startController } from "./controller.ts";
 import { loopbackPostDeliverer } from "./loopback-deliverer.ts";
+import { bridgeDeliverers, type MattermostBridgeOptions } from "./mattermost-bridge.ts";
 
 const repoRoot = fileURLToPath(new URL("../../..", import.meta.url));
 
@@ -30,7 +31,7 @@ export const IDS = {
 } as const;
 
 /** The example configuration with every agent on the mock runtime and short timeouts. */
-function exampleConfig() {
+export function exampleConfig() {
 	const organization = OrganizationConfigSchema.parse(
 		Bun.YAML.parse(readFileSync(join(repoRoot, "config/examples/organization.yaml"), "utf8")),
 	);
@@ -59,6 +60,17 @@ const WORKER_ROLE = "gateway_worker";
 /** Throwaway credential of a throwaway test database. */
 const WORKER_PASSWORD = "worker-test";
 
+export type TestGatewayOptions = Readonly<{
+	/**
+	 * Run against a real Mattermost: after the configuration is applied, `bootstrap` resolves
+	 * the directory and bots (instead of fake ids), and the controller restarts with the bridge.
+	 */
+	mattermost?: Readonly<{
+		bridge: MattermostBridgeOptions;
+		bootstrap: (deps: ControlPlaneDeps) => Promise<void>;
+	}>;
+}>;
+
 export type TestGateway = Readonly<{
 	postgres: TestPostgres;
 	workerConnectionString: string;
@@ -76,7 +88,7 @@ export type TestGateway = Readonly<{
  * A full control plane on a throwaway database: migrations, the example organization on the
  * mock runtime, resolved directory entries, a controller with loopback delivery and one worker.
  */
-export async function startTestGateway(): Promise<TestGateway> {
+export async function startTestGateway(options: TestGatewayOptions = {}): Promise<TestGateway> {
 	const postgres = await startTestPostgres();
 	const pool = createPool(postgres.connectionString, 4);
 	await migrateDatabase(pool);
@@ -87,6 +99,7 @@ export async function startTestGateway(): Promise<TestGateway> {
 	const workerConnectionString = workerUrl.toString();
 	let controller: RunningController | null = null;
 	let worker: RunningWorker | null = null;
+	let bridge: MattermostBridgeOptions | null = null;
 	const gateway: TestGateway = {
 		postgres,
 		workerConnectionString,
@@ -99,16 +112,18 @@ export async function startTestGateway(): Promise<TestGateway> {
 		},
 		deps: () => gateway.controller().deps,
 		startController: async () => {
+			const real = bridge;
 			controller = await startController({
 				connectionString: postgres.connectionString,
 				log: silentLogger,
-				deliverers: (deps) => ({
-					...dryRunDeliverers(silentLogger),
-					"mattermost.post": loopbackPostDeliverer(deps),
-				}),
+				deliverers: (deps) =>
+					real === null
+						? { ...dryRunDeliverers(silentLogger), "mattermost.post": loopbackPostDeliverer(deps) }
+						: bridgeDeliverers(deps, real),
 				random: () => 0,
 				pollingIntervalSeconds: 0.5,
 				reconcileIntervalMs: 1000,
+				...(real === null ? {} : { mattermost: real }),
 			});
 		},
 		stopController: async () => {
@@ -150,10 +165,24 @@ export async function startTestGateway(): Promise<TestGateway> {
 	const deps = gateway.deps();
 	const config = exampleConfig();
 	await applyConfig(deps, config, "test");
-	for (const channel of config.organization.mattermost.channels) {
-		await setDirectoryEntry(deps, "channel", channel, IDS.channel(channel), "test");
+	if (options.mattermost === undefined) {
+		for (const channel of config.organization.mattermost.channels) {
+			await setDirectoryEntry(deps, "channel", channel, IDS.channel(channel), "test");
+		}
+		await setDirectoryEntry(deps, "user", "owner", IDS.owner, "test");
+		await setDirectoryEntry(
+			deps,
+			"team",
+			config.organization.mattermost.team,
+			IDS.channel("team"),
+			"test",
+		);
+	} else {
+		await options.mattermost.bootstrap(deps);
+		bridge = options.mattermost.bridge;
+		await gateway.stopController();
+		await gateway.startController();
 	}
-	await setDirectoryEntry(deps, "user", "owner", IDS.owner, "test");
 	await gateway.startWorker();
 	return gateway;
 }

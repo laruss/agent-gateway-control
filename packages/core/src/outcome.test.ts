@@ -104,6 +104,34 @@ describe("run scope", () => {
 			"nextState.waits.0.correlationId",
 		]);
 	});
+
+	it("keeps each thread's cascade and the highest hop of coalesced events", () => {
+		const human = postEvent({ rootId: null, targets: ["developer"] });
+		const agentReply = postEvent({ sender: "finance", hop: 6, correlation: "thread:other" });
+		const scoped = runScope([human, agentReply]);
+		expect(scoped.maxHop).toBe(6);
+		expect(scoped.threadRoots.get(ROOT)).toEqual({
+			channelId: CHANNEL,
+			correlationId: "thread:other",
+		});
+	});
+
+	it("rejects a reply to a thread in another channel", () => {
+		const elsewhere = result({
+			publicMessages: [
+				{
+					channelId: "e1sewhere00000000000000000",
+					rootPostId: ROOT,
+					markdown: "x",
+					targetAgentIds: [],
+					attachments: [],
+				},
+			],
+		});
+		expect(checkRunScope(elsewhere, scope).map((issue) => issue.path)).toEqual([
+			"publicMessages.0.channelId",
+		]);
+	});
 });
 
 describe("model waits", () => {

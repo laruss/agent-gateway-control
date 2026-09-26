@@ -5,7 +5,9 @@ import {
 	type ApprovalRequestDraft,
 	checkTurnResultAuthority,
 	type JsonValue,
+	type MattermostApprovalPayload,
 	type MattermostId,
+	type MattermostPostPayload,
 	QUEUES,
 	type RunError,
 	type RunReport,
@@ -33,6 +35,7 @@ import {
 	approvalActionHash,
 	checkRunScope,
 	type OutcomeIssue,
+	type RunScope,
 	renderPostMessage,
 	riskLevelFor,
 	runRetryDelaySeconds,
@@ -47,6 +50,7 @@ import {
 	enqueueOutbox,
 	loadActiveConfig,
 	loadDirectory,
+	loadTeamChannels,
 	lockAgent,
 	lockCascade,
 	raiseAlert,
@@ -398,7 +402,7 @@ async function applyCompletion(
 	}
 
 	const artifactIds = await persistArtifacts(uow, run, result);
-	await persistMessages(uow, run, agent, result, artifactIds);
+	await persistMessages(uow, run, agent, result, artifactIds, scope);
 	await persistMemory(uow, run, result);
 	await persistSession(uow, agent.id, result);
 
@@ -517,6 +521,7 @@ async function persistMessages(
 	agent: AgentRow,
 	result: AgentTurnResult,
 	artifactIds: ReadonlyMap<string, string>,
+	scope: RunScope,
 ): Promise<void> {
 	for (const [index, message] of result.publicMessages.entries()) {
 		const attachmentIds = message.attachments.flatMap((ref) => {
@@ -524,20 +529,26 @@ async function persistMessages(
 				ref.artifactId ?? (ref.artifactKey === null ? undefined : artifactIds.get(ref.artifactKey));
 			return id === undefined ? [] : [id];
 		});
+		const payload: MattermostPostPayload = {
+			agentId: agent.id,
+			runId: run.id,
+			channelId: message.channelId,
+			rootPostId: message.rootPostId,
+			message: renderPostMessage(message),
+			targetAgentIds: message.targetAgentIds,
+			attachmentArtifactIds: attachmentIds,
+			// A reply belongs to its thread's cascade, and every post builds on the highest hop the
+			// run saw: coalesced inbox events cannot lower either.
+			correlationId:
+				message.rootPostId === null
+					? run.correlationId
+					: (scope.threadRoots.get(message.rootPostId)?.correlationId ?? run.correlationId),
+			hop: Math.max(run.hop, scope.maxHop) + 1,
+		};
 		await enqueueOutbox(uow, {
 			kind: "mattermost.post",
 			destination: `channel/${message.channelId}`,
-			payload: {
-				agentId: agent.id,
-				runId: run.id,
-				channelId: message.channelId,
-				rootPostId: message.rootPostId,
-				message: renderPostMessage(message),
-				targetAgentIds: message.targetAgentIds,
-				attachmentArtifactIds: attachmentIds,
-				correlationId: run.correlationId,
-				hop: run.hop + 1,
-			},
+			payload,
 			idempotencyKey: `mattermost-post:${run.id}:${index}`,
 			runId: run.id,
 		});
@@ -659,6 +670,8 @@ async function createApproval(
 		throw new Error("approval requested without an active configuration");
 	}
 	const expiresAt = new Date(uow.now.getTime() + APPROVAL_TTL_MS);
+	const immutableActionHash = approvalActionHash(draft);
+	const riskLevel = riskLevelFor(draft.actionType);
 	const [approval] = await uow.tx.db
 		.insert(approvalRequests)
 		.values({
@@ -666,9 +679,9 @@ async function createApproval(
 			runId: run.id,
 			actionType: draft.actionType,
 			actionParams: draft.actionParams,
-			immutableActionHash: approvalActionHash(draft),
+			immutableActionHash,
 			actionSummary: draft.actionSummary,
-			riskLevel: riskLevelFor(draft.actionType),
+			riskLevel,
 			status: "pending",
 			allowedApproverUserIds: [...approvers],
 			nonce: randomBytes(24).toString("hex"),
@@ -679,12 +692,24 @@ async function createApproval(
 	if (approval === undefined) {
 		throw new Error("approval insert returned no row");
 	}
-	const channels = await loadDirectory(uow.tx.db, "channel");
+	const channels = await loadTeamChannels(uow.tx.db);
 	const channelName = config.organization.mattermost.approvals_channel;
+	const card: MattermostApprovalPayload = {
+		approvalId: approval.id,
+		channelName,
+		channelId: channels.get(channelName) ?? null,
+		requestedByAgentId: agentId,
+		actionType: draft.actionType,
+		actionSummary: draft.actionSummary,
+		actionParams: draft.actionParams,
+		riskLevel,
+		immutableActionHash,
+		expiresAt: expiresAt.toISOString(),
+	};
 	await enqueueOutbox(uow, {
 		kind: "mattermost.approval",
 		destination: `channel/${channelName}`,
-		payload: { approvalId: approval.id, channelName, channelId: channels.get(channelName) ?? null },
+		payload: card,
 		idempotencyKey: `approval-card:${approval.id}`,
 		runId: run.id,
 	});

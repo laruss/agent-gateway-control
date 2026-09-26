@@ -5,15 +5,21 @@ import type {
 	Uuid,
 	WakeRule,
 } from "@agent-gateway/contracts";
-import { isReservedEventType, WaitTimeoutDataSchema } from "@agent-gateway/contracts";
+import {
+	isRecordOnlyEventType,
+	isReservedEventType,
+	WaitTimeoutDataSchema,
+} from "@agent-gateway/contracts";
 import type { AgentState, RouteDecision } from "@agent-gateway/db";
-import { eventSenderAgentId, eventTargets } from "@agent-gateway/events";
+import { eventSenderAgentId, eventTargets, mattermostPost } from "@agent-gateway/events";
 import { type ActiveWait, isGatewayEmitted, waitMatches } from "./waits.ts";
 
 export type RoutingAgent = Readonly<{
 	id: AgentId;
 	state: AgentState;
 	wakeRules: Readonly<WakeRule[]>;
+	/** Resolved ids of the agent's allowed channels: a post elsewhere never reaches it. */
+	channelIds: ReadonlySet<string>;
 }>;
 
 /** Counters the loop guards need, computed by the caller for the event's cascade. */
@@ -26,6 +32,8 @@ export type LoopStats = Readonly<{
 	duplicateContent: number;
 	/** Wake-ups the sender agent caused per recipient inside the pairwise window. */
 	pairwiseMessages: Readonly<Record<AgentId, number>>;
+	/** Wake-ups already granted in the event's thread (correlation) inside the loop window. */
+	threadWakes: number;
 }>;
 
 export type RoutingInput = Readonly<{
@@ -44,10 +52,12 @@ export type RouteReason =
 	| "target"
 	| "subscription"
 	| "self_post"
+	| "channel_not_allowed"
 	| "agent_disabled"
 	| "hop_limit"
 	| "cascade_limit"
 	| "rate_limit"
+	| "thread_rate_limit"
 	| "duplicate_payload"
 	| "pairwise_limit";
 
@@ -63,6 +73,11 @@ export type Route = Readonly<{
 
 /** Messages one agent may send another inside the pairwise window. */
 export const MAX_PAIRWISE_MESSAGES = 12;
+/**
+ * Wake-ups one thread may grant inside the loop window, whoever asks. The cascade budget resets
+ * with every human instruction; this bounds a thread's activity across cascades.
+ */
+export const MAX_THREAD_WAKES_PER_WINDOW = 30;
 
 const PRIORITY = { wait: 10, target: 5, subscription: 0 } as const;
 
@@ -105,6 +120,8 @@ function waitCandidates(input: RoutingInput): Candidate[] {
 function subscribes(agent: RoutingAgent, event: GatewayEvent): boolean {
 	return (
 		!isReservedEventType(event.type) &&
+		// Mattermost posts wake only their addressees, who are checked against the channel.
+		!event.type.startsWith("mattermost.") &&
 		agent.wakeRules.some(
 			(rule) => rule.target_agent_id === undefined && rule.event_type === event.type,
 		)
@@ -146,7 +163,7 @@ export function wakePriority(agent: RoutingAgent, event: GatewayEvent): number |
  */
 export function routeEvent(input: RoutingInput): Readonly<Route[]> {
 	const { event, agents, limits, stats } = input;
-	if (event.type.startsWith("gateway.control.")) {
+	if (event.type.startsWith("gateway.control.") || isRecordOnlyEventType(event.type)) {
 		return [];
 	}
 	const known = new Map(agents.map((agent) => [agent.id, agent]));
@@ -164,6 +181,7 @@ export function routeEvent(input: RoutingInput): Readonly<Route[]> {
 
 	const sender = eventSenderAgentId(event);
 	let cascadeWakes = stats.cascadeWakes;
+	let threadWakes = stats.threadWakes;
 	const routes: Route[] = [];
 	for (const candidate of candidates) {
 		const isWait = candidate.waitId !== null;
@@ -184,7 +202,12 @@ export function routeEvent(input: RoutingInput): Readonly<Route[]> {
 		if (agent === undefined) {
 			continue;
 		}
-		if (sender === agent.id) {
+		const post = mattermostPost(event);
+		if (post !== null && !agent.channelIds.has(post.channel_id)) {
+			// Checked here, in the ingest transaction, against the configuration being applied:
+			// a permission revoked a moment ago no longer routes.
+			routes.push(route("ignore", "channel_not_allowed"));
+		} else if (sender === agent.id) {
 			routes.push(route("ignore", "self_post"));
 		} else if (agent.state === "disabled") {
 			routes.push(route("ignore", "agent_disabled"));
@@ -192,6 +215,7 @@ export function routeEvent(input: RoutingInput): Readonly<Route[]> {
 			// A timeout resolves a wait the agent already holds; blocking it would leave the agent
 			// waiting forever. At most one per wait, so it cannot amplify a loop.
 			cascadeWakes += 1;
+			threadWakes += 1;
 			routes.push(route(decision, candidate.reason));
 		} else if (event.hop > limits.max_agent_hops) {
 			routes.push(route("blocked", "hop_limit"));
@@ -199,6 +223,8 @@ export function routeEvent(input: RoutingInput): Readonly<Route[]> {
 			routes.push(route("blocked", "cascade_limit"));
 		} else if ((stats.runsLastHour[agent.id] ?? 0) >= limits.max_runs_per_agent_per_hour) {
 			routes.push(route("blocked", "rate_limit"));
+		} else if (threadWakes >= MAX_THREAD_WAKES_PER_WINDOW) {
+			routes.push(route("blocked", "thread_rate_limit"));
 		} else if (sender !== null && stats.duplicateContent > 0) {
 			routes.push(route("blocked", "duplicate_payload"));
 		} else if (
@@ -208,6 +234,7 @@ export function routeEvent(input: RoutingInput): Readonly<Route[]> {
 			routes.push(route("blocked", "pairwise_limit"));
 		} else {
 			cascadeWakes += 1;
+			threadWakes += 1;
 			routes.push(route(decision, candidate.reason));
 		}
 	}

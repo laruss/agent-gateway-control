@@ -22,15 +22,23 @@ import {
 	mattermostIdentities,
 	type OutboxStatus,
 	outbox,
+	sourceCursors,
 	waitSubscriptions,
 	withTransaction,
 } from "@agent-gateway/db";
 import { canonicalHash } from "@agent-gateway/events";
-import { and, asc, desc, eq, inArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, ne, or, sql } from "drizzle-orm";
 import { nextAgentState, requireTransition } from "../state-machine.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
 import { type ScheduleResult, scheduleAgent } from "./scheduler.ts";
-import { audit, lockAgent, setAgentState, toGatewayEvent } from "./store.ts";
+import {
+	audit,
+	loadActiveConfig,
+	loadDirectory,
+	lockAgent,
+	setAgentState,
+	toGatewayEvent,
+} from "./store.ts";
 import { cancelActiveWaits } from "./wait-store.ts";
 
 async function inTransaction<T>(
@@ -127,6 +135,53 @@ export async function applyConfig(
 	});
 	return inTransaction(deps, async (uow) => {
 		const { db } = uow.tx;
+		// The configuration row first, for update: applies are serialized, and `previous` is the
+		// configuration this apply really replaces. The row is made sure to exist before it is
+		// locked (a missing row would lock nothing).
+		await db.insert(gatewayControls).values({ id: 1 }).onConflictDoNothing();
+		const [controls] = await db
+			.select({ generation: gatewayControls.configGeneration })
+			.from(gatewayControls)
+			.where(eq(gatewayControls.id, 1))
+			.for("update");
+		const generation = (controls?.generation ?? 0) + 1;
+		const previous = await loadActiveConfig(db);
+		if (
+			previous !== null &&
+			previous.organization.mattermost.team !== input.organization.mattermost.team
+		) {
+			// Another team: every channel's catch-up starts afresh once bootstrap resolves it, so
+			// switching away and back never replays the interval in between. The marker voids any
+			// start scanned before this generation.
+			await uow.tx.client.query(
+				"delete from source_cursors where source_id ~ '^mattermost:channel(-floor|-floor-posts)?:'",
+			);
+			await markChannelsLeft(uow, [TEAM_CHANGE_MARKER], generation);
+		} else if (previous !== null) {
+			// A channel leaving the configuration loses its catch-up at once: re-added later, it
+			// starts afresh instead of replaying what was posted while it was unmanaged.
+			const kept = new Set(input.organization.mattermost.channels);
+			const resolved = await loadDirectory(db, "channel");
+			const ids = previous.organization.mattermost.channels
+				.filter((name) => !kept.has(name))
+				.flatMap((name) => {
+					const id = resolved.get(name);
+					return id === undefined ? [] : [id];
+				});
+			if (ids.length > 0) {
+				await uow.tx.client.query(
+					`delete from source_cursors
+					  where regexp_replace(source_id, '^mattermost:channel(-floor|-floor-posts)?:', '') = any($1::text[])
+					    and source_id ~ '^mattermost:channel(-floor|-floor-posts)?:'`,
+					[ids],
+				);
+				await markChannelsLeft(
+					uow,
+					ids.map((id) => `mattermost:channel-left:${id}`),
+					generation,
+				);
+			}
+		}
 		await db
 			.insert(configVersions)
 			.values({
@@ -138,10 +193,15 @@ export async function applyConfig(
 			.onConflictDoNothing();
 		await db
 			.insert(gatewayControls)
-			.values({ id: 1, activeConfigVersion: version, updatedAt: uow.now })
+			.values({
+				id: 1,
+				activeConfigVersion: version,
+				configGeneration: generation,
+				updatedAt: uow.now,
+			})
 			.onConflictDoUpdate({
 				target: gatewayControls.id,
-				set: { activeConfigVersion: version, updatedAt: uow.now },
+				set: { activeConfigVersion: version, configGeneration: generation, updatedAt: uow.now },
 			});
 
 		// Every existing agent row, locked in id order up front: the apply touches most of them.
@@ -214,6 +274,34 @@ export async function applyConfig(
 	});
 }
 
+/** Marker of the generation in which every channel left management (a team change). */
+export const TEAM_CHANGE_MARKER = "mattermost:team-changed";
+
+/**
+ * Records the generation in which channels left management: a catch-up start scanned before it
+ * is void for them (see `startManagedChannel`).
+ */
+async function markChannelsLeft(
+	uow: UnitOfWork,
+	markers: Readonly<string[]>,
+	generation: number,
+): Promise<void> {
+	for (const sourceId of markers) {
+		await uow.tx.db
+			.insert(sourceCursors)
+			.values({
+				sourceId,
+				cursorType: "generation",
+				cursorValue: String(generation),
+				updatedAt: uow.now,
+			})
+			.onConflictDoUpdate({
+				target: sourceCursors.sourceId,
+				set: { cursorValue: String(generation), updatedAt: uow.now },
+			});
+	}
+}
+
 /**
  * Enables or disables an agent. Disabling cancels the agent's waits and expires its pending
  * approvals, so nothing can resume it behind the operator's back. Enabling restores FAILED when
@@ -268,17 +356,36 @@ export async function setDirectoryEntry(
 	mattermostId: MattermostId,
 	actor: string,
 ): Promise<void> {
+	await inTransaction(deps, (uow) => setDirectoryEntryIn(uow, kind, name, mattermostId, actor));
+}
+
+/** {@link setDirectoryEntry} inside a caller's transaction. */
+export async function setDirectoryEntryIn(
+	uow: UnitOfWork,
+	kind: DirectoryKind,
+	name: string,
+	mattermostId: MattermostId,
+	actor: string,
+): Promise<void> {
 	const id = MattermostIdSchema.parse(mattermostId);
-	await inTransaction(deps, async (uow) => {
-		await uow.tx.db
-			.insert(mattermostDirectory)
-			.values({ kind, name, mattermostId: id, resolvedAt: uow.now })
-			.onConflictDoUpdate({
-				target: [mattermostDirectory.kind, mattermostDirectory.name],
-				set: { mattermostId: id, resolvedAt: uow.now },
-			});
-		await audit(uow, actor, "directory.set", kind, name, { mattermost_id: id });
-	});
+	// A renamed channel or user keeps its id: the old name gives way to the new one.
+	await uow.tx.db
+		.delete(mattermostDirectory)
+		.where(
+			and(
+				eq(mattermostDirectory.kind, kind),
+				eq(mattermostDirectory.mattermostId, id),
+				ne(mattermostDirectory.name, name),
+			),
+		);
+	await uow.tx.db
+		.insert(mattermostDirectory)
+		.values({ kind, name, mattermostId: id, resolvedAt: uow.now })
+		.onConflictDoUpdate({
+			target: [mattermostDirectory.kind, mattermostDirectory.name],
+			set: { mattermostId: id, resolvedAt: uow.now },
+		});
+	await audit(uow, actor, "directory.set", kind, name, { mattermost_id: id });
 }
 
 // ---------------------------------------------------------------------------

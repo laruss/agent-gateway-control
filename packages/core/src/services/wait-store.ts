@@ -5,7 +5,14 @@ import { routeEvent } from "../routing.ts";
 import { type ActiveWait, waitMatches } from "../waits.ts";
 import type { UnitOfWork } from "./deps.ts";
 import { loopStats, type StoredEventPosition } from "./loop-stats.ts";
-import { loadActiveConfig, loadAgents, raiseAlert, toGatewayEvent } from "./store.ts";
+import {
+	loadActiveConfig,
+	loadAgents,
+	loadTeamChannels,
+	raiseAlert,
+	toGatewayEvent,
+	toRoutingAgent,
+} from "./store.ts";
 
 /** Inbox priority of an entry that resolved a wait. */
 export const WAIT_PRIORITY = 10;
@@ -70,7 +77,7 @@ async function lateMatchAllowed(
 	const guards = await loopStats(uow, event, position);
 	const [route] = routeEvent({
 		event,
-		agents: [{ id: agent.id, state: agent.state, wakeRules: agent.config.wake_rules }],
+		agents: [toRoutingAgent(agent, await loadTeamChannels(db))],
 		waits: [wait],
 		limits,
 		stats: guards.stats,

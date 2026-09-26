@@ -1,0 +1,2 @@
+ALTER TABLE "mattermost_directory" DROP CONSTRAINT "mattermost_directory_kind";--> statement-breakpoint
+ALTER TABLE "mattermost_directory" ADD CONSTRAINT "mattermost_directory_kind" CHECK (kind in ('channel', 'user', 'team'));

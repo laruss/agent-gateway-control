@@ -13,6 +13,8 @@ export const GatewayEventTypeSchema = z.enum([
 	"mattermost.post.created",
 	"mattermost.post.edited",
 	"mattermost.post.deleted",
+	/** A post first seen after it was edited: its original text, hence its address, is unknown. */
+	"mattermost.post.recovered",
 	"mattermost.agent.mentioned",
 	"mattermost.thread.reply",
 	"agent.run.requested",
@@ -50,11 +52,25 @@ export function isReservedEventType(type: GatewayEventType): boolean {
 	);
 }
 
+/**
+ * Edits, deletions and recovered posts are recorded for audit and never route: no wake-up, no
+ * wait match, no new cascade. An edit that adds a mention does not address anyone; a new post
+ * does.
+ */
+export function isRecordOnlyEventType(type: GatewayEventType): boolean {
+	return (
+		type === "mattermost.post.edited" ||
+		type === "mattermost.post.deleted" ||
+		type === "mattermost.post.recovered"
+	);
+}
+
 /** Event types carrying a Mattermost post in `data`. */
 export const MATTERMOST_POST_EVENT_TYPES: Readonly<GatewayEventType[]> = [
 	"mattermost.post.created",
 	"mattermost.post.edited",
 	"mattermost.post.deleted",
+	"mattermost.post.recovered",
 	"mattermost.agent.mentioned",
 	"mattermost.thread.reply",
 ];

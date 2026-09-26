@@ -19,11 +19,13 @@ import {
 import type { OutboxKind } from "@agent-gateway/db";
 import { createPool, pendingMigrationCount } from "@agent-gateway/db";
 import { errorFields, type Logger } from "@agent-gateway/logging";
+import type { RunningListener } from "@agent-gateway/mattermost";
 import { type Deliverer, deliverOutboxItem, reconcileOutbox } from "@agent-gateway/outbox";
 import { createBoss, ensureQueues, transactionalJobSink } from "@agent-gateway/queue";
 import type { HealthCheck } from "@agent-gateway/service";
 import type pg from "pg";
 import type { PgBoss } from "pg-boss";
+import { type MattermostBridgeOptions, startBridgeListener } from "./mattermost-bridge.ts";
 
 export type ControllerOptions = Readonly<{
 	connectionString: string;
@@ -36,11 +38,15 @@ export type ControllerOptions = Readonly<{
 	reconcileIntervalMs?: number;
 	/** Queue polling interval; lower in tests. */
 	pollingIntervalSeconds?: number;
+	/** Listen to Mattermost; without it no Mattermost event reaches the Gateway. */
+	mattermost?: MattermostBridgeOptions;
 }>;
 
 export type RunningController = Readonly<{
 	deps: ControlPlaneDeps;
 	boss: PgBoss;
+	/** The Mattermost listener, when one runs. */
+	listener: RunningListener | null;
 	readiness: () => Promise<Readonly<HealthCheck[]>>;
 	stop: () => Promise<void>;
 }>;
@@ -176,6 +182,8 @@ export async function startController(options: ControllerOptions): Promise<Runni
 	};
 	await reconcile();
 	const timer = setInterval(() => void reconcile(), options.reconcileIntervalMs ?? 60_000);
+	const listener =
+		options.mattermost === undefined ? null : startBridgeListener(deps, options.mattermost, log);
 
 	const readiness = async (): Promise<Readonly<HealthCheck[]>> => {
 		const checks: HealthCheck[] = [];
@@ -191,6 +199,16 @@ export async function startController(options: ControllerOptions): Promise<Runni
 				detail: error instanceof Error ? error.message : "failed",
 			});
 		}
+		if (listener !== null) {
+			const status = listener.status();
+			checks.push({
+				name: "mattermost",
+				ok: status.connected,
+				detail: status.connected
+					? `connected${status.degraded ? ", catching up" : ""}`
+					: "disconnected",
+			});
+		}
 		return checks;
 	};
 
@@ -198,9 +216,11 @@ export async function startController(options: ControllerOptions): Promise<Runni
 	return {
 		deps,
 		boss,
+		listener,
 		readiness,
 		stop: async () => {
 			clearInterval(timer);
+			await listener?.stop();
 			await boss.stop({ graceful: true, timeout: 30_000 });
 			await pool.end();
 			log.info("controller stopped");

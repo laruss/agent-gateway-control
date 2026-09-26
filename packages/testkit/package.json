@@ -10,7 +10,8 @@
     "@testcontainers/postgresql": "12.1.0",
     "drizzle-orm": "0.45.3",
     "pg": "8.23.0",
-    "pg-boss": "12.34.0"
+    "pg-boss": "12.34.0",
+    "testcontainers": "12.1.0"
   },
   "devDependencies": {
     "@types/pg": "8.23.1"

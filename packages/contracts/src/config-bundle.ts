@@ -1,5 +1,5 @@
 import type { AgentConfig } from "./agent-config.ts";
-import { toolPatternsOverlap } from "./common.ts";
+import { ROUTING_KEY_SECRET_FILE, toolPatternsOverlap } from "./common.ts";
 import type { OrganizationConfig } from "./organization.ts";
 
 export type ConfigBundle = Readonly<{
@@ -54,9 +54,25 @@ function financeIssues(agent: AgentConfig, financeAgentId: string): ConfigBundle
 export function validateConfigBundle(bundle: ConfigBundle): Readonly<ConfigBundleIssue[]> {
 	const issues: ConfigBundleIssue[] = [];
 	const { organization } = bundle.organization;
+	const { listener } = bundle.organization.mattermost;
 	const channels = new Set(bundle.organization.mattermost.channels);
 	const agentIds = new Set<string>();
 	const usernames = new Set<string>();
+	const secretFiles = new Set<string>([ROUTING_KEY_SECRET_FILE]);
+	if (listener.token_secret_file === ROUTING_KEY_SECRET_FILE) {
+		issues.push({
+			agentId: null,
+			message: `listener token file '${ROUTING_KEY_SECRET_FILE}' is reserved for the routing key`,
+		});
+	}
+	secretFiles.add(listener.token_secret_file);
+
+	if (organization.owner_mattermost_usernames.includes(listener.username)) {
+		issues.push({
+			agentId: null,
+			message: `listener username '${listener.username}' collides with a human owner`,
+		});
+	}
 
 	for (const agent of bundle.agents) {
 		if (agentIds.has(agent.id)) {
@@ -75,6 +91,20 @@ export function validateConfigBundle(bundle: ConfigBundle): Readonly<ConfigBundl
 			issues.push({ agentId: agent.id, message: `duplicate Mattermost username '${username}'` });
 		}
 		usernames.add(username);
+
+		if (username === listener.username) {
+			issues.push({
+				agentId: agent.id,
+				message: `bot username '${username}' collides with the listener bot`,
+			});
+		}
+		if (secretFiles.has(agent.mattermost.token_secret_file)) {
+			issues.push({
+				agentId: agent.id,
+				message: `token secret file '${agent.mattermost.token_secret_file}' is used by another bot or the routing key`,
+			});
+		}
+		secretFiles.add(agent.mattermost.token_secret_file);
 
 		if (organization.owner_mattermost_usernames.includes(username)) {
 			issues.push({

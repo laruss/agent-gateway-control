@@ -66,6 +66,17 @@ export async function loopStats(
 	const pairwiseMessages: Record<AgentId, number> = Object.fromEntries(
 		pairs.map((row) => [row.agentId, row.n]),
 	);
+	const [thread] = await db
+		.select({ n: count() })
+		.from(eventRoutes)
+		.innerJoin(events, eq(events.id, eventRoutes.eventId))
+		.where(
+			and(
+				eq(events.correlationId, event.correlationid),
+				earlier,
+				inArray(eventRoutes.decision, ["wake", "wait-match"]),
+			),
+		);
 	return {
 		cascadeAnchor: cascade.anchor,
 		stats: {
@@ -73,6 +84,7 @@ export async function loopStats(
 			runsLastHour: Object.fromEntries(hourly.map((row) => [row.agentId, row.n])),
 			duplicateContent: duplicates?.n ?? 0,
 			pairwiseMessages,
+			threadWakes: thread?.n ?? 0,
 		},
 	};
 }

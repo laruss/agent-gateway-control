@@ -80,6 +80,10 @@ export function organization(): OrganizationConfig {
 			channels: ["hq", "approvals", "gateway-alerts"],
 			approvals_channel: "approvals",
 			alerts_channel: "gateway-alerts",
+			listener: {
+				username: "gateway-listener",
+				token_secret_file: "/run/secrets/mm_gateway_listener_token",
+			},
 		},
 	};
 }

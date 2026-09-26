@@ -2,8 +2,14 @@ import type { OrganizationLimits, WakeRule } from "@agent-gateway/contracts";
 import type { AgentState } from "@agent-gateway/db";
 import { GATEWAY_SOURCE } from "@agent-gateway/events";
 import { describe, expect, it } from "vitest";
-import { type LoopStats, MAX_PAIRWISE_MESSAGES, type RoutingAgent, routeEvent } from "./routing.ts";
-import { postEvent, ROOT } from "./test-events.ts";
+import {
+	type LoopStats,
+	MAX_PAIRWISE_MESSAGES,
+	MAX_THREAD_WAKES_PER_WINDOW,
+	type RoutingAgent,
+	routeEvent,
+} from "./routing.ts";
+import { CHANNEL, HUMAN, postEvent, ROOT } from "./test-events.ts";
 import { type ActiveWait, waitMatches } from "./waits.ts";
 
 const NOW = new Date("2026-09-25T10:00:00.000Z");
@@ -15,13 +21,14 @@ const LIMITS: OrganizationLimits = {
 };
 const NO_STATS: LoopStats = {
 	cascadeWakes: 0,
+	threadWakes: 0,
 	runsLastHour: {},
 	duplicateContent: 0,
 	pairwiseMessages: {},
 };
 
 function agent(id: string, state: AgentState = "idle", wakeRules: WakeRule[] = []): RoutingAgent {
-	return { id, state, wakeRules };
+	return { id, state, wakeRules, channelIds: new Set([CHANNEL]) };
 }
 
 const AGENTS = [agent("developer"), agent("finance"), agent("research")];
@@ -192,6 +199,34 @@ describe("routing", () => {
 		).toBe("rate_limit");
 	});
 
+	it("bounds a thread's wake-ups across cascades, for humans too", () => {
+		const human = postEvent({ rootId: null, targets: ["developer", "finance"] });
+		const routes = route(human, {
+			stats: { ...NO_STATS, threadWakes: MAX_THREAD_WAKES_PER_WINDOW - 1 },
+		});
+		expect(routes.map((r) => [r.agentId, r.decision, r.reason])).toEqual([
+			["developer", "wake", "target"],
+			["finance", "blocked", "thread_rate_limit"],
+		]);
+	});
+
+	it("never routes a post to an agent not allowed in its channel", () => {
+		const elsewhere = [
+			{ ...agent("developer"), channelIds: new Set(["0therchanne10000000000000a"]) },
+		];
+		const human = postEvent({ rootId: null, targets: ["developer"] });
+		expect(route(human, { agents: elsewhere })[0]).toMatchObject({
+			decision: "ignore",
+			reason: "channel_not_allowed",
+		});
+		expect(
+			route(postEvent({ sender: "finance", targets: ["developer"] }), {
+				agents: elsewhere,
+				waits: [wait()],
+			}),
+		).toEqual([expect.objectContaining({ decision: "ignore", reason: "channel_not_allowed" })]);
+	});
+
 	it("lets a human repeat themselves", () => {
 		const human = postEvent({ rootId: null, targets: ["developer"] });
 		expect(route(human, { stats: { ...NO_STATS, duplicateContent: 3 } })[0]?.decision).toBe("wake");
@@ -212,10 +247,41 @@ describe("routing", () => {
 			data: {},
 		};
 		expect(route(control)).toEqual([]);
+		const edit = {
+			...postEvent({ rootId: null, targets: ["developer"] }),
+			type: "mattermost.post.edited" as const,
+		};
+		expect(
+			route(edit, {
+				agents: [agent("developer", "idle", [{ event_type: "mattermost.post.created" }])],
+			}),
+		).toEqual([]);
+		// A recovered reply matches no wait, although the same reply would: its text is unknown.
+		const reply = postEvent({ sender: "finance", targets: ["developer"] });
+		expect(route(reply, { waits: [wait()] })[0]?.decision).toBe("wait-match");
+		const recovered = { ...reply, type: "mattermost.post.recovered" as const };
+		expect(route(recovered, { waits: [wait()] })).toEqual([]);
 	});
 
 	it("ignores targets that are not registered agents", () => {
 		expect(route(postEvent({ rootId: null, targets: ["ghost"] }))).toEqual([]);
+	});
+});
+
+describe("waits for a human", () => {
+	it("match only the human's own posts, not integrations under that account", () => {
+		const humanWait = wait({
+			condition: {
+				...wait().condition,
+				expectedSenderAgentIds: [],
+				expectedSenderUserIds: [HUMAN],
+				requireTargetAgentId: null,
+			},
+		});
+		const answer = postEvent({ targets: [] });
+		expect(waitMatches(humanWait, answer, NOW)).toBe(true);
+		const webhook = { ...answer, trustlevel: "internal-untrusted" as const };
+		expect(waitMatches(humanWait, webhook, NOW)).toBe(false);
 	});
 });
 

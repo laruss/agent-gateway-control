@@ -15,32 +15,52 @@ export type OutcomeIssue = Readonly<{ path: string; message: string }>;
  * What the run's own events establish: the correlations it may wait on and the thread roots
  * it may reply to. A result may not reach into a conversation the run was never part of.
  */
+/** A thread the run may reply in: its channel and the cascade its events belong to. */
+export type ThreadScope = Readonly<{ channelId: string; correlationId: string }>;
+
 export type RunScope = Readonly<{
 	correlationIds: ReadonlySet<string>;
-	threadRootIds: ReadonlySet<string>;
+	/** Thread root post id to the thread's channel and correlation. */
+	threadRoots: ReadonlyMap<string, ThreadScope>;
+	/** Highest hop among the run's events: what the run's own posts build on. */
+	maxHop: number;
 }>;
 
 export function runScope(events: Readonly<GatewayEvent[]>): RunScope {
 	const correlationIds = new Set<string>();
-	const threadRootIds = new Set<string>();
+	const threadRoots = new Map<string, ThreadScope>();
+	let maxHop = 0;
 	for (const event of events) {
 		correlationIds.add(event.correlationid);
+		maxHop = Math.max(maxHop, event.hop);
 		const post = mattermostPost(event);
 		if (post !== null) {
-			threadRootIds.add(post.root_id ?? post.post_id);
+			threadRoots.set(post.root_id ?? post.post_id, {
+				channelId: post.channel_id,
+				correlationId: event.correlationid,
+			});
 		}
 	}
-	return { correlationIds, threadRootIds };
+	return { correlationIds, threadRoots, maxHop };
 }
 
 /** Checks waits and replies against the run's scope; complements the authority check. */
 export function checkRunScope(result: AgentTurnResult, scope: RunScope): Readonly<OutcomeIssue[]> {
 	const issues: OutcomeIssue[] = [];
 	result.publicMessages.forEach((message, i) => {
-		if (message.rootPostId !== null && !scope.threadRootIds.has(message.rootPostId)) {
+		if (message.rootPostId === null) {
+			return;
+		}
+		const channelId = scope.threadRoots.get(message.rootPostId)?.channelId;
+		if (channelId === undefined) {
 			issues.push({
 				path: `publicMessages.${i}.rootPostId`,
 				message: `thread '${message.rootPostId}' is not part of this run`,
+			});
+		} else if (channelId !== message.channelId) {
+			issues.push({
+				path: `publicMessages.${i}.channelId`,
+				message: `thread '${message.rootPostId}' is in another channel`,
 			});
 		}
 	});

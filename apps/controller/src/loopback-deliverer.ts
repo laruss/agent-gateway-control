@@ -1,20 +1,7 @@
-import { type GatewayEvent, MattermostIdSchema } from "@agent-gateway/contracts";
+import { MattermostPostPayloadSchema } from "@agent-gateway/contracts";
 import { type ControlPlaneDeps, ingestEvent } from "@agent-gateway/core";
-import { sha256Hex } from "@agent-gateway/events";
+import { newPostEventType, sha256Hex } from "@agent-gateway/events";
 import { type Deliverer, DeliveryError } from "@agent-gateway/outbox";
-import { z } from "zod";
-
-/** The `mattermost.post` outbox payload written by the controller. */
-const PostPayloadSchema = z.object({
-	agentId: z.string(),
-	runId: z.uuid(),
-	channelId: MattermostIdSchema,
-	rootPostId: MattermostIdSchema.nullable(),
-	message: z.string(),
-	targetAgentIds: z.array(z.string()),
-	correlationId: z.string(),
-	hop: z.int().min(0),
-});
 
 /** A stable fake Mattermost id: the same key always yields the same post. */
 function fakeMattermostId(key: string): string {
@@ -30,18 +17,13 @@ function fakeMattermostId(key: string): string {
 export function loopbackPostDeliverer(deps: ControlPlaneDeps): Deliverer {
 	return {
 		deliver: async (item) => {
-			const payload = PostPayloadSchema.safeParse(item.payload);
+			const payload = MattermostPostPayloadSchema.safeParse(item.payload);
 			if (!payload.success) {
 				throw new DeliveryError("malformed mattermost.post payload", false);
 			}
 			const post = payload.data;
 			const postId = fakeMattermostId(item.idempotencyKey);
-			const type: GatewayEvent["type"] =
-				post.rootPostId !== null
-					? "mattermost.thread.reply"
-					: post.targetAgentIds.length > 0
-						? "mattermost.agent.mentioned"
-						: "mattermost.post.created";
+			const type = newPostEventType(post.rootPostId, post.targetAgentIds);
 			const result = await ingestEvent(deps, {
 				specversion: "1.0",
 				id: `mattermost:post:${postId}`,

@@ -17,3 +17,4 @@ rewritten in substance: a changed decision gets a new ADR that references the ol
 | [009](009-model-output-vs-turn-result.md) | Model output is separate from the turn result and fits strict structured output | Accepted |
 | [010](010-zod-is-the-validator.md) | Zod is the only validator; published JSON Schemas are structural | Accepted |
 | [011](011-run-execution-protocol.md) | Run execution protocol between controller and workers | Accepted |
+| [012](012-mattermost-bridge.md) | Mattermost bridge: identity, signed routing, durable catch-up | Accepted |

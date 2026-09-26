@@ -2,6 +2,7 @@ import {
 	type GatewayEvent,
 	GatewayEventSchema,
 	type JsonObject,
+	type MattermostAlertPayload,
 	type MattermostId,
 	type OrganizationConfig,
 	QUEUES,
@@ -20,8 +21,16 @@ import {
 	outbox,
 } from "@agent-gateway/db";
 import { and, asc, count, eq, inArray, isNull, max } from "drizzle-orm";
+import type { RoutingAgent } from "../routing.ts";
 import type { AgentRecord } from "../turn-context.ts";
 import type { UnitOfWork } from "./deps.ts";
+
+/** Event types of new posts, as opposed to edits, deletions and recovered posts. */
+export const NEW_POST_EVENT_TYPES = [
+	"mattermost.post.created",
+	"mattermost.agent.mentioned",
+	"mattermost.thread.reply",
+] as const;
 
 export type ActiveConfig = Readonly<{
 	version: string;
@@ -74,8 +83,9 @@ export async function loadAgents(db: Db): Promise<AgentRecord[]> {
 export type CascadeBudget = Readonly<{ anchor: number | null; spent: number }>;
 
 /**
- * A cascade starts with the latest human post of the correlation (a new human instruction is a
- * new cascade; `anchor` is that post's `seq`, null before any). Every granted `wake` or
+ * A cascade starts with the latest new human post of the correlation (a new human instruction
+ * or answer is a new cascade; `anchor` is that post's `seq`, null before any). Edits, deletions
+ * and recovered posts are no new words and start nothing. Every granted `wake` or
  * `wait-match` route records the anchor it was granted under, so the budget counts exactly the
  * wake-ups of the current cascade, whenever and for whichever event they were granted.
  */
@@ -88,6 +98,7 @@ export async function cascadeBudget(db: Db, correlationId: string): Promise<Casc
 				eq(events.correlationId, correlationId),
 				eq(events.trustLevel, "human-trusted"),
 				eq(events.hop, 0),
+				inArray(events.type, [...NEW_POST_EVENT_TYPES]),
 			),
 		);
 	const anchor = start?.seq ?? null;
@@ -163,6 +174,20 @@ export async function loadDirectory(
 		.from(mattermostDirectory)
 		.where(eq(mattermostDirectory.kind, kind));
 	return new Map(rows.map((row) => [row.name, row.id]));
+}
+
+/**
+ * Channel ids by name within the configured team, as bootstrap resolved them. Until bootstrap
+ * has resolved the configured team (after a team change), no channel is known: names recorded
+ * for another team must not stand for this one's channels.
+ */
+export async function loadTeamChannels(db: Db): Promise<Map<string, MattermostId>> {
+	const config = await loadActiveConfig(db);
+	if (config === null) {
+		return new Map();
+	}
+	const teams = await loadDirectory(db, "team");
+	return teams.has(config.organization.mattermost.team) ? loadDirectory(db, "channel") : new Map();
 }
 
 type EventRow = typeof events.$inferSelect;
@@ -245,16 +270,35 @@ export async function raiseAlert(
 	uow.deps.log.warn(message, { alert_key: key });
 	const config = await loadActiveConfig(uow.tx.db);
 	const channelName = config?.organization.mattermost.alerts_channel ?? null;
-	const channels = await loadDirectory(uow.tx.db, "channel");
+	const channels = await loadTeamChannels(uow.tx.db);
+	const payload: MattermostAlertPayload = {
+		channelName,
+		channelId: channelName === null ? null : (channels.get(channelName) ?? null),
+		message,
+		detail,
+	};
 	await enqueueOutbox(uow, {
 		kind: "mattermost.alert",
 		destination: `channel/${channelName ?? "unconfigured"}`,
-		payload: {
-			channelName,
-			channelId: channelName === null ? null : (channels.get(channelName) ?? null),
-			message,
-			detail,
-		},
+		payload,
 		idempotencyKey: `alert:${key}`,
 	});
+}
+
+/** An agent as routing sees it, with its allowed channels resolved to ids. */
+export function toRoutingAgent(
+	agent: AgentRecord,
+	channels: ReadonlyMap<string, MattermostId>,
+): RoutingAgent {
+	return {
+		id: agent.id,
+		state: agent.state,
+		wakeRules: agent.config.wake_rules,
+		channelIds: new Set(
+			agent.config.mattermost.allowed_channels.flatMap((name) => {
+				const id = channels.get(name);
+				return id === undefined ? [] : [id];
+			}),
+		),
+	};
 }

@@ -14,8 +14,9 @@
 | Zone | Trust level | Notes |
 |------|-------------|-------|
 | Admin CLI/API on localhost or VPN | `system-trusted` | Source of administrative truth |
-| Owners on the allowlist, by Mattermost user id | `human-trusted` | The only approvers |
-| Posts by other humans and agents in Mattermost | `internal-untrusted` | Text grants no authority |
+| Posts by human accounts in managed channels | `human-trusted` | May address agents by mention; grants no tool authority |
+| Owners on the allowlist, by Mattermost user id | `human-trusted` | The only approvers (checked by user id, not by the label) |
+| Posts by agent bots, other bots, webhooks and plugins | `internal-untrusted` | Text grants no authority |
 | Email, web, files, attachments | `external-untrusted` | Always explicitly labeled in context |
 | Model output (`AgentTurnResult`) | untrusted | Strict validation, fail-closed |
 
@@ -40,8 +41,13 @@
   per-agent rate, duplicate normalized payload and pairwise guards on every wake-up; a blocked
   wake-up stops the cascade and posts an alert; `kill-all` pauses every agent and blocks new
   runs. Cascade budgets are serialized per correlation. Lifecycle, wait, approval, timer and
-  control events cannot be ingested from outside the Gateway. HMAC-signed props arrive with the
-  Mattermost bridge (Phase 2).
+  control events cannot be ingested from outside the Gateway.
+- Status (Phase 2): agent posts route only by HMAC-signed props bound to the exact post
+  (channel, thread, text) and to the posting bot's own agent; the run's correlation is signed,
+  so a new thread does not reset the cascade budget. Human posts route by exact mentions
+  outside code and quotes, only to agents allowed in the channel. Edits, deletions and posts
+  by integrations never wake anyone. A thread may grant at most 30 wake-ups per 10 minutes
+  across cascades. Guard alerts are posted to the alerts channel by the listener bot.
 
 ### T3. Credential leakage
 
@@ -53,6 +59,11 @@
   and truncated.
 - Status: `token_secret_file` is restricted to `/run/secrets/`; `.gitignore` excludes
   `secrets/`, `*.pem`, `*.key`.
+- Status (Phase 2): bootstrap writes bot tokens straight into secret files (mode 0600, atomic,
+  never through a symlink) and never prints them; the admin token is needed only for bootstrap.
+  Bot tokens and the routing key are read only by the controller; in a deployment workers get
+  neither (the secrets are mounted into the controller container only). In local development
+  both processes run as one user in one working tree, so this boundary does not hold there.
 
 ### T4. Compromised runtime worker
 
@@ -90,6 +101,20 @@
   request cannot be `granted`/`executed` without a decision by an allowlisted user before
   expiry. Config keeps finance tools with `finance_agent_id` only and requires human approval
   for every finance action except `finance.read`. The flow is Phase 7.
+
+### T9. Bot impersonation and forged routing
+
+- Anyone can set `props` on a post, including `from_bot` and a copy of the Gateway's routing
+  metadata; a leaked bot token lets someone post as an agent.
+- Status (Phase 2): senders are identified by Mattermost user id only. An agent bot's post
+  without a valid signature for exactly that post is not ingested, is audited once
+  (`mattermost.post.rejected`) and raises an alert; an exact copy of a signed post is the same
+  event (keyed by its signed idempotency key) and is rejected as a replay. Other bot accounts
+  are recognized by user id and never address anyone; a wait for a human's user id is
+  satisfied only by that human's own post, not by a webhook or plugin posting under the
+  account. A signed post counts only as the exact post the outbox delivered with its key. Humans' copied metadata is ignored; their
+  posts route by their own mentions only. Bots are plain members, added only to their
+  channels ([ADR-012](../adr/012-mattermost-bridge.md)).
 
 ## Open questions
 

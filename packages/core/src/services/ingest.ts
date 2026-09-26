@@ -29,10 +29,12 @@ import {
 	audit,
 	loadActiveConfig,
 	loadAgents,
+	loadTeamChannels,
 	lockAgent,
 	lockCascade,
 	lockConfigShared,
 	raiseAlert,
+	toRoutingAgent,
 } from "./store.ts";
 import { resolveWait } from "./wait-store.ts";
 
@@ -64,6 +66,39 @@ export async function ingestEvent(
 	deps: ControlPlaneDeps,
 	event: GatewayEvent,
 ): Promise<IngestResult> {
+	const valid = externalEvent(event);
+	return withTransaction(deps.pool, (tx) =>
+		ingestInTransaction({ deps, tx, jobs: deps.jobs(tx), now: deps.clock() }, valid),
+	);
+}
+
+/** Whether an event may still be ingested, decided inside the ingest transaction. */
+export type IngestAdmission = (uow: UnitOfWork) => Promise<boolean>;
+
+/**
+ * {@link ingestEvent}, but only if `admit` holds, checked in the same transaction under the
+ * event's cascade lock and the configuration row in share mode (the order every ingest takes):
+ * a config apply cannot change what `admit` reads between the check and the routing. Null when
+ * the event was not admitted (nothing is stored).
+ */
+export async function ingestEventIf(
+	deps: ControlPlaneDeps,
+	event: GatewayEvent,
+	admit: IngestAdmission,
+): Promise<IngestResult | null> {
+	const valid = externalEvent(event);
+	return withTransaction(deps.pool, async (tx) => {
+		const uow: UnitOfWork = { deps, tx, jobs: deps.jobs(tx), now: deps.clock() };
+		await lockCascade(uow, valid.correlationid);
+		await lockConfigShared(uow);
+		if (!(await admit(uow))) {
+			return null;
+		}
+		return ingestInTransaction(uow, valid);
+	});
+}
+
+function externalEvent(event: GatewayEvent): GatewayEvent {
 	const valid = GatewayEventSchema.parse(event);
 	if (
 		isReservedEventType(valid.type) ||
@@ -72,9 +107,7 @@ export async function ingestEvent(
 	) {
 		throw new ReservedEventError(valid.type);
 	}
-	return withTransaction(deps.pool, (tx) =>
-		ingestInTransaction({ deps, tx, jobs: deps.jobs(tx), now: deps.clock() }, valid),
-	);
+	return valid;
 }
 
 export async function ingestInTransaction(
@@ -124,8 +157,9 @@ export async function ingestInTransaction(
 		});
 		return { status: "accepted", eventId, routes: [] };
 	}
+	const channels = await loadTeamChannels(db);
 	const toRouting = (list: Awaited<ReturnType<typeof loadAgents>>): RoutingAgent[] =>
-		list.map((agent) => ({ id: agent.id, state: agent.state, wakeRules: agent.config.wake_rules }));
+		list.map((agent) => toRoutingAgent(agent, channels));
 	// Every agent this event may wake is locked, in id order, before routing reads its state:
 	// the lock order of every use case (cascade, then agents by id, then runs and waits), and no
 	// concurrent disable or pause can slip between the decision and its effect.

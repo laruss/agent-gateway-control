@@ -41,3 +41,7 @@ mattermost:
     - gateway-alerts
   approvals_channel: approvals
   alerts_channel: gateway-alerts
+  # The Gateway's own bot: listens to every channel above, posts alerts and approval cards.
+  listener:
+    username: gateway-listener
+    token_secret_file: /run/secrets/mm_gateway_listener_token

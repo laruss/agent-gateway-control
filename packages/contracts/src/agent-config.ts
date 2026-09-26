@@ -5,10 +5,11 @@ import {
 	MemoryNamespaceSchema,
 	PromptPathSchema,
 	RuntimeAdapterIdSchema,
+	SecretFileSchema,
 	ToolPatternSchema,
 	toolPatternOverlaps,
 } from "./common.ts";
-import { GatewayEventTypeSchema, isReservedEventType } from "./event.ts";
+import { GatewayEventTypeSchema, isRecordOnlyEventType, isReservedEventType } from "./event.ts";
 
 export const SessionPolicySchema = z.enum(["stateless", "resumable-if-available"]);
 export type SessionPolicy = z.infer<typeof SessionPolicySchema>;
@@ -28,15 +29,26 @@ export type AgentRuntimeConfig = z.infer<typeof AgentRuntimeConfigSchema>;
 
 /**
  * An event type that wakes the agent. Gateway-reserved types (lifecycle, waits, approvals,
- * timers, control) never wake by rule: waits resume their own agent without one.
+ * timers, control) never wake by rule: waits resume their own agent without one. Edits and
+ * deletions are record-only.
  */
-export const WakeRuleSchema = z.strictObject({
-	event_type: GatewayEventTypeSchema.refine(
-		(type) => !isReservedEventType(type),
-		"Gateway-reserved event types cannot be wake rules",
-	),
-	target_agent_id: AgentIdSchema.optional(),
-});
+export const WakeRuleSchema = z
+	.strictObject({
+		event_type: GatewayEventTypeSchema.refine(
+			(type) => !isReservedEventType(type),
+			"Gateway-reserved event types cannot be wake rules",
+		).refine((type) => !isRecordOnlyEventType(type), "edits and deletions never wake an agent"),
+		target_agent_id: AgentIdSchema.optional(),
+	})
+	.refine(
+		(rule) => rule.target_agent_id !== undefined || !rule.event_type.startsWith("mattermost."),
+		{
+			message:
+				"Mattermost posts wake only the agents they address; an untargeted Mattermost wake rule would bypass mentions and channel permissions",
+			path: ["target_agent_id"],
+		},
+	);
+
 export type WakeRule = z.infer<typeof WakeRuleSchema>;
 
 export const AgentPermissionsSchema = z
@@ -65,7 +77,7 @@ export const AgentConfigSchema = z.strictObject({
 	mattermost: z.strictObject({
 		/** Bot username, equal to the agent id; the bot user id is resolved by bootstrap. */
 		username: MattermostNameSchema,
-		token_secret_file: z.string().regex(/^\/run\/secrets\/[a-z0-9_]+$/, "path under /run/secrets/"),
+		token_secret_file: SecretFileSchema,
 		allowed_channels: z.array(MattermostNameSchema).min(1).max(32),
 	}),
 	runtime: AgentRuntimeConfigSchema,

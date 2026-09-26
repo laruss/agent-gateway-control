@@ -129,9 +129,24 @@
         "alerts_channel": {
           "type": "string",
           "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"
+        },
+        "listener": {
+          "type": "object",
+          "properties": {
+            "username": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"
+            },
+            "token_secret_file": {
+              "type": "string",
+              "pattern": "^\\/run\\/secrets\\/[a-z0-9_]+$"
+            }
+          },
+          "required": ["username", "token_secret_file"],
+          "additionalProperties": false
         }
       },
-      "required": ["team", "channels", "approvals_channel", "alerts_channel"],
+      "required": ["team", "channels", "approvals_channel", "alerts_channel", "listener"],
       "additionalProperties": false
     }
   },

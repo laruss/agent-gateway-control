@@ -74,7 +74,7 @@ export const APPROVAL_STATUSES = ["pending", "granted", "denied", "expired", "ex
 export const MEMORY_STATUSES = ["proposed", "accepted", "rejected", "superseded"] as const;
 export const VISIBILITIES = ["private", "shared", "public"] as const;
 export const POLICY_DECISIONS = ["allow", "deny", "require_approval"] as const;
-export const DIRECTORY_KINDS = ["channel", "user"] as const;
+export const DIRECTORY_KINDS = ["channel", "user", "team"] as const;
 export type DirectoryKind = (typeof DIRECTORY_KINDS)[number];
 
 /** Global switches; exactly one row with id 1. */
@@ -85,6 +85,8 @@ export const gatewayControls = pgTable(
 		/** Set by kill-all: no new runs start until an operator releases it. */
 		killSwitch: boolean("kill_switch").notNull().default(false),
 		activeConfigVersion: text("active_config_version"),
+		/** Incremented by every config apply: tells whether anything was applied in between. */
+		configGeneration: bigint("config_generation", { mode: "number" }).notNull().default(0),
 		updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 	},
 	(t) => [check("gateway_controls_single_row", sql`${t.id} = 1`)],
@@ -181,6 +183,8 @@ export const events = pgTable(
 		index("events_correlation").on(t.correlationId),
 		index("events_content_hash").on(t.contentHash, t.receivedAt),
 		index("events_sender_agent").on(t.senderAgentId, t.receivedAt),
+		/** Finds the events of one Mattermost post (`channel/<id>/post/<id>`). */
+		index("events_subject").on(t.source, t.subject),
 	],
 );
 

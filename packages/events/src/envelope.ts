@@ -54,11 +54,36 @@ function normalizeMessage(message: string): string {
 }
 
 /**
- * Hash of the normalized content of a post: sender, place, addressees and text, without ids.
- * Repeating the same content in the same place is the duplicate-payload loop signal.
- * Null for events that are not Mattermost posts.
+ * The event type of a new Mattermost post: a thread reply, else a post addressing agents, else a
+ * plain post. The listener and the loopback deliverer both use it, so a post is classified the
+ * same way whichever path delivered it.
+ */
+export function newPostEventType(
+	rootId: string | null,
+	targets: Readonly<AgentId[]>,
+): GatewayEventType {
+	if (rootId !== null) {
+		return "mattermost.thread.reply";
+	}
+	return targets.length > 0 ? "mattermost.agent.mentioned" : "mattermost.post.created";
+}
+
+/** Event types of new posts, as opposed to edits and deletions of existing ones. */
+const NEW_POST_EVENT_TYPES: Readonly<GatewayEventType[]> = [
+	"mattermost.post.created",
+	"mattermost.agent.mentioned",
+	"mattermost.thread.reply",
+];
+
+/**
+ * Hash of the normalized content of a new post: sender, place, addressees and text, without
+ * ids. Repeating the same content in the same place is the duplicate-payload loop signal.
+ * Null for other events, edits and deletions included: they are not new content.
  */
 export function contentHash(event: GatewayEvent): string | null {
+	if (!NEW_POST_EVENT_TYPES.includes(event.type)) {
+		return null;
+	}
 	const post = mattermostPost(event);
 	if (post === null) {
 		return null;

@@ -50,6 +50,7 @@ import {
 import { requireSetting } from "@agent-gateway/service";
 import type { PgBoss } from "pg-boss";
 import { loadConfigDirectory } from "./config-files.ts";
+import { mattermostBootstrap, mattermostReconcile } from "./mattermost-commands.ts";
 
 export class UsageError extends Error {
 	constructor(message: string) {
@@ -77,7 +78,7 @@ export const USAGE = `gateway <command>
   config apply <dir> [--root .] [--mock-runtimes]
                                       store the configuration as the active version;
                                       --mock-runtimes runs every agent on the mock runtime
-  directory set <channel|user> <name> <mattermost-id>
+  directory set <channel|user|team> <name> <mattermost-id>
   agents list | show <id> | enable <id> | disable <id> | pause <id> | resume <id>
   runs list [--agent <id>] | show <run-id> | cancel <run-id> | redrive <run-id>
   waits list
@@ -85,6 +86,12 @@ export const USAGE = `gateway <command>
   dlq list | redrive <dlq-name> <job-id>
   outbox list [--status <status>] | redrive <outbox-id>
   approvals list [--status <status>]
+  mattermost bootstrap --secrets-dir <dir> [--rotate-tokens]
+                                      resolve team, channels and owners, create the bots and
+                                      their memberships, store tokens in <dir> (needs
+                                      MATTERMOST_URL and a temporary MATTERMOST_ADMIN_TOKEN)
+  mattermost reconcile [--secrets-dir <dir>]
+                                      check tokens, bot accounts and memberships
   kill-all [--release]`;
 
 function actor(): string {
@@ -297,9 +304,9 @@ async function runSessionCommand(
 			return 0;
 		}
 		case "directory set": {
-			const kind = arg(args, 2, "channel|user");
-			if (kind !== "channel" && kind !== "user") {
-				throw new UsageError("kind must be 'channel' or 'user'");
+			const kind = arg(args, 2, "channel|user|team");
+			if (kind !== "channel" && kind !== "user" && kind !== "team") {
+				throw new UsageError("kind must be 'channel', 'user' or 'team'");
 			}
 			const id = MattermostIdSchema.parse(arg(args, 4, "mattermost-id"));
 			await setDirectoryEntry(deps, kind, arg(args, 3, "name"), id, who);
@@ -400,6 +407,19 @@ async function runSessionCommand(
 		case "approvals list":
 			out.print(json(await listApprovals(deps, flag(args, "status"))));
 			return 0;
+		case "mattermost bootstrap":
+			await mattermostBootstrap(
+				deps,
+				{
+					secretsDir: flag(args, "secrets-dir"),
+					rotateTokens: args.includes("--rotate-tokens"),
+					actor: who,
+				},
+				out.print,
+			);
+			return 0;
+		case "mattermost reconcile":
+			return (await mattermostReconcile(deps, flag(args, "secrets-dir"), out.print)) ? 0 : 1;
 		case "kill-all":
 			if (args.includes("--release")) {
 				await releaseKillSwitch(deps, who);

@@ -18,6 +18,8 @@ export type OutboxItem = Readonly<{
 	payload: JsonObject;
 	idempotencyKey: string;
 	attempt: number;
+	/** When the side effect was decided; a retry looks for its own earlier effect since then. */
+	createdAt: Date;
 }>;
 
 /**
@@ -105,6 +107,7 @@ export async function deliverOutboxItem(
 		payload: claimed.payload,
 		idempotencyKey: claimed.idempotencyKey,
 		attempt: claimed.attempts,
+		createdAt: claimed.createdAt,
 	};
 	const log = deps.log.child({ outbox_id: item.id, run_id: claimed.runId ?? undefined });
 

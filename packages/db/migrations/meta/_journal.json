@@ -15,6 +15,27 @@
       "when": 1790356499358,
       "tag": "0001_audit_log_append_only",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1790364961294,
+      "tag": "0002_events_subject_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1790411305854,
+      "tag": "0003_directory_team_kind",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1790418282528,
+      "tag": "0004_config_generation",
+      "breakpoints": true
     }
   ]
 }

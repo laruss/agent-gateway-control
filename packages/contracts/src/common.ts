@@ -24,6 +24,15 @@ export const MattermostNameSchema = z
 	.regex(/^[a-z0-9][a-z0-9._-]{0,63}$/, "Mattermost team/channel/user name");
 export type MattermostName = z.infer<typeof MattermostNameSchema>;
 
+/** A Docker/Compose secret file: `/run/secrets/<name>`. */
+export const SecretFileSchema = z
+	.string()
+	.regex(/^\/run\/secrets\/[a-z0-9_]+$/, "path under /run/secrets/");
+export type SecretFile = z.infer<typeof SecretFileSchema>;
+
+/** The controller's HMAC key for agent routing props; no bot token may live there. */
+export const ROUTING_KEY_SECRET_FILE: SecretFile = "/run/secrets/gateway_routing_key";
+
 export const TimestampSchema = z.iso.datetime({ offset: true });
 export type Timestamp = z.infer<typeof TimestampSchema>;
 

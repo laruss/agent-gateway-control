@@ -8,11 +8,19 @@ import {
 	runQueue,
 } from "@agent-gateway/contracts";
 import {
+	afterChannelStart,
+	applyConfig,
+	deleteDirectoryEntry,
+	deleteUnmanagedChannelCursors,
 	enqueueOutbox,
 	handleRunReport,
 	handleWaitTimeout,
 	ingestEvent,
+	ingestEventIf,
 	killAll,
+	loadConfigGeneration,
+	loadMattermostSnapshot,
+	mattermostBootstrapStore,
 	pauseAgent,
 	ReservedEventError,
 	reconcileRunsAndWaits,
@@ -20,7 +28,10 @@ import {
 	releaseKillSwitch,
 	resumeAgent,
 	setAgentEnabled,
+	setDirectoryEntry,
+	startManagedChannel,
 	type UnitOfWork,
+	whileAgentMayPost,
 } from "@agent-gateway/core";
 import { createPool, grantWorkerRole, withTransaction } from "@agent-gateway/db";
 import { silentLogger } from "@agent-gateway/logging";
@@ -37,6 +48,7 @@ import { bossJobProbe } from "./controller.ts";
 import { loopbackPostDeliverer } from "./loopback-deliverer.ts";
 import {
 	eventually,
+	exampleConfig,
 	flakyDeliverer,
 	humanPost,
 	IDS,
@@ -609,6 +621,33 @@ describe("durable core with the mock runtime", () => {
 		};
 	};
 
+	it("keeps the cascade when a human only edits a post", async () => {
+		await gateway.stopWorker();
+		const mention = humanPost("@research look at X", ["research"]);
+		const first = await ingestEvent(gateway.deps(), mention);
+		const edit = humanPost("@research look at Y", []);
+		await ingestEvent(gateway.deps(), {
+			...edit,
+			id: `${mention.id}:edited:1`,
+			type: "mattermost.post.edited",
+			correlationid: mention.correlationid,
+			data: { ...edit.data, post_id: mention.data.post_id ?? null, target_agent_ids: [] },
+		});
+		const reply = untargetedReply(mention, "finance", "b0tf1nance0000000000000000", 1);
+		const routed = await ingestEvent(gateway.deps(), {
+			...reply,
+			data: { ...reply.data, target_agent_ids: ["research"] },
+		});
+		const [row] = await query<{ same: string }>(
+			`select (r.cascade_anchor = e.seq)::text as same from event_routes r, events e
+			  where r.event_id = $1 and r.agent_id = 'research' and e.id = $2`,
+			[routed.eventId, first.eventId],
+		);
+		expect(row).toEqual({ same: "true" });
+		// research is FAILED by an earlier test: its new inbox entry never runs.
+		await gateway.startWorker();
+	});
+
 	it("resumes on an untargeted answer stored before the wait existed", async () => {
 		await idle("developer");
 		await gateway.stopWorker();
@@ -1009,6 +1048,7 @@ describe("durable core with the mock runtime", () => {
 			destination: `channel/${IDS.channel("hq")}`,
 			idempotencyKey: `mattermost-post:${randomUUID()}:0`,
 			attempt: 1,
+			createdAt: new Date(),
 			payload: {
 				agentId: "finance",
 				runId: randomUUID(),
@@ -1016,6 +1056,7 @@ describe("durable core with the mock runtime", () => {
 				rootPostId: null,
 				message: "status update",
 				targetAgentIds: [],
+				attachmentArtifactIds: [],
 				correlationId: `test:${randomUUID()}`,
 				hop: 1,
 			},
@@ -1044,5 +1085,231 @@ describe("durable core with the mock runtime", () => {
 		);
 		expect(inbox).toEqual([{ status: "pending", run_id: null }]);
 		expect(await agentState("developer")).toBe("paused");
+	});
+
+	it("keeps a config apply from revoking a post that is already authorized", async () => {
+		const deps = gateway.deps();
+		await setDirectoryEntry(deps, "team", "autonomous-lab", IDS.channel("team"), "test");
+		const config = exampleConfig();
+		const revoked = {
+			...config,
+			agents: config.agents.map((agent) =>
+				agent.id === "developer"
+					? { ...agent, mattermost: { ...agent.mattermost, allowed_channels: ["engineering"] } }
+					: agent,
+			),
+		};
+		let release = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let posting = false;
+		const post = whileAgentMayPost(deps, "developer", IDS.channel("hq"), async () => {
+			posting = true;
+			await gate;
+			return "posted";
+		});
+		await eventually(async () => posting, 10_000, "post authorized");
+		let applied = false;
+		const apply = applyConfig(deps, revoked, "test").then(() => {
+			applied = true;
+		});
+		await Bun.sleep(500);
+		expect(applied).toBe(false);
+		release();
+		expect(await post).toEqual({ allowed: true, value: "posted" });
+		await apply;
+		expect(
+			await whileAgentMayPost(deps, "developer", IDS.channel("hq"), async () => "posted"),
+		).toEqual({ allowed: false });
+		await applyConfig(deps, config, "test");
+	});
+
+	it("manages no Mattermost channel until the configured team is resolved", async () => {
+		const deps = gateway.deps();
+		await deleteDirectoryEntry(deps, "team", "autonomous-lab", IDS.channel("team"), "test");
+		const before = await loadMattermostSnapshot(deps);
+		expect(before?.channels.size).toBe(0);
+		await setDirectoryEntry(deps, "team", "autonomous-lab", IDS.channel("team"), "test");
+		const after = await loadMattermostSnapshot(deps);
+		expect(after?.channels.get(IDS.channel("hq"))).toBe("hq");
+	});
+
+	it("restarts every channel's catch-up when the configuration moves to another team", async () => {
+		const deps = gateway.deps();
+		await gateway.pool.query(
+			"insert into source_cursors (source_id, cursor_type, cursor_value) values ($1, 'update_at_ms', '1'), ($2, 'create_at_ms', '1')",
+			[`mattermost:channel:${IDS.channel("hq")}`, `mattermost:channel-floor:${IDS.channel("hq")}`],
+		);
+		const config = exampleConfig();
+		await applyConfig(
+			deps,
+			{
+				...config,
+				organization: {
+					...config.organization,
+					mattermost: { ...config.organization.mattermost, team: "another-team" },
+				},
+			},
+			"test",
+		);
+		expect(
+			await query(
+				"select source_id from source_cursors where source_id like 'mattermost:channel%'",
+			),
+		).toEqual([]);
+		await applyConfig(deps, config, "test");
+	});
+
+	it("forgets a channel's catch-up when the configuration drops the channel", async () => {
+		const deps = gateway.deps();
+		await gateway.pool.query(
+			"insert into source_cursors (source_id, cursor_type, cursor_value) values ($1, 'update_at_ms', '1'), ($2, 'update_at_ms', '1')",
+			[`mattermost:channel:${IDS.channel("mail")}`, `mattermost:channel:${IDS.channel("hq")}`],
+		);
+		const config = exampleConfig();
+		await applyConfig(
+			deps,
+			{
+				...config,
+				organization: {
+					...config.organization,
+					mattermost: {
+						...config.organization.mattermost,
+						channels: config.organization.mattermost.channels.filter((name) => name !== "mail"),
+					},
+				},
+				agents: config.agents.map((agent) => ({
+					...agent,
+					mattermost: {
+						...agent.mattermost,
+						allowed_channels: agent.mattermost.allowed_channels.filter((name) => name !== "mail"),
+					},
+				})),
+			},
+			"test",
+		);
+		expect(
+			await query(
+				"select source_id from source_cursors where source_id ~ '^mattermost:channel(-floor|-floor-posts)?:'",
+			),
+		).toEqual([{ source_id: `mattermost:channel:${IDS.channel("hq")}` }]);
+		await applyConfig(deps, config, "test");
+	});
+
+	it("admits a new post only after its channel's current start", async () => {
+		const deps = gateway.deps();
+		const channelId = IDS.channel("hq");
+		const post = humanPost("an ambient note", []);
+		const postId = String(post.data.post_id);
+		const admit = (createAt: number) => afterChannelStart(channelId, postId, createAt);
+		await gateway.pool.query(
+			"delete from source_cursors where source_id like 'mattermost:channel%'",
+		);
+		expect(await ingestEventIf(deps, post, admit(5000))).toBeNull();
+		await gateway.pool.query(
+			"insert into source_cursors (source_id, cursor_type, cursor_value) values ($1, 'create_at_ms', '1000'), ($2, 'post_ids', $3)",
+			[
+				`mattermost:channel-floor:${channelId}`,
+				`mattermost:channel-floor-posts:${channelId}`,
+				postId,
+			],
+		);
+		expect(await ingestEventIf(deps, post, admit(999))).toBeNull();
+		expect(await ingestEventIf(deps, post, admit(1000))).toBeNull();
+		// A channel that is not managed now admits nothing, whatever start it still has.
+		const stray = "strayc0000000000000000000a";
+		await gateway.pool.query(
+			"insert into source_cursors (source_id, cursor_type, cursor_value) values ($1, 'create_at_ms', '1')",
+			[`mattermost:channel-floor:${stray}`],
+		);
+		expect(await ingestEventIf(deps, post, afterChannelStart(stray, postId, 5000))).toBeNull();
+		expect((await ingestEventIf(deps, post, admit(1001)))?.status).toBe("accepted");
+		await gateway.pool.query(
+			"delete from source_cursors where source_id like 'mattermost:channel%'",
+		);
+	});
+
+	it("keeps channel starts staged for a team that is not recorded yet", async () => {
+		const deps = gateway.deps();
+		await deleteDirectoryEntry(deps, "team", "autonomous-lab", IDS.channel("team"), "test");
+		await gateway.pool.query(
+			"insert into source_cursors (source_id, cursor_type, cursor_value) values ($1, 'update_at_ms', '1') on conflict do nothing",
+			[`mattermost:channel:${IDS.channel("hq")}`],
+		);
+		await deleteUnmanagedChannelCursors(deps);
+		expect(
+			await query("select 1 from source_cursors where source_id = $1", [
+				`mattermost:channel:${IDS.channel("hq")}`,
+			]),
+		).toHaveLength(1);
+		await setDirectoryEntry(deps, "team", "autonomous-lab", IDS.channel("team"), "test");
+		await gateway.pool.query(
+			"delete from source_cursors where source_id like 'mattermost:channel%'",
+		);
+	});
+
+	it("installs no channel start scanned before the channel left the configuration", async () => {
+		const deps = gateway.deps();
+		const store = mattermostBootstrapStore(deps, "test");
+		const start = { cursor: 5, floor: 5, floorPostIds: [] };
+		const mail = { name: "mail", id: IDS.channel("mail"), start };
+		const team = { name: "autonomous-lab", id: IDS.channel("team") };
+		const count = async () =>
+			(
+				await query(
+					"select 1 from source_cursors where source_id ~ '^mattermost:channel(-floor|-floor-posts)?:'",
+				)
+			).length;
+		await gateway.pool.query(
+			"delete from source_cursors where source_id like 'mattermost:channel%'",
+		);
+		const config = exampleConfig();
+		// Re-applying the same configuration leaves a scan valid.
+		const scanned = await loadConfigGeneration(deps);
+		await applyConfig(deps, config, "test");
+		expect(await startManagedChannel(deps, mail.id, start, scanned)).toBe(true);
+		await gateway.pool.query(
+			"delete from source_cursors where source_id ~ '^mattermost:channel(-floor|-floor-posts)?:'",
+		);
+		// Dropping and re-adding the channel voids a scan made before.
+		const before = await loadConfigGeneration(deps);
+		const withoutMail = {
+			...config,
+			organization: {
+				...config.organization,
+				mattermost: {
+					...config.organization.mattermost,
+					channels: config.organization.mattermost.channels.filter((name) => name !== "mail"),
+				},
+			},
+			agents: config.agents.map((agent) => ({
+				...agent,
+				mattermost: {
+					...agent.mattermost,
+					allowed_channels: agent.mattermost.allowed_channels.filter((name) => name !== "mail"),
+				},
+			})),
+		};
+		await applyConfig(deps, withoutMail, "test");
+		await applyConfig(deps, config, "test");
+		expect(await startManagedChannel(deps, mail.id, start, before)).toBe(false);
+		expect(await store.publishTeam(team, [mail], before)).toBe(false);
+		expect(await count()).toBe(0);
+		expect(await store.publishTeam(team, [mail], await loadConfigGeneration(deps))).toBe(true);
+		expect(await count()).toBe(3);
+		await gateway.pool.query(
+			"delete from source_cursors where source_id like 'mattermost:channel%'",
+		);
+	});
+
+	it("serializes concurrent config applies, each one generation", async () => {
+		const deps = gateway.deps();
+		const before = await loadConfigGeneration(deps);
+		await Promise.all([
+			applyConfig(deps, exampleConfig(), "test"),
+			applyConfig(deps, exampleConfig(), "test"),
+		]);
+		expect(await loadConfigGeneration(deps)).toBe(before + 2);
 	});
 });

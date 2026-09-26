@@ -97,6 +97,7 @@
               "mattermost.post.created",
               "mattermost.post.edited",
               "mattermost.post.deleted",
+              "mattermost.post.recovered",
               "mattermost.agent.mentioned",
               "mattermost.thread.reply",
               "agent.run.requested",

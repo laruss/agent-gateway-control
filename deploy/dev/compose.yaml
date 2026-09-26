@@ -20,5 +20,44 @@ services:
       timeout: 3s
       retries: 30
 
+  # Mattermost keeps its own database: backups, restores and permissions stay independent.
+  mattermost-postgres:
+    image: postgres:17.6-alpine
+    environment:
+      POSTGRES_DB: mattermost
+      POSTGRES_USER: mattermost
+      POSTGRES_PASSWORD: mattermost-dev
+    volumes:
+      - mattermost-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mattermost -d mattermost"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  mattermost:
+    # Same pinned ESR as the e2e tests (packages/testkit/src/mattermost.ts). The image is amd64
+    # only; on Apple silicon Docker runs it emulated.
+    image: mattermost/mattermost-team-edition:11.7.11
+    platform: linux/amd64
+    depends_on:
+      mattermost-postgres:
+        condition: service_healthy
+    environment:
+      MM_SQLSETTINGS_DRIVERNAME: postgres
+      MM_SQLSETTINGS_DATASOURCE: postgres://mattermost:mattermost-dev@mattermost-postgres:5432/mattermost?sslmode=disable
+      MM_SERVICESETTINGS_SITEURL: http://127.0.0.1:8065
+      # Bootstrap creates bot accounts and their personal access tokens.
+      MM_SERVICESETTINGS_ENABLEBOTACCOUNTCREATION: "true"
+      MM_SERVICESETTINGS_ENABLEUSERACCESSTOKENS: "true"
+    ports:
+      - "127.0.0.1:8065:8065"
+    volumes:
+      - mattermost-data:/mattermost/data
+    # No healthcheck: the image is distroless (no shell, no curl). Ready when
+    # http://127.0.0.1:8065/api/v4/system/ping answers.
+
 volumes:
   postgres-data:
+  mattermost-postgres-data:
+  mattermost-data:

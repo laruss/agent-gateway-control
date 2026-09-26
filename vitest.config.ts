@@ -7,7 +7,7 @@ export default defineConfig({
 				test: {
 					name: "unit",
 					include: ["{apps,packages}/**/*.test.ts"],
-					exclude: ["**/node_modules/**", "**/*.integration.test.ts"],
+					exclude: ["**/node_modules/**", "**/*.integration.test.ts", "**/*.e2e.test.ts"],
 				},
 			},
 			{
@@ -16,6 +16,15 @@ export default defineConfig({
 					include: ["{apps,packages}/**/*.integration.test.ts"],
 					testTimeout: 120_000,
 					hookTimeout: 120_000,
+					fileParallelism: false,
+				},
+			},
+			{
+				test: {
+					name: "e2e",
+					include: ["{apps,packages}/**/*.e2e.test.ts"],
+					testTimeout: 180_000,
+					hookTimeout: 360_000,
 					fileParallelism: false,
 				},
 			},

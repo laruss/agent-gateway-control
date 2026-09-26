@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { AgentConfigSchema, AgentPermissionsSchema } from "./agent-config.ts";
+import { AgentConfigSchema, AgentPermissionsSchema, WakeRuleSchema } from "./agent-config.ts";
 import {
 	type ApprovalRequest,
 	ApprovalRequestDraftSchema,
@@ -351,6 +351,16 @@ describe("WaitCondition", () => {
 });
 
 describe("ApprovalRequestDraft", () => {
+	it("must fit one approval card", () => {
+		const big = Array.from({ length: 32 }, (_, n) => ({ name: `p${n}`, value: "x".repeat(2000) }));
+		const parsed = ApprovalRequestDraftSchema.safeParse({
+			actionType: "finance.payment.create",
+			actionParams: big,
+			actionSummary: "pay",
+		});
+		expect(parsed.success).toBe(false);
+	});
+
 	const draft = {
 		actionType: "finance.payment.create",
 		actionParams: [
@@ -530,6 +540,20 @@ describe("GatewayEvent", () => {
 	});
 });
 
+describe("wake rules", () => {
+	it("allow subscriptions only outside Mattermost, and never on edits or reserved types", () => {
+		const ok = (rule: object) => WakeRuleSchema.safeParse(rule).success;
+		expect(ok({ event_type: "google.gmail.message.received" })).toBe(true);
+		expect(ok({ event_type: "mattermost.agent.mentioned", target_agent_id: "developer" })).toBe(
+			true,
+		);
+		expect(ok({ event_type: "mattermost.agent.mentioned" })).toBe(false);
+		expect(ok({ event_type: "mattermost.post.created" })).toBe(false);
+		expect(ok({ event_type: "mattermost.post.edited", target_agent_id: "developer" })).toBe(false);
+		expect(ok({ event_type: "approval.granted", target_agent_id: "developer" })).toBe(false);
+	});
+});
+
 describe("config schemas", () => {
 	it.each(["all", "here", "channel", "ab-", "a--b", "-ab"])("rejects the agent id '%s'", (id) => {
 		expect(AgentIdSchema.safeParse(id).success).toBe(false);
@@ -566,6 +590,20 @@ describe("config schemas", () => {
 });
 
 describe("validateConfigBundle", () => {
+	it("reserves the routing key file", () => {
+		const org = organization();
+		const clash = agent("developer", {
+			mattermost: {
+				...agent("developer").mattermost,
+				token_secret_file: "/run/secrets/gateway_routing_key",
+			},
+		});
+		const issues = validateConfigBundle({ organization: org, agents: [clash, agent("finance")] });
+		expect(issues.map((i) => i.message)).toContain(
+			"token secret file '/run/secrets/gateway_routing_key' is used by another bot or the routing key",
+		);
+	});
+
 	const finance = agent("finance", {
 		permissions: {
 			tools_allow: ["finance.read"],
