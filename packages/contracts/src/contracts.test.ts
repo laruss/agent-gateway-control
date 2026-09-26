@@ -13,6 +13,7 @@ import {
 	agent,
 	CHANNEL_ID,
 	financeReplyWait,
+	gmailMessageData,
 	idleResult,
 	issuePaths,
 	message,
@@ -230,16 +231,16 @@ describe("AgentTurnResult", () => {
 describe("AgentTurnInput", () => {
 	const gmailTrigger = {
 		specversion: "1.0",
-		id: "gmail:message:18c2",
-		source: "gmail://mailbox/ops",
+		id: "gmail-message:primary:18c2a1b2c3d4e5f6",
+		source: "gmail://primary",
 		type: "google.gmail.message.received",
 		time: "2026-09-24T14:00:00Z",
 		datacontenttype: "application/json",
-		correlationid: "gmail-thread:18c2",
+		correlationid: "gmail-thread:primary:18c2a1b2c3d4e5f6",
 		causationid: null,
 		trustlevel: "external-untrusted",
 		hop: 0,
-		data: { message_id: "18c2" },
+		data: gmailMessageData(),
 	};
 	const input = {
 		schemaVersion: 1,
@@ -511,6 +512,49 @@ describe("GatewayEvent", () => {
 		]);
 	});
 
+	it("keeps Gmail events external-untrusted, with normalized data", () => {
+		const mail = {
+			...event,
+			id: "gmail-message:primary:18c2a1b2c3d4e5f6",
+			source: "gmail://primary",
+			type: "google.gmail.message.received",
+			correlationid: "gmail-thread:primary:18c2a1b2c3d4e5f6",
+			trustlevel: "external-untrusted",
+			data: gmailMessageData(),
+		};
+		expect(issuePaths(GatewayEventSchema, mail)).toEqual([]);
+		expect(issuePaths(GatewayEventSchema, { ...mail, trustlevel: "human-trusted" })).toEqual([
+			"trustlevel",
+		]);
+		expect(
+			issuePaths(GatewayEventSchema, {
+				...mail,
+				data: gmailMessageData({ body_text: "hidden\u202Eoverride" }),
+			}),
+		).toEqual(["data.body_text"]);
+		expect(
+			issuePaths(GatewayEventSchema, {
+				...mail,
+				correlationid: "thread:0123456789abcdefghijklmnop",
+			}),
+		).toEqual(["correlationid"]);
+		expect(issuePaths(GatewayEventSchema, { ...mail, source: "gmail://other" })).toEqual([
+			"source",
+		]);
+		expect(issuePaths(GatewayEventSchema, { ...mail, id: "gmail-message:primary:x" })).toEqual([
+			"id",
+		]);
+		const notification = {
+			...mail,
+			type: "google.gmail.notification.received",
+			data: { mailbox_id: "primary", history_id: "123" },
+		};
+		expect(issuePaths(GatewayEventSchema, notification)).toEqual([]);
+		expect(
+			issuePaths(GatewayEventSchema, { ...notification, data: { mailbox_id: "primary" } }),
+		).toEqual(["data.history_id"]);
+	});
+
 	it("requires a root post for thread replies", () => {
 		const reply = { ...event, type: "mattermost.thread.reply" };
 		expect(issuePaths(GatewayEventSchema, reply)).toEqual(["data.root_id"]);
@@ -545,6 +589,7 @@ describe("wake rules", () => {
 	it("allow subscriptions only outside Mattermost, and never on edits or reserved types", () => {
 		const ok = (rule: object) => WakeRuleSchema.safeParse(rule).success;
 		expect(ok({ event_type: "google.gmail.message.received" })).toBe(true);
+		expect(ok({ event_type: "google.gmail.notification.received" })).toBe(false);
 		expect(ok({ event_type: "mattermost.agent.mentioned", target_agent_id: "developer" })).toBe(
 			true,
 		);

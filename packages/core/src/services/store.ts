@@ -20,7 +20,7 @@ import {
 	type OutboxKind,
 	outbox,
 } from "@agent-gateway/db";
-import { and, asc, count, eq, inArray, isNull, max } from "drizzle-orm";
+import { and, asc, count, eq, inArray, isNull, max, or } from "drizzle-orm";
 import type { RoutingAgent } from "../routing.ts";
 import type { AgentRecord } from "../turn-context.ts";
 import type { UnitOfWork } from "./deps.ts";
@@ -84,8 +84,9 @@ export type CascadeBudget = Readonly<{ anchor: number | null; spent: number }>;
 
 /**
  * A cascade starts with the latest new human post of the correlation (a new human instruction
- * or answer is a new cascade; `anchor` is that post's `seq`, null before any). Edits, deletions
- * and recovered posts are no new words and start nothing. Every granted `wake` or
+ * or answer is a new cascade; `anchor` is that post's `seq`, null before any), or the latest
+ * received email: each mail is new words from outside, and a long mail thread must not use up
+ * one budget for good. Edits, deletions and recovered posts are no new words and start nothing. Every granted `wake` or
  * `wait-match` route records the anchor it was granted under, so the budget counts exactly the
  * wake-ups of the current cascade, whenever and for whichever event they were granted.
  */
@@ -96,9 +97,14 @@ export async function cascadeBudget(db: Db, correlationId: string): Promise<Casc
 		.where(
 			and(
 				eq(events.correlationId, correlationId),
-				eq(events.trustLevel, "human-trusted"),
 				eq(events.hop, 0),
-				inArray(events.type, [...NEW_POST_EVENT_TYPES]),
+				or(
+					and(
+						eq(events.trustLevel, "human-trusted"),
+						inArray(events.type, [...NEW_POST_EVENT_TYPES]),
+					),
+					eq(events.type, "google.gmail.message.received"),
+				),
 			),
 		);
 	const anchor = start?.seq ?? null;

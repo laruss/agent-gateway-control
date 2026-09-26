@@ -29,6 +29,21 @@
   saw it.
 - The Gateway reads nothing from Direct Messages ([ADR-006](../adr/006-no-direct-messages-in-mvp.md)).
 
+## Email
+
+- The Gmail connector stores each inbox message it sees as an event: sender, reply-to,
+  recipients, subject, `Message-ID`, the date, the body as plain text (up to 16 000 characters)
+  and each attachment's name, type and size. Attachment content, labels and read state are not
+  stored. Spam, trash, drafts and chats are skipped. Mail that was in the mailbox before the
+  connector's first start is not read.
+- Each Pub/Sub notification is stored as a record-only event holding the mailbox id and a
+  history id, not the address. The mailbox's cursor, watch expiry and sync times are kept in
+  `gmail_mailboxes`, with a SHA-256 hash of the account's address (to refuse a credential of
+  another account), not the address itself.
+- Like posts, stored mail reaches the turns of the agents woken by it (`@mail-follower`) and
+  so the runtime provider of that agent, and stays in the database and the run snapshots when
+  it is deleted in Gmail. Retention of raw mail is a deployment policy (Phase 8).
+
 ## Runtime providers
 
 - A turn's whole prompt goes to the agent's runtime provider (OpenAI for Codex, Anthropic for

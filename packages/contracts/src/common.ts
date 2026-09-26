@@ -215,6 +215,20 @@ export function hasUnsafeCharacters(value: string, safety: TextSafety): boolean 
 	return false;
 }
 
+/**
+ * `value` without the characters `text` safety rejects: for external content (mail, web) that is
+ * kept, not refused, but must not carry controls, bidi overrides or invisible tag characters.
+ */
+export function withoutUnsafeCharacters(value: string): string {
+	let result = "";
+	for (const char of value) {
+		if (!isUnsafeTextCharacter(char)) {
+			result += char;
+		}
+	}
+	return result;
+}
+
 /** Non-blank text without control or invisible characters, bounded by `max`. */
 export function safeText(max: number, safety: TextSafety) {
 	return z

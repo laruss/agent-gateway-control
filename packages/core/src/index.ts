@@ -2,6 +2,7 @@ export * from "./outcome.ts";
 export * from "./routing.ts";
 export * from "./services/admin.ts";
 export * from "./services/deps.ts";
+export * from "./services/gmail.ts";
 export * from "./services/ingest.ts";
 export * from "./services/mattermost-bridge.ts";
 export { decideMemory, listMemory, MEMORY_REVIEW_STATUSES } from "./services/memory.ts";

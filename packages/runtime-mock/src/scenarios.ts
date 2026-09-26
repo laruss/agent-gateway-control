@@ -6,7 +6,7 @@ import type {
 	PublicMessage,
 	WorkingSummary,
 } from "@agent-gateway/contracts";
-import { MattermostPostDataSchema } from "@agent-gateway/contracts";
+import { GmailMessageDataSchema, MattermostPostDataSchema } from "@agent-gateway/contracts";
 import { INVALID_OUTPUT_MARKER } from "@agent-gateway/runtime-sdk";
 
 /** Scenarios the mock can play, selected by a `[mock:<name> <arg>]` directive in the trigger. */
@@ -37,10 +37,23 @@ function isScenario(name: string): name is MockScenario {
 	return MOCK_SCENARIOS.some((scenario) => scenario === name);
 }
 
-/** The directive in the triggering post; `reply` when there is none. */
-export function mockDirective(input: AgentTurnInput): MockDirective {
+/** The text a directive may be in: a post's message or a mail's body. */
+function triggerText(input: AgentTurnInput): string | null {
 	const post = MattermostPostDataSchema.safeParse(input.trigger.data);
-	const match = post.success ? DIRECTIVE.exec(post.data.message) : null;
+	if (post.success) {
+		return post.data.message;
+	}
+	const mail = GmailMessageDataSchema.safeParse(input.trigger.data);
+	return mail.success ? mail.data.body_text : null;
+}
+
+/**
+ * The directive in the triggering post or mail; `reply` when there is none. In a mail it plays
+ * a model that obeys whatever the sender wrote.
+ */
+export function mockDirective(input: AgentTurnInput): MockDirective {
+	const text = triggerText(input);
+	const match = text === null ? null : DIRECTIVE.exec(text);
 	const name = match?.[1];
 	if (name === undefined || !isScenario(name)) {
 		return { scenario: "reply", arg: null };

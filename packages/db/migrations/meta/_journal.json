@@ -57,6 +57,13 @@
       "when": 1790451378214,
       "tag": "0007_runtime_workers",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1790456959974,
+      "tag": "0008_gmail_mailboxes",
+      "breakpoints": true
     }
   ]
 }

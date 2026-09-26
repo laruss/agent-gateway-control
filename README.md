@@ -20,6 +20,7 @@ bun run schemas:generate  # regenerate config/schemas from Zod contracts
 bun run db:generate       # new migration after a schema change
 bun run dev:infra         # development PostgreSQL and Mattermost (Docker Compose)
 bun run dev               # controller and a mock worker
+bun run dev:connector-gmail  # Gmail connector (see the Gmail guide)
 bun run gateway doctor    # admin CLI
 ```
 
@@ -34,6 +35,7 @@ See [local development](docs/operations/local-development.md) for the full walkt
 - [Threat model](docs/security/threat-model.md)
 - [Local development](docs/operations/local-development.md)
 - [Mattermost bootstrap and operation](docs/operations/mattermost.md)
+- [Gmail connector setup and operation](docs/operations/gmail.md)
 - [Privacy notes](docs/security/privacy.md)
 - [Implementation status](IMPLEMENTATION_STATUS.md)
 

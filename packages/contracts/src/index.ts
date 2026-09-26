@@ -3,6 +3,7 @@ export * from "./approval.ts";
 export * from "./common.ts";
 export * from "./config-bundle.ts";
 export * from "./event.ts";
+export * from "./ingest.ts";
 export * from "./jobs.ts";
 export * from "./json-schema.ts";
 export * from "./organization.ts";

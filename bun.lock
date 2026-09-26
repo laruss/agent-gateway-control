@@ -22,6 +22,7 @@
         "gateway": "./src/main.ts",
       },
       "dependencies": {
+        "@agent-gateway/connector-gmail": "workspace:*",
         "@agent-gateway/contracts": "workspace:*",
         "@agent-gateway/core": "workspace:*",
         "@agent-gateway/db": "workspace:*",
@@ -37,6 +38,27 @@
         "zod": "4.6.5",
       },
       "devDependencies": {
+        "@types/pg": "8.23.1",
+      },
+    },
+    "apps/connector-gmail": {
+      "name": "@agent-gateway/connector-gmail-app",
+      "version": "0.0.0",
+      "dependencies": {
+        "@agent-gateway/connector-gmail": "workspace:*",
+        "@agent-gateway/contracts": "workspace:*",
+        "@agent-gateway/core": "workspace:*",
+        "@agent-gateway/db": "workspace:*",
+        "@agent-gateway/logging": "workspace:*",
+        "@agent-gateway/queue": "workspace:*",
+        "@agent-gateway/service": "workspace:*",
+        "pg": "8.23.0",
+        "pg-boss": "12.34.0",
+      },
+      "devDependencies": {
+        "@agent-gateway/controller": "workspace:*",
+        "@agent-gateway/events": "workspace:*",
+        "@agent-gateway/testkit": "workspace:*",
         "@types/pg": "8.23.1",
       },
     },
@@ -82,6 +104,16 @@
         "@agent-gateway/runtime-sdk": "workspace:*",
         "@agent-gateway/service": "workspace:*",
         "pg-boss": "12.34.0",
+      },
+    },
+    "packages/connector-gmail": {
+      "name": "@agent-gateway/connector-gmail",
+      "version": "0.0.0",
+      "dependencies": {
+        "@agent-gateway/contracts": "workspace:*",
+        "@agent-gateway/events": "workspace:*",
+        "@agent-gateway/logging": "workspace:*",
+        "zod": "4.6.5",
       },
     },
     "packages/context": {
@@ -264,6 +296,10 @@
   },
   "packages": {
     "@agent-gateway/cli": ["@agent-gateway/cli@workspace:apps/cli"],
+
+    "@agent-gateway/connector-gmail": ["@agent-gateway/connector-gmail@workspace:packages/connector-gmail"],
+
+    "@agent-gateway/connector-gmail-app": ["@agent-gateway/connector-gmail-app@workspace:apps/connector-gmail"],
 
     "@agent-gateway/context": ["@agent-gateway/context@workspace:packages/context"],
 

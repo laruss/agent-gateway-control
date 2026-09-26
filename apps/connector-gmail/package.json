@@ -1,28 +1,29 @@
 {
-  "name": "@agent-gateway/cli",
+  "name": "@agent-gateway/connector-gmail-app",
   "version": "0.0.0",
   "type": "module",
   "private": true,
-  "bin": {
-    "gateway": "./src/main.ts"
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "bun src/main.ts"
   },
   "dependencies": {
     "@agent-gateway/connector-gmail": "workspace:*",
     "@agent-gateway/contracts": "workspace:*",
     "@agent-gateway/core": "workspace:*",
     "@agent-gateway/db": "workspace:*",
-    "@agent-gateway/events": "workspace:*",
     "@agent-gateway/logging": "workspace:*",
-    "@agent-gateway/mattermost": "workspace:*",
     "@agent-gateway/queue": "workspace:*",
-    "@agent-gateway/runtime-sdk": "workspace:*",
     "@agent-gateway/service": "workspace:*",
-    "@agent-gateway/worker": "workspace:*",
     "pg": "8.23.0",
-    "pg-boss": "12.34.0",
-    "zod": "4.6.5"
+    "pg-boss": "12.34.0"
   },
   "devDependencies": {
-    "@types/pg": "8.23.1"
+    "@types/pg": "8.23.1",
+    "@agent-gateway/controller": "workspace:*",
+    "@agent-gateway/events": "workspace:*",
+    "@agent-gateway/testkit": "workspace:*"
   }
 }

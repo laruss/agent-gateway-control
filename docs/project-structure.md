@@ -11,6 +11,7 @@ agent-gateway-control/
 ├── apps/
 │   ├── controller/          # report/timeout/outbox consumers, health endpoints     (done)
 │   ├── worker/              # generic worker host for one runtime adapter           (done)
+│   ├── connector-gmail/     # Gmail connector process for one mailbox               (done)
 │   └── cli/                 # `gateway` admin CLI                                    (done)
 ├── packages/
 │   ├── contracts/           # Zod schemas: config, events, turn, queue payloads      (done)
@@ -33,7 +34,8 @@ agent-gateway-control/
 │   ├── runtime-kiro/        # Kiro through `kiro-cli chat --no-interactive`          (done)
 │   ├── runtime-opencode/    # OpenCode Go through `opencode run --format json`       (done)
 │   ├── runtime-hermes/      # Hermes through `hermes chat --format stream-json`      (done)
-│   ├── connector-gmail/     #                                                        (Phase 6)
+│   ├── connector-gmail/     # Gmail watch, Pub/Sub pull, history sync, mail          (done)
+│   │                        #   normalization, OAuth consent
 │   ├── policy/              # tool permissions and approvals                         (Phase 7)
 │   └── connector-webhook/   #                                                        (later)
 ├── config/
@@ -62,6 +64,10 @@ agent-gateway-control/
 - Every runtime adapter depends only on `runtime-sdk` and `contracts`. The worker builds its
   adapter from settings (`createRuntimeAdapter`); the CLI reuses that factory for
   `gateway runtime doctor`, so the doctor checks exactly what the worker would run.
+- `connector-gmail` depends on `contracts`, `events` and `logging` only and talks to Google
+  over plain REST; it reaches the control plane through the `GmailStore` port, which
+  `apps/connector-gmail` implements with `core`. Only that process holds the Google
+  credential.
 - `testkit` is used only by tests. Integration tests may compose the controller and a worker
   in one process; production code may not.
 

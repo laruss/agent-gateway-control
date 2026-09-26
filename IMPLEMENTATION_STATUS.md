@@ -1164,3 +1164,181 @@ Deliberate choices in this phase ([ADR-015](docs/adr/015-unconfined-runtimes-and
 | 3 | 1 / 3 | 0 / 1 | fixed |
 | 4 | 1 / 3 | 0 / 2 (one re-rated then fixed with Codex's P1) | fixed |
 | 5 | 0 / 2 | 0 / 2 | fixed, closed |
+
+## Phase 6 - Gmail connector
+
+Status: **done** except the live check against a real mailbox (review closed after round 5,
+the round limit: its P2s are fixed and covered by tests)
+
+| Item | State | Evidence |
+|------|-------|----------|
+| OAuth setup docs; `gateway gmail authorize` (loopback, PKCE, state), exactly `gmail.readonly` + `pubsub` | done | [docs/operations/gmail.md](docs/operations/gmail.md), `apps/cli/src/gmail-commands.ts` |
+| Gmail watch lifecycle: created on start, renewed daily and before expiry, alert when renewal fails near expiry | done | `packages/connector-gmail/src/connector.ts` |
+| Pub/Sub pull subscriber: notification stored before acknowledgement, foreign and malformed messages dropped | done | `connector.ts`, `pubsub-client.ts` |
+| Cursor and history delta: per page, ingested with the cursor move in one transaction (compare-and-set) | done | `sync.ts`, `core/src/services/gmail.ts`, migration `0008_gmail_mailboxes` |
+| Reconciliation: periodic sync without notifications; full sync and alert after a history gap | done | `sync.ts` |
+| Normalized events: `google.gmail.message.received` (deterministic id, per-thread correlation, stable fields), record-only notifications | done | `normalize.ts`, `contracts/src/event.ts` |
+| Mail body sanitization: HTML to text without active or hidden content, unsafe characters stripped, bounded; attachments described only | done | `html.ts`, `mime.ts` |
+| `@mail-follower` sample agent | done | `config/examples/agents/mail-follower.yaml`, `prompts/examples/agents/mail-follower.md` |
+| Health: connector readiness, `gateway gmail status`, Gmail checks in `gateway health` | done | `apps/connector-gmail`, `apps/cli` |
+
+Acceptance (integration tests against a fake Google speaking the REST wire format,
+`apps/connector-gmail/src/gmail.integration.test.ts`):
+
+- [x] One incoming email wakes mail-follower once.
+- [x] A duplicate Pub/Sub notification (a redelivery, and a second notification of the same
+  change) is deduplicated: one message event, one run.
+- [x] A dropped notification is found by reconciliation.
+- [x] A restart resumes from the cursor: mail received while the connector was down is
+  ingested once, nothing is replayed.
+- [x] Email prompt injection cannot invoke a privileged tool: the run asking for a finance
+  action is refused (`deny` policy decisions, alert, nothing published, no approval request);
+  the turn input is labelled external-untrusted and holds no credential.
+- [x] No send permission exists: the credential has exactly two read scopes and a wider one is
+  refused on every refresh; the Gmail client has no call that changes mail; no outbox kind
+  delivers mail.
+- [ ] Live check against a real mailbox.
+
+Deliberate choices in this phase ([ADR-016](docs/adr/016-gmail-connector.md)):
+
+- Plain REST with `fetch` and synchronous Pub/Sub pull instead of Google's SDKs and gRPC
+  streaming pull.
+- One OAuth credential of the owner for Gmail and Pub/Sub (owner's decision) instead of a
+  separate service account.
+- The connector is a process of its own; only it holds the Google credential.
+
+Known gaps, deferred:
+
+- Attachment scanning and handing attachments to tools (Phase 7 Tool Broker).
+- One mailbox per connector process; several mailboxes run several processes.
+- Retention of stored mail (Phase 8).
+
+### Phase 6 review log
+
+- Round 1 (Codex + Opus subagent): Codex 4 P1 + 4 P2, Opus 0 P1 + 6 P2 + 8 P3.
+  - Fixed (Codex P1): history references usually carry no labels, and the sync dropped every
+    message without them: against real Gmail no mail would have arrived. A message now counts
+    when history (read filtered by INBOX) reports it; its current labels only exclude spam,
+    trash, drafts and chats. The fake answers with ids only, as Gmail does.
+  - Fixed (Codex P1): the first watch and the first sync raced to create the cursor. The
+    watch creates it, and syncing and pulling wait for the first watch attempt.
+  - Fixed (Codex P1, Opus P2): a sync that found nothing recorded nothing, so `gateway health`
+    failed on a quiet mailbox and a later full sync looked back from the wrong time. Every
+    completed sync commits (the cursor unchanged) and records its time; the health threshold
+    follows `GMAIL_RECONCILE_SECONDS`.
+  - Re-rated P3, kept by design (Codex P1): a full sync reads at most the latest 500 messages,
+    so a long outage does not wake agents for thousands of old mails. The alert now says
+    plainly when older mail was left unread.
+  - Fixed (Codex P2, Opus P2): mail archived before it was read was dropped, contrary to the
+    ADR (see the first fix).
+  - Fixed (Codex P2, Opus P2): hidden text passed through when hidden by the mail's stylesheet,
+    `height:0;overflow:hidden`, off-screen positioning, tiny fonts, background-coloured text,
+    CSS comments or `/` attribute separators, and an unclosed hidden paragraph hid the rest of
+    the mail. The sanitizer reads the mail's hiding rules (classes, ids), a broader set of
+    hiding declarations, and applies implied end tags.
+  - Fixed (Codex P2, Opus P2): the plain part was preferred, so a sender could show harmless
+    HTML to the reader and put instructions in the plain part. The HTML part is used when it
+    has text; the injection test now sends divergent parts.
+  - Fixed (Codex P2, Opus P3): Gmail ids were assumed hex; a message that cannot be
+    normalized was skipped silently. Ids are opaque URL-safe strings; a skipped message alerts.
+  - Fixed (Opus P2): a Gmail thread's cascade budget never reset, so a thread of more than 20
+    mails stopped waking `@mail-follower` for good. Each received mail starts a new cascade
+    (integration test with 22 mails in one thread).
+  - Fixed (Opus P2): watch renewal, renewal failure near expiry, full sync paging and its
+    bound, and full sync against Postgres had no tests; the fake's listing did not paginate.
+  - Fixed (Opus P3): lock order of notification recording (mailbox row before the ingest
+    locks) and its comment; a sync request between a sync's end and its cleanup was lost; stop
+    now aborts Gmail calls in flight; pull failures alert after five in a row (daily); a doc
+    comment split by a new function; duplicate delta, commit and ingest status types now live
+    in `contracts`.
+- Round 2 (Codex + Opus subagent): Codex 2 P1 + 2 P2 + 1 P3, Opus 0 P1 + 1 P2 + 5 P3. Opus
+  verified every round 1 fix.
+  - Fixed (Codex P1): every page commit recorded the sync time, so after a sync stopped
+    halfway and a history gap, the full sync looked back from the wrong moment and could skip
+    mail. Only a sync that reached the present is recorded; with none yet, the full sync looks
+    back from the cursor's creation (test: stop after the first page, expire history).
+  - Re-rated P3 (Codex P1): when Google accepted the first watch but its database write
+    failed, the fallback cursor starts at the profile's history id, a moment later. Mail in
+    between arrived before the mailbox had any cursor, which the first start never reads by
+    design. Fixed with it: `syncNow()` from outside also waits for the first watch attempt.
+  - Fixed (Codex P2): mail moved into the inbox later (a filter that skipped it, taken back
+    from the archive) never became an event. History is read for `labelAdded` too, admitting
+    additions of INBOX; a message is ingested once however often it enters.
+  - Fixed (Codex P2, Opus P3): stylesheet rules with element types (`div{display:none}`) and
+    CSS escapes (`n\6f ne`) hid text unnoticed. Rules are matched by their selector's last
+    compound (tag, classes, id); declarations are unescaped.
+  - Fixed (Opus P2): stylesheet rules over-hid ordinary mail: rules inside `@media` (a
+    responsive template's mobile or desktop version) and every class anywhere in a selector
+    (`.wrapper .pre` hid the whole wrapper). Conditional at-rules are ignored, and only the
+    element the selector styles is hidden.
+  - Fixed (Opus P3): any hop-0 Gmail event could reset a cascade budget whatever its
+    correlation. The contract binds a Gmail event's source, id and correlation to its data.
+  - Fixed (Opus P3): the long-thread test only excluded `cascade_limit`; it now requires every
+    route to wake. The owner's sent mail is excluded by its labels as well as by the inbox
+    filter. A sync request during a failed sync now gets its own sync. An empty pull that
+    returns at once pauses a second instead of spinning (Codex P3).
+  - Accepted (Opus P3): white text without a set background, or with the background on a
+    parent, is not detected; attribute selectors are not resolved. The body stays
+    external-untrusted and the policy checks every result.
+- Round 3 (Codex + Opus subagent): Codex 0 P1 + 4 P2 + 1 P3, Opus 0 P1 + 1 P2 + 2 P3. Both
+  verified the round 2 fixes.
+  - Fixed (Opus P2): stylesheet hiding was bypassed by wrapping the rule in `@media screen`,
+    `@media all` or `@layer`, or adding a pseudo-class (`:nth-child(n)`, `:not(...)`,
+    `:where(...)`). Unconditional at-rules are read through (only `@media` with conditions,
+    and print, are skipped); pseudo-classes that only narrow a match are read as matched,
+    interaction states (`:hover`) as never.
+  - Fixed (Codex P2): the history-gap alert was raised after the cursor commit and could be
+    lost; it is now committed in the same transaction.
+  - Fixed (Codex P2): a credential re-authorized for another account continued from the old
+    account's cursor. The cursor stores a hash of its account's address; another account is
+    refused with an alert until `gateway gmail reset <mailbox-id>`.
+  - Fixed (Codex P2): deeply nested HTML made the conversion quadratic. Nesting is read to
+    256 levels and HTML to 2 million characters; the body is marked truncated beyond.
+  - Fixed (Codex P3): the process health counted an unfinished sync as fresh.
+  - Re-rated, not a defect (Codex P2): mail with both SENT and INBOX is mail the owner sent
+    to themself; it did arrive in the inbox and stays an event. Only SENT without INBOX is
+    excluded.
+  - Accepted (Opus P3): the CSS cascade is not modelled, so a later rule that shows an element
+    again is ignored and the text dropped. Rare in mail, and it errs towards dropping.
+  - Fixed (Opus P3): stacked doc comments in `html.ts`.
+- Round 4 (Codex + Opus subagent): Codex 0 P1 + 3 P2, Opus 0 P1 + 2 P2 + 1 P3. Both
+  verified the round 3 fixes.
+  - Fixed (Opus P2): the refresh token was re-read at every token refresh while the account
+    was checked once per process, so a consent for another account given while the connector
+    ran would have been used. The token is read once at start; a new consent applies at the
+    next start, where the account check runs. A refused account is not asked again.
+  - Fixed (Opus P2): stylesheet hiding still leaked through `@media (min-width:0)`,
+    `:is(.a,.h)`, `.h:not(:hover)`, nested `:where()` and `:not(.a,.b)`. Selectors are split
+    at top-level commas, `:is()`/`:where()` stand for each argument, `:not()` is removed
+    before looking for interaction states. A hiding rule that is conditional or unresolved no
+    longer passes silently: its text is kept and the mail is marked `hidden_text_suspected`,
+    which the agent's prompt tells it to treat with care.
+  - Fixed (Codex P2): an HTML part without text fell back to the plain part, reopening the
+    divergent-alternative trick; the HTML part now always wins.
+  - Fixed (Codex P2): each element was checked against every hiding rule (quadratic in a
+    crafted mail). Rules are indexed by id, class and tag, and bounded to 2000 (beyond, the
+    mail is marked suspected).
+  - Re-rated P3, accepted (Codex P2): a full sync finds mail by its date, so an old message
+    moved into the inbox during a week-long outage is missed; listing the whole inbox would
+    wake agents for all mail from before the connector's start. Recorded in ADR-016.
+- Round 5 (Codex + Opus subagent, the round limit): Codex 0 P1 + 2 P2 + 1 P3, Opus 0 P1 +
+  1 P2 + 2 P3. Both verified the round 4 fixes. The review is closed: the P2s below are fixed
+  and covered by tests.
+  - Fixed (Opus P2): a rule for a pseudo-element (`::-webkit-scrollbar`, `::after`,
+    `:first-line`) hid the element itself, so templates that hide their scrollbar gave an
+    empty body. Such rules are ignored.
+  - Fixed (Codex P2): `:hover` inside a quoted attribute value (`[data-x=":hover"]`) was read
+    as an interaction state; attribute selectors are removed first.
+  - Fixed (Codex P2): at-rules nested beyond the read depth were skipped silently; the mail is
+    marked `hidden_text_suspected`.
+  - Fixed (Opus P3): `:link` matches at rest and no longer counts as an interaction state;
+    `:visited` is unresolved (suspected). Stale docs on reading the refresh token. Fixed
+    (Codex P3): `gmail authorize --port` is validated.
+
+| Round | Codex P1/P2 | Opus P1/P2 | Result |
+|---|---|---|---|
+| 1 | 4 / 4 | 0 / 6 | fixed (one P1 re-rated P3, kept by design) |
+| 2 | 2 / 2 | 0 / 1 | fixed (one P1 re-rated P3) |
+| 3 | 0 / 4 | 0 / 1 | fixed (one P2 re-rated, not a defect) |
+| 4 | 0 / 3 | 0 / 2 | fixed (one P2 re-rated P3, accepted) |
+| 5 | 0 / 2 | 0 / 1 | fixed, closed |

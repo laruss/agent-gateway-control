@@ -25,6 +25,7 @@ import {
 	index,
 	integer,
 	jsonb,
+	numeric,
 	pgTable,
 	primaryKey,
 	text,
@@ -573,4 +574,27 @@ export const sourceCursors = pgTable("source_cursors", {
 	cursorType: text("cursor_type").notNull(),
 	cursorValue: text("cursor_value").notNull(),
 	updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+/**
+ * A watched Gmail mailbox: its history cursor and watch. The cursor moves in the transaction
+ * that ingests the messages up to it, so a restart resumes exactly after them.
+ */
+export const gmailMailboxes = pgTable("gmail_mailboxes", {
+	/** The Gateway's name for the mailbox (`GMAIL_MAILBOX_ID`), never the address. */
+	mailboxId: text("mailbox_id").primaryKey(),
+	/**
+	 * SHA-256 of the account's address (lowercased): the cursor belongs to that account, and a
+	 * credential of another one is refused rather than read from this cursor. Not the address.
+	 */
+	accountHash: text("account_hash").notNull(),
+	/** Gmail history id every change up to which is ingested; a uint64. */
+	historyId: numeric("history_id", { precision: 20, scale: 0 }).notNull(),
+	watchExpiresAt: timestamp("watch_expires_at", { withTimezone: true }),
+	watchRenewedAt: timestamp("watch_renewed_at", { withTimezone: true }),
+	lastNotificationAt: timestamp("last_notification_at", { withTimezone: true }),
+	lastSyncAt: timestamp("last_sync_at", { withTimezone: true }),
+	/** The last time history was gone and recent messages were listed instead. */
+	lastFullSyncAt: timestamp("last_full_sync_at", { withTimezone: true }),
+	createdAt: createdAt(),
 });

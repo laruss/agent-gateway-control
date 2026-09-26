@@ -1,5 +1,6 @@
 import type { z } from "zod";
 import type { AgentConfig } from "./agent-config.ts";
+import type { GmailMessageData } from "./event.ts";
 import type { OrganizationConfig } from "./organization.ts";
 import type { AgentTurnResult, PublicMessage } from "./turn.ts";
 import type { WaitCondition } from "./wait.ts";
@@ -11,6 +12,29 @@ export const CHANNEL_ID = "abcdefghijklmnopqrstuvwxyz";
 export const OTHER_CHANNEL_ID = "zyxwvutsrqponmlkjihgfedcba";
 export const ROOT_ID = "0123456789abcdefghijklmnop";
 export const USER_ID = "u123456789abcdefghijklmnop";
+
+export function gmailMessageData(overrides: Partial<GmailMessageData> = {}): GmailMessageData {
+	return {
+		mailbox_id: "primary",
+		message_id: "18c2a1b2c3d4e5f6",
+		thread_id: "18c2a1b2c3d4e5f6",
+		received_at: "2026-09-24T14:00:00.000Z",
+		from: "Customer <customer@example.com>",
+		reply_to: "",
+		to: "ops@example.org",
+		cc: "",
+		subject: "Invoice question",
+		rfc822_message_id: "<abc@example.com>",
+		body_text: "Hello, where is my invoice?",
+		body_format: "plain",
+		body_truncated: false,
+		hidden_text_removed: false,
+		hidden_text_suspected: false,
+		attachments: [],
+		attachments_omitted: 0,
+		...overrides,
+	};
+}
 
 export function idleResult(): AgentTurnResult {
 	return {

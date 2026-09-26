@@ -36,6 +36,14 @@
   so an injected agent cannot plant instructions for others; a turn reads only its own
   namespaces. Waits can name only humans who posted in the run's threads or owners
   ([ADR-013](../adr/013-turn-context.md)).
+- Status (Phase 6): every Gmail event is `external-untrusted`, enforced by the event contract.
+  Mail bodies reach the model as plain text only, taken from the HTML part a reader sees:
+  scripts, styles, forms, frames, media and text hidden from the reader (inline or by the
+  mail's stylesheet) are removed, control and invisible characters stripped, link
+  targets shown next to their text. Attachments are described, never read. An email that talks
+  the model into a finance action or a secret gets a refused run with `deny` policy decisions
+  and an alert, and nothing is published (integration test)
+  ([ADR-016](../adr/016-gmail-connector.md)).
 
 ### T2. Infinite agent loops
 
@@ -70,6 +78,14 @@
   Bot tokens and the routing key are read only by the controller; in a deployment workers get
   neither (the secrets are mounted into the controller container only). In local development
   both processes run as one user in one working tree, so this boundary does not hold there.
+- Status (Phase 6): the Google refresh token is held only by the Gmail connector process, in
+  a mode-0600 file read once at start (a new consent applies after a restart, where the
+  account check runs); `gateway gmail authorize` writes it without printing
+  it. The credential grants reading mail and pulling notifications only. A token with any
+  other scope (sending, drafts, modification) is refused on every refresh, so a mistaken or
+  widened grant cannot give the Gateway send permission. Google API errors are reduced to
+  Google's error code before logging; mailbox addresses are not logged, and the mailbox is
+  named by the operator's id (`GMAIL_MAILBOX_ID`) in events and alerts.
 
 ### T4. Compromised runtime worker
 

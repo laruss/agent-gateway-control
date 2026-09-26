@@ -6,6 +6,14 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ### Added
 
+- Gmail connector (`@agent-gateway/connector-gmail`, `apps/connector-gmail`): Gmail watch with
+  daily renewal, Pub/Sub pull, history sync with a transactional cursor, periodic
+  reconciliation and full sync after a history gap. Mail is normalized to plain text
+  (active and hidden HTML removed, attachments described only) as external-untrusted
+  `google.gmail.message.received` events that wake `@mail-follower`. A read-only credential:
+  `gateway gmail authorize` (loopback OAuth with PKCE) grants exactly `gmail.readonly` and
+  `pubsub`, and any wider token is refused. `gateway gmail status`, Gmail checks in
+  `gateway health`, migration `0008_gmail_mailboxes`. ADR-016.
 - Runtime adapters for Grok (`@agent-gateway/runtime-grok`), Kiro (`runtime-kiro`), OpenCode Go
   (`runtime-opencode`) and Hermes Agent (`runtime-hermes`). Each uses a home directory the
   Gateway owns, and gets only the built-in tools it can confine. ADR-015.

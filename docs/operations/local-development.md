@@ -116,6 +116,32 @@ behaviour from a directive in the post text:
 | `[mock:retryable]` / `[mock:flaky]` / `[mock:permanent]` | runtime errors |
 | `[mock:slow]` | never finishes; exercises timeouts and cancellation |
 
+## Mail
+
+The Gmail connector needs a Google Cloud project and the owner's consent; see
+[Gmail connector setup](gmail.md). Without Google, ingest a mail event by hand to drive
+`@mail-follower`. Mock directives work in a mail body too, playing a model that obeys the
+sender:
+
+```bash
+cat > /tmp/mail.json <<'JSON'
+{"specversion": "1.0", "id": "gmail-message:primary:18c0000000000001",
+ "source": "gmail://primary", "type": "google.gmail.message.received",
+ "time": "2026-09-26T10:00:00Z", "datacontenttype": "application/json",
+ "correlationid": "gmail-thread:primary:18c0000000000001", "causationid": null,
+ "trustlevel": "external-untrusted", "hop": 0,
+ "data": {"mailbox_id": "primary", "message_id": "18c0000000000001",
+  "thread_id": "18c0000000000001", "received_at": "2026-09-26T10:00:00Z",
+  "from": "Customer <customer@example.com>", "reply_to": "", "to": "owner@example.org",
+  "cc": "", "subject": "Invoice", "rfc822_message_id": "", "body_text": "Where is my invoice?",
+  "body_format": "plain", "body_truncated": false, "hidden_text_removed": false,
+  "hidden_text_suspected": false,
+  "attachments": [], "attachments_omitted": 0}}
+JSON
+bun run gateway events ingest /tmp/mail.json
+bun run gateway runs list --agent mail-follower
+```
+
 ## Operations
 
 ```bash

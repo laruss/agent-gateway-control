@@ -1,0 +1,16 @@
+{
+  "name": "@agent-gateway/connector-gmail",
+  "version": "0.0.0",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": "./src/index.ts",
+    "./testing": "./src/testing.ts"
+  },
+  "dependencies": {
+    "@agent-gateway/contracts": "workspace:*",
+    "@agent-gateway/events": "workspace:*",
+    "@agent-gateway/logging": "workspace:*",
+    "zod": "4.6.5"
+  }
+}

@@ -2,6 +2,7 @@ import {
 	type AgentId,
 	type GatewayEvent,
 	GatewayEventSchema,
+	type IngestStatus,
 	isReservedEventType,
 	type Uuid,
 	WaitTimeoutDataSchema,
@@ -48,8 +49,6 @@ export class ReservedEventError extends Error {
 		this.name = "ReservedEventError";
 	}
 }
-
-export type IngestStatus = "accepted" | "duplicate" | "conflict";
 
 export type IngestResult = Readonly<{
 	status: IngestStatus;
@@ -98,7 +97,8 @@ export async function ingestEventIf(
 	});
 }
 
-function externalEvent(event: GatewayEvent): GatewayEvent {
+/** The event, validated, if an external source may ingest it; throws otherwise. */
+export function externalEvent(event: GatewayEvent): GatewayEvent {
 	const valid = GatewayEventSchema.parse(event);
 	if (
 		isReservedEventType(valid.type) ||

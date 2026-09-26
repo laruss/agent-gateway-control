@@ -37,7 +37,10 @@ export const WakeRuleSchema = z
 		event_type: GatewayEventTypeSchema.refine(
 			(type) => !isReservedEventType(type),
 			"Gateway-reserved event types cannot be wake rules",
-		).refine((type) => !isRecordOnlyEventType(type), "edits and deletions never wake an agent"),
+		).refine(
+			(type) => !isRecordOnlyEventType(type),
+			"edits, deletions and notifications never wake an agent",
+		),
 		target_agent_id: AgentIdSchema.optional(),
 	})
 	.refine(

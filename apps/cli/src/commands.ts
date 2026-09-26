@@ -1,7 +1,9 @@
 import { userInfo } from "node:os";
 import { resolve } from "node:path";
+import { GOOGLE_ENDPOINTS } from "@agent-gateway/connector-gmail";
 import {
 	GatewayEventSchema,
+	GmailMailboxIdSchema,
 	MattermostIdSchema,
 	QUEUES,
 	RuntimeAdapterIdSchema,
@@ -21,6 +23,7 @@ import {
 	killAll,
 	listAgents,
 	listApprovals,
+	listGmailMailboxes,
 	listMemory,
 	listOutbox,
 	listRuns,
@@ -30,6 +33,7 @@ import {
 	redriveOutbox,
 	redriveRun,
 	releaseKillSwitch,
+	resetGmailMailbox,
 	resumeAgent,
 	runtimeHealth,
 	setAgentEnabled,
@@ -52,10 +56,11 @@ import {
 	transactionalJobSink,
 } from "@agent-gateway/queue";
 import { runtimeDoctor } from "@agent-gateway/runtime-sdk";
-import { requireSetting } from "@agent-gateway/service";
+import { intSetting, requireSetting } from "@agent-gateway/service";
 import { createRuntimeAdapter, workspaceRoot } from "@agent-gateway/worker";
 import type { PgBoss } from "pg-boss";
 import { loadConfigDirectory } from "./config-files.ts";
+import { gmailAuthorize } from "./gmail-commands.ts";
 import { mattermostBootstrap, mattermostReconcile } from "./mattermost-commands.ts";
 
 export class UsageError extends Error {
@@ -102,6 +107,13 @@ export const USAGE = `gateway <command>
                                       MATTERMOST_URL and a temporary MATTERMOST_ADMIN_TOKEN)
   mattermost reconcile [--secrets-dir <dir>]
                                       check tokens, bot accounts and memberships
+  gmail authorize --out <file> [--port <n>]
+                                      consent for the Gmail connector (read mail, pull its
+                                      notifications); stores the refresh token in <file> (needs
+                                      GMAIL_OAUTH_CLIENT_ID and GMAIL_OAUTH_CLIENT_SECRET[_FILE])
+  gmail status                        cursor, watch and last sync of each watched mailbox
+  gmail reset <mailbox-id>            forget a mailbox's cursor (e.g. after authorizing another
+                                      account); its connector starts it anew at the present
   runtime doctor <adapter> [--model <id>]
                                       preflight of a runtime on this host, configured like
                                       its worker: version, auth, a real structured turn,
@@ -158,6 +170,14 @@ const UNRESOLVED_FAILED_RUNS = `
 	    from agent_runs r join agents a on a.id = r.agent_id
 	   order by r.agent_id, r.queued_at desc
 	) latest where latest.status = 'failed'`;
+
+/**
+ * A mailbox not synced for three sync intervals counts as failing. The connector syncs every
+ * `GMAIL_RECONCILE_SECONDS` (5 min by default) and records every completed sync.
+ */
+function gmailSyncStaleMs(): number {
+	return 3 * intSetting("GMAIL_RECONCILE_SECONDS", 300) * 1000;
+}
 
 /** Opens database and queue connections for commands that need them. */
 export async function openSession(): Promise<Session> {
@@ -255,6 +275,19 @@ async function doctor(session: Session, out: Output): Promise<boolean> {
 				: `no ready worker${health.detail === null ? "" : `: ${health.detail}`}; its agents are degraded`,
 		});
 	}
+	// A mailbox whose watch lapsed only gets mail through the periodic sync; one that stopped
+	// syncing gets none.
+	const now = Date.now();
+	for (const mailbox of await listGmailMailboxes(session.deps)) {
+		const watchOk = mailbox.watchExpiresAt !== null && mailbox.watchExpiresAt.getTime() > now;
+		const syncOk =
+			mailbox.lastSyncAt !== null && now - mailbox.lastSyncAt.getTime() <= gmailSyncStaleMs();
+		checks.push({
+			name: `gmail:${mailbox.mailboxId}`,
+			ok: watchOk && syncOk,
+			detail: `watch ${watchOk ? `until ${mailbox.watchExpiresAt?.toISOString()}` : "not active"}, last sync ${mailbox.lastSyncAt?.toISOString() ?? "never"}`,
+		});
+	}
 	for (const name of deadLetterQueues(RuntimeAdapterIdSchema.options)) {
 		const jobs = await session.boss.findJobs(name, { queued: true });
 		checks.push({ name, ok: jobs.length === 0, detail: `${jobs.length} dead-lettered` });
@@ -287,6 +320,30 @@ export async function runCommand(args: Readonly<string[]>, out: Output): Promise
 			await pool.end();
 		}
 		out.print("worker role limited to its adapter's queues");
+		return 0;
+	}
+	if (group === "gmail" && action === "authorize") {
+		const file = flag(args, "out");
+		if (file === null) {
+			throw new UsageError("missing --out <file>");
+		}
+		const portFlag = flag(args, "port");
+		const port = portFlag === null ? null : Number(portFlag);
+		if (port !== null && (!Number.isInteger(port) || port < 1 || port > 65_535)) {
+			throw new UsageError("--port must be an integer from 1 to 65535");
+		}
+		await gmailAuthorize(
+			{
+				client: {
+					clientId: requireSetting("GMAIL_OAUTH_CLIENT_ID"),
+					clientSecret: requireSetting("GMAIL_OAUTH_CLIENT_SECRET"),
+				},
+				out: resolve(file),
+				endpoints: GOOGLE_ENDPOINTS,
+				...(port === null ? {} : { port }),
+			},
+			out.print,
+		);
 		return 0;
 	}
 	if (group === "runtime" && action === "doctor") {
@@ -470,6 +527,19 @@ async function runSessionCommand(
 			const decision = args[1] === "accept" ? "accept" : "reject";
 			await decideMemory(deps, arg(args, 2, "id"), decision, who);
 			out.print(`memory item ${decision === "accept" ? "accepted" : "rejected"}`);
+			return 0;
+		}
+		case "gmail status":
+			out.print(json(await listGmailMailboxes(deps)));
+			return 0;
+		case "gmail reset": {
+			const mailbox = GmailMailboxIdSchema.parse(arg(args, 2, "mailbox-id"));
+			const reset = await resetGmailMailbox(deps, mailbox, who);
+			out.print(
+				reset
+					? `mailbox '${mailbox}' reset; restart its connector to start it anew`
+					: `mailbox '${mailbox}' has no stored state`,
+			);
 			return 0;
 		}
 		case "approvals list":
