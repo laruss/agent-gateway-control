@@ -1,6 +1,12 @@
 import { createTokenSource, GMAIL_CONNECTOR_SCOPES } from "@agent-gateway/connector-gmail";
 import { type FakeGoogle, startFakeGoogle } from "@agent-gateway/connector-gmail/testing";
-import { eventually, startTestGateway, type TestGateway } from "@agent-gateway/controller/testing";
+import {
+	eventually,
+	exampleConfig,
+	startTestGateway,
+	type TestGateway,
+} from "@agent-gateway/controller/testing";
+import { applyConfig } from "@agent-gateway/core";
 import { OUTBOX_KINDS } from "@agent-gateway/db";
 import { silentLogger } from "@agent-gateway/logging";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -56,6 +62,26 @@ async function started(): Promise<void> {
 
 beforeAll(async () => {
 	gateway = await startTestGateway();
+	// These tests send some 30 mails to @mail-follower within minutes; a slow runner coalesces
+	// few of them, so the hourly run limit would block the later ones.
+	const config = exampleConfig();
+	await applyConfig(
+		gateway.deps(),
+		{
+			...config,
+			organization: {
+				...config.organization,
+				organization: {
+					...config.organization.organization,
+					default_limits: {
+						...config.organization.organization.default_limits,
+						max_runs_per_agent_per_hour: 1000,
+					},
+				},
+			},
+		},
+		"test",
+	);
 	google = startFakeGoogle({ ackDeadlineMs: 500 });
 	await startApp();
 	await started();
@@ -240,11 +266,16 @@ describe("Gmail connector", () => {
 			15_000,
 			"the connector refusing the credential",
 		);
-		const alerts = await query<{ message: string }>(
-			"select payload->>'message' as message from outbox where kind = 'mattermost.alert'",
-		);
-		expect(alerts.some((alert) => alert.message.includes("cannot use its Google credential"))).toBe(
-			true,
+		// The status flips before the alert commits.
+		await eventually(
+			async () =>
+				(
+					await query<{ message: string }>(
+						"select payload->>'message' as message from outbox where kind = 'mattermost.alert'",
+					)
+				).some((alert) => alert.message.includes("cannot use its Google credential")),
+			15_000,
+			"the credential alert",
 		);
 		expect((await app?.readiness())?.find((check) => check.name === "gmail_auth")?.ok).toBe(false);
 		google.setGrantedScopes(GMAIL_CONNECTOR_SCOPES);
