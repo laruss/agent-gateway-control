@@ -153,8 +153,17 @@ describe("codex adapter", () => {
 
 	it("stops the whole process group on cancel", async () => {
 		const controller = new AbortController();
-		setTimeout(() => controller.abort(), 1_000);
+		const before = (await recorded()).filter((entry) => entry.child !== undefined).length;
+		// Abort once the fake started its child, however slow the machine is.
+		const started = setInterval(async () => {
+			const children = (await recorded()).filter((entry) => entry.child !== undefined);
+			if (children.length > before) {
+				clearInterval(started);
+				controller.abort();
+			}
+		}, 100);
 		const { execution } = await turn("@developer [fake:slow]", {}, controller.signal);
+		clearInterval(started);
 		expect(execution.kind === "failed" ? execution.error.code : null).toBe("cancelled");
 		const child = (await recorded()).findLast((entry) => entry.child !== undefined)?.child;
 		expect(child).toBeGreaterThan(0);

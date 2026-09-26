@@ -6,6 +6,7 @@ import {
 	type OrganizationConfig,
 	OrganizationConfigSchema,
 	QUEUES,
+	type RuntimeAdapterId,
 	validateConfigBundle,
 } from "@agent-gateway/contracts";
 import {
@@ -30,6 +31,7 @@ import { canonicalHash } from "@agent-gateway/events";
 import { and, asc, desc, eq, inArray, ne, or, sql } from "drizzle-orm";
 import { nextAgentState, requireTransition } from "../state-machine.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
+import { type RuntimeHealth, runtimeHealth } from "./runtime-health.ts";
 import { type ScheduleResult, scheduleAgent } from "./scheduler.ts";
 import {
 	audit,
@@ -392,23 +394,43 @@ export async function setDirectoryEntryIn(
 // Agents
 // ---------------------------------------------------------------------------
 
+/** An enabled agent whose runtime has no ready worker is degraded: its runs wait in the queue. */
+export type AgentRuntimeStatus = "ok" | "degraded" | "disabled";
+
+function runtimeStatusOf(
+	enabled: boolean,
+	adapter: RuntimeAdapterId,
+	health: Readonly<RuntimeHealth[]>,
+): AgentRuntimeStatus {
+	if (!enabled) {
+		return "disabled";
+	}
+	return health.some((h) => h.adapter === adapter && h.available) ? "ok" : "degraded";
+}
+
 export async function listAgents(deps: ControlPlaneDeps) {
-	return deps.pool.query<{
+	const rows = await deps.pool.query<{
 		id: string;
 		state: string;
-		runtime_adapter: string;
+		enabled: boolean;
+		runtime_adapter: RuntimeAdapterId;
 		pending: number;
 		active_waits: number;
 	}>(
-		`select a.id, a.state, a.runtime_adapter,
+		`select a.id, a.state, a.enabled, a.runtime_adapter,
 		   (select count(*)::int from agent_inbox i where i.agent_id = a.id and i.status = 'pending') as pending,
 		   (select count(*)::int from wait_subscriptions w where w.agent_id = a.id and w.status = 'active') as active_waits
 		 from agents a order by a.id`,
 	);
+	const health = await runtimeHealth(deps);
+	return rows.rows.map(({ enabled, ...row }) => ({
+		...row,
+		runtime_status: runtimeStatusOf(enabled, row.runtime_adapter, health),
+	}));
 }
 
 export async function showAgent(deps: ControlPlaneDeps, agentId: string) {
-	return inTransaction(deps, async ({ tx }) => {
+	const shown = await inTransaction(deps, async ({ tx }) => {
 		const [agent] = await tx.db.select().from(agents).where(eq(agents.id, agentId));
 		if (agent === undefined) {
 			throw new AdminError(`agent '${agentId}' does not exist`);
@@ -436,6 +458,19 @@ export async function showAgent(deps: ControlPlaneDeps, agentId: string) {
 			.where(and(eq(waitSubscriptions.agentId, agentId), eq(waitSubscriptions.status, "active")));
 		return { agent, identity: identity ?? null, runs, waits };
 	});
+	const runtime = (await runtimeHealth(deps)).find((h) => h.adapter === shown.agent.runtimeAdapter);
+	return {
+		...shown,
+		runtime: {
+			status: runtimeStatusOf(
+				shown.agent.enabled,
+				shown.agent.runtimeAdapter,
+				runtime === undefined ? [] : [runtime],
+			),
+			versions: runtime?.runtimeVersions ?? [],
+			detail: runtime?.detail ?? null,
+		},
+	};
 }
 
 export async function setAgentEnabled(

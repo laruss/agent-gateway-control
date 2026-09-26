@@ -89,6 +89,14 @@
   home directory, the CLI's login and session files, other runs' workspaces or `/run/secrets`,
   write only into the workspace and have no network. System paths stay readable (reported by
   `gateway runtime doctor`) ([ADR-014](../adr/014-cli-runtime-adapters.md)).
+- Status (Phase 5): the Grok, Kiro, OpenCode and Hermes CLIs cannot confine every tool, so a
+  built-in tool is granted only where the runtime keeps it inside the workspace and off its
+  login: web tools for Grok, Kiro and Hermes, file and web tools for OpenCode, never their
+  commands. Each runs with a home directory the Gateway owns and rewrites (Grok and Hermes also
+  with an empty `HOME`), so the operator's own logins, settings, memory and messaging gateway
+  stay out of reach; Hermes borrows no other CLI's login. A worker whose runtime fails stays
+  up without taking jobs, and only that adapter's agents are degraded
+  ([ADR-015](../adr/015-unconfined-runtimes-and-runtime-health.md)).
 
 ### T5. Supply chain
 
@@ -103,6 +111,9 @@
 - Status (Phase 4): every turn is killed at its deadline. Claude Code calls are bounded by
   `CLAUDE_MAX_TURNS` and, optionally, `CLAUDE_MAX_BUDGET_USD`. Runtime usage (tokens, and cost
   where the CLI reports it) is stored per run.
+- Status (Phase 5): Grok and Hermes calls are bounded by `GROK_MAX_TURNS` and
+  `HERMES_MAX_TURNS`. Kiro meters credits and records no token usage; OpenCode Go and Hermes
+  report no cost.
 - Real payments only through approval ([ADR-007](../adr/007-approval-model.md)).
 
 ### T7. Home server exposure

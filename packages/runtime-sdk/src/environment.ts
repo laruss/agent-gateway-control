@@ -1,6 +1,17 @@
-import { realpathSync } from "node:fs";
-import { chmod, lstat, mkdir, readdir, realpath, rm } from "node:fs/promises";
-import { isAbsolute, join, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, realpathSync } from "node:fs";
+import {
+	chmod,
+	lstat,
+	mkdir,
+	readdir,
+	readFile,
+	realpath,
+	rename,
+	rm,
+	writeFile,
+} from "node:fs/promises";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import {
 	AgentIdSchema,
 	type ToolName,
@@ -198,4 +209,92 @@ export function nativeToolGrants(policy: ToolPolicySnapshot): NativeToolGrants {
 		webSearch: granted(policy, NATIVE_TOOLS.webSearch),
 		webFetch: granted(policy, NATIVE_TOOLS.webFetch),
 	};
+}
+
+export const ALL_NATIVE_TOOLS: Readonly<NativeTool[]> = [
+	"read",
+	"write",
+	"exec",
+	"webSearch",
+	"webFetch",
+];
+
+/**
+ * The grants an adapter honours. A runtime that cannot confine a built-in tool (keep it inside
+ * the workspace, off the worker's credentials) never gets it, whatever the policy says:
+ * fail-closed. `write` and `exec` need `read`, so they fall with it.
+ */
+export function confinedGrants(
+	grants: NativeToolGrants,
+	confinable: Readonly<NativeTool[]>,
+): NativeToolGrants {
+	const can = (tool: NativeTool) => grants[tool] && confinable.includes(tool);
+	const read = can("read");
+	return {
+		read,
+		write: read && can("write"),
+		exec: read && can("exec"),
+		webSearch: can("webSearch"),
+		webFetch: can("webFetch"),
+	};
+}
+
+/** The probe risk of an adapter that withholds some built-in tools, or null. */
+export function withheldToolsRisk(
+	runtime: string,
+	confinable: Readonly<NativeTool[]>,
+): string | null {
+	const withheld = ALL_NATIVE_TOOLS.filter((tool) => !confinable.includes(tool)).map(
+		(tool) => NATIVE_TOOLS[tool],
+	);
+	return withheld.length === 0
+		? null
+		: `${runtime} cannot confine ${withheld.join(", ")} to the run workspace; these grants are withheld from its agents`;
+}
+
+/**
+ * Writes a file a runtime reads, atomically and only when its content differs: a CLI starting
+ * at the same moment sees either the old or the new file, never a missing or partial one.
+ */
+export async function writeRuntimeFile(path: string, content: string): Promise<void> {
+	const current = await readFile(path, "utf8").catch(() => null);
+	if (current === content) {
+		return;
+	}
+	await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+	const temporary = `${path}.${randomUUID()}.tmp`;
+	try {
+		await writeFile(temporary, content, { mode: 0o600 });
+		await rename(temporary, path);
+	} catch (error) {
+		await rm(temporary, { force: true });
+		throw error;
+	}
+}
+
+/**
+ * The nearest ancestor of `path` (itself included) that is a git checkout, or null. Runtimes
+ * that confine their tools to the "project" treat the whole checkout as the project.
+ */
+export function gitCheckoutOf(path: string): string | null {
+	let current = resolve(path);
+	for (;;) {
+		if (existsSync(join(current, ".git"))) {
+			return current;
+		}
+		const parent = dirname(current);
+		if (parent === current) {
+			return null;
+		}
+		current = parent;
+	}
+}
+
+/**
+ * The real path of a directory the adapter owns, created (0700) if missing: a CLI may refuse a
+ * home reached through a symlink, and a path resolved before the directory existed keeps one.
+ */
+export function runtimeHome(path: string): string {
+	mkdirSync(resolve(path), { recursive: true, mode: 0o700 });
+	return sandboxPath(path);
 }

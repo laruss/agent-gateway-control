@@ -1,6 +1,6 @@
 import type { ToolPolicySnapshot } from "@agent-gateway/contracts";
 import { describe, expect, it } from "vitest";
-import { nativeToolGrants } from "./environment.ts";
+import { confinedGrants, nativeToolGrants, withheldToolsRisk } from "./environment.ts";
 
 const policy = (
 	allow: string[],
@@ -41,5 +41,40 @@ describe("nativeToolGrants", () => {
 		expect(nativeToolGrants(policy(["tests.run"], [], ["workspace.*"]))).toMatchObject({
 			exec: false,
 		});
+	});
+});
+
+describe("confinedGrants", () => {
+	const all = nativeToolGrants(
+		policy(["repository.read", "workspace.write", "tests.run", "web.search", "web.fetch"]),
+	);
+
+	it("withholds the tools a runtime cannot confine", () => {
+		expect(confinedGrants(all, ["webSearch", "webFetch"])).toEqual({
+			read: false,
+			write: false,
+			exec: false,
+			webSearch: true,
+			webFetch: true,
+		});
+		expect(withheldToolsRisk("grok", ["webSearch", "webFetch"])).toContain(
+			"repository.read, workspace.write, tests.run",
+		);
+	});
+
+	it("drops writing and commands with reading", () => {
+		expect(confinedGrants(all, ["write", "exec", "webSearch"])).toMatchObject({
+			read: false,
+			write: false,
+			exec: false,
+		});
+		expect(confinedGrants(all, ["read", "write"])).toMatchObject({
+			read: true,
+			write: true,
+			exec: false,
+		});
+		expect(
+			withheldToolsRisk("codex", ["read", "write", "exec", "webSearch", "webFetch"]),
+		).toBeNull();
 	});
 });

@@ -9,9 +9,14 @@ import type {
 	RuntimeUsage,
 } from "@agent-gateway/contracts";
 import {
+	ALL_NATIVE_TOOLS,
+	asCount,
+	asRecord,
+	asString,
 	type NativeToolGrants,
 	nativeToolGrants,
 	type ProcessResult,
+	parseJson,
 	RunProcesses,
 	type RuntimeAdapter,
 	RuntimeError,
@@ -25,6 +30,7 @@ import {
 	SessionUnavailableError,
 	sandboxPath,
 	type TurnOptions,
+	tail,
 } from "@agent-gateway/runtime-sdk";
 
 export type ClaudeRuntimeOptions = Readonly<{
@@ -68,36 +74,10 @@ function allowedTools(grants: NativeToolGrants): string[] {
 	];
 }
 
-function asRecord(value: JsonValue | undefined): Readonly<Record<string, JsonValue>> | null {
-	return typeof value === "object" && value !== null && !Array.isArray(value) ? value : null;
-}
-
-function asString(value: JsonValue | undefined): string | null {
-	return typeof value === "string" ? value : null;
-}
-
-function asCount(value: JsonValue | undefined): number {
-	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
-}
-
-function tail(text: string, max = 600): string {
-	const trimmed = text.trim();
-	return trimmed.length <= max ? trimmed : `…${trimmed.slice(-max)}`;
-}
-
 /** The provider schema without `$schema`: Claude Code rejects the 2020-12 meta-schema id. */
 function claudeSchema(schema: JsonObject): JsonObject {
 	const { $schema: _, ...rest } = schema;
 	return rest;
-}
-
-function parseJson(text: string): JsonValue | null {
-	try {
-		const value: JsonValue = JSON.parse(text);
-		return value;
-	} catch {
-		return null;
-	}
 }
 
 /**
@@ -343,7 +323,7 @@ export function createClaudeRuntime(options: ClaudeRuntimeOptions = {}): Runtime
 
 	return {
 		id: "claude-code",
-		capabilities: { sessionResume: true },
+		capabilities: { sessionResume: true, confinedTools: ALL_NATIVE_TOOLS },
 		probe,
 		health: async () => {
 			const result = await probe();

@@ -13,6 +13,8 @@ export default defineConfig({
 						"**/*.e2e.test.ts",
 						"**/*.live.test.ts",
 					],
+					// Adapter tests start fake CLI processes, several per test and many in parallel.
+					testTimeout: 30_000,
 				},
 			},
 			{

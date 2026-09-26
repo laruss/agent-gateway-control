@@ -36,3 +36,7 @@ See [local development](docs/operations/local-development.md) for the full walkt
 - [Mattermost bootstrap and operation](docs/operations/mattermost.md)
 - [Privacy notes](docs/security/privacy.md)
 - [Implementation status](IMPLEMENTATION_STATUS.md)
+
+## License
+
+[MIT](LICENSE)

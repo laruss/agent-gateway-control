@@ -25,6 +25,8 @@
   },
   "devDependencies": {
     "@types/pg": "8.23.1",
+    "@agent-gateway/runtime-mock": "workspace:*",
+    "@agent-gateway/runtime-sdk": "workspace:*",
     "@agent-gateway/testkit": "workspace:*",
     "@agent-gateway/worker": "workspace:*"
   }

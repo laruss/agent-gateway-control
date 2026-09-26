@@ -57,7 +57,8 @@ curl -s localhost:8080/health/ready
 | `GATEWAY_ROUTING_KEY` | required with `mattermost` | HMAC key of agent routing props (use `_FILE`) |
 | `SECRETS_DIR` | unset | directory standing in for `/run/secrets/` (bot tokens) |
 | `HEALTH_PORT` / `HEALTH_HOST` | `8080` / `127.0.0.1` | controller health endpoints |
-| `WORKER_ADAPTER` | `mock` | runtime adapter the worker serves: `mock`, `codex` or `claude-code` |
+| `WORKER_ADAPTER` | `mock` | runtime adapter the worker serves: `mock`, `codex`, `claude-code`, `grok`, `kiro`, `opencode-go` or `hermes` |
+| `WORKER_RUNTIME_VERSION` | unset | exact runtime version the worker was verified with, e.g. `grok/1.0.41`; any other makes the runtime unavailable |
 | `WORKER_CONCURRENCY` | `1` | parallel runs per worker process |
 | `WORKER_WORKSPACE_ROOT` | `<tmp>/agent-gateway-workspaces` | absolute directory of the per-run workspaces |
 | `CODEX_BIN` / `CODEX_HOME` | `codex` / `~/.codex` | Codex CLI and its home (login, session files) |
@@ -65,6 +66,13 @@ curl -s localhost:8080/health/ready
 | `CLAUDE_BIN` / `CLAUDE_CONFIG_DIR` | `claude` / `~/.claude` | Claude Code CLI and its config dir (login, session files) |
 | `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` | unset | credentials instead of the login in the config dir (use `_FILE`) |
 | `CLAUDE_MAX_TURNS` / `CLAUDE_MAX_BUDGET_USD` | `40` / unset | limits of one Claude Code call |
+| `GROK_BIN` / `GROK_HOME` | `grok` / required | Grok CLI and the Gateway's own home (login, sessions) |
+| `XAI_API_KEY` / `GROK_MAX_TURNS` | unset / `40` | API key instead of the login; turns per call |
+| `KIRO_BIN` / `KIRO_HOME` / `KIRO_API_KEY` | `kiro-cli` / required / unset | Kiro CLI, the Gateway's own home, API key instead of the user's login |
+| `OPENCODE_BIN` / `OPENCODE_HOME` / `OPENCODE_API_KEY` | `opencode` / required / unset | OpenCode CLI, the Gateway's own home, the OpenCode Go key |
+| `OPENCODE_PROVIDER` / `OPENCODE_MODEL` | `opencode-go` / unset | provider of bare model ids; model of agents without one |
+| `HERMES_BIN` / `HERMES_HOME` | `hermes` / required | Hermes and the Gateway's own home (provider login, sessions) |
+| `HERMES_PROVIDER` / `HERMES_MAX_TURNS` | unset / `40` | inference provider; tool-calling iterations per turn |
 
 ## With Mattermost
 
@@ -133,7 +141,7 @@ holds exactly what the runtime received: thread, memory and durable state.
 A FAILED agent keeps its failure through pause, disable/enable and kill-all; `runs redrive`
 is the only way out. Disabling an agent cancels its waits and expires its pending approvals.
 
-## Real runtimes: Codex and Claude Code
+## Real runtimes
 
 The `codex` and `claude-code` adapters drive the installed CLIs non-interactively
 ([ADR-014](../adr/014-cli-runtime-adapters.md)). Log in once with the home or config dir the
@@ -167,9 +175,46 @@ Posting, memory, mail and finance always go through the structured result. Under
 `session_policy: resumable-if-available` the next run resumes the agent's provider session.
 When the runtime no longer has that session, the run starts fresh.
 
-`bun run test:live` runs the doctor and the isolation checks against the installed CLIs
-(`RUNTIME_LIVE=codex` or `RUNTIME_LIVE=claude-code` selects one; `LIVE_CODEX_MODEL` and
-`LIVE_CLAUDE_MODEL` choose the models). It is not part of CI.
+### Grok, Kiro, OpenCode Go and Hermes
+
+These adapters run their CLIs with a home directory the Gateway owns, never the operator's
+own ([ADR-015](../adr/015-unconfined-runtimes-and-runtime-health.md)). The adapter rewrites
+its configuration there on every probe; only the login is yours to put there:
+
+| Adapter | Home setting | Login |
+|---|---|---|
+| `grok` | `GROK_HOME` | `GROK_HOME=<dir> grok login`, or `XAI_API_KEY` |
+| `kiro` | `KIRO_HOME` | `kiro-cli login` as the worker user, or `KIRO_API_KEY` |
+| `opencode-go` | `OPENCODE_HOME` | `OPENCODE_API_KEY` (an OpenCode Go key); `OPENCODE_MODEL` for agents without a model |
+| `hermes` | `HERMES_HOME` | `HERMES_HOME=<dir> hermes auth add <provider>`; `HERMES_PROVIDER` |
+
+These runtimes cannot confine every built-in tool, so their agents get fewer:
+
+- Grok, Kiro and Hermes: web search and fetch only;
+- OpenCode Go: reading and writing workspace files, and the web; never commands. Keep
+  `WORKER_WORKSPACE_ROOT` outside any git checkout: OpenCode refuses to run inside one.
+
+The probe lists the withheld grants as policy risks.
+
+### Runtime health
+
+A worker whose probe fails stays up, takes no jobs and reports the runtime unavailable. It
+probes again and takes jobs once the runtime works. Agents of an adapter without a ready
+worker are `degraded`: their runs wait in the queue. A change that lasts a minute raises one
+alert; a restart does not.
+
+```bash
+bun run gateway runtimes list    # availability, versions and probe detail per adapter
+bun run gateway agents list      # runtime_status: ok, degraded or disabled
+```
+
+`WORKER_RUNTIME_VERSION` pins the exact version a worker was verified with, for example
+`grok/1.0.41`; any other version makes the runtime unavailable.
+
+`bun run test:live` runs the doctor and the isolation checks against the installed CLIs.
+`RUNTIME_LIVE` selects runtimes by adapter id (for example `RUNTIME_LIVE=grok,kiro`), and
+`LIVE_<RUNTIME>_MODEL` chooses a model. The Grok, Kiro, OpenCode and Hermes suites use the
+homes under `~/.agent-gateway/` unless `LIVE_<RUNTIME>_HOME` is set. It is not part of CI.
 
 ## Worker database role
 

@@ -12,8 +12,10 @@ import type {
 	ThreadSummary,
 	TurnAuthorityContext,
 	WaitCondition,
+	WorkerStatus,
 	WorkingSummary,
 } from "@agent-gateway/contracts";
+import { WorkerStatusSchema } from "@agent-gateway/contracts";
 import { sql } from "drizzle-orm";
 import {
 	bigint,
@@ -318,6 +320,40 @@ export const runtimeSessions = pgTable(
 		check("runtime_sessions_status", oneOf("status", ["active", "expired", "revoked"])),
 	],
 );
+
+/** The last heartbeat of every worker process, as reported on its adapter's report queue. */
+export const runtimeWorkers = pgTable(
+	"runtime_workers",
+	{
+		workerId: uuid("worker_id").primaryKey(),
+		adapter: text("adapter").$type<RuntimeAdapterId>().notNull(),
+		status: text("status").$type<WorkerStatus>().notNull(),
+		/** The report's sequence number: only a later report of the worker replaces it. */
+		sequence: bigint("sequence", { mode: "number" }).notNull(),
+		runtimeVersion: text("runtime_version").notNull(),
+		detail: text("detail").notNull(),
+		firstSeenAt: timestamp("first_seen_at", { withTimezone: true }).notNull().defaultNow(),
+		lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).notNull().defaultNow(),
+	},
+	(t) => [
+		index("runtime_workers_adapter").on(t.adapter, t.lastSeenAt),
+		check("runtime_workers_status", oneOf("status", WorkerStatusSchema.options)),
+	],
+);
+
+/**
+ * Whether each adapter has a ready worker, as last settled; a change that lasts raises one alert.
+ * Agents of an unavailable adapter are degraded: their runs wait in the queue.
+ */
+export const runtimeAvailability = pgTable("runtime_availability", {
+	adapter: text("adapter").$type<RuntimeAdapterId>().primaryKey(),
+	available: boolean("available").notNull(),
+	/** Versions of the adapter's ready workers, sorted. */
+	runtimeVersions: jsonb("runtime_versions").$type<Readonly<string[]>>().notNull(),
+	changedAt: timestamp("changed_at", { withTimezone: true }).notNull().defaultNow(),
+	/** Since when health has differed from `available`; a change counts once it lasts. */
+	pendingSince: timestamp("pending_since", { withTimezone: true }),
+});
 
 export const waitSubscriptions = pgTable(
 	"wait_subscriptions",

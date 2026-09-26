@@ -155,6 +155,23 @@ describe("worker run job", () => {
 		expect(reports.filter((r) => r.kind === "completed")).toHaveLength(2);
 	});
 
+	it("refuses a job while the worker no longer accepts turns", async () => {
+		const { reports, host } = recordingHost();
+		const outcome = await processRunJob(
+			{ ...host, accepting: () => false },
+			job("@developer hello"),
+			signal(),
+		);
+		expect(outcome).toBe("failed");
+		expect(reports.map((r) => r.kind)).toEqual(["started", "failed"]);
+		const last = reports.at(-1);
+		expect(last?.kind === "failed" ? last.error : null).toMatchObject({
+			code: "runtime_retryable",
+			retryable: true,
+			detail: expect.stringContaining("unavailable"),
+		});
+	});
+
 	it("rejects a malformed job without reporting", async () => {
 		const { reports, host } = recordingHost();
 		await expect(processRunJob(host, { runId: "x" }, signal())).rejects.toThrow(

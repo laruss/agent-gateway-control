@@ -7,6 +7,7 @@ export * from "./services/mattermost-bridge.ts";
 export { decideMemory, listMemory, MEMORY_REVIEW_STATUSES } from "./services/memory.ts";
 export * from "./services/reconcile.ts";
 export * from "./services/runs.ts";
+export * from "./services/runtime-health.ts";
 export * from "./services/scheduler.ts";
 export { enqueueOutbox, type OutboxDraft, raiseAlert } from "./services/store.ts";
 export * from "./services/wait-timeouts.ts";

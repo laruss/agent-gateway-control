@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { AgentTurnInput, RuntimeSessionHandle } from "@agent-gateway/contracts";
 import {
+	ALL_NATIVE_TOOLS,
 	type RuntimeAdapter,
 	RuntimeError,
 	type RuntimeTurnOutput,
@@ -97,7 +98,7 @@ export function createMockRuntime(options: MockRuntimeOptions = {}): RuntimeAdap
 
 	return {
 		id: "mock",
-		capabilities: { sessionResume: true },
+		capabilities: { sessionResume: true, confinedTools: ALL_NATIVE_TOOLS },
 		probe: async () => ({
 			ok: true,
 			runtimeVersion: MOCK_RUNTIME_VERSION,

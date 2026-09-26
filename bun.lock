@@ -58,6 +58,8 @@
         "zod": "4.6.5",
       },
       "devDependencies": {
+        "@agent-gateway/runtime-mock": "workspace:*",
+        "@agent-gateway/runtime-sdk": "workspace:*",
         "@agent-gateway/testkit": "workspace:*",
         "@agent-gateway/worker": "workspace:*",
         "@types/pg": "8.23.1",
@@ -72,7 +74,11 @@
         "@agent-gateway/queue": "workspace:*",
         "@agent-gateway/runtime-claude": "workspace:*",
         "@agent-gateway/runtime-codex": "workspace:*",
+        "@agent-gateway/runtime-grok": "workspace:*",
+        "@agent-gateway/runtime-hermes": "workspace:*",
+        "@agent-gateway/runtime-kiro": "workspace:*",
         "@agent-gateway/runtime-mock": "workspace:*",
+        "@agent-gateway/runtime-opencode": "workspace:*",
         "@agent-gateway/runtime-sdk": "workspace:*",
         "@agent-gateway/service": "workspace:*",
         "pg-boss": "12.34.0",
@@ -186,8 +192,40 @@
         "@agent-gateway/runtime-sdk": "workspace:*",
       },
     },
+    "packages/runtime-grok": {
+      "name": "@agent-gateway/runtime-grok",
+      "version": "0.0.0",
+      "dependencies": {
+        "@agent-gateway/contracts": "workspace:*",
+        "@agent-gateway/runtime-sdk": "workspace:*",
+      },
+    },
+    "packages/runtime-hermes": {
+      "name": "@agent-gateway/runtime-hermes",
+      "version": "0.0.0",
+      "dependencies": {
+        "@agent-gateway/contracts": "workspace:*",
+        "@agent-gateway/runtime-sdk": "workspace:*",
+      },
+    },
+    "packages/runtime-kiro": {
+      "name": "@agent-gateway/runtime-kiro",
+      "version": "0.0.0",
+      "dependencies": {
+        "@agent-gateway/contracts": "workspace:*",
+        "@agent-gateway/runtime-sdk": "workspace:*",
+      },
+    },
     "packages/runtime-mock": {
       "name": "@agent-gateway/runtime-mock",
+      "version": "0.0.0",
+      "dependencies": {
+        "@agent-gateway/contracts": "workspace:*",
+        "@agent-gateway/runtime-sdk": "workspace:*",
+      },
+    },
+    "packages/runtime-opencode": {
+      "name": "@agent-gateway/runtime-opencode",
       "version": "0.0.0",
       "dependencies": {
         "@agent-gateway/contracts": "workspace:*",
@@ -251,7 +289,15 @@
 
     "@agent-gateway/runtime-codex": ["@agent-gateway/runtime-codex@workspace:packages/runtime-codex"],
 
+    "@agent-gateway/runtime-grok": ["@agent-gateway/runtime-grok@workspace:packages/runtime-grok"],
+
+    "@agent-gateway/runtime-hermes": ["@agent-gateway/runtime-hermes@workspace:packages/runtime-hermes"],
+
+    "@agent-gateway/runtime-kiro": ["@agent-gateway/runtime-kiro@workspace:packages/runtime-kiro"],
+
     "@agent-gateway/runtime-mock": ["@agent-gateway/runtime-mock@workspace:packages/runtime-mock"],
+
+    "@agent-gateway/runtime-opencode": ["@agent-gateway/runtime-opencode@workspace:packages/runtime-opencode"],
 
     "@agent-gateway/runtime-sdk": ["@agent-gateway/runtime-sdk@workspace:packages/runtime-sdk"],
 

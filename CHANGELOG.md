@@ -6,6 +6,14 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ### Added
 
+- Runtime adapters for Grok (`@agent-gateway/runtime-grok`), Kiro (`runtime-kiro`), OpenCode Go
+  (`runtime-opencode`) and Hermes Agent (`runtime-hermes`). Each uses a home directory the
+  Gateway owns, and gets only the built-in tools it can confine. ADR-015.
+- Runtime health: worker heartbeats, `gateway runtimes list`, degraded agents and an alert when
+  a runtime has no ready worker; `WORKER_RUNTIME_VERSION` pins a runtime version. Migration
+  `0007_runtime_workers`. A worker whose probe fails now stays up and reports it instead of
+  exiting.
+- MIT license.
 - Runtime adapters for Codex (`@agent-gateway/runtime-codex`, `codex exec --json`) and Claude
   Code (`@agent-gateway/runtime-claude`, `claude -p`). Each call runs in its own process group,
   with a clean environment and a workspace per run. Built-in tools follow the agent's tool

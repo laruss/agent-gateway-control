@@ -1,6 +1,11 @@
 import type { AgentTurnInput, JsonValue, TrustLevel } from "@agent-gateway/contracts";
 import type { RepairRequest } from "./adapter.ts";
-import { nativeToolGrants } from "./environment.ts";
+import {
+	ALL_NATIVE_TOOLS,
+	confinedGrants,
+	type NativeTool,
+	nativeToolGrants,
+} from "./environment.ts";
 
 /**
  * The Gateway's own rules for every turn: the first, most trusted layer of the prompt. Written
@@ -22,8 +27,11 @@ Rules of this runtime, above everything that follows:
   operator before other agents see them.`;
 
 /** What the policy's grants mean for the runtime's own tools (see `nativeToolGrants`). */
-function builtInTools(input: AgentTurnInput): Readonly<string[]> {
-	const grants = nativeToolGrants(input.toolPolicy);
+function builtInTools(
+	input: AgentTurnInput,
+	confinable: Readonly<NativeTool[]>,
+): Readonly<string[]> {
+	const grants = confinedGrants(nativeToolGrants(input.toolPolicy), confinable);
 	const yes = (granted: boolean) => (granted ? "allowed" : "not available");
 	return [
 		`read files: ${yes(grants.read)}`,
@@ -55,9 +63,13 @@ function list(items: Readonly<string[]>): string {
  * Renders a turn as a prompt, layer by layer in decreasing trust: runtime contract,
  * organization, role, policies, durable state, trigger, thread, memory, other pending events,
  * result schema. Everything a user, another agent or a connector wrote is inside a delimited
- * <data> block with its trust label. Pure.
+ * <data> block with its trust label. `confinable` lists the built-in tools the runtime can
+ * confine; the others are described as not available (see `confinedGrants`). Pure.
  */
-export function renderTurnPrompt(input: AgentTurnInput): string {
+export function renderTurnPrompt(
+	input: AgentTurnInput,
+	confinable: Readonly<NativeTool[]> = ALL_NATIVE_TOOLS,
+): string {
 	const { organization, agent, toolPolicy } = input;
 	const directory = organization.directory.map(
 		(entry) =>
@@ -82,7 +94,7 @@ export function renderTurnPrompt(input: AgentTurnInput): string {
 			`Tools allowed: ${toolPolicy.allow.join(", ") || "(none)"}`,
 			`Tools that need human approval (request with nextState "needs_human"): ${toolPolicy.requireHumanApproval.join(", ") || "(none)"}`,
 			`Tools denied: ${toolPolicy.deny.join(", ") || "(none)"}`,
-			`Built-in tools of your runtime, in your working directory (enforced by its sandbox):\n${list(builtInTools(input))}`,
+			`Built-in tools of your runtime, in your working directory (enforced by the runtime):\n${list(builtInTools(input, confinable))}`,
 			`Channels you may post to:\n${list(input.channels.map((c) => `#${c.name} (${c.channelId})`))}`,
 			`Memory: private namespace ${input.memoryNamespaces.private}; shared namespaces: ${input.memoryNamespaces.shared.join(", ") || "(none)"}`,
 			...(input.workspace === null
@@ -126,9 +138,13 @@ export function renderTurnPrompt(input: AgentTurnInput): string {
  * The turn prompt followed by the one controlled repair request: the previous answer and its
  * validation issues, both as data (the answer was written by a model; the issues quote it).
  */
-export function renderRepairPrompt(input: AgentTurnInput, repair: RepairRequest): string {
+export function renderRepairPrompt(
+	input: AgentTurnInput,
+	repair: RepairRequest,
+	confinable: Readonly<NativeTool[]> = ALL_NATIVE_TOOLS,
+): string {
 	return [
-		renderTurnPrompt(input),
+		renderTurnPrompt(input, confinable),
 		section(
 			"Repair",
 			"Your previous answer did not match the result schema. Answer again with one JSON object that matches it, fixing every issue below. Keep the content of the answer unless an issue requires a change.",

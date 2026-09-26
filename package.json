@@ -2,6 +2,7 @@
   "name": "agent-gateway-control",
   "type": "module",
   "private": true,
+  "license": "MIT",
   "packageManager": "bun@1.4.0",
   "engines": {
     "bun": ">=1.4.0"

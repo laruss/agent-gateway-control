@@ -6,6 +6,7 @@ import type {
 	RuntimeSessionHandle,
 	RuntimeUsage,
 } from "@agent-gateway/contracts";
+import type { NativeTool } from "./environment.ts";
 
 export type RuntimeProbeResult = Readonly<{
 	/** Installed, authenticated and able to take turns. */
@@ -25,6 +26,11 @@ export type CancelResult = Readonly<{ cancelled: boolean; detail: string }>;
 export type RuntimeCapabilities = Readonly<{
 	/** `continueTurn` can resume a provider session returned by an earlier turn. */
 	sessionResume: boolean;
+	/**
+	 * The built-in tools this runtime keeps inside the run workspace and away from the worker's
+	 * credentials. Policy grants of any other tool are withheld (`confinedGrants`).
+	 */
+	confinedTools: Readonly<NativeTool[]>;
 }>;
 
 /**

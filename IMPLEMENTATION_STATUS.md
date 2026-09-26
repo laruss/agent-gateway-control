@@ -982,3 +982,185 @@ Findings per round (P1 / P2, as reported):
 | 3 | 2 / 3 (one P1 re-rated P2, one declined) | 0 / 1 | fixed |
 | 4 | 3 / 2 (P1s re-rated P2, P2, P3) | 0 / 1 | fixed |
 | 5 | 0 / 2 | 0 / 0 | fixed, closed |
+
+## Phase 5 - Grok, Kiro, OpenCode Go, Hermes
+
+Status: **done** (review closed after round 5, the round limit: its P2s are fixed and covered
+by tests)
+
+| Item | State | Evidence |
+|------|-------|----------|
+| Grok adapter: `grok --prompt-file /dev/stdin --output-format json`, `--json-schema`, resume by session id | done | `packages/runtime-grok` |
+| Kiro adapter: `kiro-cli chat --no-interactive --output-format stream-json`, engine v2, resume by session id | done | `packages/runtime-kiro` |
+| OpenCode Go adapter: `opencode run --format json`, per-call permissions, no resume | done | `packages/runtime-opencode` |
+| Hermes adapter: `hermes chat --query-file - --format stream-json`, resume by session id | done | `packages/runtime-hermes` |
+| Built-in tools granted only where the runtime confines them; withheld ones removed from the prompt and reported as risks | done | `confinedGrants`, `capabilities.confinedTools` |
+| Gateway-owned home per runtime, configuration rewritten before use; no operator settings, rules, skills, plugins, MCP, memory or telemetry | done | the four adapters |
+| JSON answers of runtimes without structured output, in or out of a code fence | done | `parseJsonAnswer` |
+| Worker heartbeats; a failing probe stops taking jobs, recovery resumes them | done | `apps/worker/src/worker.ts` |
+| Runtime availability per adapter; agents of an unavailable runtime degraded; one alert per change | done | `runtime-health.ts`, migration `0007_runtime_workers` |
+| Pinned runtime version (`WORKER_RUNTIME_VERSION`); version in heartbeats, runs and `gateway runtimes list` | done | `pinProbe`, `apps/cli` |
+
+Acceptance. CI runs the contract suite against a fake CLI of each runtime. The live suite
+(doctor with cancel and resume, structured wait, tool withholding, local-file fetch; reads and
+writes for OpenCode) ran against grok 1.0.41, kiro-cli 2.24.1, opencode 1.18.31 (OpenCode Go)
+and Hermes 0.21.5 (openai-codex):
+
+- [x] Each passes the common contract suite (mock task, wait result, invalid output, timeout,
+  cancel, session fallback), plus its own tests.
+- [x] Runtime version pinned and observable: a worker on another version than
+  `WORKER_RUNTIME_VERSION` reports the runtime unavailable (integration test); the version is
+  in every heartbeat, run and `gateway runtimes list`.
+- [x] Secrets isolated: none of the worker's environment reaches a runtime (each adapter's
+  tests); the runtimes use their own homes, never the operator's; Grok and Hermes get an empty
+  `HOME`; no tool that could read a login is granted.
+- [x] An unavailable runtime marks only its agents degraded: a worker whose probe fails stays
+  up, takes no jobs and reports it; its agents are degraded and alerted, the other adapters'
+  agents are not; recovery clears it (integration test).
+
+Known gaps, deferred:
+
+- Grok, Kiro and Hermes agents have no file or command tools, OpenCode no commands. A
+  container per run (Phase 8) can confine them.
+- OpenCode's file tools are confined by its own permission check, not by an OS sandbox.
+- Kiro records no token usage (it meters credits); OpenCode Go and Hermes report no cost.
+- A worker silent without a `stopped` heartbeat is noticed after three heartbeats (90 s).
+
+Deliberate choices in this phase ([ADR-015](docs/adr/015-unconfined-runtimes-and-runtime-health.md)):
+
+- The same CLI-per-call approach as ADR-014 for all four runtimes, including Grok (the CLI
+  rather than the xAI API) and OpenCode (`run` rather than `serve`).
+- A failing probe keeps the worker running and reporting instead of exiting.
+
+### Phase 5 review log
+
+- Round 1 (Codex + Opus subagent): Codex 4 P1 + 3 P2, Opus 0 P1 + 8 P2 + 9 P3.
+  - Fixed, both reviewers: the adapters rewrote their CLI configuration in place, so a CLI
+    starting during a probe could read a missing or partial file and fall back to its default
+    tools or agent. Files are now written atomically before every call, and only when changed
+    (`writeRuntimeFile`); a removed Kiro agent definition is restored.
+  - Fixed (Codex P1): an OpenCode agent without a model let the CLI choose its default
+    provider. The model is now required (`runtime.model` or `OPENCODE_MODEL`).
+  - Fixed (Codex P1, Opus P3): a probe that threw left a ready worker taking jobs, and a failed
+    `offWork` lost the subscription. Probe exceptions count as failed probes; the subscription
+    id is kept until removal succeeds; `stop` waits for a check in flight.
+  - Fixed, both reviewers (P2): heartbeat handling and sweeps could race, alert twice or be
+    undone by an older heartbeat applied later. Both now decide under one lock per adapter;
+    heartbeats are dated by when they were queued (`createdOn`) and never move backwards; the
+    alert key names the state that ended.
+  - Fixed (Opus P2): restarts, deploys and one failed probe raised alert pairs. A change is
+    settled and alerted only after it lasted 60 s (`pending_since`).
+  - Fixed (Opus P2): runs kept recording the old version after an in-place CLI upgrade. A new
+    version makes the worker take jobs anew under it.
+  - Fixed (Opus P2): the OpenCode and Hermes probes do not verify the credential (with no
+    `HERMES_PROVIDER`, Hermes checks no login). Reported as policy risks; the doctor's turn
+    verifies it.
+  - Fixed (Opus P2): OpenCode's file tools may reach a whole git checkout. A workspace inside
+    one is refused.
+  - Fixed (Codex P2, Opus P3): transcripts of failed or cancelled turns stayed behind. Grok gets
+    the new session's id from the adapter (`--session-id`) and deletes it in any case; Kiro
+    finds the id in any event. The privacy notes say what can remain.
+  - Fixed (Opus P3): an OpenCode turn cut off by the output limit (`length`) was retried; the
+    probe detail went unquoted into alerts; `withoutUnanchoredPatterns` kept `^a|b$` and
+    stripped patterns inside `const`/`default`; Grok's `forgetSession` took any id and removed
+    other runs' empty groups.
+  - Found while checking Opus P3 (web fetch of local files): Grok refused every fetch under
+    `dontAsk`. It now gets `--allow WebFetch` when fetch is granted. Grok, Kiro and OpenCode
+    refuse `file:` URLs (live suite check added); fetch reaching loopback addresses is
+    documented in ADR-015.
+  - Tests added: the health integration test covers a throwing probe, a queued run that waits
+    while its runtime is unavailable and runs after recovery, stale and out-of-order
+    heartbeats, and a worker id reused by another adapter.
+  - Accepted (Opus P3): after a recovery, jobs still running on the removed subscription can
+    overlap a new one for a moment. Deferred (Opus P3): a live check that files the model
+    writes in the first turn do not become instructions in the repair turn.
+- Round 2 (Codex + Opus subagent): Codex 1 P1 + 3 P2, Opus 0 P1 + 2 P2 + 10 P3.
+  - Re-rated P2 (Codex P1): a CLI replaced in place between probes runs, reporting the old
+    version, until the next probe (up to five minutes). Worker images are immutable; still, a
+    worker with a pinned version now probes every heartbeat.
+  - Fixed (Codex P2): the sweep's cleanup of old worker rows could wait on a row while a
+    heartbeat held the adapter lock and waited on the same row; it is now a statement of its
+    own. Two adapters racing for a new worker id could overwrite each other; the upsert now
+    requires the same adapter. The live file-fetch check granted fetch without search, which
+    Hermes needs for fetch.
+  - Fixed (Opus P2): after a cancel the workspace can be gone before the Hermes and OpenCode
+    session deletes ran there; they now run from the Gateway's home (checked on the real
+    OpenCode). After an upgrade, a failed resubscribe was not retried; the worker now keeps
+    the subscription's version and resubscribes on every tick until it matches (integration
+    test).
+  - Fixed (Opus P3): a heartbeat is sent before a slow probe; `stop` waits at most 5 s for a
+    check in flight; agents added to an adapter that is already down are alerted (only
+    adapters with enabled agents are settled); a heartbeat that fails is logged, never retried
+    into the dead letter queue; OpenCode records no cost when no step reports one; a failed
+    `writeRuntimeFile` removes its temporary file.
+  - Accepted (Opus P3): heartbeat dates are database time while the controller compares with
+    its own clock (hosts run NTP); a runtime that flaps faster than the stable window is not
+    alerted (its runs fail and alert on their own); an OpenCode workspace root inside a git
+    checkout fails runs instead of degrading the runtime; no test of two controllers alerting.
+- Round 3 (Codex + Opus subagent): Codex 1 P1 + 3 P2, Opus 0 P1 + 1 P2 + 7 P3.
+  - Fixed (Codex P1): while a subscription could not be removed, it still ran turns and the
+    heartbeat was skipped. Jobs of a subscription whose runtime failed or changed version are
+    now refused as retryable (`accepting`, unit test), removal is retried every tick, and the
+    heartbeat goes out regardless.
+  - Fixed, both reviewers (P2): under `resumable-if-available`, transcripts of failed,
+    cancelled or superseded turns were never deleted. Only a session handed back to the
+    Gateway is kept; Kiro and Hermes prune sessions past their lifetime on every probe; the
+    privacy notes say what can remain until then.
+  - Fixed (Codex P2): a session could be labeled with the version a probe read during the run.
+    The worker labels sessions with the version the run reports, and the adapters read it
+    before the call. `runtimes list` shows the versions of unavailable workers too
+    (`reportedVersions`).
+  - Fixed (Opus P3): versions are quoted in alerts; Hermes and OpenCode session ids are checked
+    before they reach a delete command; queued runs of a runtime known to be down raise no
+    "still queued" alert; the adapter homes are created before their real path is taken; a
+    pinned worker probes every minute instead of every heartbeat; Hermes checks stderr for a
+    failed login.
+- Round 4 (Codex + Opus subagent): Codex 1 P1 + 3 P2 + 1 P3, Opus 0 P1 + 2 P2 + 8 P3.
+  - Fixed, both reviewers (Codex P1, Opus P2): a subscription that could not be removed kept
+    fetching jobs and refusing them, and each refusal used up a run attempt until the agent
+    was FAILED. A worker that cannot remove a subscription now stops pg-boss altogether and
+    exits (`failed`), so its supervisor starts a clean one; its agents are degraded meanwhile.
+  - Fixed (Codex P2): a failed subscribe skipped the heartbeat; it now counts as unavailable
+    with its reason. `stop` removes the subscription before reporting `stopped`, and no turn
+    starts once the worker is stopping.
+  - Fixed, both reviewers (P2): OpenCode sessions of a call stopped before its first event
+    stayed forever. The probe deletes every OpenCode session older than a day (none is ever
+    resumed).
+  - Fixed (Opus P3): a failed resumed Kiro or Hermes turn deleted the session the Gateway still
+    holds; the heartbeat before a probe could say ready for an outdated subscription;
+    rate-limit and overload errors are always retryable, and the permanent-error patterns are
+    narrower; the live file-fetch check requires a completed turn (Codex P3); the pinned-version
+    test stops its worker.
+  - Accepted (Opus P3): a "still queued" alert suppressed while the runtime is down is not
+    raised again after recovery (the runtime's recovery alert and `gateway health` cover it);
+    availability of an adapter without enabled agents is not settled until agents use it
+    again; heartbeats read the fresh workers of every adapter (a few rows per adapter).
+- Round 5, the round limit (Codex + Opus subagent): Codex 0 P1 + 2 P2 + 1 P3, Opus 0 P1 + 2 P2
+  + 7 P3. Review closed: both reviewers' P2s are fixed and covered by tests.
+  - Fixed (Opus P2): a worker giving up left its turns' CLIs running in their own process
+    groups. It now cancels its turns and waits for them (bounded) before it exits.
+  - Fixed (Opus P2): a CLI that starts a new session instead of resuming the requested one
+    counted as resumed. Grok, Kiro and Hermes now treat it as an unavailable session: the turn
+    starts fresh and the stray session is removed.
+  - Fixed (Codex P2): two heartbeats of one worker queued at the same moment could apply in the
+    wrong order. Reports carry a per-worker sequence, and only a later one replaces the stored
+    status (integration test with equal timestamps).
+  - Fixed (Codex P2): expired sessions were pruned only when the login check passed; pruning now
+    runs first.
+  - Fixed (P3): the settings reference lists every adapter and the new settings; ADR-015 says
+    when a worker exits and that Kiro workspaces with repository content must not carry
+    `.kiro/`; the live suite checks that a runtime without confined commands creates no
+    shell-only file.
+  - Accepted (Opus P3): heartbeats wait for a probe in flight (probes are bounded by 30 s per
+    CLI call); Hermes without web grants relies on its empty `cli` toolset list (the live suite
+    checks that such an agent writes nothing); a `pending_since` left by a controller outage
+    can alert once after the restart; Grok's result schema goes on the command line (well
+    under the argument limit today).
+
+| Round | Codex P1 / P2 | Opus P1 / P2 | Outcome |
+|-------|---------------|--------------|---------|
+| 1 | 4 / 3 | 0 / 8 | fixed |
+| 2 | 1 / 3 (P1 re-rated P2) | 0 / 2 | fixed |
+| 3 | 1 / 3 | 0 / 1 | fixed |
+| 4 | 1 / 3 | 0 / 2 (one re-rated then fixed with Codex's P1) | fixed |
+| 5 | 0 / 2 | 0 / 2 | fixed, closed |

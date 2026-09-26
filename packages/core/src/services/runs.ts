@@ -25,6 +25,7 @@ import {
 	memoryItems,
 	policyDecisions,
 	type RunOutcome,
+	runtimeAvailability,
 	runtimeSessions,
 	waitSubscriptions,
 	withTransaction,
@@ -195,6 +196,15 @@ export async function handleRunTimeout(
 		}
 		const { run, agent } = locked;
 		if (run.status === "queued") {
+			// Waiting for a runtime that is known to be down is the designed state: the runtime's
+			// own alert covers it.
+			const [runtime] = await uow.tx.db
+				.select({ available: runtimeAvailability.available })
+				.from(runtimeAvailability)
+				.where(eq(runtimeAvailability.adapter, run.runtimeAdapter));
+			if (runtime?.available === false) {
+				return "ignored_stale";
+			}
 			await raiseAlert(
 				uow,
 				`queued:${run.id}:${run.attempt}`,

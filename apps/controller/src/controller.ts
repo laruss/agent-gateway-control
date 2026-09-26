@@ -1,11 +1,11 @@
 import {
 	OutboxDeliverJobSchema,
 	QUEUES,
-	RunReportSchema,
 	RunTimeoutJobSchema,
 	RuntimeAdapterIdSchema,
 	reportQueue,
 	WaitTimeoutJobSchema,
+	WorkerReportSchema,
 } from "@agent-gateway/contracts";
 import {
 	type ControlPlaneDeps,
@@ -14,6 +14,8 @@ import {
 	handleWaitTimeout,
 	type JobProbe,
 	reconcileRunsAndWaits,
+	recordWorkerStatus,
+	sweepRuntimeHealth,
 	sweepSchedules,
 } from "@agent-gateway/core";
 import type { OutboxKind } from "@agent-gateway/db";
@@ -36,6 +38,8 @@ export type ControllerOptions = Readonly<{
 	random?: () => number;
 	/** How often lost or stale outbox deliveries are re-enqueued. */
 	reconcileIntervalMs?: number;
+	/** How long a runtime availability change must last before it is alerted; lower in tests. */
+	runtimeStableMs?: number;
 	/** Queue polling interval; lower in tests. */
 	pollingIntervalSeconds?: number;
 	/** Listen to Mattermost; without it no Mattermost event reaches the Gateway. */
@@ -92,23 +96,41 @@ export async function startController(options: ControllerOptions): Promise<Runni
 	};
 	const outboxDeps = { pool, deliverers: options.deliverers(deps), clock, log };
 	const polling = { pollingIntervalSeconds: options.pollingIntervalSeconds ?? 2 };
+	const runtimeHealthOptions =
+		options.runtimeStableMs === undefined ? {} : { stableMs: options.runtimeStableMs };
 
 	// One report queue per adapter: a report counts only for runs of the adapter it came from.
 	for (const adapter of RuntimeAdapterIdSchema.options) {
 		await boss.work(
 			reportQueue(adapter),
-			{ ...polling, batchSize: 1, localConcurrency: 4 },
+			{ ...polling, batchSize: 1, localConcurrency: 4, includeMetadata: true },
 			async ([job]) => {
 				if (job === undefined) {
 					return;
 				}
-				const report = RunReportSchema.safeParse(job.data);
+				const report = WorkerReportSchema.safeParse(job.data);
 				if (!report.success) {
 					// A malformed report is a worker defect or a forgery; never retried into the domain.
 					log.error("rejected malformed run report", {
 						job_id: job.id,
 						error_code: "invalid_report",
 					});
+					return;
+				}
+				if (report.data.kind === "worker_status") {
+					// Dated by when the worker queued it, not when it is applied. A heartbeat is never
+					// retried: the next one supersedes it, and it must not fill the dead letter queue.
+					try {
+						await recordWorkerStatus(
+							deps,
+							adapter,
+							report.data,
+							job.createdOn,
+							runtimeHealthOptions,
+						);
+					} catch (error) {
+						log.error("worker status not applied", { ...errorFields(error), adapter });
+					}
 					return;
 				}
 				const outcome = await handleRunReport(deps, report.data, adapter);
@@ -168,6 +190,14 @@ export async function startController(options: ControllerOptions): Promise<Runni
 			}
 		} catch (error) {
 			log.error("schedule sweep failed", errorFields(error));
+		}
+		try {
+			const unavailable = await sweepRuntimeHealth(deps, runtimeHealthOptions);
+			if (unavailable.length > 0) {
+				log.warn("runtimes without a ready worker", { adapters: unavailable.join(",") });
+			}
+		} catch (error) {
+			log.error("runtime health sweep failed", errorFields(error));
 		}
 		try {
 			const requeued = await reconcileOutbox(outboxDeps, (tx) =>

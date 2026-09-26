@@ -145,6 +145,34 @@ export const RunReportSchema = z.discriminatedUnion("kind", [
 ]);
 export type RunReport = z.infer<typeof RunReportSchema>;
 
+export const WorkerStatusSchema = z.enum(["ready", "unavailable", "stopped"]);
+export type WorkerStatus = z.infer<typeof WorkerStatusSchema>;
+
+/**
+ * Worker -> controller heartbeat, sent on the adapter's report queue: the adapter comes from the
+ * queue, so a worker can speak only for its own runtime. `unavailable` means the probe failed and
+ * the worker takes no jobs; `stopped` is the last word of a worker shutting down.
+ */
+export const WorkerStatusReportSchema = z.strictObject({
+	kind: z.literal("worker_status"),
+	/** Random per worker process. */
+	workerId: UuidSchema,
+	/** Increases with every report of the worker: orders reports queued at the same moment. */
+	sequence: z.int().min(0),
+	status: WorkerStatusSchema,
+	runtimeVersion: z.string().max(128),
+	/** The probe's summary; never contains credentials. */
+	detail: z.string().max(500),
+});
+export type WorkerStatusReport = z.infer<typeof WorkerStatusReportSchema>;
+
+/** Everything a worker may put on its report queue. */
+export const WorkerReportSchema = z.discriminatedUnion("kind", [
+	RunReportSchema,
+	WorkerStatusReportSchema,
+]);
+export type WorkerReport = z.infer<typeof WorkerReportSchema>;
+
 export const RunTimeoutJobSchema = z.strictObject({ runId: UuidSchema, attempt: z.int().min(1) });
 export type RunTimeoutJob = z.infer<typeof RunTimeoutJobSchema>;
 

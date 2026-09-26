@@ -32,7 +32,8 @@
 ## Runtime providers
 
 - A turn's whole prompt goes to the agent's runtime provider (OpenAI for Codex, Anthropic for
-  Claude Code). The prompt holds the organization rules, the agent's role, the thread, memory,
+  Claude Code, xAI for Grok, AWS for Kiro, OpenCode and its model vendors for OpenCode Go, the
+  configured provider for Hermes). The prompt holds the organization rules, the agent's role, the thread, memory,
   durable state and pending events, so posts in the agent's channels reach that provider. The
   provider's own retention and training terms apply; choose the account and plan accordingly.
 - Under `session_policy: resumable-if-available` the CLI keeps each session's history on disk,
@@ -40,5 +41,11 @@
   stores only the session id. Under `stateless` nothing is kept (`--ephemeral`,
   `--no-session-persistence`). Deleting a post in Mattermost does not remove it from these
   files.
+- Grok, Kiro and Hermes keep a session in their Gateway homes (`GROK_HOME`, `KIRO_HOME`,
+  `HERMES_HOME`) only while the Gateway stores it; the adapter deletes every other transcript
+  after the call, and OpenCode's after every call. What can remain (the first session of a
+  repaired turn, a Kiro or Hermes call killed before the CLI named its session) is removed
+  after the seven-day session lifetime. The adapters turn off the CLIs' telemetry, trace
+  uploads, memory and feedback where the CLI allows it.
 - Run workspaces are removed after each run. `gateway runtime doctor` never prints model output
   or the account the CLI is logged in with.

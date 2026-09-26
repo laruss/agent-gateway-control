@@ -124,6 +124,7 @@ export async function startTestGateway(options: TestGatewayOptions = {}): Promis
 				random: () => 0,
 				pollingIntervalSeconds: 0.5,
 				reconcileIntervalMs: 1000,
+				runtimeStableMs: 500,
 				...(real === null ? {} : { mattermost: real }),
 			});
 		},

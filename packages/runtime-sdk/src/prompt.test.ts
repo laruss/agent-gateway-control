@@ -60,4 +60,19 @@ describe("renderTurnPrompt", () => {
 		expect(prompt).toContain('<data kind="thread" trust="mixed">');
 		expect(prompt).toContain('<data kind="durable-state" trust="internal-untrusted">');
 	});
+
+	it("describes the tools the runtime withholds as not available", () => {
+		const base = contractTurnInput({ runId: RUN_ID, message: "hi", deadlineMs: 1000 });
+		const input = {
+			...base,
+			toolPolicy: { ...base.toolPolicy, allow: ["mattermost.post", "tests.run", "web.search"] },
+		};
+		expect(renderTurnPrompt(input)).toContain(
+			"run shell commands (tests, builds, any command): allowed",
+		);
+		const confined = renderTurnPrompt(input, ["webSearch", "webFetch"]);
+		expect(confined).toContain("run shell commands (tests, builds, any command): not available");
+		expect(confined).toContain("read files: not available");
+		expect(confined).toContain("web search: allowed");
+	});
 });

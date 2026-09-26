@@ -3,6 +3,7 @@ export * from "./doctor.ts";
 export * from "./environment.ts";
 export * from "./execute.ts";
 export * from "./fake-cli.ts";
+export * from "./output.ts";
 export * from "./process.ts";
 export * from "./prompt.ts";
 export * from "./testing.ts";

@@ -15,6 +15,11 @@ const worker = await startWorker({
 	adapter: RuntimeAdapterIdSchema.parse(readSetting("WORKER_ADAPTER") ?? "mock"),
 	concurrency: intSetting("WORKER_CONCURRENCY", 1),
 	workspaceRoot: workspaceRoot(),
+	pinnedVersion: readSetting("WORKER_RUNTIME_VERSION") ?? null,
 	log,
 });
 onShutdown(log, worker.stop);
+void worker.failed.then(() => {
+	// Fail closed: a supervisor restarts the worker with a clean subscription.
+	process.exit(1);
+});

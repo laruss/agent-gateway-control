@@ -31,6 +31,7 @@ import {
 	redriveRun,
 	releaseKillSwitch,
 	resumeAgent,
+	runtimeHealth,
 	setAgentEnabled,
 	setDirectoryEntry,
 	showAgent,
@@ -85,6 +86,7 @@ export const USAGE = `gateway <command>
                                       --mock-runtimes runs every agent on the mock runtime
   directory set <channel|user|team> <name> <mattermost-id>
   agents list | show <id> | enable <id> | disable <id> | pause <id> | resume <id>
+  runtimes list                       worker availability and runtime versions per adapter
   runs list [--agent <id>] | show <run-id> | cancel <run-id> | redrive <run-id>
   waits list
   events show <id> | ingest <file.json>
@@ -242,6 +244,17 @@ async function doctor(session: Session, out: Output): Promise<boolean> {
 		ok: failedCount === 0,
 		detail: `${failedCount} agent(s) whose latest run failed`,
 	});
+	// Only adapters with enabled agents or live workers are listed; an unavailable one degrades
+	// its agents (their runs wait in the queue) and nothing else.
+	for (const health of await runtimeHealth(session.deps)) {
+		checks.push({
+			name: `runtime:${health.adapter}`,
+			ok: health.available,
+			detail: health.available
+				? `${health.readyWorkers} ready worker(s), ${health.runtimeVersions.join(", ")}`
+				: `no ready worker${health.detail === null ? "" : `: ${health.detail}`}; its agents are degraded`,
+		});
+	}
 	for (const name of deadLetterQueues(RuntimeAdapterIdSchema.options)) {
 		const jobs = await session.boss.findJobs(name, { queued: true });
 		checks.push({ name, ok: jobs.length === 0, detail: `${jobs.length} dead-lettered` });
@@ -335,7 +348,10 @@ async function runSessionCommand(
 			return 0;
 		}
 		case "agents list":
-			out.print(json((await listAgents(deps)).rows));
+			out.print(json(await listAgents(deps)));
+			return 0;
+		case "runtimes list":
+			out.print(json(await runtimeHealth(deps)));
 			return 0;
 		case "agents show":
 			out.print(json(await showAgent(deps, arg(args, 2, "id"))));

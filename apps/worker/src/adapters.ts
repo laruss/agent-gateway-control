@@ -3,9 +3,19 @@ import { join } from "node:path";
 import type { RuntimeAdapterId } from "@agent-gateway/contracts";
 import { createClaudeRuntime } from "@agent-gateway/runtime-claude";
 import { createCodexRuntime } from "@agent-gateway/runtime-codex";
+import { createGrokRuntime } from "@agent-gateway/runtime-grok";
+import { createHermesRuntime } from "@agent-gateway/runtime-hermes";
+import { createKiroRuntime } from "@agent-gateway/runtime-kiro";
 import { createMockRuntime } from "@agent-gateway/runtime-mock";
+import { createOpencodeRuntime } from "@agent-gateway/runtime-opencode";
 import type { RuntimeAdapter } from "@agent-gateway/runtime-sdk";
-import { type Environment, intSetting, readSetting, SettingError } from "@agent-gateway/service";
+import {
+	type Environment,
+	intSetting,
+	readSetting,
+	requireSetting,
+	SettingError,
+} from "@agent-gateway/service";
 
 /** Where run workspaces are created: `WORKER_WORKSPACE_ROOT`, else a directory under tmp. */
 export function workspaceRoot(env: Environment = process.env): string {
@@ -37,6 +47,13 @@ function budget(env: Environment): { maxBudgetUsd?: number } {
  * codex:       CODEX_BIN, CODEX_HOME, CODEX_API_KEY
  * claude-code: CLAUDE_BIN, CLAUDE_CONFIG_DIR, ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN,
  *              CLAUDE_MAX_TURNS, CLAUDE_MAX_BUDGET_USD
+ * grok:        GROK_BIN, GROK_HOME (required: the Gateway's own, never ~/.grok), XAI_API_KEY,
+ *              GROK_MAX_TURNS
+ * hermes:      HERMES_BIN, HERMES_HOME (required: the Gateway's own, never ~/.hermes),
+ *              HERMES_PROVIDER, HERMES_MAX_TURNS
+ * kiro:        KIRO_BIN, KIRO_HOME (required: the Gateway's own, never ~/.kiro), KIRO_API_KEY
+ * opencode-go: OPENCODE_BIN, OPENCODE_HOME (required: the Gateway's own), OPENCODE_API_KEY,
+ *              OPENCODE_PROVIDER (default opencode-go), OPENCODE_MODEL (agents without a model)
  */
 export function createRuntimeAdapter(
 	id: RuntimeAdapterId,
@@ -67,7 +84,43 @@ export function createRuntimeAdapter(
 				...budget(env),
 			});
 		}
-		default:
-			throw new Error(`runtime adapter '${id}' is not implemented yet`);
+		case "grok": {
+			const apiKey = readSetting("XAI_API_KEY", env);
+			return createGrokRuntime({
+				command: command("GROK_BIN", "grok", env),
+				grokHome: requireSetting("GROK_HOME", env),
+				...(apiKey === undefined ? {} : { apiKey }),
+				maxTurns: intSetting("GROK_MAX_TURNS", 40, env),
+			});
+		}
+		case "hermes": {
+			const provider = readSetting("HERMES_PROVIDER", env);
+			return createHermesRuntime({
+				command: command("HERMES_BIN", "hermes", env),
+				hermesHome: requireSetting("HERMES_HOME", env),
+				...(provider === undefined ? {} : { provider }),
+				maxTurns: intSetting("HERMES_MAX_TURNS", 40, env),
+			});
+		}
+		case "kiro": {
+			const apiKey = readSetting("KIRO_API_KEY", env);
+			return createKiroRuntime({
+				command: command("KIRO_BIN", "kiro-cli", env),
+				kiroHome: requireSetting("KIRO_HOME", env),
+				...(apiKey === undefined ? {} : { apiKey }),
+			});
+		}
+		case "opencode-go": {
+			const apiKey = readSetting("OPENCODE_API_KEY", env);
+			const provider = readSetting("OPENCODE_PROVIDER", env);
+			const defaultModel = readSetting("OPENCODE_MODEL", env);
+			return createOpencodeRuntime({
+				command: command("OPENCODE_BIN", "opencode", env),
+				opencodeHome: requireSetting("OPENCODE_HOME", env),
+				...(apiKey === undefined ? {} : { apiKey }),
+				...(provider === undefined ? {} : { provider }),
+				...(defaultModel === undefined ? {} : { defaultModel }),
+			});
+		}
 	}
 }

@@ -8,6 +8,10 @@ import type {
 	RuntimeUsage,
 } from "@agent-gateway/contracts";
 import {
+	ALL_NATIVE_TOOLS,
+	asCount,
+	asRecord,
+	asString,
 	type NativeToolGrants,
 	nativeToolGrants,
 	type ProcessResult,
@@ -24,6 +28,7 @@ import {
 	SessionUnavailableError,
 	sandboxPath,
 	type TurnOptions,
+	tail,
 } from "@agent-gateway/runtime-sdk";
 
 export type CodexRuntimeOptions = Readonly<{
@@ -83,18 +88,6 @@ type CodexEvent = Readonly<{
 
 type CodexUsage = Readonly<{ input: number; cached: number; output: number }>;
 
-function asRecord(value: JsonValue | undefined): Readonly<Record<string, JsonValue>> | null {
-	return typeof value === "object" && value !== null && !Array.isArray(value) ? value : null;
-}
-
-function asString(value: JsonValue | undefined): string | null {
-	return typeof value === "string" ? value : null;
-}
-
-function asCount(value: JsonValue | undefined): number {
-	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
-}
-
 /** One line of `codex exec --json`; lines that are not events are skipped. */
 function parseEvent(line: string): CodexEvent | null {
 	let value: JsonValue;
@@ -126,11 +119,6 @@ function parseEvent(line: string): CodexEvent | null {
 					},
 		error: asString(error?.message) ?? (type === "error" ? asString(event.message) : null),
 	};
-}
-
-function tail(text: string, max = 600): string {
-	const trimmed = text.trim();
-	return trimmed.length <= max ? trimmed : `…${trimmed.slice(-max)}`;
 }
 
 const AUTH_FAILURE = /\b401\b|unauthori[sz]ed|not logged in|login required|invalid api key/iu;
@@ -382,7 +370,7 @@ export function createCodexRuntime(options: CodexRuntimeOptions = {}): RuntimeAd
 
 	return {
 		id: "codex",
-		capabilities: { sessionResume: true },
+		capabilities: { sessionResume: true, confinedTools: ALL_NATIVE_TOOLS },
 		probe,
 		health: async () => {
 			const result = await probe();

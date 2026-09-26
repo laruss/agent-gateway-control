@@ -132,48 +132,56 @@ export async function runtimeDoctor(
 			: describeFailure(reply),
 	);
 
-	// A granted command runs in the runtime's OS sandbox; without its dependencies (bubblewrap
-	// on Linux) every run with tests.run would fail.
-	// Only a command can copy the word into a new file: the grant has no file-write tool, and the
-	// model's own words prove nothing.
-	const token = testWord();
-	let echoed = "";
-	let commandTmp = "";
-	let workspaceOfCheck = "";
-	let tempGone = false;
-	const sandboxed = await turn(
-		SANDBOX_TASK,
-		turnMs,
-		{},
-		["mattermost.post", "tests.run"],
-		{ "word.txt": token },
-		async (workspacePath) => {
-			echoed = await readFile(join(workspacePath, SANDBOX_ECHO), "utf8").catch(() => "");
-			commandTmp = (
-				await readFile(join(workspacePath, "tmpdir.txt"), "utf8").catch(() => "")
-			).trim();
-			workspaceOfCheck = workspacePath;
-			tempGone = commandTmp !== "" && !existsSync(commandTmp);
-		},
-	);
-	const sandboxOutput = sandboxed.kind === "completed" && echoed.trim() === token;
-	check(
-		"sandboxed command (tests.run)",
-		sandboxOutput ? "pass" : "fail",
-		sandboxOutput ? "a granted command ran in the sandbox" : describeFailure(sandboxed),
-	);
-
-	if (sandboxOutput) {
-		// Temp files that outlive the call are shared between runs: the directory must be the
-		// run's own (inside its workspace) or removed with the call.
-		const own = commandTmp.startsWith(`${workspaceOfCheck}/`) || tempGone;
+	if (!adapter.capabilities.confinedTools.includes("exec")) {
 		check(
-			"command temp directory",
-			own ? "pass" : "warn",
-			own
-				? "private to the run"
-				: `commands use ${commandTmp || "an unknown directory"}, which outlives the run`,
+			"sandboxed command (tests.run)",
+			"skip",
+			"withheld: this runtime cannot confine commands, so tests.run is never granted",
 		);
+	} else {
+		// A granted command runs in the runtime's OS sandbox; without its dependencies (bubblewrap
+		// on Linux) every run with tests.run would fail.
+		// Only a command can copy the word into a new file: the grant has no file-write tool, and the
+		// model's own words prove nothing.
+		const token = testWord();
+		let echoed = "";
+		let commandTmp = "";
+		let workspaceOfCheck = "";
+		let tempGone = false;
+		const sandboxed = await turn(
+			SANDBOX_TASK,
+			turnMs,
+			{},
+			["mattermost.post", "tests.run"],
+			{ "word.txt": token },
+			async (workspacePath) => {
+				echoed = await readFile(join(workspacePath, SANDBOX_ECHO), "utf8").catch(() => "");
+				commandTmp = (
+					await readFile(join(workspacePath, "tmpdir.txt"), "utf8").catch(() => "")
+				).trim();
+				workspaceOfCheck = workspacePath;
+				tempGone = commandTmp !== "" && !existsSync(commandTmp);
+			},
+		);
+		const sandboxOutput = sandboxed.kind === "completed" && echoed.trim() === token;
+		check(
+			"sandboxed command (tests.run)",
+			sandboxOutput ? "pass" : "fail",
+			sandboxOutput ? "a granted command ran in the sandbox" : describeFailure(sandboxed),
+		);
+
+		if (sandboxOutput) {
+			// Temp files that outlive the call are shared between runs: the directory must be the
+			// run's own (inside its workspace) or removed with the call.
+			const own = commandTmp.startsWith(`${workspaceOfCheck}/`) || tempGone;
+			check(
+				"command temp directory",
+				own ? "pass" : "warn",
+				own
+					? "private to the run"
+					: `commands use ${commandTmp || "an unknown directory"}, which outlives the run`,
+			);
+		}
 	}
 
 	const cancel = new AbortController();

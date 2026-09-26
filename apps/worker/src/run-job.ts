@@ -1,4 +1,10 @@
-import { type JobSink, RunJobSchema, type RunReport, reportQueue } from "@agent-gateway/contracts";
+import {
+	type JobSink,
+	RunJobSchema,
+	type RunReport,
+	type RuntimeSessionHandle,
+	reportQueue,
+} from "@agent-gateway/contracts";
 import type { Logger } from "@agent-gateway/logging";
 import {
 	createRunWorkspace,
@@ -19,6 +25,11 @@ export type RunJobHost = Readonly<{
 	workspaceRoot: string;
 	reports: JobSink;
 	log: Logger;
+	/**
+	 * Whether this subscription may still run turns: false once the runtime failed its probe or
+	 * changed version, also while the subscription could not be removed yet.
+	 */
+	accepting?: () => boolean;
 }>;
 
 /**
@@ -57,9 +68,16 @@ export async function processRunJob(
 		deadline: new Date(Date.now() + timeoutSeconds * 1000).toISOString(),
 	};
 	runLog.info("run started", { attempt });
-	const workspacePath = await createRunWorkspace(host.workspaceRoot, agentId, runId, attempt).catch(
-		(error: Error) => error,
-	);
+	const refusal =
+		host.accepting === undefined || host.accepting()
+			? null
+			: "the runtime of this worker is unavailable or changed version";
+	const workspacePath =
+		refusal !== null
+			? new Error(refusal)
+			: await createRunWorkspace(host.workspaceRoot, agentId, runId, attempt).catch(
+					(error: Error) => error,
+				);
 	if (workspacePath instanceof Error) {
 		await send({
 			kind: "failed",
@@ -70,7 +88,10 @@ export async function processRunJob(
 			error: {
 				code: "runtime_retryable",
 				retryable: true,
-				detail: `cannot create the run workspace: ${workspacePath.message}`.slice(0, 2000),
+				detail: (refusal ?? `cannot create the run workspace: ${workspacePath.message}`).slice(
+					0,
+					2000,
+				),
 			},
 			usage: null,
 			session: null,
@@ -103,6 +124,10 @@ export async function processRunJob(
 	if (execution.resume === "unavailable") {
 		runLog.info("provider session unavailable, started fresh", { attempt });
 	}
+	// A session is labeled with the version this run reports, not whatever the CLI is by the
+	// end of the run: after an upgrade mid-run, a worker of the new version starts fresh.
+	const labeled = (session: RuntimeSessionHandle | null) =>
+		session === null ? null : { ...session, runtimeVersion };
 	if (execution.kind === "completed") {
 		await send({
 			kind: "completed",
@@ -110,7 +135,7 @@ export async function processRunJob(
 			attempt,
 			agentId,
 			runtimeVersion,
-			result: execution.result,
+			result: { ...execution.result, session: labeled(execution.result.session) },
 		});
 		runLog.info("run completed", { attempt, next_state: execution.result.nextState.kind });
 		return "completed";
@@ -123,7 +148,7 @@ export async function processRunJob(
 		runtimeVersion,
 		error: execution.error,
 		usage: execution.usage,
-		session: execution.session,
+		session: labeled(execution.session),
 	});
 	runLog.warn("run failed", { attempt, error_code: execution.error.code });
 	return "failed";
