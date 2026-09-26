@@ -1,0 +1,13 @@
+{
+  "name": "@agent-gateway/runtime-codex",
+  "version": "0.0.0",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@agent-gateway/contracts": "workspace:*",
+    "@agent-gateway/runtime-sdk": "workspace:*"
+  }
+}

@@ -5,7 +5,8 @@
   "private": true,
   "exports": {
     ".": "./src/index.ts",
-    "./contract-suite": "./src/contract-suite.ts"
+    "./contract-suite": "./src/contract-suite.ts",
+    "./live-suite": "./src/live-suite.ts"
   },
   "dependencies": {
     "@agent-gateway/contracts": "workspace:*",

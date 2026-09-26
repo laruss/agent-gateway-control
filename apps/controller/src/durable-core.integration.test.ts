@@ -6,6 +6,7 @@ import {
 	type JsonValue,
 	MattermostPostDataSchema,
 	QUEUES,
+	RunJobSchema,
 	type RunQueueName,
 	reportQueue,
 	runDeadLetterQueue,
@@ -784,6 +785,58 @@ describe("durable core with the mock runtime", () => {
 		const run = await finishedRun(event.id, "flaky run");
 		expect(run).toMatchObject({ status: "succeeded", attempt: 2, outcome: "idle" });
 		await idle("director");
+	});
+
+	it("offers the stored provider session within its conversation and starts fresh when it is gone", async () => {
+		const storedRef = async () =>
+			(
+				await query<{ ref: string }>(
+					"select provider_session_ref as ref from runtime_sessions where agent_id = 'director' and adapter = 'mock'",
+				)
+			)[0]?.ref;
+		const offered = async (runId: string) => {
+			const [job] = await gateway.controller().boss.findJobs(runQueue("mock"), { data: { runId } });
+			return RunJobSchema.parse(job?.data).runtime.session?.providerSessionId ?? null;
+		};
+		const run = async (event: GatewayEvent) => {
+			await ingestEvent(gateway.deps(), event);
+			const finished = await finishedRun(event.id, event.id);
+			expect(finished).toMatchObject({ status: "succeeded" });
+			await idle("director");
+			return finished.id;
+		};
+		const root = threadEvent({ rootId: null, message: "@director first", targets: ["director"] });
+		const reply = (message: string) =>
+			threadEvent({
+				rootId: MattermostPostDataSchema.parse(root.data).post_id,
+				message,
+				targets: ["director"],
+			});
+
+		await idle("director");
+		await run(root);
+		const first = await storedRef();
+		expect(first).toBeDefined();
+		const second = await run(reply("@director second"));
+		expect(await offered(second)).toBe(first);
+		const renewed = await storedRef();
+		expect(renewed).not.toBe(first);
+
+		// Another conversation never resumes this one's transcript.
+		const elsewhere = await run(
+			threadEvent({ rootId: null, message: "@director other", targets: ["director"] }),
+		);
+		expect(await offered(elsewhere)).toBeNull();
+
+		// A new worker process knows none of the old sessions: the run starts fresh and succeeds.
+		const back = await run(reply("@director back"));
+		const kept = await storedRef();
+		expect(await offered(back)).toBeNull();
+		await gateway.stopWorker();
+		await gateway.startWorker();
+		const third = await run(reply("@director third"));
+		expect(await offered(third)).toBe(kept);
+		expect(await storedRef()).not.toBe(kept);
 	});
 
 	it("rejects invalid structured output without publishing it", async () => {

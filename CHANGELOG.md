@@ -6,6 +6,15 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ### Added
 
+- Runtime adapters for Codex (`@agent-gateway/runtime-codex`, `codex exec --json`) and Claude
+  Code (`@agent-gateway/runtime-claude`, `claude -p`). Each call runs in its own process group,
+  with a clean environment and a workspace per run. Built-in tools follow the agent's tool
+  policy. Provider sessions are resumed under `resumable-if-available`, with a fresh start when
+  a session is gone. ADR-014.
+- `gateway runtime doctor <adapter>`: version, login, a real structured turn, cancellation,
+  session resume and policy risks. Worker settings `WORKER_WORKSPACE_ROOT`, `CODEX_*` and
+  `CLAUDE_*`. Live runtime tests (`bun run test:live`); fake CLIs for the contract suite in CI.
+
 - Turn context (`@agent-gateway/context`): the turn's Mattermost thread assembled from stored
   events within a budget, thread summaries compacted from run summaries (`thread_summaries`),
   the agent's memory from its own namespaces; a turn resumed by a timeout keeps its thread.

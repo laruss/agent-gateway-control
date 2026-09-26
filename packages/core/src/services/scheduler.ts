@@ -7,8 +7,12 @@ import {
 	type MemoryItem,
 	QUEUES,
 	type ResolvedWait,
+	type RunRuntime,
 	type RuntimeAdapterId,
+	type RuntimeSessionHandle,
+	RuntimeSessionHandleSchema,
 	runQueue,
+	type SessionPolicy,
 	type WaitCondition,
 	type WorkingSummary,
 } from "@agent-gateway/contracts";
@@ -17,6 +21,7 @@ import {
 	agentRuns,
 	contextSnapshots,
 	events,
+	runtimeSessions,
 	waitSubscriptions,
 	withTransaction,
 } from "@agent-gateway/db";
@@ -425,6 +430,10 @@ export async function scheduleAgent(
 		runId,
 		attempt: 1,
 		adapter,
+		agentId,
+		model: agent.config.runtime.model ?? null,
+		sessionPolicy: agent.config.runtime.session_policy,
+		sessionScope: sessionScope(agent.configVersion, input),
 		input,
 		timeoutSeconds: agent.config.runtime.timeout_seconds,
 		startAfter: null,
@@ -442,10 +451,66 @@ export type AttemptInit = Readonly<{
 	runId: string;
 	attempt: number;
 	adapter: RuntimeAdapterId;
+	agentId: string;
+	model: string | null;
+	sessionPolicy: SessionPolicy;
+	/** See `sessionScope`; only a session stored under the same scope is offered. */
+	sessionScope: string;
 	input: JsonObject;
 	timeoutSeconds: number;
 	startAfter: Date | null;
 }>;
+
+/**
+ * What a provider session may be resumed for: the same configuration version (role, policy,
+ * channels) and the same conversations, those of the trigger and of every carried inbox event.
+ * A session's transcript holds everything its earlier turns saw, so resuming it elsewhere would
+ * show a run more than its own context allows.
+ */
+export function sessionScope(
+	configVersion: string,
+	input: Readonly<{ trigger: GatewayEvent; pendingInbox: Readonly<GatewayEvent[]> }>,
+): string {
+	const correlations = [
+		...new Set([input.trigger, ...input.pendingInbox].map((event) => event.correlationid)),
+	].sort();
+	// JSON keeps ids containing separators apart.
+	return JSON.stringify([configVersion, correlations]);
+}
+
+/**
+ * The agent's stored provider session for this adapter, if active, unexpired and stored under
+ * the same scope. Only an offer: the worker checks the runtime version and falls back to a
+ * fresh start.
+ */
+async function storedSession(
+	uow: UnitOfWork,
+	agentId: string,
+	adapter: RuntimeAdapterId,
+	scope: string,
+): Promise<RuntimeSessionHandle | null> {
+	const [row] = await uow.tx.db
+		.select()
+		.from(runtimeSessions)
+		.where(
+			and(
+				eq(runtimeSessions.agentId, agentId),
+				eq(runtimeSessions.adapter, adapter),
+				eq(runtimeSessions.status, "active"),
+				or(isNull(runtimeSessions.expiresAt), gt(runtimeSessions.expiresAt, uow.now)),
+			),
+		);
+	if (row === undefined || row.resumeMetadata.scope !== scope) {
+		return null;
+	}
+	const handle = RuntimeSessionHandleSchema.safeParse({
+		adapter: row.adapter,
+		providerSessionId: row.providerSessionRef,
+		runtimeVersion: row.runtimeVersion,
+		expiresAt: row.expiresAt?.toISOString() ?? null,
+	});
+	return handle.success ? handle.data : null;
+}
 
 /**
  * Enqueues one attempt of a run for its worker. The deadline starts when the worker starts the
@@ -454,12 +519,21 @@ export type AttemptInit = Readonly<{
  */
 export async function enqueueAttempt(uow: UnitOfWork, init: AttemptInit): Promise<void> {
 	const start = init.startAfter ?? uow.now;
+	const runtime: RunRuntime = {
+		model: init.model,
+		sessionPolicy: init.sessionPolicy,
+		session:
+			init.sessionPolicy === "resumable-if-available"
+				? await storedSession(uow, init.agentId, init.adapter, init.sessionScope)
+				: null,
+	};
 	const jobId = await uow.jobs.send(
 		runQueue(init.adapter),
 		{
 			runId: init.runId,
 			attempt: init.attempt,
 			timeoutSeconds: init.timeoutSeconds,
+			runtime,
 			input: init.input,
 		},
 		{

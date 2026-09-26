@@ -19,3 +19,4 @@ rewritten in substance: a changed decision gets a new ADR that references the ol
 | [011](011-run-execution-protocol.md) | Run execution protocol between controller and workers | Accepted |
 | [012](012-mattermost-bridge.md) | Mattermost bridge: identity, signed routing, durable catch-up | Accepted |
 | [013](013-turn-context.md) | Turn context: stored threads, run summaries, reviewed shared memory | Accepted |
+| [014](014-cli-runtime-adapters.md) | CLI runtime adapters: confined processes, policy-mapped tools, optional sessions | Accepted |

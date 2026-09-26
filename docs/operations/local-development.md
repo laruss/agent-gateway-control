@@ -57,8 +57,14 @@ curl -s localhost:8080/health/ready
 | `GATEWAY_ROUTING_KEY` | required with `mattermost` | HMAC key of agent routing props (use `_FILE`) |
 | `SECRETS_DIR` | unset | directory standing in for `/run/secrets/` (bot tokens) |
 | `HEALTH_PORT` / `HEALTH_HOST` | `8080` / `127.0.0.1` | controller health endpoints |
-| `WORKER_ADAPTER` | `mock` | runtime adapter the worker serves |
+| `WORKER_ADAPTER` | `mock` | runtime adapter the worker serves: `mock`, `codex` or `claude-code` |
 | `WORKER_CONCURRENCY` | `1` | parallel runs per worker process |
+| `WORKER_WORKSPACE_ROOT` | `<tmp>/agent-gateway-workspaces` | absolute directory of the per-run workspaces |
+| `CODEX_BIN` / `CODEX_HOME` | `codex` / `~/.codex` | Codex CLI and its home (login, session files) |
+| `CODEX_API_KEY` | unset | API key instead of the login in `CODEX_HOME` (use `_FILE`) |
+| `CLAUDE_BIN` / `CLAUDE_CONFIG_DIR` | `claude` / `~/.claude` | Claude Code CLI and its config dir (login, session files) |
+| `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` | unset | credentials instead of the login in the config dir (use `_FILE`) |
+| `CLAUDE_MAX_TURNS` / `CLAUDE_MAX_BUDGET_USD` | `40` / unset | limits of one Claude Code call |
 
 ## With Mattermost
 
@@ -126,6 +132,44 @@ holds exactly what the runtime received: thread, memory and durable state.
 
 A FAILED agent keeps its failure through pause, disable/enable and kill-all; `runs redrive`
 is the only way out. Disabling an agent cancels its waits and expires its pending approvals.
+
+## Real runtimes: Codex and Claude Code
+
+The `codex` and `claude-code` adapters drive the installed CLIs non-interactively
+([ADR-014](../adr/014-cli-runtime-adapters.md)). Log in once with the home or config dir the
+worker will use (`codex login`, `claude auth login`), then check the installation:
+
+```bash
+bun run gateway runtime doctor codex         # version, login, a real structured turn,
+bun run gateway runtime doctor claude-code   # cancel, session resume, policy risks
+```
+
+The doctor spends a few real turns and prints no model output; exit code 1 means a check
+failed. Warnings are policy risks to review, not failures. To run agents on real runtimes,
+apply the configuration without `--mock-runtimes` and start one worker per adapter the agents
+use:
+
+```bash
+bun run gateway config apply config/examples
+WORKER_ADAPTER=codex bun run dev:worker
+WORKER_ADAPTER=claude-code bun run dev:worker
+```
+
+Each run gets an empty workspace that is removed afterwards. The runtime sees none of the
+worker's settings. Its built-in tools follow the agent's `permissions`:
+
+- `repository.read` reads files;
+- `workspace.write` edits them;
+- `tests.run` runs commands;
+- `web.search` and `web.fetch` reach the web.
+
+Posting, memory, mail and finance always go through the structured result. Under
+`session_policy: resumable-if-available` the next run resumes the agent's provider session.
+When the runtime no longer has that session, the run starts fresh.
+
+`bun run test:live` runs the doctor and the isolation checks against the installed CLIs
+(`RUNTIME_LIVE=codex` or `RUNTIME_LIVE=claude-code` selects one; `LIVE_CODEX_MODEL` and
+`LIVE_CLAUDE_MODEL` choose the models). It is not part of CI.
 
 ## Worker database role
 

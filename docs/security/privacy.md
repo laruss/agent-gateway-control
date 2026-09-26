@@ -28,3 +28,17 @@
   (`context_snapshots`), so a post deleted later remains in the snapshots of runs that already
   saw it.
 - The Gateway reads nothing from Direct Messages ([ADR-006](../adr/006-no-direct-messages-in-mvp.md)).
+
+## Runtime providers
+
+- A turn's whole prompt goes to the agent's runtime provider (OpenAI for Codex, Anthropic for
+  Claude Code). The prompt holds the organization rules, the agent's role, the thread, memory,
+  durable state and pending events, so posts in the agent's channels reach that provider. The
+  provider's own retention and training terms apply; choose the account and plan accordingly.
+- Under `session_policy: resumable-if-available` the CLI keeps each session's history on disk,
+  in the worker's `CODEX_HOME` or `CLAUDE_CONFIG_DIR`, until someone deletes it; the database
+  stores only the session id. Under `stateless` nothing is kept (`--ephemeral`,
+  `--no-session-persistence`). Deleting a post in Mattermost does not remove it from these
+  files.
+- Run workspaces are removed after each run. `gateway runtime doctor` never prints model output
+  or the account the CLI is logged in with.

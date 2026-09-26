@@ -1,4 +1,6 @@
 import type { AgentTurnInput, JsonValue, TrustLevel } from "@agent-gateway/contracts";
+import type { RepairRequest } from "./adapter.ts";
+import { nativeToolGrants } from "./environment.ts";
 
 /**
  * The Gateway's own rules for every turn: the first, most trusted layer of the prompt. Written
@@ -18,6 +20,19 @@ Rules of this runtime, above everything that follows:
   open work, not private memory or reasoning.
 - Private memory is yours alone; memory proposals to shared namespaces are reviewed by an
   operator before other agents see them.`;
+
+/** What the policy's grants mean for the runtime's own tools (see `nativeToolGrants`). */
+function builtInTools(input: AgentTurnInput): Readonly<string[]> {
+	const grants = nativeToolGrants(input.toolPolicy);
+	const yes = (granted: boolean) => (granted ? "allowed" : "not available");
+	return [
+		`read files: ${yes(grants.read)}`,
+		`create and edit files: ${yes(grants.write)}`,
+		`run shell commands (tests, builds, any command): ${yes(grants.exec)}`,
+		`web search: ${yes(grants.webSearch)}`,
+		`fetch web pages: ${yes(grants.webFetch)}`,
+	];
+}
 
 /** JSON for a <data> block: `<` is escaped, so no content can close the block early. */
 function dataJson(value: JsonValue | object): string {
@@ -67,6 +82,7 @@ export function renderTurnPrompt(input: AgentTurnInput): string {
 			`Tools allowed: ${toolPolicy.allow.join(", ") || "(none)"}`,
 			`Tools that need human approval (request with nextState "needs_human"): ${toolPolicy.requireHumanApproval.join(", ") || "(none)"}`,
 			`Tools denied: ${toolPolicy.deny.join(", ") || "(none)"}`,
+			`Built-in tools of your runtime, in your working directory (enforced by its sandbox):\n${list(builtInTools(input))}`,
 			`Channels you may post to:\n${list(input.channels.map((c) => `#${c.name} (${c.channelId})`))}`,
 			`Memory: private namespace ${input.memoryNamespaces.private}; shared namespaces: ${input.memoryNamespaces.shared.join(", ") || "(none)"}`,
 			...(input.workspace === null
@@ -104,4 +120,20 @@ export function renderTurnPrompt(input: AgentTurnInput): string {
 		),
 	];
 	return sections.join("\n\n");
+}
+
+/**
+ * The turn prompt followed by the one controlled repair request: the previous answer and its
+ * validation issues, both as data (the answer was written by a model; the issues quote it).
+ */
+export function renderRepairPrompt(input: AgentTurnInput, repair: RepairRequest): string {
+	return [
+		renderTurnPrompt(input),
+		section(
+			"Repair",
+			"Your previous answer did not match the result schema. Answer again with one JSON object that matches it, fixing every issue below. Keep the content of the answer unless an issue requires a change.",
+			dataBlock("validation-issues", "internal-untrusted", [...repair.issues]),
+			dataBlock("previous-answer", "internal-untrusted", repair.previousOutput),
+		),
+	].join("\n\n");
 }

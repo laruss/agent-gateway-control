@@ -79,7 +79,16 @@
   their adapter's queue tables (`gateway db grant-worker`), so they cannot touch domain tables,
   other adapters' jobs or timeouts; reports count only for runs of the reporting adapter; every report is re-validated by the controller, checked against the authority and
   run scope fixed at scheduling, and ignored when it is stale or names another agent's run
-  ([ADR-011](../adr/011-run-execution-protocol.md)). Container hardening in Phase 4 and 8.
+  ([ADR-011](../adr/011-run-execution-protocol.md)). Container hardening in Phase 8.
+- Status (Phase 4): the Codex and Claude Code adapters run each call in its own process group,
+  stopped as a whole on deadline and cancellation. Each run works in its own workspace, removed
+  afterwards. The runtime process gets a clean environment (no database URL, no worker
+  settings), and the commands the model runs get no credentials. Built-in tools follow the
+  agent's tool policy, fail-closed; user config, skills, AGENTS.md/CLAUDE.md, plugins, hooks,
+  MCP and connectors are off. Commands run in the runtime's OS sandbox: they cannot read the
+  home directory, the CLI's login and session files, other runs' workspaces or `/run/secrets`,
+  write only into the workspace and have no network. System paths stay readable (reported by
+  `gateway runtime doctor`) ([ADR-014](../adr/014-cli-runtime-adapters.md)).
 
 ### T5. Supply chain
 
@@ -91,6 +100,9 @@
 ### T6. Runaway spend
 
 - Per-agent and global budgets, max turns, run duration, cascade limits, cost metrics.
+- Status (Phase 4): every turn is killed at its deadline. Claude Code calls are bounded by
+  `CLAUDE_MAX_TURNS` and, optionally, `CLAUDE_MAX_BUDGET_USD`. Runtime usage (tokens, and cost
+  where the CLI reports it) is stored per run.
 - Real payments only through approval ([ADR-007](../adr/007-approval-model.md)).
 
 ### T7. Home server exposure
@@ -124,5 +136,6 @@
 
 ## Open questions
 
-- Storage of provider session ids: encrypted in the database or a reference to a secret store,
-  decide in Phase 4.
+- None open. Provider session ids (decided in Phase 4) are stored in plain text. A session id is
+  only a reference: the history it names lives in the worker's `CODEX_HOME` or
+  `CLAUDE_CONFIG_DIR`, and resuming it takes that directory and the worker's login.

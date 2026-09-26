@@ -47,7 +47,7 @@ import { clampWaitTimeout, isThreadBound } from "../waits.ts";
 import { parseThreadRef, recordThreadSummary, threadCorrelationOf } from "./context-store.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
 import { lockMemoryKey, supersedeMemory } from "./memory.ts";
-import { enqueueAttempt, enqueueRunDeadline, scheduleAgent } from "./scheduler.ts";
+import { enqueueAttempt, enqueueRunDeadline, scheduleAgent, sessionScope } from "./scheduler.ts";
 import {
 	audit,
 	enqueueOutbox,
@@ -237,7 +237,7 @@ async function applyFailure(
 		const timeoutSeconds = run.timeoutSeconds;
 		const deadline = new Date(startAfter.getTime() + timeoutSeconds * 1000);
 		const [snapshot] = await db
-			.select({ input: contextSnapshots.input })
+			.select({ input: contextSnapshots.input, configVersion: contextSnapshots.configVersion })
 			.from(contextSnapshots)
 			.where(eq(contextSnapshots.runId, run.id));
 		if (snapshot === undefined) {
@@ -268,6 +268,10 @@ async function applyFailure(
 			runId: run.id,
 			attempt,
 			adapter: run.runtimeAdapter,
+			agentId: agent.id,
+			model: run.model,
+			sessionPolicy: agent.config.runtime.session_policy,
+			sessionScope: sessionScope(snapshot.configVersion, snapshot.input),
 			input,
 			timeoutSeconds,
 			startAfter,
@@ -431,7 +435,7 @@ async function applyCompletion(
 	const artifactIds = await persistArtifacts(uow, run, result);
 	await persistMessages(uow, run, agent, result, artifactIds, scope);
 	await persistMemory(uow, run, agent, result);
-	await persistSession(uow, agent.id, result);
+	await persistSession(uow, agent.id, result, sessionScope(snapshot.configVersion, snapshot.input));
 	// A thread's summary is read by every agent working in that thread's channel: a run that also
 	// saw posts of another channel keeps its summary to itself.
 	const threadRef = parseThreadRef(snapshot.threadRef);
@@ -635,6 +639,7 @@ async function persistSession(
 	uow: UnitOfWork,
 	agentId: string,
 	result: AgentTurnResult,
+	scope: string,
 ): Promise<void> {
 	const session = result.session;
 	if (session === null) {
@@ -645,6 +650,7 @@ async function persistSession(
 		adapter: session.adapter,
 		providerSessionRef: session.providerSessionId,
 		runtimeVersion: session.runtimeVersion,
+		resumeMetadata: { scope },
 		lastUsedAt: uow.now,
 		expiresAt: session.expiresAt === null ? null : new Date(session.expiresAt),
 		status: "active",

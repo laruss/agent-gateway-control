@@ -50,7 +50,9 @@ import {
 	ensureQueues,
 	transactionalJobSink,
 } from "@agent-gateway/queue";
+import { runtimeDoctor } from "@agent-gateway/runtime-sdk";
 import { requireSetting } from "@agent-gateway/service";
+import { createRuntimeAdapter, workspaceRoot } from "@agent-gateway/worker";
 import type { PgBoss } from "pg-boss";
 import { loadConfigDirectory } from "./config-files.ts";
 import { mattermostBootstrap, mattermostReconcile } from "./mattermost-commands.ts";
@@ -98,6 +100,10 @@ export const USAGE = `gateway <command>
                                       MATTERMOST_URL and a temporary MATTERMOST_ADMIN_TOKEN)
   mattermost reconcile [--secrets-dir <dir>]
                                       check tokens, bot accounts and memberships
+  runtime doctor <adapter> [--model <id>]
+                                      preflight of a runtime on this host, configured like
+                                      its worker: version, auth, a real structured turn,
+                                      cancel, session resume, policy risks (spends turns)
   kill-all [--release]`;
 
 function actor(): string {
@@ -269,6 +275,15 @@ export async function runCommand(args: Readonly<string[]>, out: Output): Promise
 		}
 		out.print("worker role limited to its adapter's queues");
 		return 0;
+	}
+	if (group === "runtime" && action === "doctor") {
+		const adapter = RuntimeAdapterIdSchema.parse(arg(args, 2, "adapter"));
+		const report = await runtimeDoctor(createRuntimeAdapter(adapter), {
+			workspaceRoot: workspaceRoot(),
+			model: flag(args, "model"),
+		});
+		out.print(json(report));
+		return report.ok ? 0 : 1;
 	}
 	if (group === "config" && (action === "validate" || action === "apply")) {
 		const input = loadConfigDirectory(arg(args, 2, "dir"), resolve(flag(args, "root") ?? "."));

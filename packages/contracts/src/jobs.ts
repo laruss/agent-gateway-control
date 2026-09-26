@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { SessionPolicySchema } from "./agent-config.ts";
 import { AgentIdSchema, type JsonObject, type RuntimeAdapterId, UuidSchema } from "./common.ts";
 import { AgentTurnInputSchema, RuntimeSessionHandleSchema, RuntimeUsageSchema } from "./turn.ts";
 
@@ -63,12 +64,26 @@ export type JobSink = Readonly<{
 	send: (queue: QueueName, data: JsonObject, options?: SendOptions) => Promise<string>;
 }>;
 
+/** How the worker drives the runtime for one attempt; never shown to the model. */
+export const RunRuntimeSchema = z.strictObject({
+	/** Provider model id from the agent's config; null lets the runtime use its default. */
+	model: z.string().min(1).max(255).nullable(),
+	sessionPolicy: SessionPolicySchema,
+	/**
+	 * The agent's last provider session, offered only under `resumable-if-available`. The worker
+	 * falls back to a fresh start when the runtime cannot resume it.
+	 */
+	session: RuntimeSessionHandleSchema.nullable(),
+});
+export type RunRuntime = z.infer<typeof RunRuntimeSchema>;
+
 /** A run attempt handed to a worker; the input is complete, the worker reads no domain state. */
 export const RunJobSchema = z.strictObject({
 	runId: UuidSchema,
 	attempt: z.int().min(1),
 	/** The run's time budget; the worker sets `input.deadline` from it when the run starts. */
 	timeoutSeconds: z.int().min(1).max(86_400),
+	runtime: RunRuntimeSchema,
 	input: AgentTurnInputSchema,
 });
 export type RunJob = z.infer<typeof RunJobSchema>;

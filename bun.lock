@@ -29,7 +29,9 @@
         "@agent-gateway/logging": "workspace:*",
         "@agent-gateway/mattermost": "workspace:*",
         "@agent-gateway/queue": "workspace:*",
+        "@agent-gateway/runtime-sdk": "workspace:*",
         "@agent-gateway/service": "workspace:*",
+        "@agent-gateway/worker": "workspace:*",
         "pg": "8.23.0",
         "pg-boss": "12.34.0",
         "zod": "4.6.5",
@@ -68,6 +70,8 @@
         "@agent-gateway/contracts": "workspace:*",
         "@agent-gateway/logging": "workspace:*",
         "@agent-gateway/queue": "workspace:*",
+        "@agent-gateway/runtime-claude": "workspace:*",
+        "@agent-gateway/runtime-codex": "workspace:*",
         "@agent-gateway/runtime-mock": "workspace:*",
         "@agent-gateway/runtime-sdk": "workspace:*",
         "@agent-gateway/service": "workspace:*",
@@ -166,6 +170,22 @@
         "@types/pg": "8.23.1",
       },
     },
+    "packages/runtime-claude": {
+      "name": "@agent-gateway/runtime-claude",
+      "version": "0.0.0",
+      "dependencies": {
+        "@agent-gateway/contracts": "workspace:*",
+        "@agent-gateway/runtime-sdk": "workspace:*",
+      },
+    },
+    "packages/runtime-codex": {
+      "name": "@agent-gateway/runtime-codex",
+      "version": "0.0.0",
+      "dependencies": {
+        "@agent-gateway/contracts": "workspace:*",
+        "@agent-gateway/runtime-sdk": "workspace:*",
+      },
+    },
     "packages/runtime-mock": {
       "name": "@agent-gateway/runtime-mock",
       "version": "0.0.0",
@@ -226,6 +246,10 @@
     "@agent-gateway/outbox": ["@agent-gateway/outbox@workspace:packages/outbox"],
 
     "@agent-gateway/queue": ["@agent-gateway/queue@workspace:packages/queue"],
+
+    "@agent-gateway/runtime-claude": ["@agent-gateway/runtime-claude@workspace:packages/runtime-claude"],
+
+    "@agent-gateway/runtime-codex": ["@agent-gateway/runtime-codex@workspace:packages/runtime-codex"],
 
     "@agent-gateway/runtime-mock": ["@agent-gateway/runtime-mock@workspace:packages/runtime-mock"],
 

@@ -7,6 +7,7 @@ import type {
 	WorkingSummary,
 } from "@agent-gateway/contracts";
 import { MattermostPostDataSchema } from "@agent-gateway/contracts";
+import { INVALID_OUTPUT_MARKER } from "@agent-gateway/runtime-sdk";
 
 /** Scenarios the mock can play, selected by a `[mock:<name> <arg>]` directive in the trigger. */
 export const MOCK_SCENARIOS = [
@@ -261,5 +262,9 @@ export function scenarioOutput(
 
 /** Output that violates the schema: unknown field, missing summary. */
 export function invalidOutput(): JsonValue {
-	return { publicMessages: [], nextState: { kind: "idle" }, unexpected: true };
+	return {
+		publicMessages: [],
+		nextState: { kind: "idle" },
+		[INVALID_OUTPUT_MARKER]: INVALID_OUTPUT_MARKER,
+	};
 }

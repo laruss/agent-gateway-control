@@ -65,8 +65,8 @@ Known gaps, deferred:
 - [x] Check `WaitCondition.expectedSenderUserIds` against the thread participants (and the
   owners). Phase 3.
 - [ ] Typed parameter sets per financial action (Phase 7).
-- [ ] Phase 4: verify each provider actually accepts `agent-turn-model-output.schema.json` (the
-  linter only checks the documented subset locally).
+- [x] Verify each provider actually accepts `agent-turn-model-output.schema.json`. Phase 4: Codex
+  accepts it as is; Claude Code accepts it without `$schema`, which its adapter drops.
 - [ ] Phase 7: the approval card renders parameters in a code block (so Markdown in values is
   inert), separate from the summary, and flags mixed-script values (homoglyphs are a rendering
   concern, not a contract one).
@@ -201,6 +201,7 @@ Known gaps, deferred:
   an approval request expires and resumes the agent with a timeout.
 - `/metrics` is served but empty; metrics come with observability work.
 - Provider sessions are stored when returned but not resumed yet (`continueTurn` unused).
+  Resumed since Phase 4.
 - `max_active_runs` is limited to 1.
 
 Deliberate choices in this phase:
@@ -786,3 +787,198 @@ Findings per round (P1 / P2):
 | 5 | 1 / 1 (P1 re-rated P2) | 0 / 0 | fixed |
 | 6 (Codex only) | 0 / 2 | - | fixed |
 | 7 (Codex only) | 0 / 0 (one P2 re-rated P3) | - | closed |
+
+## Phase 4 - Codex and Claude Code
+
+Status: **done** (review closed after round 5, the round limit: its two P2s are fixed and
+covered by tests)
+
+| Item | State | Evidence |
+|------|-------|----------|
+| Codex adapter: `codex exec --json`, `--output-schema`, resume by thread id | done | `packages/runtime-codex` |
+| Claude Code adapter: `claude -p --output-format json`, `--json-schema`, `--resume` | done | `packages/runtime-claude` |
+| Process group per call, stopped as a whole on deadline, cancel and kill-all; bounded output | done | `runtime-sdk/src/process.ts` |
+| Clean runtime environment; no credentials in the model's commands | done | `runtime-sdk/src/environment.ts`, both adapters |
+| Workspace per attempt, created empty and removed by the worker | done | `createRunWorkspace`, `apps/worker/src/run-job.ts` |
+| Model commands in the OS sandbox: no home, login, secrets or other runs; writes to the workspace only; no network | done | Codex permission profile, Claude Code Bash sandbox |
+| Built-in tools mapped from the tool policy, fail-closed | done | `nativeToolGrants`, adapters' sandbox and tool flags |
+| Session resume under `resumable-if-available`, within the same config version and conversation; fresh start on any resume failure | done | `RunJob.runtime`, `scheduler.ts` (`sessionScope`, `storedSession`), `executeTurn` |
+| One repair turn with the validation issues as data | done | `renderRepairPrompt` |
+| `gateway runtime doctor <adapter>`: version, login, structured turn, cancel, resume, risks | done | `runtime-sdk/src/doctor.ts`, `apps/cli` |
+| Worker builds its adapter from settings (`CODEX_*`, `CLAUDE_*`, `WORKER_WORKSPACE_ROOT`) | done | `apps/worker/src/adapters.ts` |
+
+Acceptance for each adapter. CI runs the contract suite against fake CLIs. The live suite ran
+against codex-cli 0.156.1 and Claude Code 2.1.283:
+
+- [x] Doctor passes (live; `gateway runtime doctor` on both).
+- [x] Structured output passes: reply and a structured wait for another agent (contract suite
+  on the fake, live suite on the real CLI; both CLIs accept the provider schema).
+- [x] Timeout and cancel tested: the deadline and an abort stop the whole process group, and a
+  child the runtime started is gone afterwards (fake). Cancel of a real turn was checked by the
+  doctor.
+- [x] Workspace isolation verified. Live: a write inside the workspace succeeds and a write
+  outside it does not. Fake: the process runs in the run workspace, the workspace is removed
+  afterwards, and the worker's `DATABASE_URL` and tokens do not reach the runtime.
+- [x] Tool allowlist verified. Live: without `workspace.write` nothing is written. Fake: the
+  policy maps onto the sandbox, shell and web flags (Codex) and the built-in tool list
+  (Claude Code).
+- [x] Invalid output is handled without posting raw content: one repair, then `invalid_output`,
+  and the detail carries no model text (contract suite; integration test for the controller
+  side).
+- [x] Session resume fallback works: the stored session is offered to the next run; an unknown
+  session, or one from another runtime version, starts fresh (contract suite, worker tests,
+  and an integration test across a worker restart).
+
+Known gaps, deferred:
+
+- Workspaces are empty directories: git worktrees per run and capturing diffs and commits as
+  artifacts need repository configuration (`collectArtifacts` returns nothing).
+- Granted commands can read system paths (and `/tmp` under Claude Code); secrets must stay in
+  the denied places. Container hardening is Phase 8.
+- On Codex, `repository.read` without `tests.run` gives no file access (Codex reads only through
+  its shell), and `tests.run` sees system toolchains only.
+- `runtime.profile` is not used by these adapters.
+- A command that detaches into a new session survives cancellation (sandboxed, workspace
+  removed); a per-run cgroup or container stops it (Phase 8).
+- One stored session per agent and adapter: interleaved conversations replace each other's.
+- Codex does not report cost; its usage has tokens only.
+
+Deliberate choices in this phase ([ADR-014](docs/adr/014-cli-runtime-adapters.md)):
+
+- CLIs, not SDKs or app servers: one process per call, the same control for both runtimes.
+- `tests.run` grants any command, not only tests; finer command policies belong to the Tool
+  Broker.
+- A repair turn always starts fresh instead of resuming the first attempt's session.
+
+### Phase 4 review log
+
+- Round 1 (Codex + Opus subagent): Codex 5 P1 + 4 P2 + 1 P3, Opus 1 P1 + 3 P2 + 6 P3.
+  - Rejected: Claude sessions not resuming across workspaces (Codex P1). Checked on the real CLI:
+    a session started in one directory resumes from another, and the doctor's resume check
+    runs across workspaces.
+  - Fixed, both reviewers' P1: granted commands could read the CLI login, session transcripts,
+    secret files and other runs. They now run in the OS sandbox (Codex permission profile,
+    Claude Code Bash sandbox). A live test checks that another run's file does not leak.
+  - Fixed, re-rated P2 (Codex P1s):
+    - a descendant that left the process group could hang cancel: the result waits for exit
+      plus a bounded drain, and cancel is bounded;
+    - Claude stdout could reach error details: only its size is reported now;
+    - a model-written `AGENTS.md` could reach the repair turn (needs `workspace.write` and a
+      git repository): `project_doc_max_bytes=0`.
+  - Fixed, P2:
+    - sessions are scoped to config version and conversation;
+    - any failure of a resumed call starts fresh (one bad session no longer fails every run),
+      and sessions expire after seven days;
+    - Codex's `thread … not found` counts as a missing session;
+    - a cut event stream no longer loses the answer (read from `-o`, the stream keeps head and
+      tail, a completed turn is required);
+    - an attempt gets a fresh, attempt-specific workspace;
+    - Codex gets a shell only with `tests.run`;
+    - Claude budget and structured-output limits are permanent failures.
+  - Fixed, P3:
+    - Codex output tokens no longer count reasoning twice;
+    - the workspace root and agent directory must be the worker's own real directories;
+    - the invalid-output contract test checks for leaks.
+  - Declined, P3: a repair turn replacing the stored session; jobs queued before this change
+    failing validation (nothing is deployed); a retry reading the session policy from the
+    current config.
+- Round 2 (Codex + Opus subagent): Codex 3 P1 + 2 P2, Opus 2 P2 + 8 P3.
+  - Fixed, P2:
+    - Codex listed skills, the operator's and any written into the workspace, even with
+      `--ignore-user-config` (checked on the real CLI): `skills.include_instructions=false`;
+    - Claude Code's scratch and Bash temp files went to a shared per-user `/tmp` directory,
+      readable and writable across runs (Codex P1, Opus P2; re-rated P2: the files hold command
+      output, not credentials): `TMPDIR` and `CLAUDE_CODE_TMPDIR` point into the attempt;
+    - validation messages quote unknown key names into the failure detail (Codex P1, re-rated
+      P2: the detail goes to operators, not to channels): the detail has paths and codes only,
+      and the leak test uses a key name;
+    - the round-1 reasoning-token fix had not been applied: fixed and tested.
+  - Fixed, P3:
+    - an unknown model or rejected CLI config is a permanent failure;
+    - Codex commands get a temp directory;
+    - `view_image` is disabled;
+    - the doctor runs a sandboxed command;
+    - the workspace root must not be writable by others;
+    - ADR wording.
+  - Deferred: a detached (`setsid`) command outliving cancellation (Codex P1, re-rated P2: it
+    stays sandboxed, without network or workspace). Only a per-run cgroup or container can
+    stop it (Phase 8, documented in ADR-014).
+  - Rejected: Codex resuming in the old session's directory (checked: a resumed turn runs and
+    writes in the new workspace).
+  - Declined, P3:
+    - the fresh start after a resumed call hit a limit spends that limit once more; the
+      fallback is what keeps one bad session from failing every run;
+    - one session row per agent (documented).
+- Round 3 (Codex + Opus subagent): Codex 2 P1 + 3 P2, Opus 1 P2 + 6 P3.
+  - Fixed, P2:
+    - a workspace the model made unremovable (a directory without its write bit) threw from the
+      cleanup and lost the run's report: removal restores access and retries, and a cleanup
+      failure is logged without replacing the report;
+    - a session of a turn that also carried inbox events from other conversations was offered
+      to later turns of the trigger's conversation alone (Codex P1, re-rated P2: every
+      conversation involved was in the agent's own channels). The scope now covers every
+      carried conversation;
+    - Claude's "no conversation found" was matched against a successful answer as well;
+    - the doctor's sandbox check trusted the model's word: it now posts a token that exists
+      only in a workspace file, and the live isolation test does the same;
+    - Claude accepts a result only when the CLI exits with 0.
+  - Fixed, P3:
+    - Codex commands can write their temp directory without `workspace.write`;
+    - Claude Bash cannot read the worker's `$TMPDIR`;
+    - deny paths are resolved (`realpath`) before they reach a sandbox;
+    - the worker checks its workspace root at startup.
+  - Declined: `cancel(runId)` before a process is registered (Codex P1, re-rated P3). The Gateway
+    cancels only through the turn's signal, which every start and the fallback check; `cancel`
+    runs after that abort.
+  - Found while fixing the doctor check: with a proof word that exists only in a workspace file,
+    the live tests showed that models had not run the commands at all. Codex took `tests.run`
+    for a tool name it lacked, and read the profile's `/tmp` denial as covering its workspace.
+    Claude refused to post a value called a token. The earlier "no leak" results were
+    therefore vacuous. Fixed:
+    - the prompt names the granted built-in tools in plain words;
+    - `tests.run` implies reading;
+    - the Codex profile lists the workspace by its own path;
+    - the live checks require the proof word, using harmless wording.
+- Round 4 (Codex + Opus subagent): Codex 3 P1 + 2 P2, Opus 1 P2 + 3 P3.
+  - Fixed, P2:
+    - the sandbox checks could pass without Bash, because `tests.run` gives Claude the Read tool
+      (both reviewers). The doctor and the live test now require a file only a shell can create
+      (a copy of a workspace word, with no file-write grant);
+    - Claude's Bash wrote temp files to the shared `/tmp/claude-<uid>`. Claude Code falls back
+      to it whenever the configured temp path is long, which a workspace path always is (found by
+      the new doctor check; the reviewer rated it P2). Each call now gets a short
+      `/tmp/agw-*` directory, removed afterwards, and Bash cannot read the rest of `/tmp`;
+    - with `HOME` unset, Claude's Bash could read the account's home (Codex P1, re-rated P2:
+      needs a worker started without HOME): the home comes from the account as well;
+    - `tests.run` let Claude write the workspace while Codex kept it read-only (Codex P1,
+      re-rated P2: the workspace is the run's own scratch, and nothing leaked). Aligned:
+      commands write the workspace on both, and an explicit deny of `workspace.write` withholds
+      `tests.run`.
+  - Fixed, P3:
+    - session scopes are JSON-encoded (Codex P1, re-rated P3: ids with commas would have to
+      collide exactly);
+    - Codex matches a missing session only on a failed call;
+    - workspace cleanup does not follow a symlink out of the workspace;
+    - an explicit deny of `repository.read` withholds writing and commands.
+- Round 5 (Codex + Opus subagent): Codex 0 P1 + 2 P2, Opus 0 P1/P2 + 3 P3.
+  - Fixed, P2:
+    - the shell proof wrote into `.tmp`, which the Claude workspace does not have: the proofs
+      now go to the workspace root;
+    - an abort during Codex's call setup could recreate a workspace the worker had already
+      removed: the attempt's `.tmp` is created only inside an existing workspace.
+  - Fixed, P3:
+    - the Claude risk text and ADR-014 say that Claude's Bash denies reads by list;
+    - Codex's comment and the ADR say `tests.run` makes the workspace writable;
+    - the ADR requires the doctor to pass on the deployment host before `tests.run` is granted
+      (only macOS was verified in this phase).
+  - Review closed at the round limit.
+
+Findings per round (P1 / P2, as reported):
+
+| Round | Codex | Opus | Outcome |
+|-------|-------|------|---------|
+| 1 | 5 / 4 (one P1 rejected, three re-rated P2) | 1 / 3 | fixed |
+| 2 | 3 / 2 (two P1 re-rated P2, one deferred) | 0 / 2 | fixed |
+| 3 | 2 / 3 (one P1 re-rated P2, one declined) | 0 / 1 | fixed |
+| 4 | 3 / 2 (P1s re-rated P2, P2, P3) | 0 / 1 | fixed |
+| 5 | 0 / 2 | 0 / 0 | fixed, closed |

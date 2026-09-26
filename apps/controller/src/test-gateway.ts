@@ -1,4 +1,5 @@
 import { readdirSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -135,6 +136,7 @@ export async function startTestGateway(options: TestGatewayOptions = {}): Promis
 				connectionString: workerConnectionString,
 				adapter: "mock",
 				concurrency: 4,
+				workspaceRoot: join(tmpdir(), "agent-gateway-test-workspaces"),
 				log: silentLogger,
 				pollingIntervalSeconds: 0.5,
 			});

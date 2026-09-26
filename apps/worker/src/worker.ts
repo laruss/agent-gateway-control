@@ -1,14 +1,16 @@
 import { type RuntimeAdapterId, runQueue } from "@agent-gateway/contracts";
 import type { Logger } from "@agent-gateway/logging";
 import { createBoss, directJobSink } from "@agent-gateway/queue";
-import { createMockRuntime } from "@agent-gateway/runtime-mock";
-import type { RuntimeAdapter } from "@agent-gateway/runtime-sdk";
+import { checkWorkspaceRoot, type RuntimeAdapter } from "@agent-gateway/runtime-sdk";
+import { createRuntimeAdapter } from "./adapters.ts";
 import { processRunJob } from "./run-job.ts";
 
 export type WorkerOptions = Readonly<{
 	connectionString: string;
 	adapter: RuntimeAdapterId;
 	concurrency: number;
+	/** Absolute directory under which every run gets its own workspace. */
+	workspaceRoot: string;
 	log: Logger;
 	/** Overrides the adapter built from `adapter`, e.g. in tests. */
 	runtime?: RuntimeAdapter;
@@ -21,25 +23,17 @@ export type RunningWorker = Readonly<{
 	stop: () => Promise<void>;
 }>;
 
-function createAdapter(id: RuntimeAdapterId): RuntimeAdapter {
-	switch (id) {
-		case "mock":
-			return createMockRuntime();
-		default:
-			throw new Error(`runtime adapter '${id}' is not implemented yet`);
-	}
-}
-
 /**
  * Serves one runtime adapter's queue. Refuses to start when the adapter's probe fails, so a
  * worker without a working runtime never takes jobs.
  */
 export async function startWorker(options: WorkerOptions): Promise<RunningWorker> {
-	const adapter = options.runtime ?? createAdapter(options.adapter);
+	const adapter = options.runtime ?? createRuntimeAdapter(options.adapter);
 	const probe = await adapter.probe();
 	if (!probe.ok) {
 		throw new Error(`runtime '${adapter.id}' probe failed: ${probe.detail}`);
 	}
+	await checkWorkspaceRoot(options.workspaceRoot);
 	const log = options.log.child({ adapter: adapter.id, runtime_version: probe.runtimeVersion });
 	const boss = createBoss(options.connectionString, "client");
 	boss.on("error", (error) => log.error("pg-boss error", { error_message: error.message }));
@@ -55,12 +49,15 @@ export async function startWorker(options: WorkerOptions): Promise<RunningWorker
 		async ([job]) => {
 			if (job !== undefined) {
 				await processRunJob(
-					adapter,
-					probe.runtimeVersion,
+					{
+						adapter,
+						runtimeVersion: probe.runtimeVersion,
+						workspaceRoot: options.workspaceRoot,
+						reports,
+						log: log.child({ job_id: job.id }),
+					},
 					job.data,
-					reports,
 					job.signal,
-					log.child({ job_id: job.id }),
 				);
 			}
 		},

@@ -1,8 +1,10 @@
-import type { AgentTurnInput } from "@agent-gateway/contracts";
+import { randomUUID } from "node:crypto";
+import type { AgentTurnInput, RuntimeSessionHandle } from "@agent-gateway/contracts";
 import {
 	type RuntimeAdapter,
 	RuntimeError,
 	type RuntimeTurnOutput,
+	SessionUnavailableError,
 	type TurnOptions,
 } from "@agent-gateway/runtime-sdk";
 import { invalidOutput, mockDirective, scenarioOutput } from "./scenarios.ts";
@@ -37,11 +39,23 @@ function hang(signal: AbortSignal): Promise<never> {
 /**
  * Deterministic runtime for tests and development. The scenario comes from a `[mock:...]`
  * directive in the triggering post; see `MOCK_SCENARIOS`. `flaky` fails the first call of a
- * run and succeeds afterwards, which exercises controller retries.
+ * run and succeeds afterwards, which exercises controller retries. Sessions live in memory,
+ * so a restarted mock resumes none of them.
  */
 export function createMockRuntime(options: MockRuntimeOptions = {}): RuntimeAdapter {
 	const clock = options.clock ?? (() => new Date());
 	const calls = new Map<string, number>();
+	const sessions = new Set<string>();
+	const newSession = (): RuntimeSessionHandle => {
+		const providerSessionId = randomUUID();
+		sessions.add(providerSessionId);
+		return {
+			adapter: "mock",
+			providerSessionId,
+			runtimeVersion: MOCK_RUNTIME_VERSION,
+			expiresAt: null,
+		};
+	};
 
 	const turn = async (
 		input: AgentTurnInput,
@@ -54,7 +68,7 @@ export function createMockRuntime(options: MockRuntimeOptions = {}): RuntimeAdap
 		const done = (modelOutput: RuntimeTurnOutput["modelOutput"]): RuntimeTurnOutput => ({
 			modelOutput,
 			usage: usage(1),
-			session: null,
+			session: turnOptions.persistSession ? newSession() : null,
 		});
 		switch (directive.scenario) {
 			case "slow":
@@ -83,10 +97,21 @@ export function createMockRuntime(options: MockRuntimeOptions = {}): RuntimeAdap
 
 	return {
 		id: "mock",
-		probe: async () => ({ ok: true, runtimeVersion: MOCK_RUNTIME_VERSION, detail: "in-process" }),
+		capabilities: { sessionResume: true },
+		probe: async () => ({
+			ok: true,
+			runtimeVersion: MOCK_RUNTIME_VERSION,
+			detail: "in-process",
+			risks: [],
+		}),
 		health: async () => ({ healthy: true, detail: "in-process" }),
 		startTurn: (input, turnOptions) => turn(input, turnOptions, false),
-		continueTurn: (_session, input, turnOptions) => turn(input, turnOptions, false),
+		continueTurn: async (session, input, turnOptions) => {
+			if (!sessions.has(session.providerSessionId)) {
+				throw new SessionUnavailableError("unknown mock session");
+			}
+			return turn(input, turnOptions, false);
+		},
 		repairTurn: (input, _repair, turnOptions) => turn(input, turnOptions, true),
 		cancel: async () => ({ cancelled: true, detail: "in-process" }),
 		collectArtifacts: async () => [],
