@@ -112,6 +112,7 @@
               "approval.requested",
               "approval.granted",
               "approval.denied",
+              "approval.resolved",
               "google.gmail.notification.received",
               "google.gmail.message.received",
               "timer.fired",

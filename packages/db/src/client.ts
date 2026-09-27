@@ -191,6 +191,38 @@ export async function grantWorkerRole(
 	role: string,
 	queues: WorkerQueues,
 ): Promise<void> {
+	await grantQueueRole(pool, role, [queues], []);
+}
+
+/** The functions a tool runner may call: the `begin` gate and the stop check (ADR-018). */
+const TOOL_RUNNER_FUNCTIONS = [
+	"gateway_begin_tool_action(uuid, integer, text)",
+	"gateway_tool_action_stop_requested(uuid)",
+] as const;
+
+/**
+ * Limits an existing PostgreSQL role to the tool actions of the given namespaces: fetch and
+ * settle their execute jobs, send their reports, dead-letter their failed jobs, and call
+ * `gateway_begin_tool_action`, the one check that lets an approved action run, and
+ * `gateway_tool_action_stop_requested`. It reads no domain table. Run it again after `db migrate`.
+ */
+export async function grantToolRunnerRole(
+	pool: pg.Pool,
+	role: string,
+	queues: Readonly<WorkerQueues[]>,
+): Promise<void> {
+	if (queues.length === 0) {
+		throw new Error("a tool runner role needs at least one namespace");
+	}
+	await grantQueueRole(pool, role, queues, TOOL_RUNNER_FUNCTIONS);
+}
+
+async function grantQueueRole(
+	pool: pg.Pool,
+	role: string,
+	queueSets: Readonly<WorkerQueues[]>,
+	functions: Readonly<string[]>,
+): Promise<void> {
 	if (!ROLE_NAME.test(role)) {
 		throw new Error(`invalid role name '${role}'`);
 	}
@@ -199,9 +231,10 @@ export async function grantWorkerRole(
 		const quoted = client.escapeIdentifier(role);
 		await client.query("BEGIN");
 		await refuseUnrestrictableRole(client, role);
+		const names = queueSets.flatMap((q) => [q.run, q.report, q.deadLetter]);
 		const tables = await client.query<{ name: string; table_name: string; partition: boolean }>(
 			"select name, table_name, partition from pgboss.queue where name = any($1)",
-			[[queues.run, queues.report, queues.deadLetter]],
+			[names],
 		);
 		const allowedTables = new Map<string, Readonly<TablePrivilege[]>>([
 			["pgboss.queue", ["SELECT"]],
@@ -222,28 +255,40 @@ export async function grantWorkerRole(
 		await client.query(`REVOKE ALL ON ALL TABLES IN SCHEMA pgboss FROM ${quoted}`);
 		await client.query(`GRANT USAGE ON SCHEMA pgboss TO ${quoted}`);
 		await client.query(`GRANT SELECT ON pgboss.queue, pgboss.version TO ${quoted}`);
-		await client.query(
-			`GRANT SELECT, INSERT, UPDATE, DELETE ON ${tableOf(queues.run, ["SELECT", "INSERT", "UPDATE", "DELETE"])} TO ${quoted}`,
-		);
-		await client.query(
-			`GRANT SELECT, INSERT ON ${tableOf(queues.report, ["SELECT", "INSERT"])} TO ${quoted}`,
-		);
-		await client.query(
-			`GRANT SELECT, INSERT ON ${tableOf(queues.deadLetter, ["SELECT", "INSERT"])} TO ${quoted}`,
-		);
+		for (const queues of queueSets) {
+			await client.query(
+				`GRANT SELECT, INSERT, UPDATE, DELETE ON ${tableOf(queues.run, ["SELECT", "INSERT", "UPDATE", "DELETE"])} TO ${quoted}`,
+			);
+			await client.query(
+				`GRANT SELECT, INSERT ON ${tableOf(queues.report, ["SELECT", "INSERT"])} TO ${quoted}`,
+			);
+			await client.query(
+				`GRANT SELECT, INSERT ON ${tableOf(queues.deadLetter, ["SELECT", "INSERT"])} TO ${quoted}`,
+			);
+		}
 		// pg-boss settles a failed job by moving it through the parent job table (delete, then
 		// insert of the retry or dead letter copy). Row-level security keeps that insert to the
-		// adapter's own queues; the controller owns the table and is not subject to it.
+		// role's own queues; the controller owns the table and is not subject to it.
 		await client.query(`GRANT INSERT ON pgboss.job TO ${quoted}`);
 		await client.query("ALTER TABLE pgboss.job ENABLE ROW LEVEL SECURITY");
 		// Hashed: role names up to 63 characters must not collide after identifier truncation.
 		const policy = client.escapeIdentifier(
 			`worker_insert_${createHash("sha256").update(role).digest("hex").slice(0, 32)}`,
 		);
+		const insertable = queueSets
+			.flatMap((q) => [q.run, q.deadLetter])
+			.map((name) => client.escapeLiteral(name))
+			.join(", ");
 		await client.query(`DROP POLICY IF EXISTS ${policy} ON pgboss.job`);
 		await client.query(
-			`CREATE POLICY ${policy} ON pgboss.job FOR INSERT TO ${quoted} WITH CHECK (name = ANY (ARRAY[${client.escapeLiteral(queues.run)}, ${client.escapeLiteral(queues.deadLetter)}]))`,
+			`CREATE POLICY ${policy} ON pgboss.job FOR INSERT TO ${quoted} WITH CHECK (name = ANY (ARRAY[${insertable}]))`,
 		);
+		for (const fn of TOOL_RUNNER_FUNCTIONS) {
+			const call = functions.includes(fn) ? "GRANT" : "REVOKE";
+			await client.query(
+				`${call} EXECUTE ON FUNCTION ${fn} ${call === "GRANT" ? "TO" : "FROM"} ${quoted}`,
+			);
+		}
 		await verifyWorkerPrivileges(client, role, allowedTables);
 		await client.query("COMMIT");
 	} catch (error) {

@@ -43,6 +43,7 @@ import {
 } from "drizzle-orm";
 import { requireTransition } from "../state-machine.ts";
 import { type AgentRecord, buildTurnContext } from "../turn-context.ts";
+import { budgetHoldFor } from "./budgets.ts";
 import {
 	assembleThread,
 	formatThreadRef,
@@ -296,6 +297,11 @@ export async function scheduleAgent(
 	);
 	if (trigger === undefined) {
 		return { skipped: "nothing_pending" };
+	}
+	// A spent budget holds new runs, redrives too, until the UTC day changes or the limit is
+	// raised; the work stays in the inbox and the sweep starts it then.
+	if ((await budgetHoldFor(uow, agentId)) !== null) {
+		return { skipped: "budget_hold" };
 	}
 	const coalesce = agent.config.concurrency.while_running === "enqueue-and-coalesce";
 	const others = coalesce

@@ -12,7 +12,7 @@ rewritten in substance: a changed decision gets a new ADR that references the ol
 | [004](004-at-least-once-idempotency.md) | At-least-once delivery and idempotency | Accepted |
 | [005](005-one-bot-per-agent.md) | One Mattermost bot per logical agent | Accepted |
 | [006](006-no-direct-messages-in-mvp.md) | No Direct Messages in the MVP | Accepted |
-| [007](007-approval-model.md) | Human approval model | Accepted |
+| [007](007-approval-model.md) | Human approval model | Accepted, amended by 018 |
 | [008](008-bun-biome-typescript7.md) | Bun as runtime and package manager, Biome, TypeScript 7 | Accepted |
 | [009](009-model-output-vs-turn-result.md) | Model output is separate from the turn result and fits strict structured output | Accepted |
 | [010](010-zod-is-the-validator.md) | Zod is the only validator; published JSON Schemas are structural | Accepted |
@@ -23,3 +23,4 @@ rewritten in substance: a changed decision gets a new ADR that references the ol
 | [015](015-unconfined-runtimes-and-runtime-health.md) | Grok, Kiro, OpenCode and Hermes: tools only where confined; runtime health | Accepted |
 | [016](016-gmail-connector.md) | Gmail connector: watch, Pub/Sub pull, history cursor, read-only credential | Accepted, amended by 017 |
 | [017](017-gmail-polling-by-default.md) | Gmail connector polls by default; Pub/Sub notifications are optional | Accepted |
+| [018](018-approval-decisions-and-tool-broker.md) | Approval decisions in the card thread, a separate tool runner, daily budgets | Accepted |

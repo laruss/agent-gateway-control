@@ -242,9 +242,13 @@ export function scenarioOutput(
 					kind: "needs_human",
 					approvalRequest: {
 						actionType: target ?? "finance.payment.create",
+						// A complete payment: finance actions are approvable only with their typed set.
 						actionParams: [
 							{ name: "amount", value: "10.00" },
 							{ name: "currency", value: "EUR" },
+							{ name: "recipient", value: "DE89370400440532013000" },
+							{ name: "purpose", value: "Mock payment" },
+							{ name: "recurring", value: "false" },
 						],
 						actionSummary: "Mock payment for a test scenario.",
 					},

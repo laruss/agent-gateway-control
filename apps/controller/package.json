@@ -29,6 +29,7 @@
     "@agent-gateway/runtime-mock": "workspace:*",
     "@agent-gateway/runtime-sdk": "workspace:*",
     "@agent-gateway/testkit": "workspace:*",
-    "@agent-gateway/worker": "workspace:*"
+    "@agent-gateway/worker": "workspace:*",
+    "@agent-gateway/policy": "workspace:*"
   }
 }

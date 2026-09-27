@@ -23,6 +23,7 @@ import {
 	reconcileMattermost,
 	type TokenFiles,
 } from "@agent-gateway/mattermost";
+import { approvalCode } from "@agent-gateway/policy";
 import {
 	readSecretFile,
 	resolveSecretPath,
@@ -783,6 +784,133 @@ describe("Mattermost bridge against a real server", () => {
 		await settle();
 		expect(await runsOf(answerEvent.id)).toHaveLength(1);
 		expect(await waitsIn(root)).toEqual([{ agent_id: "developer", status: "matched" }]);
+	});
+
+	it("takes an approval decision only from an owner's own reply in the card's thread", async () => {
+		const ownerToken = mm.users.get("owner")?.token;
+		if (ownerToken === undefined) {
+			throw new Error("no owner user");
+		}
+		const ask = await say("hq", "@finance pay the invoice [mock:approval finance.payment.create]");
+		const run = await finishedRun((await eventOf(ask)).id, "finance asks for approval");
+		expect(run).toMatchObject({ agent_id: "finance", status: "succeeded" });
+		const [approval] = await query<{
+			id: string;
+			nonce: string;
+			immutable_action_hash: string;
+		}>("select id, nonce, immutable_action_hash from approval_requests where run_id = $1", [
+			run.id,
+		]);
+		if (approval === undefined) {
+			throw new Error("no approval request");
+		}
+		const cardReceipt = await eventually(
+			async () =>
+				(
+					await query<{ receipt: JsonValue }>(
+						"select receipt from outbox where idempotency_key = $1 and status = 'sent'",
+						[`approval-card:${approval.id}`],
+					)
+				)[0]?.receipt,
+			30_000,
+			"approval card delivered",
+		);
+		if (typeof cardReceipt !== "object" || cardReceipt === null || Array.isArray(cardReceipt)) {
+			throw new Error("card receipt is not an object");
+		}
+		const card = String(cardReceipt.postId);
+		const code = approvalCode({
+			id: approval.id,
+			nonce: approval.nonce,
+			immutableActionHash: approval.immutable_action_hash,
+		});
+		const cardPost = await mmApi("GET", `posts/${card}`, mm.adminToken);
+		expect(cardPost.channel_id).toBe(channel("approvals"));
+		expect(String(cardPost.message)).toContain(`approve ${code}`);
+
+		const notices = async () =>
+			query<{ notice: string; user_id: string }>(
+				"select notice, user_id from approval_replies where approval_id = $1 order by created_at",
+				[approval.id],
+			);
+		// A human who is not an owner, and a webhook on the owner's account. (Agent bots are no
+		// members of the approvals channel; a bot's attempt is covered by the integration tests.)
+		const nonOwner = await say("approvals", `approve ${code}`, { rootId: card });
+		await say("approvals", `approve ${code}`, {
+			rootId: card,
+			token: ownerToken,
+			props: { from_webhook: "true" },
+		});
+		// The owner's malformed command, edited into a valid one afterwards: an edit decides
+		// nothing. A valid command in another thread of the channel is no decision either.
+		const typo = await say("approvals", "approve", { rootId: card, token: ownerToken });
+		await eventually(async () => (await notices()).length === 3, 30_000, "malformed command");
+		await mmApi("PUT", `posts/${typo}/patch`, ownerToken, { message: `approve ${code}` });
+		const elsewhere = await say("approvals", "an unrelated note");
+		await say("approvals", `approve ${code}`, { rootId: elsewhere, token: ownerToken });
+		await gateway.controller().listener?.sync();
+		await settle();
+		expect((await notices()).map((n) => n.notice)).toEqual([
+			"not_an_approver",
+			"not_an_approver",
+			"malformed",
+		]);
+		// A command in a card's thread belongs to the decision path only: it is no routed post.
+		expect(await creationOf(nonOwner)).toEqual([]);
+		const [pending] = await query<{ status: string }>(
+			"select status from approval_requests where id = $1",
+			[approval.id],
+		);
+		expect(pending?.status).toBe("pending");
+
+		// The owner's own reply decides, and the listener bot answers in the thread.
+		await say("approvals", `deny ${code.toLowerCase()}`, { rootId: card, token: ownerToken });
+		await eventually(
+			async () => (await notices()).some((n) => n.notice === "denied"),
+			30_000,
+			"owner's decision",
+		);
+		const resumed = await eventually(
+			async () =>
+				(
+					await query<{ status: string }>(
+						`select r.status from agent_runs r join events e on e.id = r.trigger_event_id
+						  where e.external_id = $1 and r.status in ('succeeded', 'failed')`,
+						[`approval-resolved:${approval.id}`],
+					)
+				)[0],
+			60_000,
+			"finance resumed",
+		);
+		expect(resumed).toEqual({ status: "succeeded" });
+		const listenerId = await loadDirectoryEntry(gateway.deps(), "user", "gateway-listener");
+		const thread = await eventually(
+			async () => {
+				const posts = await mmApi("GET", `posts/${card}/thread`, mm.adminToken);
+				const all =
+					typeof posts.posts === "object" && posts.posts !== null ? Object.values(posts.posts) : [];
+				const answers = all.filter(
+					(post) =>
+						typeof post === "object" &&
+						post !== null &&
+						!Array.isArray(post) &&
+						post.user_id === listenerId &&
+						post.id !== card,
+				);
+				return answers.length >= 4 ? answers : null;
+			},
+			30_000,
+			"thread answers",
+		);
+		expect(
+			thread.some(
+				(post) =>
+					typeof post === "object" &&
+					post !== null &&
+					!Array.isArray(post) &&
+					String(post.message).startsWith("**Denied.**"),
+			),
+		).toBe(true);
 	});
 
 	it("retires the bot of an agent removed from the configuration", async () => {

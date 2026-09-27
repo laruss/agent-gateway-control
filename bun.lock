@@ -80,10 +80,33 @@
         "zod": "4.6.5",
       },
       "devDependencies": {
+        "@agent-gateway/policy": "workspace:*",
         "@agent-gateway/runtime-mock": "workspace:*",
         "@agent-gateway/runtime-sdk": "workspace:*",
         "@agent-gateway/testkit": "workspace:*",
         "@agent-gateway/worker": "workspace:*",
+        "@types/pg": "8.23.1",
+      },
+    },
+    "apps/tool-runner": {
+      "name": "@agent-gateway/tool-runner",
+      "version": "0.0.0",
+      "dependencies": {
+        "@agent-gateway/contracts": "workspace:*",
+        "@agent-gateway/logging": "workspace:*",
+        "@agent-gateway/queue": "workspace:*",
+        "@agent-gateway/service": "workspace:*",
+        "@agent-gateway/tool-broker": "workspace:*",
+        "pg": "8.23.0",
+        "pg-boss": "12.34.0",
+      },
+      "devDependencies": {
+        "@agent-gateway/controller": "workspace:*",
+        "@agent-gateway/core": "workspace:*",
+        "@agent-gateway/db": "workspace:*",
+        "@agent-gateway/events": "workspace:*",
+        "@agent-gateway/policy": "workspace:*",
+        "@agent-gateway/testkit": "workspace:*",
         "@types/pg": "8.23.1",
       },
     },
@@ -139,6 +162,7 @@
         "@agent-gateway/db": "workspace:*",
         "@agent-gateway/events": "workspace:*",
         "@agent-gateway/logging": "workspace:*",
+        "@agent-gateway/policy": "workspace:*",
         "drizzle-orm": "0.45.3",
         "pg": "8.23.0",
         "zod": "4.6.5",
@@ -194,6 +218,14 @@
       },
       "devDependencies": {
         "@types/pg": "8.23.1",
+      },
+    },
+    "packages/policy": {
+      "name": "@agent-gateway/policy",
+      "version": "0.0.0",
+      "dependencies": {
+        "@agent-gateway/contracts": "workspace:*",
+        "@agent-gateway/events": "workspace:*",
       },
     },
     "packages/queue": {
@@ -293,6 +325,15 @@
         "@types/pg": "8.23.1",
       },
     },
+    "packages/tool-broker": {
+      "name": "@agent-gateway/tool-broker",
+      "version": "0.0.0",
+      "dependencies": {
+        "@agent-gateway/contracts": "workspace:*",
+        "@agent-gateway/logging": "workspace:*",
+        "@agent-gateway/policy": "workspace:*",
+      },
+    },
   },
   "packages": {
     "@agent-gateway/cli": ["@agent-gateway/cli@workspace:apps/cli"],
@@ -319,6 +360,8 @@
 
     "@agent-gateway/outbox": ["@agent-gateway/outbox@workspace:packages/outbox"],
 
+    "@agent-gateway/policy": ["@agent-gateway/policy@workspace:packages/policy"],
+
     "@agent-gateway/queue": ["@agent-gateway/queue@workspace:packages/queue"],
 
     "@agent-gateway/runtime-claude": ["@agent-gateway/runtime-claude@workspace:packages/runtime-claude"],
@@ -340,6 +383,10 @@
     "@agent-gateway/service": ["@agent-gateway/service@workspace:packages/service"],
 
     "@agent-gateway/testkit": ["@agent-gateway/testkit@workspace:packages/testkit"],
+
+    "@agent-gateway/tool-broker": ["@agent-gateway/tool-broker@workspace:packages/tool-broker"],
+
+    "@agent-gateway/tool-runner": ["@agent-gateway/tool-runner@workspace:apps/tool-runner"],
 
     "@agent-gateway/worker": ["@agent-gateway/worker@workspace:apps/worker"],
 

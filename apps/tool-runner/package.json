@@ -1,0 +1,30 @@
+{
+  "name": "@agent-gateway/tool-runner",
+  "version": "0.0.0",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "bun src/main.ts"
+  },
+  "dependencies": {
+    "@agent-gateway/contracts": "workspace:*",
+    "@agent-gateway/logging": "workspace:*",
+    "@agent-gateway/queue": "workspace:*",
+    "@agent-gateway/service": "workspace:*",
+    "@agent-gateway/tool-broker": "workspace:*",
+    "pg": "8.23.0",
+    "pg-boss": "12.34.0"
+  },
+  "devDependencies": {
+    "@types/pg": "8.23.1",
+    "@agent-gateway/controller": "workspace:*",
+    "@agent-gateway/core": "workspace:*",
+    "@agent-gateway/db": "workspace:*",
+    "@agent-gateway/events": "workspace:*",
+    "@agent-gateway/policy": "workspace:*",
+    "@agent-gateway/testkit": "workspace:*"
+  }
+}

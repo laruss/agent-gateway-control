@@ -10,9 +10,14 @@ import {
 	reportQueue,
 	runDeadLetterQueue,
 	runQueue,
+	ToolNamespaceSchema,
+	toolDeadLetterQueue,
+	toolExecuteQueue,
+	toolReportQueue,
 } from "@agent-gateway/contracts";
 import {
 	applyConfig,
+	budgetReport,
 	type CancelledJob,
 	type ConfigApplyInput,
 	type ControlPlaneDeps,
@@ -27,6 +32,7 @@ import {
 	listMemory,
 	listOutbox,
 	listRuns,
+	listToolActions,
 	listWaits,
 	MEMORY_REVIEW_STATUSES,
 	pauseAgent,
@@ -38,12 +44,14 @@ import {
 	runtimeHealth,
 	setAgentEnabled,
 	setDirectoryEntry,
+	settleToolAction,
 	showAgent,
 	showEvent,
 	showRun,
 } from "@agent-gateway/core";
 import {
 	createPool,
+	grantToolRunnerRole,
 	grantWorkerRole,
 	migrateDatabase,
 	pendingMigrationCount,
@@ -85,6 +93,9 @@ export const USAGE = `gateway <command>
   health | doctor                     check database, migrations, queues and controls
   db migrate                          apply database and queue migrations
   db grant-worker <role> <adapter>    limit an existing role to one adapter's worker jobs
+  db grant-tool-runner <role> <namespace>[,<namespace>...]
+                                      limit an existing role to the tool actions of these
+                                      namespaces (e.g. finance) and their begin check
   config validate <dir> [--root .]    validate organization.yaml and agents/*.yaml
   config apply <dir> [--root .] [--mock-runtimes]
                                       store the configuration as the active version;
@@ -97,7 +108,12 @@ export const USAGE = `gateway <command>
   events show <id> | ingest <file.json>
   dlq list | redrive <dlq-name> <job-id>
   outbox list [--status <status>] | redrive <outbox-id>
-  approvals list [--status <status>]
+  approvals list [--status <status>]  approval requests and how their execution went
+  tools list [--open]                 tool actions (--open: queued, running or unknown)
+  tools settle <action-id> <succeeded|failed|cancelled> --note <text>
+                                      record what an unknown action did, after checking the
+                                      provider by its idempotency key
+  budgets                             today's usage (UTC) per agent and in total, and holds
   memory list [--status <status>] [--namespace <ns>] [--limit <n>] [--offset <n>]
   memory accept <id> | reject <id>    review memory proposals to shared namespaces
                                       (proposed items are listed oldest first)
@@ -295,9 +311,39 @@ async function doctor(session: Session, out: Output): Promise<boolean> {
 			detail: `${watch}, last sync ${mailbox.lastSyncAt?.toISOString() ?? "never"}`,
 		});
 	}
+	// Checks of tables and queues newer migrations create: skipped until they are applied.
+	if (pending === 0) {
+		// An action that began and never reported may or may not have happened: an operator checks
+		// the provider. One overdue that the sweep has not settled means the controller is behind.
+		const tools = await pool.query<{ unknown: number; overdue: number }>(
+			`select count(*) filter (where status = 'unknown')::int as unknown,
+			        count(*) filter (where status in ('queued', 'running') and deadline_at < now() - interval '30 minutes')::int as overdue
+			   from tool_actions`,
+		);
+		const toolRow = tools.rows[0];
+		checks.push({
+			name: "tool_actions",
+			ok: (toolRow?.unknown ?? 0) === 0 && (toolRow?.overdue ?? 0) === 0,
+			detail: `${toolRow?.unknown ?? 0} with an unknown outcome, ${toolRow?.overdue ?? 0} overdue`,
+		});
+		const budgets = await budgetReport(session.deps);
+		const held = budgets.agents.filter((agent) => agent.hold !== null);
+		checks.push({
+			name: "budgets",
+			ok: held.length === 0,
+			detail:
+				held.length === 0
+					? `no hold on ${budgets.day}`
+					: `held on ${budgets.day}: ${held.map((agent) => `@${agent.agentId}`).join(", ")}`,
+		});
+	}
 	for (const name of deadLetterQueues(RuntimeAdapterIdSchema.options)) {
-		const jobs = await session.boss.findJobs(name, { queued: true });
-		checks.push({ name, ok: jobs.length === 0, detail: `${jobs.length} dead-lettered` });
+		const jobs = await session.boss.findJobs(name, { queued: true }).catch(() => null);
+		checks.push(
+			jobs === null
+				? { name, ok: false, detail: "queue missing; run 'gateway db migrate'" }
+				: { name, ok: jobs.length === 0, detail: `${jobs.length} dead-lettered` },
+		);
 	}
 	out.print(json({ checks }));
 	return checks.every((check) => check.ok);
@@ -327,6 +373,27 @@ export async function runCommand(args: Readonly<string[]>, out: Output): Promise
 			await pool.end();
 		}
 		out.print("worker role limited to its adapter's queues");
+		return 0;
+	}
+	if (group === "db" && action === "grant-tool-runner") {
+		const namespaces = arg(args, 3, "namespace")
+			.split(",")
+			.map((name) => ToolNamespaceSchema.parse(name.trim()));
+		const pool = createPool(requireSetting("DATABASE_URL"), 1);
+		try {
+			await grantToolRunnerRole(
+				pool,
+				arg(args, 2, "role"),
+				namespaces.map((namespace) => ({
+					run: toolExecuteQueue(namespace),
+					report: toolReportQueue(namespace),
+					deadLetter: toolDeadLetterQueue(namespace),
+				})),
+			);
+		} finally {
+			await pool.end();
+		}
+		out.print(`tool runner role limited to ${namespaces.join(", ")}`);
 		return 0;
 	}
 	if (group === "gmail" && action === "authorize") {
@@ -552,6 +619,25 @@ async function runSessionCommand(
 		}
 		case "approvals list":
 			out.print(json(await listApprovals(deps, flag(args, "status"))));
+			return 0;
+		case "tools list":
+			out.print(json(await listToolActions(deps, args.includes("--open"))));
+			return 0;
+		case "tools settle": {
+			const outcome = arg(args, 3, "outcome");
+			if (outcome !== "succeeded" && outcome !== "failed" && outcome !== "cancelled") {
+				throw new UsageError("the outcome is succeeded, failed or cancelled");
+			}
+			const note = flag(args, "note");
+			if (note === null) {
+				throw new UsageError("missing --note <text>: what the provider says");
+			}
+			const settled = await settleToolAction(deps, arg(args, 2, "action-id"), outcome, who, note);
+			out.print(`tool action ${settled.id} settled as ${settled.status}`);
+			return 0;
+		}
+		case "budgets":
+			out.print(json(await budgetReport(deps)));
 			return 0;
 		case "mattermost bootstrap":
 			await mattermostBootstrap(

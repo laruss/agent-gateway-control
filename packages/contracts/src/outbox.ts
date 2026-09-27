@@ -3,6 +3,7 @@ import { ActionParamsSchema } from "./approval.ts";
 import {
 	AgentIdSchema,
 	JsonObjectSchema,
+	type MattermostId,
 	MattermostIdSchema,
 	MattermostNameSchema,
 	RiskLevelSchema,
@@ -12,6 +13,7 @@ import {
 	ToolNameSchema,
 	UuidSchema,
 } from "./common.ts";
+import { ApprovalOutcomeSchema, ToolReceiptSchema } from "./tool-action.ts";
 
 /**
  * Outbox payloads: written by the controller in the transaction that decides the side effect,
@@ -60,5 +62,84 @@ export const MattermostApprovalPayloadSchema = z.strictObject({
 	riskLevel: RiskLevelSchema,
 	immutableActionHash: Sha256HexSchema,
 	expiresAt: TimestampSchema,
+	/** The one-time code an owner replies with (`approve <code>`), bound to this request. */
+	approvalCode: z
+		.string()
+		.regex(/^[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}$/),
 });
 export type MattermostApprovalPayload = z.infer<typeof MattermostApprovalPayloadSchema>;
+
+/** What the listener bot says in an approval card's thread. Every text is fixed. */
+export const APPROVAL_NOTICES = [
+	/** A valid `approve`: the action is queued for execution. */
+	"granted",
+	/** A valid `deny`. */
+	"denied",
+	/** A valid `approve` the policy no longer permits: the approval is cancelled. */
+	"refused",
+	/** A command from someone who may not decide (not an owner, a bot, an integration). */
+	"not_an_approver",
+	/** An owner's command that is not exactly `approve <code>` or `deny <code>`. */
+	"malformed",
+	/** The code does not belong to this request. */
+	"wrong_code",
+	"already_decided",
+	"expired",
+	/** Withdrawn without a decision: kill-all, the agent disabled, or a configuration change. */
+	"withdrawn",
+	/** How the execution ended; carries the outcome and the receipt. */
+	"executed",
+] as const;
+export const ApprovalNoticeSchema = z.enum(APPROVAL_NOTICES);
+export type ApprovalNotice = z.infer<typeof ApprovalNoticeSchema>;
+
+/** A reply in an approval card's thread, posted by the listener bot. */
+export const MattermostApprovalReplyPayloadSchema = z.strictObject({
+	approvalId: UuidSchema,
+	/** The card's channel and post, from the card's delivery receipt. */
+	channelId: MattermostIdSchema,
+	rootPostId: MattermostIdSchema,
+	notice: ApprovalNoticeSchema,
+	/** Who wrote the command answered; null for execution results. */
+	userId: MattermostIdSchema.nullable(),
+	outcome: ApprovalOutcomeSchema.nullable(),
+	receipt: ToolReceiptSchema.nullable(),
+	detail: safeText(500, "text").nullable(),
+});
+export type MattermostApprovalReplyPayload = z.infer<typeof MattermostApprovalReplyPayloadSchema>;
+
+/**
+ * An approval command as the listener read it: a created post in a card's thread, and its
+ * author as a fresh account lookup and the post's props describe them. Only the listener hands
+ * these over; generic event ingest never decides an approval.
+ */
+export type ApprovalReply = Readonly<{
+	postId: MattermostId;
+	rootPostId: MattermostId;
+	/**
+	 * The idempotency key the thread root claims when the root is the listener bot's own post
+	 * (`approval-card:<id>` for a card), else null.
+	 */
+	rootCardKey: string | null;
+	channelId: MattermostId;
+	userId: MattermostId;
+	message: string;
+	author: Readonly<{
+		/** A bot account, an agent's included. */
+		isBot: boolean;
+		/** Not deactivated. */
+		active: boolean;
+		/** `from_webhook`, `from_bot` or `from_plugin`: software on someone's account. */
+		automated: boolean;
+	}>;
+}>;
+
+/** What handling a reply did: the notice posted, or why nothing was. */
+export type ApprovalReplyOutcome =
+	| ApprovalNotice
+	/** Not a reply to an approval card (any other thread, or another channel). */
+	| "not_a_card"
+	/** This post was handled before. */
+	| "replayed"
+	/** Not a command attempt at all. */
+	| "ignored";

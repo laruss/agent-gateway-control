@@ -1,6 +1,6 @@
 # Threat model (draft)
 
-- Status: Draft, Phase 0
+- Status: Draft, updated through Phase 7
 
 ## Assets
 
@@ -44,6 +44,11 @@
   the model into a finance action or a secret gets a refused run with `deny` policy decisions
   and an alert, and nothing is published (integration test)
   ([ADR-016](../adr/016-gmail-connector.md)).
+- Status (Phase 7): a policy engine outside the model (`@agent-gateway/policy`) decides every
+  approval request before a card is shown: deny wins, anything no list names is denied,
+  finance belongs to the finance agent only and every finance write needs a human, and finance
+  actions need their full typed parameter set. An injected agent can at most ask; nothing runs
+  without an owner's reply ([ADR-018](../adr/018-approval-decisions-and-tool-broker.md)).
 
 ### T2. Infinite agent loops
 
@@ -114,6 +119,12 @@
   stay out of reach; Hermes borrows no other CLI's login. A worker whose runtime fails stays
   up without taking jobs, and only that adapter's agents are degraded
   ([ADR-015](../adr/015-unconfined-runtimes-and-runtime-health.md)).
+- Status (Phase 7): approved actions run only in the tool runner, a separate process that
+  holds the tool credentials (finance) and connects as a role limited to its namespaces'
+  queues and one `SECURITY DEFINER` function, `gateway_begin_tool_action`. Runtime workers
+  cannot publish execute jobs (row-level security on the job table), and a fetched job
+  authorizes nothing: the runner recomputes the hash, and `begin` checks the approval, the
+  hash, the deadline, the agent and the kill switch under the controls row.
 
 ### T5. Supply chain
 
@@ -132,6 +143,12 @@
   `HERMES_MAX_TURNS`. Kiro meters credits and records no token usage; OpenCode Go and Hermes
   report no cost.
 - Real payments only through approval ([ADR-007](../adr/007-approval-model.md)).
+- Status (Phase 7): per-agent and global daily limits on cost and tokens
+  (`organization.budgets`), summed from a ledger that books every attempt's usage, retried and
+  cancelled ones included. An agent over its limit (or everyone over the global one) starts no
+  run, retry or redrive until the UTC day changes or the limit is raised; unmetered attempts
+  hold the agent unless `unmetered: allow`. Work in flight is not stopped, so a limit can be
+  overshot by the runs already started.
 
 ### T7. Home server exposure
 
@@ -147,6 +164,21 @@
   request cannot be `granted`/`executed` without a decision by an allowlisted user before
   expiry. Config keeps finance tools with `finance_agent_id` only and requires human approval
   for every finance action except `finance.read`. The flow is Phase 7.
+- Status (Phase 7): a decision is an owner's reply `approve <code>` / `deny <code>` in the
+  card's thread, read by the listener and handed to a dedicated decision path (generic event
+  ingest never decides). It counts only from an active human account that is both in the
+  request's approver snapshot and a current owner, checked by a fresh account lookup, without
+  webhook, bot or plugin props, before expiry by the controller's clock, with the request's
+  code (derived from its id, nonce and hash; shown to the channel, it binds a reply to one
+  request and authorizes nothing by itself). Other attempts are audited and
+  alerted; the first valid decision wins and a replayed post decides nothing. Triggers keep
+  the request (action, parameters, hash, approvers, expiry) immutable and the decision final.
+  The grant re-checks the policy with the active configuration; the runner and `begin` check
+  the hash again, so a changed amount runs nothing. Kill-all cancels pending approvals and
+  queued actions and aborts running executors (integration and Mattermost e2e tests).
+  Residual risk: any credential of an owner's own account (a session, a personal access token
+  or an OAuth app acting as the owner) can decide; only webhook, bot and plugin props are
+  told apart.
 
 ### T9. Bot impersonation and forged routing
 

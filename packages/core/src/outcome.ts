@@ -1,13 +1,5 @@
-import type {
-	AgentTurnResult,
-	ApprovalRequestDraft,
-	GatewayEvent,
-	PublicMessage,
-	RiskLevel,
-	ToolPattern,
-} from "@agent-gateway/contracts";
-import { toolPatternCovers } from "@agent-gateway/contracts";
-import { canonicalHash, mattermostPost } from "@agent-gateway/events";
+import type { AgentTurnResult, GatewayEvent, PublicMessage } from "@agent-gateway/contracts";
+import { mattermostPost } from "@agent-gateway/events";
 
 export type OutcomeIssue = Readonly<{ path: string; message: string }>;
 
@@ -81,29 +73,6 @@ export function checkRunScope(result: AgentTurnResult, scope: RunScope): Readonl
 		});
 	}
 	return issues;
-}
-
-/**
- * Immutable hash of an approval: action type and parameters, canonical JSON with parameters
- * sorted by name. Execution later recomputes it and must get the same value.
- */
-export function approvalActionHash(draft: ApprovalRequestDraft): string {
-	const params = [...draft.actionParams].sort((a, b) => (a.name < b.name ? -1 : 1));
-	return canonicalHash({
-		actionType: draft.actionType,
-		actionParams: params.map((p) => ({ name: p.name, value: p.value })),
-	});
-}
-
-const RISK_RULES: Readonly<{ pattern: ToolPattern; risk: RiskLevel }[]> = [
-	{ pattern: "finance.*", risk: "critical" },
-	{ pattern: "deploy.*", risk: "high" },
-	{ pattern: "mail.*", risk: "high" },
-];
-
-/** Risk comes from policy, never from the model. */
-export function riskLevelFor(actionType: string): RiskLevel {
-	return RISK_RULES.find((rule) => toolPatternCovers(rule.pattern, actionType))?.risk ?? "medium";
 }
 
 /** The post text: visible mentions of the targets first, then the model's Markdown. */

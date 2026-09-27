@@ -24,12 +24,14 @@ import {
 	type OutboxStatus,
 	outbox,
 	sourceCursors,
+	toolActions,
 	waitSubscriptions,
 	withTransaction,
 } from "@agent-gateway/db";
 import { canonicalHash } from "@agent-gateway/events";
 import { and, asc, desc, eq, inArray, ne, or, sql } from "drizzle-orm";
 import { nextAgentState, requireTransition } from "../state-machine.ts";
+import { revokeQueuedActions, sweepApprovals, withdrawOpenApprovals } from "./approvals.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
 import { type RuntimeHealth, runtimeHealth } from "./runtime-health.ts";
 import { type ScheduleResult, scheduleAgent } from "./scheduler.ts";
@@ -263,6 +265,19 @@ export async function applyConfig(
 				disabled.push(id);
 			}
 		}
+		// Approved actions that have not begun are checked against the new policy.
+		await revokeQueuedActions(uow);
+		// Cards live in the approvals channel, and only replies there decide: when it moves (or the
+		// team changes), the requests still waiting are withdrawn (their agents learn it and may
+		// ask again).
+		if (
+			previous !== null &&
+			(previous.organization.mattermost.approvals_channel !==
+				input.organization.mattermost.approvals_channel ||
+				previous.organization.mattermost.team !== input.organization.mattermost.team)
+		) {
+			await withdrawOpenApprovals(uow, null, "the approvals channel changed", true);
+		}
 		// An agent enabled by this config may already have work waiting in its inbox.
 		for (const id of [...configured].sort()) {
 			await scheduleAgent(uow, id);
@@ -325,18 +340,9 @@ async function applyEnabled(
 		if (next === null) {
 			throw new AdminError(`agent '${agentId}' is '${state}'; pause it before disabling`);
 		}
-		const correlations = await cancelActiveWaits(uow, agentId);
-		const approvalIds = correlations.flatMap((c) =>
-			c.startsWith("approval:") ? [c.slice("approval:".length)] : [],
-		);
-		if (approvalIds.length > 0) {
-			await uow.tx.db
-				.update(approvalRequests)
-				.set({ status: "expired" })
-				.where(
-					and(inArray(approvalRequests.id, approvalIds), eq(approvalRequests.status, "pending")),
-				);
-		}
+		await cancelActiveWaits(uow, agentId);
+		// Its open approvals are withdrawn: nothing it asked for runs while it is disabled.
+		await withdrawOpenApprovals(uow, agentId, reason);
 		await setAgentState(uow, agentId, state, next, reason);
 		return;
 	}
@@ -731,8 +737,11 @@ export async function listApprovals(deps: ControlPlaneDeps, status: string | nul
 				riskLevel: approvalRequests.riskLevel,
 				status: approvalRequests.status,
 				expiresAt: approvalRequests.expiresAt,
+				decidedByUserId: approvalRequests.decidedByUserId,
+				execution: toolActions.status,
 			})
 			.from(approvalRequests)
+			.leftJoin(toolActions, eq(toolActions.approvalId, approvalRequests.id))
 			.where(status === null ? undefined : eq(approvalRequests.status, status))
 			.orderBy(desc(approvalRequests.createdAt)),
 	);
@@ -747,7 +756,7 @@ export async function listApprovals(deps: ControlPlaneDeps, status: string | nul
  * is paused, cancelling runs in progress. Releasing the switch does not resume agents.
  */
 export async function killAll(deps: ControlPlaneDeps, actor: string): Promise<CancelledJob[]> {
-	return inTransaction(deps, async (uow) => {
+	const cancelled = await inTransaction(deps, async (uow) => {
 		const { db } = uow.tx;
 		await db
 			.insert(gatewayControls)
@@ -757,13 +766,24 @@ export async function killAll(deps: ControlPlaneDeps, actor: string): Promise<Ca
 				set: { killSwitch: true, updatedAt: uow.now },
 			});
 		await audit(uow, actor, "gateway.kill_all", "gateway", "controls");
-		const cancelled: CancelledJob[] = [];
+		// Under the controls row: a tool runner's `begin` either came first (the action runs and
+		// is asked to stop) or finds the switch on.
+		await withdrawOpenApprovals(uow, null, `kill-all by ${actor}`);
+		const jobs: CancelledJob[] = [];
 		const rows = await db.select({ id: agents.id }).from(agents).orderBy(agents.id);
 		for (const row of rows) {
-			cancelled.push(...(await pauseInTransaction(uow, row.id, actor, `kill-all by ${actor}`)));
+			jobs.push(...(await pauseInTransaction(uow, row.id, actor, `kill-all by ${actor}`)));
 		}
-		return cancelled;
+		return jobs;
 	});
+	// The agents learn their approvals were withdrawn outside the kill-all transaction, in the
+	// lock order of every approval use case; the reconcile sweep retries whatever fails here.
+	await sweepApprovals(deps).catch((error: unknown) => {
+		deps.log.warn("approvals not resolved after kill-all; the sweep retries", {
+			error_message: error instanceof Error ? error.message : String(error),
+		});
+	});
+	return cancelled;
 }
 
 export async function releaseKillSwitch(deps: ControlPlaneDeps, actor: string): Promise<void> {

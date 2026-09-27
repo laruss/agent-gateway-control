@@ -142,6 +142,25 @@ bun run gateway events ingest /tmp/mail.json
 bun run gateway runs list --agent mail-follower
 ```
 
+## Approvals
+
+`[mock:approval finance.payment.create]` in a post to `@finance` asks for a complete sandbox
+payment. With Mattermost, the card appears in `#approvals`; reply in its thread as the owner
+with `approve <code>` or `deny <code>` ([approvals](approvals.md)). Without Mattermost there is
+no one to decide: the card is "posted" at a fake id and the request expires after 24 hours.
+
+To see an approved action run, start a tool runner with sandbox executors, which record the
+call and move nothing:
+
+```bash
+GATEWAY_ENV=development TOOL_RUNNER_NAMESPACES=finance TOOL_RUNNER_SANDBOX=true \
+  bun run dev:tool-runner
+bun run gateway tools list
+```
+
+In development the runner may use the owner role; in a deployment give it its own role
+(`gateway db grant-tool-runner <role> finance`, see below).
+
 ## Operations
 
 ```bash
@@ -165,7 +184,8 @@ proposal to a shared namespace reaches other agents only after `memory accept`
 holds exactly what the runtime received: thread, memory and durable state.
 
 A FAILED agent keeps its failure through pause, disable/enable and kill-all; `runs redrive`
-is the only way out. Disabling an agent cancels its waits and expires its pending approvals.
+is the only way out. Disabling an agent cancels its waits and its open approvals (pending
+requests and actions that have not begun).
 
 ## Real runtimes
 
@@ -256,6 +276,13 @@ refuses the owning role, superusers and roles that bypass row-level security. Th
 and the CLI must use the role that owns the tables (the one that ran `db migrate`): the
 pg-boss job table has row-level security, and any other role sees none of its rows. In
 development the worker may simply use the owner role without running `grant-worker`.
+
+A tool runner gets the same treatment for its namespaces, plus the `begin` check it may call:
+
+```bash
+psql "$DATABASE_URL" -c "create role gateway_tool_runner login password '<secret>'"
+bun run gateway db grant-tool-runner gateway_tool_runner finance
+```
 
 ## Schema changes
 

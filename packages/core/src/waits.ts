@@ -36,7 +36,10 @@ export function waitMatches(wait: ActiveWait, event: GatewayEvent, now: Date): b
 	if (event.type !== condition.eventType || event.correlationid !== condition.correlationId) {
 		return false;
 	}
-	if (wait.timeoutAt.getTime() <= now.getTime()) {
+	// How an approval ended always reaches its wait, also when it is the timeout that ends it:
+	// the Gateway emits it at most once per approval.
+	const resolution = event.type === "approval.resolved" && isGatewayEmitted(event);
+	if (wait.timeoutAt.getTime() <= now.getTime() && !resolution) {
 		return false;
 	}
 	// Approvals, timers and lifecycle events count only when the Gateway itself emitted them.

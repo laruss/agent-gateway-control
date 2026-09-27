@@ -9,6 +9,7 @@ export * from "./json-schema.ts";
 export * from "./organization.ts";
 export * from "./outbox.ts";
 export * from "./thread-summary.ts";
+export * from "./tool-action.ts";
 export * from "./turn.ts";
 export * from "./turn-authority.ts";
 export * from "./wait.ts";

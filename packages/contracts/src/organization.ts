@@ -61,6 +61,34 @@ export const OrganizationMattermostSchema = z
 	});
 export type OrganizationMattermost = z.infer<typeof OrganizationMattermostSchema>;
 
+/** Daily caps of one scope; a metric left out is not limited. */
+export const DailyBudgetSchema = z
+	.strictObject({
+		cost_usd: z.number().positive().max(1_000_000).optional(),
+		/** Input plus output tokens; cached input is part of the input and not added again. */
+		tokens: z.int().positive().max(10_000_000_000).optional(),
+	})
+	.refine(
+		(budget) => budget.cost_usd !== undefined || budget.tokens !== undefined,
+		"a budget sets cost_usd, tokens or both",
+	);
+export type DailyBudget = z.infer<typeof DailyBudgetSchema>;
+
+/**
+ * Spending limits per UTC day. An agent over its own limit, or everyone over the global one,
+ * starts no run until the day changes or the limit is raised (ADR-018).
+ */
+export const OrganizationBudgetsSchema = z.strictObject({
+	per_agent_daily: DailyBudgetSchema.optional(),
+	global_daily: DailyBudgetSchema.optional(),
+	/**
+	 * An attempt that reports neither cost nor tokens: `hold` stops its agent for the day (fail
+	 * closed), `allow` counts it as nothing.
+	 */
+	unmetered: z.enum(["hold", "allow"]).default("hold"),
+});
+export type OrganizationBudgets = z.infer<typeof OrganizationBudgetsSchema>;
+
 export const OrganizationConfigSchema = z.strictObject({
 	schema_version: z.literal(1),
 	organization: z.strictObject({
@@ -74,6 +102,7 @@ export const OrganizationConfigSchema = z.strictObject({
 		finance_agent_id: AgentIdSchema,
 		rules: z.array(OrganizationRuleSchema).max(100),
 		default_limits: OrganizationLimitsSchema,
+		budgets: OrganizationBudgetsSchema.optional(),
 	}),
 	mattermost: OrganizationMattermostSchema,
 });

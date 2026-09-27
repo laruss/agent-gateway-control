@@ -26,6 +26,8 @@ export type BridgeDirectory = Readonly<{
 	source: string;
 	/** Managed channels: id to name. Posts elsewhere are not the Gateway's business. */
 	channels: ReadonlyMap<MattermostId, string>;
+	/** Where approval cards are posted; replies in their threads may decide. Null until resolved. */
+	approvalsChannelId: MattermostId | null;
 	agents: Readonly<BridgeAgent[]>;
 }>;
 
@@ -70,7 +72,8 @@ const MAX_STORED_MESSAGE = 16_383;
 /** Props that mark a post as written by software on a human's account. */
 const AUTOMATION_PROPS = ["from_webhook", "from_bot", "from_plugin"] as const;
 
-function isAutomated(post: ApiPost): boolean {
+/** Whether the post says it was made by a webhook, bot or plugin on someone's account. */
+export function isAutomatedPost(post: ApiPost): boolean {
 	return AUTOMATION_PROPS.some((prop) => post.props[prop] === "true" || post.props[prop] === true);
 }
 
@@ -200,7 +203,7 @@ function author(post: ApiPost, change: PostChange, ctx: NormalizeContext): Autho
 	// Anyone else. Posts by other bots and integrations (webhooks, plugins) are recorded but
 	// address nobody: only a human's own words are an instruction. Bots are known by account,
 	// not by props any client can set.
-	const human = !ctx.authorIsBot && !isAutomated(post);
+	const human = !ctx.authorIsBot && !isAutomatedPost(post);
 	const targets =
 		human && change === "created"
 			? mentionedAgents(post.message, addressable(ctx, post.channel_id))

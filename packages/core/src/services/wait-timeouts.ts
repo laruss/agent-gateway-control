@@ -1,19 +1,19 @@
 import { QUEUES, type WaitTimeoutJob } from "@agent-gateway/contracts";
-import { agentRuns, approvalRequests, waitSubscriptions, withTransaction } from "@agent-gateway/db";
+import { agentRuns, waitSubscriptions, withTransaction } from "@agent-gateway/db";
 import { internalEvent } from "@agent-gateway/events";
-import { and, eq } from "drizzle-orm";
+import { eq } from "drizzle-orm";
+import { approvalIdOf } from "./approval-store.ts";
+import { settleApprovalOnTimeout } from "./approvals.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
 import { type IngestResult, ingestInTransaction } from "./ingest.ts";
 import { lockAgent, lockCascade, lockConfigShared } from "./store.ts";
-
-const APPROVAL_CORRELATION_PREFIX = "approval:";
 
 export type WaitTimeoutOutcome = "timed_out" | "not_due" | "ignored";
 
 /**
  * Fires when a wait's timeout is reached: emits an `agent.wait.timeout` event, which resolves
- * the wait and resumes the agent through normal routing. An expired approval wait also marks
- * its approval request expired.
+ * the wait and resumes the agent through normal routing. An approval's wait ends differently: a
+ * pending request expires, an open action is settled, and `approval.resolved` resumes the agent.
  */
 export async function handleWaitTimeout(
 	deps: ControlPlaneDeps,
@@ -54,16 +54,11 @@ export async function handleWaitTimeout(
 			return "not_due";
 		}
 		const { correlationId } = wait.wait;
-		if (correlationId.startsWith(APPROVAL_CORRELATION_PREFIX)) {
-			await tx.db
-				.update(approvalRequests)
-				.set({ status: "expired" })
-				.where(
-					and(
-						eq(approvalRequests.id, correlationId.slice(APPROVAL_CORRELATION_PREFIX.length)),
-						eq(approvalRequests.status, "pending"),
-					),
-				);
+		const approvalId = approvalIdOf(correlationId);
+		if (approvalId !== null && (await settleApprovalOnTimeout(uow, approvalId))) {
+			// The agent learns how the approval ended (expired, or its action settled) from
+			// `approval.resolved`, which resolves this very wait.
+			return "timed_out";
 		}
 		const result: IngestResult = await ingestInTransaction(
 			uow,

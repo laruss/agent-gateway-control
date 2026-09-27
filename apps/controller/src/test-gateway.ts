@@ -18,8 +18,9 @@ import { dryRunDeliverers } from "@agent-gateway/outbox";
 import { startTestPostgres, type TestPostgres } from "@agent-gateway/testkit";
 import { type RunningWorker, startWorker } from "@agent-gateway/worker";
 import type pg from "pg";
+import { withPendingApprovalCards } from "./approval-cards.ts";
 import { type RunningController, startController } from "./controller.ts";
-import { loopbackPostDeliverer } from "./loopback-deliverer.ts";
+import { loopbackApprovalCardDeliverer, loopbackPostDeliverer } from "./loopback-deliverer.ts";
 import { bridgeDeliverers, type MattermostBridgeOptions } from "./mattermost-bridge.ts";
 
 const repoRoot = fileURLToPath(new URL("../../..", import.meta.url));
@@ -118,9 +119,16 @@ export async function startTestGateway(options: TestGatewayOptions = {}): Promis
 				connectionString: postgres.connectionString,
 				log: silentLogger,
 				deliverers: (deps) =>
-					real === null
-						? { ...dryRunDeliverers(silentLogger), "mattermost.post": loopbackPostDeliverer(deps) }
-						: bridgeDeliverers(deps, real),
+					withPendingApprovalCards(
+						deps,
+						real === null
+							? {
+									...dryRunDeliverers(silentLogger),
+									"mattermost.post": loopbackPostDeliverer(deps),
+									"mattermost.approval": loopbackApprovalCardDeliverer(),
+								}
+							: bridgeDeliverers(deps, real),
+					),
 				random: () => 0,
 				pollingIntervalSeconds: 0.5,
 				reconcileIntervalMs: 1000,

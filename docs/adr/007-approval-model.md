@@ -1,6 +1,6 @@
 # ADR-007. Human approval model
 
-- Status: Accepted
+- Status: Accepted, amended by [ADR-018](018-approval-decisions-and-tool-broker.md)
 - Date: 2026-09-24
 
 ## Context

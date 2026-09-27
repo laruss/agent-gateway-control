@@ -5,6 +5,10 @@ import {
 	reportQueue,
 	runDeadLetterQueue,
 	runQueue,
+	TOOL_NAMESPACES,
+	toolDeadLetterQueue,
+	toolExecuteQueue,
+	toolReportQueue,
 } from "@agent-gateway/contracts";
 import type { PgBoss } from "pg-boss";
 
@@ -85,9 +89,25 @@ const CONTROLLER_DEAD_LETTER_QUEUES: Readonly<QueueName[]> = [
 	QUEUES.deadLetterTimeouts,
 ];
 
+/**
+ * An execute job is never retried by pg-boss either: a runner that fetched it may have begun,
+ * and an action that may have run is settled by the controller, never blindly run again. An
+ * expired or failed job goes to the namespace's dead letter queue.
+ */
+const TOOL_EXECUTE_POLICY: QueuePolicy = {
+	retryLimit: 0,
+	// Each job sets its own expiration from the action's deadline.
+	expireInSeconds: 3600,
+	partition: true,
+};
+
 /** Every dead letter queue, for `doctor` and `dlq list`. */
 export function deadLetterQueues(adapters: Readonly<RuntimeAdapterId[]>): Readonly<QueueName[]> {
-	return [...CONTROLLER_DEAD_LETTER_QUEUES, ...adapters.map(runDeadLetterQueue)];
+	return [
+		...CONTROLLER_DEAD_LETTER_QUEUES,
+		...adapters.map(runDeadLetterQueue),
+		...TOOL_NAMESPACES.map(toolDeadLetterQueue),
+	];
 }
 
 /** pg-boss caps job expiration at 24 hours. */
@@ -119,5 +139,13 @@ export async function ensureQueues(
 		await ensureQueue(boss, runDeadLetterQueue(adapter), { ...DEAD_LETTER, partition: true });
 		await ensureQueue(boss, runQueue(adapter), runQueuePolicy(adapter));
 		await ensureQueue(boss, reportQueue(adapter), REPORT_POLICY);
+	}
+	for (const namespace of TOOL_NAMESPACES) {
+		await ensureQueue(boss, toolDeadLetterQueue(namespace), { ...DEAD_LETTER, partition: true });
+		await ensureQueue(boss, toolExecuteQueue(namespace), {
+			...TOOL_EXECUTE_POLICY,
+			deadLetter: toolDeadLetterQueue(namespace),
+		});
+		await ensureQueue(boss, toolReportQueue(namespace), REPORT_POLICY);
 	}
 }

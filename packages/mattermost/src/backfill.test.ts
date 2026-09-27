@@ -4,7 +4,13 @@ import type { ApiPost, ApiPostList } from "./api-schemas.ts";
 import { channelChangesSince, type PostSource } from "./backfill.ts";
 import { channelStartOf } from "./bootstrap.ts";
 import { POSTS_SINCE_LIMIT } from "./client.ts";
-import { codeBlock, renderAlert, renderApprovalCard } from "./render.ts";
+import {
+	codeBlock,
+	renderAlert,
+	renderApprovalCard,
+	renderApprovalReply,
+	scriptsOf,
+} from "./render.ts";
 
 const CHANNEL = "channe1000000000000000000a";
 
@@ -185,8 +191,8 @@ describe("channel backfill", () => {
 
 describe("rendering", () => {
 	it("keeps the largest valid approval card within one post", () => {
-		// Long backtick runs make the fences as long as they get.
-		const value = `${"`".repeat(1990)}x`;
+		// Long backtick runs make the fences as long as they get; mixed scripts add the warning.
+		const value = `${"`".repeat(1988)}xа`;
 		const params: { name: string; value: string }[] = [];
 		const summary = `${"`".repeat(1990)} s`;
 		for (let n = 0; n < 32; n += 1) {
@@ -213,8 +219,52 @@ describe("rendering", () => {
 			riskLevel: "critical",
 			immutableActionHash: "a".repeat(64),
 			expiresAt: "2026-09-25T10:00:00.000Z",
+			approvalCode: "AB12-CD34-EF56",
 		});
 		expect(card.length).toBeLessThanOrEqual(16_383);
+	});
+
+	it("prints the decision code and flags values that mix alphabets", () => {
+		const card = renderApprovalCard({
+			approvalId: "0d7bc6f6-58a4-4a4b-8b7e-8b7c1f0d0a11",
+			channelName: "approvals",
+			channelId: null,
+			requestedByAgentId: "finance",
+			actionType: "finance.payment.create",
+			actionSummary: "Pay the domain",
+			actionParams: [
+				{ name: "amount", value: "120.00" },
+				// A Cyrillic "а" in a Latin IBAN.
+				{ name: "recipient", value: "DE89370400440532013000а" },
+			],
+			riskLevel: "critical",
+			immutableActionHash: "a".repeat(64),
+			expiresAt: "2026-09-25T10:00:00.000Z",
+			approvalCode: "AB12-CD34-EF56",
+		});
+		expect(card).toContain("`approve AB12-CD34-EF56` or `deny AB12-CD34-EF56`");
+		expect(card).toContain(":warning: Mixed alphabets in `recipient`");
+		expect(card).not.toContain("`amount`");
+		expect(scriptsOf("日本語のカタカナ")).toEqual(["CJK"]);
+		expect(scriptsOf("Straße 12")).toEqual(["Latin"]);
+	});
+
+	it("answers in a card's thread with fixed texts and inert details", () => {
+		const reply = renderApprovalReply({
+			approvalId: "0d7bc6f6-58a4-4a4b-8b7e-8b7c1f0d0a11",
+			channelId: CHANNEL,
+			rootPostId: "p".repeat(26),
+			notice: "executed",
+			userId: null,
+			outcome: "succeeded",
+			receipt: { payment_id: "pay_@all_1" },
+			detail: null,
+		});
+		expect(reply.split("\n").slice(0, 2)).toEqual([
+			"**Execution finished.**",
+			"The action succeeded.",
+		]);
+		expect(reply).toContain('```\n{\n  "payment_id": "pay_@all_1"\n}\n```');
 	});
 
 	it("keeps variable text inside a code block it cannot close", () => {

@@ -29,6 +29,14 @@ organization:
     max_runs_per_agent_per_hour: 30
     default_run_timeout_seconds: 1800
 
+  # Spending limits per UTC day; an agent over its limit (everyone over the global one) starts
+  # no run until the day changes. Tokens are input plus output tokens.
+  budgets:
+    per_agent_daily: { cost_usd: 5, tokens: 5000000 }
+    global_daily: { cost_usd: 20 }
+    # Kiro reports no usage: 'hold' would stop its agents after their first run each day.
+    unmetered: allow
+
 mattermost:
   team: autonomous-lab
   channels:

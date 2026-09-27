@@ -319,14 +319,14 @@ describe("wait matching of other event types", () => {
 		const approvalWait = wait({
 			condition: {
 				...wait().condition,
-				eventType: "approval.granted",
+				eventType: "approval.resolved",
 				expectedSenderAgentIds: [],
 				requireTargetAgentId: null,
 			},
 		});
 		const granted = {
 			...postEvent({ correlation: `thread:${ROOT}` }),
-			type: "approval.granted" as const,
+			type: "approval.resolved" as const,
 			trustlevel: "system-trusted" as const,
 			data: {},
 		};

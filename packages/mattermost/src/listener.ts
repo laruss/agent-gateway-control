@@ -1,11 +1,19 @@
-import type { AgentId, GatewayEvent, MattermostId } from "@agent-gateway/contracts";
+import type {
+	AgentId,
+	ApprovalReply,
+	ApprovalReplyOutcome,
+	GatewayEvent,
+	MattermostId,
+} from "@agent-gateway/contracts";
 import { errorFields, type Logger } from "@agent-gateway/logging";
 import { type ApiPost, ApiPostSchema, WsEventSchema, WsReplySchema } from "./api-schemas.ts";
 import { changesOf, channelChangesSince } from "./backfill.ts";
 import { type ChannelStart, channelStartOf, isBeforeStart } from "./bootstrap.ts";
 import { MattermostApiError, MattermostClient, websocketUrl } from "./client.ts";
+import { claimedKey } from "./deliver.ts";
 import {
 	type BridgeDirectory,
+	isAutomatedPost,
 	normalizePost,
 	type PostChange,
 	postSubject,
@@ -79,6 +87,11 @@ export type ListenerStore = Readonly<{
 	) => Promise<Readonly<{ exists: boolean; status: string | null; postId: string | null }>>;
 	/** Records (and alerts about) a post that impersonates an agent. */
 	reject: (post: RejectedPost) => Promise<void>;
+	/**
+	 * Hands a reply in an approval card's thread to the decision path (never to generic ingest).
+	 * Throws {@link AwaitingReceiptError} while the card it may answer is still being delivered.
+	 */
+	approvalReply: (reply: ApprovalReply) => Promise<ApprovalReplyOutcome>;
 }>;
 
 export type ListenerOptions = Readonly<{
@@ -219,20 +232,73 @@ export function startListener(options: ListenerOptions): RunningListener {
 	 */
 	const directory = (): Promise<BridgeDirectory | null> => store.directory();
 
-	const isBot = async (source: MattermostClient, userId: MattermostId, dir: BridgeDirectory) => {
-		if (dir.agents.some((agent) => agent.userId === userId)) {
-			return true;
+	/** Whether an account is a bot and whether it is active, as Mattermost says now. */
+	const account = async (source: MattermostClient, userId: MattermostId, dir: BridgeDirectory) => {
+		if (dir.agents.some((agent) => agent.userId === userId) || botAccounts.has(userId)) {
+			return { isBot: true, active: true };
 		}
-		if (botAccounts.has(userId)) {
-			return true;
-		}
-		// Asked for every post: a human account can be converted into a bot at any moment, and
-		// only a bot stays one.
+		// Asked for every post: a human account can be converted into a bot or deactivated at any
+		// moment, and only a bot stays one.
 		const user = await source.user(userId);
 		if (user.is_bot) {
 			botAccounts.add(userId);
 		}
-		return user.is_bot;
+		return { isBot: user.is_bot, active: user.delete_at === 0 };
+	};
+
+	const isBot = async (source: MattermostClient, userId: MattermostId, dir: BridgeDirectory) =>
+		(await account(source, userId, dir)).isBot;
+
+	/** The card key of thread roots the listener bot posted; its posts never change. */
+	const cardKeys = new Map<MattermostId, string | null>();
+	/**
+	 * The approval card key a thread root carries, when the root is the listener bot's own post
+	 * (the props alone prove nothing; the author does). Null for any other root.
+	 */
+	const cardKeyOf = async (source: MattermostClient, rootId: MattermostId) => {
+		const known = cardKeys.get(rootId);
+		if (known !== undefined) {
+			return known;
+		}
+		const root = await source.post(rootId);
+		const key = root !== null && root.user_id === listenerUserId ? claimedKey(root) : null;
+		if (root !== null) {
+			if (cardKeys.size > 1000) {
+				cardKeys.clear();
+			}
+			cardKeys.set(rootId, key);
+		}
+		return key;
+	};
+
+	/**
+	 * A reply in the approvals channel's threads may decide an approval: handed over before any
+	 * trust filter, so a bot's or an integration's attempt is audited too. Only creations count;
+	 * an edit decides nothing.
+	 */
+	const handleApprovalReply = async (
+		source: MattermostClient,
+		post: ApiPost,
+		dir: BridgeDirectory,
+	): Promise<ApprovalReplyOutcome> => {
+		const admission = { channelId: post.channel_id, postId: post.id, createAt: post.create_at };
+		if (!(await store.admits(admission))) {
+			return "ignored";
+		}
+		const author = await account(source, post.user_id, dir);
+		const outcome = await store.approvalReply({
+			postId: post.id,
+			rootPostId: post.root_id,
+			rootCardKey: await cardKeyOf(source, post.root_id),
+			channelId: post.channel_id,
+			userId: post.user_id,
+			message: post.message,
+			author: { ...author, automated: isAutomatedPost(post) },
+		});
+		if (outcome !== "ignored" && outcome !== "not_a_card" && outcome !== "replayed") {
+			log.info("approval reply handled", { post_id: post.id, notice: outcome });
+		}
+		return outcome;
 	};
 
 	/** A rejected token (rotated or revoked): reconnect, which reads the current one. */
@@ -281,6 +347,20 @@ export function startListener(options: ListenerOptions): RunningListener {
 			!(await store.hasPostCreation(dir.source, postSubject(post)))
 		) {
 			return;
+		}
+		if (
+			change === "created" &&
+			post.root_id !== "" &&
+			post.type === "" &&
+			post.user_id !== listenerUserId &&
+			post.channel_id === dir.approvalsChannelId
+		) {
+			const outcome = await handleApprovalReply(source, post, dir);
+			if (outcome !== "ignored" && outcome !== "not_a_card") {
+				// A command in a card's thread is the decision path's alone (recorded there, by
+				// post id): it never also routes as a post, so it cannot address an agent.
+				return;
+			}
 		}
 		const root = rootSubject(post);
 		const result = normalizePost(post, change, {

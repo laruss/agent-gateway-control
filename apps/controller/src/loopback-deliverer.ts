@@ -1,4 +1,7 @@
-import { MattermostPostPayloadSchema } from "@agent-gateway/contracts";
+import {
+	MattermostApprovalPayloadSchema,
+	MattermostPostPayloadSchema,
+} from "@agent-gateway/contracts";
 import { type ControlPlaneDeps, ingestEvent } from "@agent-gateway/core";
 import { newPostEventType, sha256Hex } from "@agent-gateway/events";
 import { type Deliverer, DeliveryError } from "@agent-gateway/outbox";
@@ -47,6 +50,30 @@ export function loopbackPostDeliverer(deps: ControlPlaneDeps): Deliverer {
 				},
 			});
 			return { loopback: true, postId, eventId: result.eventId, ingest: result.status };
+		},
+	};
+}
+
+/**
+ * Development and test stand-in for an approval card: "posts" it at a stable fake post id in
+ * the approvals channel, so a reply in its thread can be handed to the decision path as the
+ * listener would.
+ */
+export function loopbackApprovalCardDeliverer(): Deliverer {
+	return {
+		deliver: async (item) => {
+			const payload = MattermostApprovalPayloadSchema.safeParse(item.payload);
+			if (!payload.success) {
+				throw new DeliveryError("malformed mattermost.approval payload", false);
+			}
+			if (payload.data.channelId === null) {
+				throw new DeliveryError("the approvals channel is not resolved yet", true);
+			}
+			return {
+				loopback: true,
+				postId: fakeMattermostId(item.idempotencyKey),
+				channelId: payload.data.channelId,
+			};
 		},
 	};
 }

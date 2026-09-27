@@ -211,9 +211,13 @@ export function routeEvent(input: RoutingInput): Readonly<Route[]> {
 			routes.push(route("ignore", "self_post"));
 		} else if (agent.state === "disabled") {
 			routes.push(route("ignore", "agent_disabled"));
-		} else if (candidate.reason === "wait_timeout") {
-			// A timeout resolves a wait the agent already holds; blocking it would leave the agent
-			// waiting forever. At most one per wait, so it cannot amplify a loop.
+		} else if (
+			candidate.reason === "wait_timeout" ||
+			(isWait && event.type === "approval.resolved" && isGatewayEmitted(event))
+		) {
+			// A timeout, or how an approval ended, resolves a wait the agent already holds; blocking
+			// it would leave the agent waiting forever. At most one per wait, so it cannot amplify a
+			// loop.
 			cascadeWakes += 1;
 			threadWakes += 1;
 			routes.push(route(decision, candidate.reason));

@@ -6,6 +6,29 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ### Added
 
+- Approval decisions and the tool broker. An owner decides in the approval card's thread with
+  `approve <code>` or `deny <code>`. The listener hands the reply to a dedicated decision path
+  that checks the owner (fresh account lookup, approver snapshot and current owners), the
+  one-time code, the status and the expiry, and answers in the thread. A grant re-checks the
+  policy and queues a tool action. `apps/tool-runner` (`@agent-gateway/tool-broker`) executes
+  it: it recomputes the hash, runs the `gateway_begin_tool_action` check (approval, hash,
+  deadline, kill switch) and reports a receipt. The agent waits for one `approval.resolved`
+  event with the outcome. Kill-all cancels pending approvals and queued actions.
+  A stop request (kill-all, disable) aborts a running executor. An unknown outcome is never
+  retried; `gateway tools settle` records it by hand. `gateway db grant-tool-runner`,
+  `gateway tools list`. ADR-018.
+- Policy engine (`@agent-gateway/policy`): deny-by-default tool evaluation, finance only for the
+  finance agent and always approval-gated, typed parameter sets for `finance.payment.create`
+  and `finance.subscription.create`, checked before a card is shown, at grant and in the
+  runner. Approval cards flag values that mix alphabets.
+- Daily budgets (`organization.budgets`): per-agent and global limits on cost and tokens per
+  UTC day, summed from a usage ledger of every run attempt; an agent over its limit starts no
+  run until the day changes or the limit is raised. `gateway budgets`, budget and tool action
+  checks in `gateway health`.
+- Migrations `0010_approvals_and_tool_actions` (`tool_actions`, `approval_replies`,
+  `run_usage`, approval `cancelled` replaces `executed`) and `0011_approval_guards`
+  (immutability triggers and the `begin` function).
+
 - Gmail connector without Pub/Sub by default: it polls the mailbox's history every minute with
   a credential that grants `gmail.readonly` only; Pub/Sub push notifications are optional
   (`gateway gmail authorize --pubsub`, `GMAIL_PUBSUB_*`). `GMAIL_SYNC_SECONDS` replaces

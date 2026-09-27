@@ -61,7 +61,7 @@
     },
     "status": {
       "type": "string",
-      "enum": ["pending", "granted", "denied", "expired", "executed"]
+      "enum": ["pending", "granted", "denied", "expired", "cancelled"]
     },
     "allowedApproverUserIds": {
       "minItems": 1,

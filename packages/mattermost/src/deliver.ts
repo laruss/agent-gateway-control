@@ -2,6 +2,7 @@ import {
 	type AgentId,
 	MattermostAlertPayloadSchema,
 	MattermostApprovalPayloadSchema,
+	MattermostApprovalReplyPayloadSchema,
 	type MattermostId,
 	type MattermostPostPayload,
 	MattermostPostPayloadSchema,
@@ -12,7 +13,7 @@ import type { z } from "zod";
 import type { ApiPost } from "./api-schemas.ts";
 import { channelChangesSince } from "./backfill.ts";
 import { MattermostApiError, MattermostClient } from "./client.ts";
-import { renderAlert, renderApprovalCard } from "./render.ts";
+import { renderAlert, renderApprovalCard, renderApprovalReply } from "./render.ts";
 import { ROUTING_PROPS_KEY, signedRoutingProps, verifiedRoutingMetadata } from "./routing-props.ts";
 
 export type AgentBot = Readonly<{ userId: MattermostId; token: string }>;
@@ -42,10 +43,17 @@ export type BotCredentials = Readonly<{
 	 * has not resolved the bot or the channel.
 	 */
 	withListenerChannel: <T>(
-		purpose: "alerts" | "approvals",
+		purpose: ListenerTarget,
 		post: (bot: AgentBot, channelId: MattermostId) => Promise<T>,
 	) => Promise<Readonly<{ kind: "posted"; value: T }> | Readonly<{ kind: "unresolved" }>>;
 }>;
+
+/**
+ * Where the listener bot posts: the alerts or approvals channel as configured now, or a given
+ * managed channel (a card's thread stays in the card's channel after the approvals channel
+ * moved).
+ */
+export type ListenerTarget = "alerts" | "approvals" | Readonly<{ channelId: MattermostId }>;
 
 export type MattermostDelivererOptions = Readonly<{
 	baseUrl: string;
@@ -57,6 +65,7 @@ export type MattermostDeliverers = Readonly<{
 	"mattermost.post": Deliverer;
 	"mattermost.alert": Deliverer;
 	"mattermost.approval": Deliverer;
+	"mattermost.approval.reply": Deliverer;
 }>;
 
 /** Clock skew allowed between the Gateway and Mattermost when looking for an earlier post. */
@@ -100,8 +109,11 @@ function receipt(post: ApiPost) {
 	};
 }
 
-/** The idempotency key a post's props claim, if any. Anyone can set it: never proof alone. */
-function claimedKey(post: ApiPost): string | null {
+/**
+ * The idempotency key a post's props claim, if any. Anyone can set it: never proof alone, only
+ * together with the author's user id (the listener bot's own posts).
+ */
+export function claimedKey(post: ApiPost): string | null {
 	const props = post.props[ROUTING_PROPS_KEY];
 	if (typeof props !== "object" || props === null || Array.isArray(props)) {
 		return null;
@@ -252,8 +264,16 @@ export function mattermostDeliverers(options: MattermostDelivererOptions): Matte
 	 * Posts as the listener bot in the channel configured for `purpose` now (the channel recorded
 	 * when the item was decided may have moved or left the configuration).
 	 */
-	const asListener = async (item: OutboxItem, purpose: "alerts" | "approvals", message: string) => {
-		const outcome = await credentials.withListenerChannel(purpose, async (listener, channelId) => {
+	const asListener = async (
+		item: OutboxItem,
+		purpose: "alerts" | "approvals",
+		message: string,
+		/** A reply in a card's thread, in the card's own channel while that channel is managed. */
+		thread: Readonly<{ channelId: string; rootId: string }> | null = null,
+	) => {
+		const target: ListenerTarget = thread === null ? purpose : { channelId: thread.channelId };
+		const outcome = await credentials.withListenerChannel(target, async (listener, channelId) => {
+			const rootId = thread?.rootId ?? "";
 			const client = new MattermostClient({ baseUrl, token: listener.token });
 			try {
 				await assertOwner(client, listener.userId, "the listener");
@@ -263,7 +283,7 @@ export function mattermostDeliverers(options: MattermostDelivererOptions): Matte
 						item,
 						channelId,
 						listener.userId,
-						(candidate) => candidate.root_id === "" && candidate.message === message,
+						(candidate) => candidate.root_id === rootId && candidate.message === message,
 					);
 					if (earlier !== null) {
 						return receipt(earlier);
@@ -271,6 +291,7 @@ export function mattermostDeliverers(options: MattermostDelivererOptions): Matte
 				}
 				const created = await client.createPost({
 					channel_id: channelId,
+					...(thread === null ? {} : { root_id: thread.rootId }),
 					message,
 					// Unsigned: the listener's own posts never route, the key only finds them again.
 					props: { [ROUTING_PROPS_KEY]: { idempotency_key: item.idempotencyKey } },
@@ -283,7 +304,7 @@ export function mattermostDeliverers(options: MattermostDelivererOptions): Matte
 		});
 		if (outcome.kind === "unresolved") {
 			throw new DeliveryError(
-				`${item.kind}: the listener bot or its ${purpose} channel is not bootstrapped yet`,
+				`${item.kind}: the listener bot or its ${thread === null ? purpose : "card's"} channel is not resolved`,
 				true,
 			);
 		}
@@ -302,6 +323,15 @@ export function mattermostDeliverers(options: MattermostDelivererOptions): Matte
 			deliver: async (item) => {
 				const card = parsePayload(MattermostApprovalPayloadSchema, item);
 				return asListener(item, "approvals", renderApprovalCard(card));
+			},
+		},
+		"mattermost.approval.reply": {
+			deliver: async (item) => {
+				const reply = parsePayload(MattermostApprovalReplyPayloadSchema, item);
+				return asListener(item, "approvals", renderApprovalReply(reply), {
+					channelId: reply.channelId,
+					rootId: reply.rootPostId,
+				});
 			},
 		},
 	};

@@ -155,8 +155,11 @@ export async function whileAgentMayPost<T>(
 	});
 }
 
-/** What the listener bot posts: alerts or approval cards, each in its configured channel. */
-export type ListenerPurpose = "alerts" | "approvals";
+/**
+ * Where the listener bot posts: alerts and approval cards each in the channel configured for
+ * them, and answers in a card's thread in that card's own channel, as long as it is managed.
+ */
+export type ListenerPurpose = "alerts" | "approvals" | Readonly<{ channelId: MattermostId }>;
 
 /**
  * Runs `post` for the listener bot in the channel the active configuration names for `purpose`,
@@ -179,9 +182,14 @@ export async function whileListenerMayPost<T>(
 			return null;
 		}
 		const { mattermost } = snapshot.organization;
-		const name = purpose === "alerts" ? mattermost.alerts_channel : mattermost.approvals_channel;
-		const channelId =
-			[...snapshot.channels].find(([, channelName]) => channelName === name)?.[0] ?? null;
+		let channelId: MattermostId | null;
+		if (typeof purpose === "object") {
+			channelId = snapshot.channels.has(purpose.channelId) ? purpose.channelId : null;
+		} else {
+			const name = purpose === "alerts" ? mattermost.alerts_channel : mattermost.approvals_channel;
+			channelId =
+				[...snapshot.channels].find(([, channelName]) => channelName === name)?.[0] ?? null;
+		}
 		const users = await loadDirectory(uow.tx.db, "user");
 		return post(
 			users.get(mattermost.listener.username) ?? null,

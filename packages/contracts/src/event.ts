@@ -9,6 +9,7 @@ import {
 	type TrustLevel,
 	TrustLevelSchema,
 } from "./common.ts";
+import { ApprovalDecisionDataSchema, ApprovalResolvedDataSchema } from "./tool-action.ts";
 
 /** MVP event types. */
 export const GatewayEventTypeSchema = z.enum([
@@ -31,6 +32,8 @@ export const GatewayEventTypeSchema = z.enum([
 	"approval.requested",
 	"approval.granted",
 	"approval.denied",
+	/** How an approval ended, execution included: the one approval event an agent waits for. */
+	"approval.resolved",
 	"google.gmail.notification.received",
 	"google.gmail.message.received",
 	"timer.fired",
@@ -256,6 +259,13 @@ function gmailEnvelopeIssues(
 	return issues;
 }
 
+/** Approval events are the Gateway's; their data says which request and how it ended. */
+const APPROVAL_DATA_SCHEMAS: Readonly<Partial<Record<GatewayEventType, z.ZodType>>> = {
+	"approval.granted": ApprovalDecisionDataSchema,
+	"approval.denied": ApprovalDecisionDataSchema,
+	"approval.resolved": ApprovalResolvedDataSchema,
+};
+
 /** W3C trace context `traceparent` header value. */
 export const TraceparentSchema = z
 	.string()
@@ -283,6 +293,18 @@ export const GatewayEventSchema = z
 		data: JsonObjectSchema,
 	})
 	.check((ctx) => {
+		const approvalSchema = APPROVAL_DATA_SCHEMAS[ctx.value.type];
+		if (approvalSchema !== undefined) {
+			for (const issue of approvalSchema.safeParse(ctx.value.data).error?.issues ?? []) {
+				ctx.issues.push({
+					code: "custom",
+					input: ctx.value.data,
+					path: ["data", ...issue.path],
+					message: issue.message,
+				});
+			}
+			return;
+		}
 		const gmailSchema = GMAIL_DATA_SCHEMAS[ctx.value.type];
 		if (gmailSchema !== undefined) {
 			// Mail is written by whoever sends it: never trusted, whatever the connector claims.

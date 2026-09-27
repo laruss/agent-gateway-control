@@ -5,6 +5,8 @@ import { AgentIdSchema, MattermostIdSchema, TimestampSchema, UuidSchema } from "
 export const WaitableEventTypeSchema = z.enum([
 	"mattermost.thread.reply",
 	"mattermost.agent.mentioned",
+	"approval.resolved",
+	// Waits stored before ADR-018 waited on the decision events; kept so they still parse.
 	"approval.granted",
 	"approval.denied",
 	"google.gmail.message.received",

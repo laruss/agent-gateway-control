@@ -12,6 +12,7 @@
     "@agent-gateway/db": "workspace:*",
     "@agent-gateway/events": "workspace:*",
     "@agent-gateway/logging": "workspace:*",
+    "@agent-gateway/policy": "workspace:*",
     "drizzle-orm": "0.45.3",
     "pg": "8.23.0",
     "zod": "4.6.5"

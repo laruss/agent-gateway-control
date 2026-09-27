@@ -14,6 +14,8 @@ import {
 	type RunTimeoutJob,
 	type RuntimeAdapterId,
 	type RuntimeUsage,
+	type ToolPolicySnapshot,
+	toolNamespace,
 	type WaitCondition,
 } from "@agent-gateway/contracts";
 import {
@@ -32,19 +34,25 @@ import {
 } from "@agent-gateway/db";
 import { mattermostPost } from "@agent-gateway/events";
 import { redactForStorage } from "@agent-gateway/logging";
-import { and, eq } from "drizzle-orm";
 import {
 	approvalActionHash,
+	approvalCode,
+	approvedActionIssues,
+	riskLevelFor,
+} from "@agent-gateway/policy";
+import { and, eq } from "drizzle-orm";
+import {
 	checkRunScope,
 	type OutcomeIssue,
 	type RunScope,
 	renderPostMessage,
-	riskLevelFor,
 	runRetryDelaySeconds,
 	runScope,
 } from "../outcome.ts";
 import { requireTransition } from "../state-machine.ts";
 import { clampWaitTimeout, isThreadBound } from "../waits.ts";
+import { approvalCorrelation } from "./approval-store.ts";
+import { budgetHoldFor, recordRunUsage, reportedUsage } from "./budgets.ts";
 import { parseThreadRef, recordThreadSummary, threadCorrelationOf } from "./context-store.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
 import { lockMemoryKey, supersedeMemory } from "./memory.ts";
@@ -71,6 +79,8 @@ export type ReportOutcome =
 	| "started"
 	| "completed"
 	| "retry_scheduled"
+	/** A retry held by the budget: the work went back to the inbox. */
+	| "deferred"
 	| "failed"
 	| "ignored_stale"
 	| "ignored_unknown";
@@ -146,6 +156,20 @@ export async function handleRunReport(
 		if (run.runtimeAdapter !== adapter) {
 			deps.log.warn("report from another adapter's queue", { run_id: run.id, adapter });
 			return "ignored_unknown";
+		}
+		// Usage counts for budgets whatever happens to the report: a retried, failed or late
+		// cancelled attempt consumed it all the same. A completed turn ran the model, so a result
+		// without usage is unmetered; a failure without usage (a workspace error, a runtime that
+		// did not start) is no consumption the Gateway knows of.
+		if (report.kind !== "started" && report.attempt <= run.attempt) {
+			const usage = report.kind === "failed" ? report.usage : reportedUsage(report.result);
+			if (report.kind === "completed" || usage !== null) {
+				await recordRunUsage(
+					uow,
+					{ runId: run.id, attempt: report.attempt, agentId: agent.id },
+					usage,
+				);
+			}
 		}
 		if (!inProgress(run) || run.attempt !== report.attempt) {
 			return "ignored_stale";
@@ -240,7 +264,12 @@ async function applyFailure(
 ): Promise<ReportOutcome> {
 	const { db } = uow.tx;
 	const detail = redactForStorage(error.detail);
-	if (error.retryable && run.attempt < run.maxAttempts) {
+	const retry = error.retryable && run.attempt < run.maxAttempts;
+	const hold = retry ? await budgetHoldFor(uow, agent.id) : null;
+	if (hold !== null) {
+		return deferForBudget(uow, run, agent, error, hold.reason, runtimeVersion);
+	}
+	if (retry) {
 		const attempt = run.attempt + 1;
 		const delaySeconds = runRetryDelaySeconds(run.attempt, uow.deps.random);
 		const startAfter = new Date(uow.now.getTime() + delaySeconds * 1000);
@@ -320,6 +349,49 @@ async function applyFailure(
 	);
 	await audit(uow, "system", "run.failed", "run", run.id, { error_code: error.code });
 	return "failed";
+}
+
+/**
+ * A retry the budget holds: the run ends as cancelled and its events go back to the inbox, so
+ * the work starts again (as a new run) once the hold lifts, by the day changing or a raised
+ * limit. The agent is idle meanwhile; no operator has to redrive anything.
+ */
+async function deferForBudget(
+	uow: UnitOfWork,
+	run: RunRow,
+	agent: AgentRow,
+	error: RunError,
+	reason: string,
+	runtimeVersion: string,
+): Promise<ReportOutcome> {
+	const { db } = uow.tx;
+	await db
+		.update(agentRuns)
+		.set({
+			status: "cancelled",
+			finishedAt: uow.now,
+			errorCode: error.code,
+			errorDetailRedacted: redactForStorage(`${error.detail}; retry deferred: ${reason}`),
+			runtimeVersion,
+		})
+		.where(eq(agentRuns.id, run.id));
+	await db
+		.update(agentInbox)
+		.set({ status: "pending", runId: null })
+		.where(and(eq(agentInbox.runId, run.id), eq(agentInbox.status, "claimed")));
+	await setAgentState(
+		uow,
+		agent.id,
+		agent.state,
+		requireTransition(agent.id, agent.state, "complete_idle"),
+		`run ${run.id} deferred by the budget`,
+	);
+	await audit(uow, "system", "run.deferred", "run", run.id, {
+		attempt: run.attempt,
+		error_code: error.code,
+		reason,
+	});
+	return "deferred";
 }
 
 function issuesDetail(issues: Readonly<OutcomeIssue[]>): string {
@@ -425,6 +497,29 @@ async function applyCompletion(
 
 	let approvers: MattermostId[] = [];
 	if (result.nextState.kind === "needs_human") {
+		const refusal = await approvalPolicyIssues(
+			uow,
+			run,
+			agent.id,
+			snapshot.authority.toolPolicy,
+			result.nextState.approvalRequest,
+		);
+		if (refusal.length > 0) {
+			await raiseAlert(
+				uow,
+				`approval-policy:${run.id}`,
+				`Run ${run.id} of @${agent.id} asked to approve an action the policy refuses; no approval card was posted.`,
+				{ action_type: result.nextState.approvalRequest.actionType },
+			);
+			return applyFailure(
+				uow,
+				run,
+				agent,
+				{ code: "invalid_output", retryable: false, detail: refusal.join("; ") },
+				runtimeVersion,
+				result.usage,
+			);
+		}
 		approvers = await loadOwnerUserIds(uow.tx.db);
 		if (approvers.length === 0) {
 			return applyFailure(
@@ -730,8 +825,48 @@ async function createWaits(
 }
 
 /**
+ * The policy's verdict on an approval request, outside the model: the action must be
+ * approval-gated for the agent and not denied, finance only for the finance agent, its
+ * parameters must fit the action's typed set, and some tool namespace must execute it. Records
+ * the decision either way; returns the reasons for a refusal.
+ */
+async function approvalPolicyIssues(
+	uow: UnitOfWork,
+	run: RunRow,
+	agentId: string,
+	toolPolicy: ToolPolicySnapshot,
+	draft: ApprovalRequestDraft,
+): Promise<Readonly<string[]>> {
+	const config = await loadActiveConfig(uow.tx.db);
+	const financeAgentId = config?.organization.organization.finance_agent_id ?? "";
+	const issues = [
+		...approvedActionIssues(toolPolicy, { agentId, financeAgentId }, draft),
+		...(toolNamespace(draft.actionType) === null
+			? [`no tool namespace executes '${draft.actionType}'`]
+			: []),
+	];
+	const decisions =
+		issues.length === 0
+			? [{ decision: "require_approval" as const, reason: "approval requested" }]
+			: issues.slice(0, 20).map((reason) => ({ decision: "deny" as const, reason }));
+	for (const { decision, reason } of decisions) {
+		await uow.tx.db.insert(policyDecisions).values({
+			runId: run.id,
+			agentId,
+			action: draft.actionType,
+			decision,
+			reason,
+			policyVersion: toolPolicy.policyVersion,
+			inputRedacted: { param_names: draft.actionParams.map((param) => param.name) },
+			createdAt: uow.now,
+		});
+	}
+	return issues;
+}
+
+/**
  * Persists an immutable approval request, posts its card through the outbox, and makes the
- * agent wait for the decision.
+ * agent wait for how it ends (ADR-018): one wait on `approval.resolved`.
  */
 async function createApproval(
 	uow: UnitOfWork,
@@ -747,6 +882,7 @@ async function createApproval(
 	const expiresAt = new Date(uow.now.getTime() + APPROVAL_TTL_MS);
 	const immutableActionHash = approvalActionHash(draft);
 	const riskLevel = riskLevelFor(draft.actionType);
+	const nonce = randomBytes(24).toString("hex");
 	const [approval] = await uow.tx.db
 		.insert(approvalRequests)
 		.values({
@@ -759,7 +895,7 @@ async function createApproval(
 			riskLevel,
 			status: "pending",
 			allowedApproverUserIds: [...approvers],
-			nonce: randomBytes(24).toString("hex"),
+			nonce,
 			createdAt: uow.now,
 			expiresAt,
 		})
@@ -780,6 +916,7 @@ async function createApproval(
 		riskLevel,
 		immutableActionHash,
 		expiresAt: expiresAt.toISOString(),
+		approvalCode: approvalCode({ id: approval.id, nonce, immutableActionHash }),
 	};
 	await enqueueOutbox(uow, {
 		kind: "mattermost.approval",
@@ -788,24 +925,21 @@ async function createApproval(
 		idempotencyKey: `approval-card:${approval.id}`,
 		runId: run.id,
 	});
-	const correlationId = `approval:${approval.id}`;
-	for (const eventType of ["approval.granted", "approval.denied"] as const) {
-		await insertWait(
-			uow,
-			run,
-			agentId,
-			{
-				eventType,
-				correlationId,
-				expectedSenderAgentIds: [],
-				expectedSenderUserIds: [],
-				requireTargetAgentId: null,
-				timeoutAt: expiresAt.toISOString(),
-			},
-			expiresAt,
-			null,
-		);
-	}
+	await insertWait(
+		uow,
+		run,
+		agentId,
+		{
+			eventType: "approval.resolved",
+			correlationId: approvalCorrelation(approval.id),
+			expectedSenderAgentIds: [],
+			expectedSenderUserIds: [],
+			requireTargetAgentId: null,
+			timeoutAt: expiresAt.toISOString(),
+		},
+		expiresAt,
+		null,
+	);
 	await audit(uow, "system", "approval.requested", "approval", approval.id, {
 		run_id: run.id,
 		action_type: draft.actionType,

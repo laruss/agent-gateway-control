@@ -76,10 +76,16 @@ export const ApprovalRequestDraftSchema = z
 	});
 export type ApprovalRequestDraft = z.infer<typeof ApprovalRequestDraftSchema>;
 
-export const ApprovalStatusSchema = z.enum(["pending", "granted", "denied", "expired", "executed"]);
+/**
+ * An approval's decision, never its execution: a granted approval stays granted whatever the
+ * tool action does (ADR-018). `cancelled`: withdrawn before a decision (kill-all, the agent
+ * disabled) or refused by policy when granted.
+ */
+export const APPROVAL_STATUSES = ["pending", "granted", "denied", "expired", "cancelled"] as const;
+export const ApprovalStatusSchema = z.enum(APPROVAL_STATUSES);
 export type ApprovalStatus = z.infer<typeof ApprovalStatusSchema>;
 
-const DECIDED_STATUSES: Readonly<ApprovalStatus[]> = ["granted", "denied", "executed"];
+const DECIDED_STATUSES: Readonly<ApprovalStatus[]> = ["granted", "denied"];
 
 /** Persisted, immutable approval request (ADR-007). */
 export const ApprovalRequestSchema = z

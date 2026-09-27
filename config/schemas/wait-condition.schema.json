@@ -8,6 +8,7 @@
       "enum": [
         "mattermost.thread.reply",
         "mattermost.agent.mentioned",
+        "approval.resolved",
         "approval.granted",
         "approval.denied",
         "google.gmail.message.received",

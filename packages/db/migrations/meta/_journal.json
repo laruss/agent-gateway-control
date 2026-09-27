@@ -71,6 +71,20 @@
       "when": 1790510825106,
       "tag": "0009_gmail_mode",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1790532340153,
+      "tag": "0010_approvals_and_tool_actions",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1790532360421,
+      "tag": "0011_approval_guards",
+      "breakpoints": true
     }
   ]
 }

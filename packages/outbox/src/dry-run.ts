@@ -21,5 +21,6 @@ export function dryRunDeliverers(log: Logger): Readonly<Record<OutboxKind, Deliv
 		"mattermost.post": deliverer,
 		"mattermost.alert": deliverer,
 		"mattermost.approval": deliverer,
+		"mattermost.approval.reply": deliverer,
 	};
 }

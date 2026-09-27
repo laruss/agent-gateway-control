@@ -172,6 +172,7 @@
             "approval.requested",
             "approval.granted",
             "approval.denied",
+            "approval.resolved",
             "google.gmail.notification.received",
             "google.gmail.message.received",
             "timer.fired",
@@ -374,6 +375,7 @@
                     "enum": [
                       "mattermost.thread.reply",
                       "mattermost.agent.mentioned",
+                      "approval.resolved",
                       "approval.granted",
                       "approval.denied",
                       "google.gmail.message.received",
@@ -727,6 +729,7 @@
               "approval.requested",
               "approval.granted",
               "approval.denied",
+              "approval.resolved",
               "google.gmail.notification.received",
               "google.gmail.message.received",
               "timer.fired",

@@ -1,6 +1,20 @@
 export * from "./outcome.ts";
 export * from "./routing.ts";
 export * from "./services/admin.ts";
+export {
+	ApprovalCardPendingError,
+	approvalPending,
+	handleApprovalReply,
+	handleToolReport,
+	listToolActions,
+	type ManualOutcome,
+	settleToolAction,
+	sweepApprovals,
+	TOOL_BEGIN_WINDOW_MS,
+	TOOL_RUN_GRACE_MS,
+	type ToolReportOutcome,
+} from "./services/approvals.ts";
+export { type BudgetReport, budgetHoldFor, budgetReport } from "./services/budgets.ts";
 export * from "./services/deps.ts";
 export * from "./services/gmail.ts";
 export * from "./services/ingest.ts";

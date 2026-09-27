@@ -31,6 +31,7 @@ const ctx: NormalizeContext = {
 			[HQ, "hq"],
 			[FIN, "finance"],
 		]),
+		approvalsChannelId: null,
 		agents: [
 			{ id: "developer", userId: DEV_BOT, channelIds: new Set([HQ]) },
 			{ id: "finance", userId: FIN_BOT, channelIds: new Set([HQ, FIN]) },

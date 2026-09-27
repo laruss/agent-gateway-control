@@ -1,13 +1,6 @@
 import type { AgentTurnResult } from "@agent-gateway/contracts";
 import { describe, expect, it } from "vitest";
-import {
-	approvalActionHash,
-	checkRunScope,
-	renderPostMessage,
-	riskLevelFor,
-	runRetryDelaySeconds,
-	runScope,
-} from "./outcome.ts";
+import { checkRunScope, renderPostMessage, runRetryDelaySeconds, runScope } from "./outcome.ts";
 import { CHANNEL, postEvent, ROOT } from "./test-events.ts";
 import { clampWaitTimeout, MAX_WAIT_SECONDS, MIN_WAIT_SECONDS } from "./waits.ts";
 
@@ -141,7 +134,7 @@ describe("model waits", () => {
 				kind: "waiting",
 				waits: [
 					{
-						eventType: "approval.granted",
+						eventType: "approval.resolved",
 						correlationId: `thread:${ROOT}`,
 						expectedSenderAgentIds: [],
 						expectedSenderUserIds: [],
@@ -154,41 +147,6 @@ describe("model waits", () => {
 		expect(checkRunScope(forged, runScope([postEvent()])).map((i) => i.path)).toEqual([
 			"nextState.waits.0.eventType",
 		]);
-	});
-});
-
-describe("approvals", () => {
-	it("hashes parameters independently of their order", () => {
-		const a = approvalActionHash({
-			actionType: "finance.payment.create",
-			actionParams: [
-				{ name: "amount", value: "10.00" },
-				{ name: "currency", value: "EUR" },
-			],
-			actionSummary: "one",
-		});
-		const b = approvalActionHash({
-			actionType: "finance.payment.create",
-			actionParams: [
-				{ name: "currency", value: "EUR" },
-				{ name: "amount", value: "10.00" },
-			],
-			actionSummary: "the summary is not part of the hash",
-		});
-		expect(a).toBe(b);
-		expect(a).toMatch(/^[a-f0-9]{64}$/);
-		const changed = approvalActionHash({
-			actionType: "finance.payment.create",
-			actionParams: [{ name: "amount", value: "10.01" }],
-			actionSummary: "one",
-		});
-		expect(changed).not.toBe(a);
-	});
-
-	it("assigns risk from policy", () => {
-		expect(riskLevelFor("finance.payment.create")).toBe("critical");
-		expect(riskLevelFor("mail.send")).toBe("high");
-		expect(riskLevelFor("repository.write")).toBe("medium");
 	});
 });
 

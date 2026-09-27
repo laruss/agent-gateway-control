@@ -64,12 +64,13 @@ Known gaps, deferred:
   Phase 1.
 - [x] Check `WaitCondition.expectedSenderUserIds` against the thread participants (and the
   owners). Phase 3.
-- [ ] Typed parameter sets per financial action (Phase 7).
+- [x] Typed parameter sets per financial action. Phase 7: `finance.payment.create` and
+  `finance.subscription.create`; other finance writes cannot be approved.
 - [x] Verify each provider actually accepts `agent-turn-model-output.schema.json`. Phase 4: Codex
   accepts it as is; Claude Code accepts it without `$schema`, which its adapter drops.
-- [ ] Phase 7: the approval card renders parameters in a code block (so Markdown in values is
-  inert), separate from the summary, and flags mixed-script values (homoglyphs are a rendering
-  concern, not a contract one).
+- [x] The approval card renders parameters in a code block (so Markdown in values is inert),
+  separate from the summary, and flags mixed-script values (homoglyphs are a rendering
+  concern, not a contract one). Code blocks since Phase 2, the mixed-script warning in Phase 7.
 
 ## Review log
 
@@ -198,7 +199,7 @@ Known gaps, deferred:
 - Context assembly was minimal: no thread context, memories or workspace. Threads, summaries
   and memory came in Phase 3; workspaces come with the coding runtimes.
 - Approval decisions (grant/deny) arrive with the Mattermost approval flow (Phase 7); until then
-  an approval request expires and resumes the agent with a timeout.
+  an approval request expires and resumes the agent with a timeout. Done in Phase 7.
 - `/metrics` is served but empty; metrics come with observability work.
 - Provider sessions are stored when returned but not resumed yet (`continueTurn` unused).
   Resumed since Phase 4.
@@ -1214,7 +1215,8 @@ Deliberate choices in this phase ([ADR-016](docs/adr/016-gmail-connector.md)):
 
 Known gaps, deferred:
 
-- Attachment scanning and handing attachments to tools (Phase 7 Tool Broker).
+- Attachment scanning and handing attachments to tools (after Phase 7: the tool broker executes
+  approved actions only, no tool reads mail attachments yet).
 - One mailbox per connector process; several mailboxes run several processes.
 - Retention of stored mail (Phase 8).
 - A Google OAuth app left in "Testing" status issues refresh tokens that expire after seven
@@ -1361,3 +1363,134 @@ credentials can send mail). One review round (Codex + Opus subagent): 0 P1, Code
     `gateway gmail authorize --pubsub` in the Pub/Sub mode.
   - Fixed (Opus P3): a connector started with the renamed `GMAIL_RECONCILE_SECONDS` refuses to
     start.
+
+## Phase 7 - Policies and approvals
+
+Status: **done** (review closed after round 5, the round limit: its P2 is fixed and covered by
+the Mattermost e2e test)
+
+| Item | State | Evidence |
+|------|-------|----------|
+| Policy engine outside the model: deny wins, deny by default, finance only for the finance agent and always approval-gated, typed finance parameters, risk by policy | done | `packages/policy`, checked at request (`runs.ts`), at grant and in the runner |
+| Approval decisions in the card's thread (`approve <code>` / `deny <code>`), handed over by the listener only, answered in the thread | done | `listener.ts`, `core/src/services/approvals.ts`, [docs/operations/approvals.md](docs/operations/approvals.md) |
+| Owner identity verification: approver snapshot and current owners, fresh account lookup (not a bot, active), no integration props, expiry by the controller's clock under the request lock | done | `approvals.ts`, `listener.ts` |
+| Immutable action hashes: triggers keep the request and a tool action immutable and decisions final; the hash is recomputed at grant, by the runner and by `begin` | done | migration `0011_approval_guards`, `tool-job.ts` |
+| Tool broker boundary: `apps/tool-runner` per namespace, a role limited to its queues and `gateway_begin_tool_action`, static executors, idempotency keys, `unknown` outcomes never retried | done | `packages/tool-broker`, `apps/tool-runner`, `grantToolRunnerRole` |
+| One `approval.resolved` continuation per approval, exempt from loop guards, deferred by kill-all and budget holds | done | `approval-store.ts`, `routing.ts`, `waits.ts` |
+| Budgets: per-agent and global daily cost and token limits, usage ledger of every attempt, gate at schedule, retry and redrive | done | `core/src/services/budgets.ts`, migration `0010_approvals_and_tool_actions` |
+| Kill-all: also cancels pending approvals and queued actions, asks running ones to stop; `begin` refuses under the switch | done | `admin.ts`, `0011_approval_guards` |
+| CLI: `db grant-tool-runner`, `tools list`, `budgets`, execution status in `approvals list`, tool action and budget checks in `gateway health` | done | `apps/cli/src/commands.ts` |
+
+Acceptance (`apps/tool-runner/src/approvals.integration.test.ts` with the controller, a mock
+worker and a tool runner on PostgreSQL; the Mattermost path in `mattermost-bridge.e2e.test.ts`):
+
+- [x] The developer cannot call a finance tool: a developer run that asks for
+  `finance.payment.create` fails with `deny` policy decisions and gets no approval request;
+  configuration validation and the policy engine both refuse finance tools to any agent but the
+  finance agent.
+- [x] The finance agent still cannot execute a payment without human approval: finance writes
+  can only be approval-gated; nothing runs until an owner approves, and `begin` refuses an
+  action whose approval is not granted.
+- [x] Forged approval text is rejected: replies from a bot, from a human who is not an owner,
+  with webhook props on the owner's account, from a deactivated account, with the wrong code,
+  malformed commands and plain `APPROVED` decide nothing (audited and alerted); a replayed post
+  decides nothing twice; a reply after expiry is refused. Checked against a real Mattermost for
+  a non-owner and a webhook on the owner's account.
+- [x] A changed amount invalidates the approval: the stored request cannot be updated
+  (trigger), and a job with a changed amount is refused by the runner before `begin`; only the
+  approved amount is executed, once.
+- [x] Kill-all prevents new runs and cancels active runs where supported, and now also
+  withdraws pending approvals and queued actions; `begin` answers `kill_switch`, and a runner
+  started afterwards executes nothing.
+
+Deliberate choices in this phase ([ADR-018](docs/adr/018-approval-decisions-and-tool-broker.md),
+advised by Codex astra, decided by the owner where noted):
+
+- Decisions by a reply in the card's thread (owner's choice), not buttons or reactions.
+- A separate tool runner holding the tool credentials (owner's choice).
+- Daily budgets per agent and in total (owner's choice), computed from a ledger, not stored
+  holds.
+- No real payment or mail integration ships: sandbox executors for development, tests with
+  recording executors.
+
+Known gaps, deferred:
+
+- A stop request aborts an executor's call only where the executor honours its abort signal;
+  a provider call already made may still complete (its report counts).
+- Approvals pending before migration `0010` wait on the old decision events; they end with
+  their expiry. There was no deployment yet.
+- Kill-all and a concurrent run report can deadlock (the report locks the agent, then the
+  controls row; kill-all the other way round). Postgres aborts one: the report is retried by
+  its queue, a failed kill-all is run again. Pre-existing since Phase 1.
+- An approved action that begins after the controller's clock and the database clock disagree
+  by minutes may be refused by `begin` (the deadline is checked by the database clock).
+- Budgets admit work by reported usage; runs in flight can overshoot a limit.
+- In loopback development without Mattermost there is no way to decide an approval.
+- A retry deferred by the budget starts again as a new run with fresh attempts.
+
+### Phase 7 review log
+
+- Round 1 (Codex + Opus subagent): Codex 1 P1 + 2 P2, Opus 1 P1 + 4 P2 + 13 P3.
+  - Fixed (Codex P1): a stop request (kill-all, disable) on a running action was only recorded.
+    The runner now polls `gateway_tool_action_stop_requested` and aborts the executor's call.
+  - Fixed (Codex P2): the executor got the job's idempotency key; `begin` now hands out the
+    stored one, and a job carrying its own key is malformed.
+  - Fixed (Codex P2, Opus P2): any command-shaped reply stalled the approvals channel while any
+    card was undelivered. A reply waits only when its thread root is the listener bot's own
+    post claiming that card's key.
+  - Fixed (Opus P1): a failure that never reached the model (no usage) was booked as unmetered
+    and, under `unmetered: hold`, held the agent for the day and cancelled its retry. Only a
+    completed turn without usage is unmetered; usage is booked on the day it is reported (a
+    retry after midnight no longer escapes today's limit); cost is capped to the column.
+  - Fixed (Opus P2): `gateway tools settle` records an unknown action's outcome by hand.
+  - Fixed (Opus P2): tests for the runner role's isolation (no domain tables, no other
+    namespace's `begin`, no worker access), the deadline sweep (cancelled, unknown, a late
+    report without a second resolution), revocation by config apply, disable, kill-all against
+    a running executor, the global budget, and in e2e an edited command and a command in
+    another thread.
+  - Fixed (Opus P3): the sweep isolates failing approvals and expires pending requests whose
+    wait is gone; withdrawn requests get a notice on the card; quoted or code-formatted
+    commands are answered as malformed; forgery alerts are one per request and author; `begin`
+    refuses a runner role of another namespace; a grant under the kill switch is refused;
+    errors are bounded before resolution; legacy wait types still parse; lock-order and
+    threat-model wording (the code is per request, not a secret; any owner credential decides).
+- Round 2 (Codex + Opus subagent): Codex 1 P1 + 2 P2, Opus 0 P1/P2 (all round-1 fixes
+  confirmed) + 6 P3.
+  - Fixed (Codex P1): a retry held by the budget failed the run for good. It is deferred now:
+    the run ends as cancelled, its events go back to the inbox, and the work runs once the hold
+    lifts (integration test).
+  - Fixed (Codex P2): `gateway health` failed on a database with pending migrations; the new
+    checks wait for them and a missing queue is reported, not thrown.
+  - Fixed (Codex P2): moving `approvals_channel` left pending requests undecidable until expiry;
+    a config apply that moves it withdraws them (integration test).
+  - Fixed (Opus P3): stop checks no longer pile up; a report contradicting a settled action is
+    audited and alerted; a refusal names its reason (policy or kill switch) instead of always
+    blaming the policy.
+  - Deferred to round 3 (Opus P3): a final notice for a request that ended before its card was
+    delivered. Migration `0011` changed in place during the review; it was never committed or
+    deployed.
+- Round 3 (Codex + Opus subagent): Codex 0 P1 + 2 P2, Opus 0 P1/P2 + 4 P3.
+  - Fixed (Codex P2): a request that ended before its card was delivered left a card inviting
+    a decision. Cards are posted only for pending requests, and the sweep posts the last word on
+    a card that was delivered as its request ended.
+  - Fixed (Codex P2): after the approvals channel moved, the withdrawal notice for an old card
+    was refused; answers in a card's thread now go to the card's own channel while it is managed.
+  - Fixed (Opus P3): a team change withdraws pending requests like a channel move; the pending
+    withdrawal honours its agent filter; a known failure of an action cancelled before it began
+    raises no conflict alert. Kept as a known gap: a deferred retry restarts with fresh
+    attempts.
+- Round 4 (Codex + Opus subagent): Codex 0 P1 + 2 P2, Opus 0 P1/P2 + 3 P3.
+  - Fixed (Codex P2): a forged job naming a queued action under another action type could fail
+    that action ("no executor") without `begin`. The runner calls `begin` first, which checks the
+    job against the stored action; only then does a missing executor fail it.
+  - Fixed (Codex P2): a job aborted while `begin` was pending could still start its executor;
+    the runner now fails it as known before anything is sent.
+  - Fixed (Opus P3): the late-notice query probes notices by their unique keys; the two-day
+    window is documented.
+- Round 5 (Codex + Opus subagent): Codex 0 P1 + 1 P2, Opus 0 P1/P2 + 1 P3.
+  - Fixed (Codex P2): a command in a card's thread, handled by the decision path, also went
+    through ordinary routing, so `approve <code> @agent` could wake an agent allowed in the
+    approvals channel. Such a command is now the decision path's alone and is not ingested as a
+    post (e2e test).
+  - Fixed (Opus P3): stale comments about failures "before `begin`".
+

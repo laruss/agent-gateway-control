@@ -11,12 +11,21 @@ import type {
 	RuntimeAdapterId,
 	RuntimeUsage,
 	ThreadSummary,
+	ToolActionStatus,
+	ToolNamespace,
+	ToolReceipt,
 	TurnAuthorityContext,
 	WaitCondition,
 	WorkerStatus,
 	WorkingSummary,
 } from "@agent-gateway/contracts";
-import { GMAIL_MODES, WorkerStatusSchema } from "@agent-gateway/contracts";
+import {
+	APPROVAL_STATUSES,
+	GMAIL_MODES,
+	TOOL_ACTION_STATUSES,
+	TOOL_NAMESPACES,
+	WorkerStatusSchema,
+} from "@agent-gateway/contracts";
 import { sql } from "drizzle-orm";
 import {
 	bigint,
@@ -72,10 +81,14 @@ export type WaitStatus = (typeof WAIT_STATUSES)[number];
 export const OUTBOX_STATUSES = ["pending", "sending", "sent", "dead"] as const;
 export type OutboxStatus = (typeof OUTBOX_STATUSES)[number];
 
-export const OUTBOX_KINDS = ["mattermost.post", "mattermost.alert", "mattermost.approval"] as const;
+export const OUTBOX_KINDS = [
+	"mattermost.post",
+	"mattermost.alert",
+	"mattermost.approval",
+	"mattermost.approval.reply",
+] as const;
 export type OutboxKind = (typeof OUTBOX_KINDS)[number];
 
-export const APPROVAL_STATUSES = ["pending", "granted", "denied", "expired", "executed"] as const;
 export const MEMORY_STATUSES = ["proposed", "accepted", "rejected", "superseded"] as const;
 export const VISIBILITIES = ["private", "shared", "public"] as const;
 export const POLICY_DECISIONS = ["allow", "deny", "require_approval"] as const;
@@ -525,6 +538,10 @@ export const approvalRequests = pgTable(
 		expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
 		decidedByUserId: text("decided_by_user_id"),
 		decidedAt: timestamp("decided_at", { withTimezone: true }),
+		/** The owner's reply that decided, by Mattermost post id. */
+		decisionPostId: text("decision_post_id"),
+		/** When `approval.resolved` was emitted for the requesting agent; null until then. */
+		resolvedAt: timestamp("resolved_at", { withTimezone: true }),
 	},
 	(t) => [
 		check("approval_requests_status", oneOf("status", APPROVAL_STATUSES)),
@@ -551,6 +568,93 @@ export const policyDecisions = pgTable(
 	(t) => [
 		index("policy_decisions_run").on(t.runId),
 		check("policy_decisions_decision", oneOf("decision", POLICY_DECISIONS)),
+	],
+);
+
+/**
+ * The execution of a granted approval, at most one per approval. Its action and hash are copied
+ * from the approval and immutable (a trigger); the tool runner may start it only through
+ * `gateway_begin_tool_action`, which checks the approval, the hash and the kill switch.
+ */
+export const toolActions = pgTable(
+	"tool_actions",
+	{
+		id: uuid("id").primaryKey().defaultRandom(),
+		approvalId: uuid("approval_id")
+			.notNull()
+			.unique()
+			.references(() => approvalRequests.id),
+		agentId: text("agent_id")
+			.notNull()
+			.references(() => agents.id),
+		namespace: text("namespace").$type<ToolNamespace>().notNull(),
+		actionType: text("action_type").notNull(),
+		actionParams: jsonb("action_params").$type<ActionParams>().notNull(),
+		immutableActionHash: text("immutable_action_hash").notNull(),
+		/** `tool-action:<approval id>:<hash>`: executors are idempotent by it at their provider. */
+		idempotencyKey: text("idempotency_key").notNull().unique(),
+		status: text("status").$type<ToolActionStatus>().notNull(),
+		attempt: integer("attempt").notNull().default(1),
+		/** The configuration the grant was checked against. */
+		configVersion: text("config_version").notNull(),
+		/** `begin` refuses after it; the controller's sweep settles the action then. */
+		deadlineAt: timestamp("deadline_at", { withTimezone: true }).notNull(),
+		/** Kill-all asked a running action to stop; the runner's report still counts. */
+		cancelRequestedAt: timestamp("cancel_requested_at", { withTimezone: true }),
+		startedAt: timestamp("started_at", { withTimezone: true }),
+		completedAt: timestamp("completed_at", { withTimezone: true }),
+		receipt: jsonb("receipt").$type<ToolReceipt>(),
+		errorRedacted: text("error_redacted"),
+		createdAt: createdAt(),
+	},
+	(t) => [
+		index("tool_actions_open").on(t.status, t.deadlineAt),
+		check("tool_actions_status", oneOf("status", TOOL_ACTION_STATUSES)),
+		check("tool_actions_namespace", oneOf("namespace", TOOL_NAMESPACES)),
+	],
+);
+
+/**
+ * Every approval command the listener handed over, by the post that carried it: a replayed
+ * post decides nothing twice and gets no second acknowledgement.
+ */
+export const approvalReplies = pgTable("approval_replies", {
+	postId: text("post_id").primaryKey(),
+	approvalId: uuid("approval_id")
+		.notNull()
+		.references(() => approvalRequests.id),
+	userId: text("user_id").notNull(),
+	/** What the reply got: the notice posted in the thread. */
+	notice: text("notice").notNull(),
+	createdAt: createdAt(),
+});
+
+/**
+ * Usage of every run attempt that reported it, booked once per attempt on the UTC day its run
+ * was queued. Budgets sum this ledger, never `agent_runs.usage` (which keeps the last attempt
+ * only).
+ */
+export const runUsage = pgTable(
+	"run_usage",
+	{
+		runId: uuid("run_id")
+			.notNull()
+			.references(() => agentRuns.id),
+		attempt: integer("attempt").notNull(),
+		agentId: text("agent_id")
+			.notNull()
+			.references(() => agents.id),
+		/** `YYYY-MM-DD`, UTC. */
+		day: text("day").notNull(),
+		/** Null: the runtime reported no cost. */
+		costUsd: numeric("cost_usd", { precision: 14, scale: 6, mode: "number" }),
+		/** Input plus output tokens; null: the runtime reported none. */
+		tokens: bigint("tokens", { mode: "number" }),
+		recordedAt: timestamp("recorded_at", { withTimezone: true }).notNull(),
+	},
+	(t) => [
+		primaryKey({ columns: [t.runId, t.attempt] }),
+		index("run_usage_day").on(t.day, t.agentId),
 	],
 );
 

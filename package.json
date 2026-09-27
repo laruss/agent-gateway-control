@@ -29,6 +29,7 @@
     "dev:controller": "bun apps/controller/src/main.ts",
     "dev:worker": "bun apps/worker/src/main.ts",
     "dev:connector-gmail": "bun apps/connector-gmail/src/main.ts",
+    "dev:tool-runner": "bun apps/tool-runner/src/main.ts",
     "dev:infra": "docker compose -f deploy/dev/compose.yaml up -d --wait",
     "dev:infra:down": "docker compose -f deploy/dev/compose.yaml down",
     "db:generate": "cd packages/db && bun --bun drizzle-kit generate --config drizzle.config.ts"

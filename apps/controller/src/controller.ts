@@ -4,6 +4,9 @@ import {
 	RunTimeoutJobSchema,
 	RuntimeAdapterIdSchema,
 	reportQueue,
+	TOOL_NAMESPACES,
+	ToolReportSchema,
+	toolReportQueue,
 	WaitTimeoutJobSchema,
 	WorkerReportSchema,
 } from "@agent-gateway/contracts";
@@ -11,10 +14,12 @@ import {
 	type ControlPlaneDeps,
 	handleRunReport,
 	handleRunTimeout,
+	handleToolReport,
 	handleWaitTimeout,
 	type JobProbe,
 	reconcileRunsAndWaits,
 	recordWorkerStatus,
+	sweepApprovals,
 	sweepRuntimeHealth,
 	sweepSchedules,
 } from "@agent-gateway/core";
@@ -70,8 +75,8 @@ export function bossJobProbe(boss: PgBoss): JobProbe {
 }
 
 /**
- * The control plane process: consumes worker reports, run and wait timeouts, and outbox
- * deliveries. Refuses to start on a database with pending migrations.
+ * The control plane process: consumes worker and tool runner reports, run and wait timeouts,
+ * and outbox deliveries. Refuses to start on a database with pending migrations.
  */
 export async function startController(options: ControllerOptions): Promise<RunningController> {
 	const { log } = options;
@@ -138,6 +143,33 @@ export async function startController(options: ControllerOptions): Promise<Runni
 			},
 		);
 	}
+	// One report queue per tool namespace: a report counts only for actions of that namespace.
+	for (const namespace of TOOL_NAMESPACES) {
+		await boss.work(
+			toolReportQueue(namespace),
+			{ ...polling, batchSize: 1, localConcurrency: 2 },
+			async ([job]) => {
+				if (job === undefined) {
+					return;
+				}
+				const report = ToolReportSchema.safeParse(job.data);
+				if (!report.success) {
+					log.error("rejected malformed tool report", {
+						job_id: job.id,
+						namespace,
+						error_code: "invalid_report",
+					});
+					return;
+				}
+				const outcome = await handleToolReport(deps, namespace, report.data);
+				log.info("tool report applied", {
+					job_id: job.id,
+					tool_action_id: report.data.actionId,
+					outcome,
+				});
+			},
+		);
+	}
 	await boss.work(QUEUES.agentTimeout, polling, async ([job]) => {
 		if (job !== undefined) {
 			await handleRunTimeout(deps, RunTimeoutJobSchema.parse(job.data));
@@ -190,6 +222,14 @@ export async function startController(options: ControllerOptions): Promise<Runni
 			}
 		} catch (error) {
 			log.error("schedule sweep failed", errorFields(error));
+		}
+		try {
+			const settled = await sweepApprovals(deps);
+			if (settled > 0) {
+				log.info("settled or resolved approvals", { count: settled });
+			}
+		} catch (error) {
+			log.error("approval sweep failed", errorFields(error));
 		}
 		try {
 			const unavailable = await sweepRuntimeHealth(deps, runtimeHealthOptions);

@@ -8,8 +8,9 @@ import {
 	requireSetting,
 	startHealthServer,
 } from "@agent-gateway/service";
+import { withPendingApprovalCards } from "./approval-cards.ts";
 import { type ControllerOptions, startController } from "./controller.ts";
-import { loopbackPostDeliverer } from "./loopback-deliverer.ts";
+import { loopbackApprovalCardDeliverer, loopbackPostDeliverer } from "./loopback-deliverer.ts";
 import { bridgeDeliverers, type MattermostBridgeOptions } from "./mattermost-bridge.ts";
 
 const environment = readSetting("GATEWAY_ENV") ?? "unset";
@@ -51,10 +52,14 @@ function bridgeOptions(): MattermostBridgeOptions {
 const bridge = delivery === "mattermost" ? bridgeOptions() : null;
 const deliverers: ControllerOptions["deliverers"] = (deps) => {
 	if (bridge !== null) {
-		return bridgeDeliverers(deps, bridge);
+		return withPendingApprovalCards(deps, bridgeDeliverers(deps, bridge));
 	}
 	return delivery === "loopback"
-		? { ...dryRunDeliverers(log), "mattermost.post": loopbackPostDeliverer(deps) }
+		? withPendingApprovalCards(deps, {
+				...dryRunDeliverers(log),
+				"mattermost.post": loopbackPostDeliverer(deps),
+				"mattermost.approval": loopbackApprovalCardDeliverer(),
+			})
 		: dryRunDeliverers(log);
 };
 

@@ -104,6 +104,11 @@ export class MattermostClient {
 		return this.call("GET", `users/${userId}`, ApiUserSchema);
 	}
 
+	/** One post, or null when it does not exist (or was deleted). */
+	post(postId: MattermostId): Promise<ApiPost | null> {
+		return this.optional(this.call("GET", `posts/${postId}`, ApiPostSchema));
+	}
+
 	userByUsername(username: string): Promise<ApiUser | null> {
 		return this.optional(this.call("GET", `users/username/${segment(username)}`, ApiUserSchema));
 	}

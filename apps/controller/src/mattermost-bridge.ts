@@ -1,10 +1,12 @@
 import {
+	ApprovalCardPendingError,
 	advanceNumericCursor,
 	afterChannelStart,
 	type ControlPlaneDeps,
 	channelAdmits,
 	channelCursorIds,
 	deleteUnmanagedChannelCursors,
+	handleApprovalReply,
 	ingestEvent,
 	ingestEventIf,
 	loadConfigGeneration,
@@ -22,6 +24,7 @@ import {
 } from "@agent-gateway/core";
 import type { Logger } from "@agent-gateway/logging";
 import {
+	AwaitingReceiptError,
 	type BotCredentials,
 	type BridgeDirectory,
 	type ListenerStore,
@@ -54,9 +57,13 @@ async function bridgeDirectory(deps: ControlPlaneDeps): Promise<BridgeDirectory 
 	if (snapshot === null) {
 		return null;
 	}
+	const approvals = snapshot.organization.mattermost.approvals_channel;
+	const approvalsChannelId =
+		[...snapshot.channels].find(([, name]) => name === approvals)?.[0] ?? null;
 	return {
 		source: mattermostSource(snapshot.organization.mattermost.team),
 		channels: snapshot.channels,
+		approvalsChannelId,
 		agents: snapshot.agents,
 	};
 }
@@ -99,6 +106,16 @@ export function listenerStore(deps: ControlPlaneDeps): ListenerStore {
 		forgetUnmanagedChannels: () => deleteUnmanagedChannelCursors(deps),
 		deliveredPost: (key) => outboxReceiptPostId(deps, key),
 		reject: (post) => recordImpersonation(deps, post),
+		approvalReply: async (reply) => {
+			try {
+				return await handleApprovalReply(deps, reply);
+			} catch (error) {
+				if (error instanceof ApprovalCardPendingError) {
+					throw new AwaitingReceiptError(reply.postId);
+				}
+				throw error;
+			}
+		},
 	};
 }
 

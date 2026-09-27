@@ -1,6 +1,11 @@
 import { z } from "zod";
 import { SessionPolicySchema } from "./agent-config.ts";
 import { AgentIdSchema, type JsonObject, type RuntimeAdapterId, UuidSchema } from "./common.ts";
+import type {
+	ToolDeadLetterQueueName,
+	ToolExecuteQueueName,
+	ToolReportQueueName,
+} from "./tool-action.ts";
 import { AgentTurnInputSchema, RuntimeSessionHandleSchema, RuntimeUsageSchema } from "./turn.ts";
 
 /**
@@ -30,7 +35,10 @@ export type QueueName =
 	| (typeof QUEUES)[keyof typeof QUEUES]
 	| RunQueueName
 	| ReportQueueName
-	| RunDeadLetterQueueName;
+	| RunDeadLetterQueueName
+	| ToolExecuteQueueName
+	| ToolReportQueueName
+	| ToolDeadLetterQueueName;
 
 /** Controller -> worker queue of one runtime adapter. */
 export function runQueue(adapter: RuntimeAdapterId): RunQueueName {

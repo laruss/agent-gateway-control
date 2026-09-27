@@ -36,6 +36,7 @@ See [local development](docs/operations/local-development.md) for the full walkt
 - [Local development](docs/operations/local-development.md)
 - [Mattermost bootstrap and operation](docs/operations/mattermost.md)
 - [Gmail connector setup and operation](docs/operations/gmail.md)
+- [Approvals, the tool runner and budgets](docs/operations/approvals.md)
 - [Privacy notes](docs/security/privacy.md)
 - [Implementation status](IMPLEMENTATION_STATUS.md)
 

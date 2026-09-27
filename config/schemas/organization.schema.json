@@ -92,6 +92,49 @@
             "default_run_timeout_seconds"
           ],
           "additionalProperties": false
+        },
+        "budgets": {
+          "type": "object",
+          "properties": {
+            "per_agent_daily": {
+              "type": "object",
+              "properties": {
+                "cost_usd": {
+                  "type": "number",
+                  "exclusiveMinimum": 0,
+                  "maximum": 1000000
+                },
+                "tokens": {
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 10000000000
+                }
+              },
+              "additionalProperties": false
+            },
+            "global_daily": {
+              "type": "object",
+              "properties": {
+                "cost_usd": {
+                  "type": "number",
+                  "exclusiveMinimum": 0,
+                  "maximum": 1000000
+                },
+                "tokens": {
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 10000000000
+                }
+              },
+              "additionalProperties": false
+            },
+            "unmetered": {
+              "default": "hold",
+              "type": "string",
+              "enum": ["hold", "allow"]
+            }
+          },
+          "additionalProperties": false
         }
       },
       "required": [

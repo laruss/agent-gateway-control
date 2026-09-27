@@ -463,7 +463,8 @@ describe("ApprovalRequest", () => {
 
 	it.each([
 		["granted without a decision", { ...pending, status: "granted" }, "decidedByUserId"],
-		["executed without a decision", { ...pending, status: "executed" }, "decidedByUserId"],
+		["denied without a decision", { ...pending, status: "denied" }, "decidedByUserId"],
+		["cancelled with a decision", { ...granted, status: "cancelled" }, "decidedByUserId"],
 		[
 			"decided by a user outside the allowlist",
 			{ ...granted, decidedByUserId: "x".repeat(26) },

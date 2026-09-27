@@ -12,6 +12,7 @@ agent-gateway-control/
 │   ├── controller/          # report/timeout/outbox consumers, health endpoints     (done)
 │   ├── worker/              # generic worker host for one runtime adapter           (done)
 │   ├── connector-gmail/     # Gmail connector process for one mailbox               (done)
+│   ├── tool-runner/         # executes approved tool actions of its namespaces      (done)
 │   └── cli/                 # `gateway` admin CLI                                    (done)
 ├── packages/
 │   ├── contracts/           # Zod schemas: config, events, turn, queue payloads      (done)
@@ -36,7 +37,9 @@ agent-gateway-control/
 │   ├── runtime-hermes/      # Hermes through `hermes chat --format stream-json`      (done)
 │   ├── connector-gmail/     # Gmail watch, Pub/Sub pull, history sync, mail          (done)
 │   │                        #   normalization, OAuth consent
-│   ├── policy/              # tool permissions and approvals                         (Phase 7)
+│   ├── policy/              # tool evaluation, risk, action hash, approval codes,    (done)
+│   │                        #   typed finance parameters, budget math
+│   ├── tool-broker/         # executor port, execute job handling, sandbox executors (done)
 │   └── connector-webhook/   #                                                        (later)
 ├── config/
 │   ├── examples/            # organization.yaml and agents/*.yaml
@@ -68,6 +71,11 @@ agent-gateway-control/
   over plain REST; it reaches the control plane through the `GmailStore` port, which
   `apps/connector-gmail` implements with `core`. Only that process holds the Google
   credential.
+- `policy` depends on `contracts` and `events` only and performs no IO: the controller and the
+  tool runner evaluate the same rules and hash.
+- `tool-broker` depends on `contracts`, `logging` and `policy`. `apps/tool-runner` hosts it; it
+  reads no domain state and reaches the control plane only through its queues and the
+  `gateway_begin_tool_action` function. Only that process holds tool credentials.
 - `testkit` is used only by tests. Integration tests may compose the controller and a worker
   in one process; production code may not.
 
