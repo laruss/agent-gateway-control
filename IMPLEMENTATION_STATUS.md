@@ -1167,8 +1167,8 @@ Deliberate choices in this phase ([ADR-015](docs/adr/015-unconfined-runtimes-and
 
 ## Phase 6 - Gmail connector
 
-Status: **done** except the live check against a real mailbox (review closed after round 5,
-the round limit: its P2s are fixed and covered by tests)
+Status: **done** (review closed after round 5, the round limit: its P2s are fixed and covered
+by tests; checked live against a real mailbox)
 
 | Item | State | Evidence |
 |------|-------|----------|
@@ -1199,7 +1199,10 @@ Acceptance (integration tests against a fake Google speaking the REST wire forma
 - [x] No send permission exists: the credential has exactly two read scopes and a wider one is
   refused on every refresh; the Gmail client has no call that changes mail; no outbox kind
   delivers mail.
-- [ ] Live check against a real mailbox.
+- [x] Live check against a real mailbox (2026-09-27, polling mode, `gmail.live.test.ts`): the
+  credential holds exactly `gmail.readonly`; an email sent to the mailbox became one
+  external-untrusted event and one `@mail-follower` run. The Pub/Sub mode is covered by the
+  fake only.
 
 Deliberate choices in this phase ([ADR-016](docs/adr/016-gmail-connector.md)):
 
@@ -1214,6 +1217,8 @@ Known gaps, deferred:
 - Attachment scanning and handing attachments to tools (Phase 7 Tool Broker).
 - One mailbox per connector process; several mailboxes run several processes.
 - Retention of stored mail (Phase 8).
+- A Google OAuth app left in "Testing" status issues refresh tokens that expire after seven
+  days; publishing it needs a home page, a privacy policy link and an authorized domain.
 
 ### Phase 6 review log
 

@@ -17,7 +17,7 @@ import { type RunningGmailConnectorApp, startGmailConnectorApp } from "./connect
  * for the connector (GMAIL_OAUTH_CLIENT_ID, GMAIL_OAUTH_CLIENT_SECRET[_FILE],
  * GMAIL_REFRESH_TOKEN_FILE; GMAIL_PUBSUB_TOPIC and GMAIL_PUBSUB_SUBSCRIPTION for the push
  * mode, else it polls). The end-to-end test waits for an email whose subject contains the
- * printed token: send it to the mailbox. Nothing of the mail is printed.
+ * printed token (or GMAIL_LIVE_TOKEN): send it to the mailbox. Nothing of the mail is printed.
  */
 const settings = {
 	clientId: readSetting("GMAIL_OAUTH_CLIENT_ID"),
@@ -103,7 +103,9 @@ describe.runIf(configured)("Gmail connector against Google", () => {
 			60_000,
 			"the mailbox cursor",
 		);
-		const token = `gateway-live-${randomBytes(4).toString("hex")}`;
+		// Given beforehand when the runner hides test output until the test ends.
+		const token =
+			readSetting("GMAIL_LIVE_TOKEN") ?? `gateway-live-${randomBytes(4).toString("hex")}`;
 		console.log(`Send an email with '${token}' in its subject to the mailbox now.`);
 		const event = await eventually(
 			async () =>
@@ -113,7 +115,8 @@ describe.runIf(configured)("Gmail connector against Google", () => {
 						[`%${token}%`],
 					)
 				).rows[0],
-			600_000,
+			// Inside the live project's 10-minute test timeout, with room for the checks after.
+			480_000,
 			"the email",
 		);
 		expect(event.trust_level).toBe("external-untrusted");
