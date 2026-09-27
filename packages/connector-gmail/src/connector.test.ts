@@ -1,6 +1,6 @@
 import { silentLogger } from "@agent-gateway/logging";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { createTokenSource } from "./auth.ts";
+import { connectorScopes, createTokenSource } from "./auth.ts";
 import { type RunningGmailConnector, startGmailConnector } from "./connector.ts";
 import { type FakeGoogle, startFakeGoogle } from "./fake-google.ts";
 import { createGmailClient } from "./gmail-client.ts";
@@ -25,19 +25,25 @@ afterEach(async () => {
 let now = Date.now();
 
 function start(
-	overrides: Readonly<{ reconcileMs?: number; watchCheckMs?: number }> = {},
+	overrides: Readonly<{ reconcileMs?: number; watchCheckMs?: number; poll?: boolean }> = {},
 ): RunningGmailConnector {
+	const poll = overrides.poll === true;
 	const tokens = createTokenSource({
 		client: { clientId: "c", clientSecret: "s" },
 		refreshToken: google.refreshToken,
+		scopes: connectorScopes(poll ? "poll" : "pubsub"),
 		endpoints: google.endpoints,
 		clock: () => new Date(),
 	});
 	connector = startGmailConnector({
 		mailboxId: "primary",
-		topicName: google.topic,
 		gmail: createGmailClient(google.endpoints, tokens),
-		pubsub: createPubsubClient(google.endpoints.pubsub, google.subscription, tokens),
+		notifications: poll
+			? null
+			: {
+					topicName: google.topic,
+					pubsub: createPubsubClient(google.endpoints.pubsub, google.subscription, tokens),
+				},
 		store,
 		log: silentLogger,
 		clock: () => new Date(now),
@@ -162,6 +168,24 @@ describe("startGmailConnector", () => {
 		expect(messages()).toEqual([]);
 		expect(store.current().historyId).toBe("5");
 		expect(google.watchCalls()).toBe(0);
+	});
+
+	it("polls the mailbox without a watch or Pub/Sub, with a read-only credential", async () => {
+		google.setGrantedScopes(connectorScopes("poll"));
+		const running = start({ poll: true, reconcileMs: 200 });
+		await until(() => store.current().historyId !== null, "start");
+		google.deliver({ subject: "polled" }, { dropNotification: true });
+		await until(() => messages().length === 1, "polled message");
+		expect(google.watchCalls()).toBe(0);
+		expect(google.requests().some((request) => request.includes("/pubsub/"))).toBe(false);
+		expect(running.status()).toMatchObject({ authorized: true, mode: "poll" });
+		expect(store.modes()).toEqual([{ mode: "poll", syncSeconds: 1 }]);
+	});
+
+	it("refuses a token with the Pub/Sub scope when polling", async () => {
+		const running = start({ poll: true, reconcileMs: 200 });
+		await until(() => running.status().authorized === false, "refusal");
+		expect(store.alerts()).toEqual([expect.stringContaining("cannot use its Google credential")]);
 	});
 
 	it("reports a revoked credential and alerts, without stopping", async () => {

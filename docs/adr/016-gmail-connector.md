@@ -1,6 +1,7 @@
 # ADR-016. Gmail connector: watch, Pub/Sub pull, history cursor, read-only credential
 
-- Status: Accepted
+- Status: Accepted; amended by [ADR-017](017-gmail-polling-by-default.md): the connector polls
+  by default, and Pub/Sub notifications (below) are optional
 - Date: 2026-09-26
 
 ## Context

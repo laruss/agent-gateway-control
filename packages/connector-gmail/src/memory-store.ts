@@ -1,4 +1,4 @@
-import type { GatewayEvent, GmailDelta, IngestStatus } from "@agent-gateway/contracts";
+import type { GatewayEvent, GmailDelta, GmailMode, IngestStatus } from "@agent-gateway/contracts";
 import { payloadHash } from "@agent-gateway/events";
 import type { GmailStore, MailboxState } from "./sync.ts";
 
@@ -8,6 +8,8 @@ export type MemoryStore = GmailStore &
 		events: () => Readonly<GatewayEvent[]>;
 		alerts: () => Readonly<string[]>;
 		current: () => MailboxState;
+		/** Every recorded mode, in order. */
+		modes: () => Readonly<Readonly<{ mode: GmailMode; syncSeconds: number }>[]>;
 		/** Makes the next `n` writes fail, as a database outage would. */
 		failNext: (n: number) => void;
 	}>;
@@ -24,6 +26,7 @@ export function memoryStore(): MemoryStore {
 	const stored = new Map<string, { event: GatewayEvent; hash: string }>();
 	const alerts = new Map<string, string>();
 	let failures = 0;
+	const modes: { mode: GmailMode; syncSeconds: number }[] = [];
 	const maybeFail = () => {
 		if (failures > 0) {
 			failures -= 1;
@@ -79,6 +82,9 @@ export function memoryStore(): MemoryStore {
 				watchRenewedAt: new Date(),
 			};
 		},
+		recordMode: async (mode, syncSeconds) => {
+			modes.push({ mode, syncSeconds });
+		},
 		alert: async (key, message) => {
 			if (!alerts.has(key)) {
 				alerts.set(key, message);
@@ -87,6 +93,7 @@ export function memoryStore(): MemoryStore {
 		events: () => [...stored.values()].map((entry) => entry.event),
 		alerts: () => [...alerts.values()],
 		current: () => state,
+		modes: () => [...modes],
 		failNext: (n) => {
 			failures = n;
 		},

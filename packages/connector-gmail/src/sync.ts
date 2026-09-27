@@ -4,6 +4,7 @@ import type {
 	GmailCommitResult,
 	GmailDelta,
 	GmailMailboxId,
+	GmailMode,
 	IngestStatus,
 } from "@agent-gateway/contracts";
 import { errorFields, type Logger } from "@agent-gateway/logging";
@@ -38,6 +39,8 @@ export type GmailStore = Readonly<{
 	recordNotification: (event: GatewayEvent) => Promise<IngestStatus>;
 	/** Records a renewed watch; creates the cursor, for the account, if there is none. */
 	recordWatch: (historyId: string, expiresAt: Date, accountHash: string) => Promise<void>;
+	/** Records how the connector syncs (mode, interval) on the existing cursor. */
+	recordMode: (mode: GmailMode, syncSeconds: number) => Promise<void>;
 	/** Raises an operator alert, once per key. */
 	alert: (key: string, message: string) => Promise<void>;
 }>;

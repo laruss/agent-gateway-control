@@ -64,6 +64,13 @@
       "when": 1790456959974,
       "tag": "0008_gmail_mailboxes",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1790510825106,
+      "tag": "0009_gmail_mode",
+      "breakpoints": true
     }
   ]
 }

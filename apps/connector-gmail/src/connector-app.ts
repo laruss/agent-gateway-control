@@ -1,4 +1,5 @@
 import {
+	connectorScopes,
 	createGmailClient,
 	createPubsubClient,
 	createTokenSource,
@@ -15,6 +16,7 @@ import {
 	commitGmailDelta,
 	loadGmailMailbox,
 	raiseConnectorAlert,
+	recordGmailMode,
 	recordGmailNotification,
 	recordGmailWatch,
 	startGmailMailbox,
@@ -27,8 +29,8 @@ import type { HealthCheck } from "@agent-gateway/service";
 export type GmailConnectorAppOptions = Readonly<{
 	connectionString: string;
 	mailboxId: GmailMailboxId;
-	topicName: string;
-	subscription: string;
+	/** Gmail's Pub/Sub notifications; null polls the history every `reconcileMs`. */
+	pubsub: Readonly<{ topicName: string; subscription: string }> | null;
 	client: OAuthClientCredentials;
 	/** Read once at start; see `TokenSourceOptions.refreshToken`. */
 	refreshToken: string;
@@ -66,6 +68,7 @@ export function gmailStore(deps: ControlPlaneDeps, mailboxId: GmailMailboxId): G
 		recordNotification: (event) => recordGmailNotification(deps, mailboxId, event),
 		recordWatch: (historyId, expiresAt, account) =>
 			recordGmailWatch(deps, mailboxId, historyId, expiresAt, account),
+		recordMode: (mode, syncSeconds) => recordGmailMode(deps, mailboxId, mode, syncSeconds),
 		alert: (key, message) => raiseConnectorAlert(deps, key, message),
 	};
 }
@@ -84,17 +87,25 @@ export function connectorChecks(
 			ok: status.authorized,
 			detail: status.authorized
 				? "authorized"
-				: "credential refused; run 'gateway gmail authorize'",
+				: `credential refused; run 'gateway gmail authorize${status.mode === "pubsub" ? " --pubsub" : ""}' and restart`,
 		},
-		{ name: "pubsub", ok: status.pulling, detail: status.pulling ? "pulling" : "not pulling" },
-		{
-			name: "gmail_watch",
-			ok: status.watchExpiresAt !== null && status.watchExpiresAt > now,
-			detail:
-				status.watchExpiresAt === null
-					? "no watch"
-					: `expires ${status.watchExpiresAt.toISOString()}`,
-		},
+		...(status.mode === "poll"
+			? []
+			: [
+					{
+						name: "pubsub",
+						ok: status.pulling,
+						detail: status.pulling ? "pulling" : "not pulling",
+					},
+					{
+						name: "gmail_watch",
+						ok: status.watchExpiresAt !== null && status.watchExpiresAt > now,
+						detail:
+							status.watchExpiresAt === null
+								? "no watch"
+								: `expires ${status.watchExpiresAt.toISOString()}`,
+					},
+				]),
 		{
 			name: "gmail_sync",
 			ok: syncFresh,
@@ -133,17 +144,27 @@ export async function startGmailConnectorApp(
 	const tokens = createTokenSource({
 		client: options.client,
 		refreshToken: options.refreshToken,
+		scopes: connectorScopes(options.pubsub === null ? "poll" : "pubsub"),
 		endpoints: options.endpoints,
 		clock,
 	});
-	const reconcileMs = options.reconcileMs ?? 5 * 60_000;
+	const reconcileMs = options.reconcileMs ?? (options.pubsub === null ? 60_000 : 5 * 60_000);
 	// Cuts off Gmail calls in flight at shutdown, so a long sync does not hold the stop.
 	const halt = new AbortController();
 	const connector = startGmailConnector({
 		mailboxId: options.mailboxId,
-		topicName: options.topicName,
 		gmail: createGmailClient(options.endpoints, tokens, halt.signal),
-		pubsub: createPubsubClient(options.endpoints.pubsub, options.subscription, tokens),
+		notifications:
+			options.pubsub === null
+				? null
+				: {
+						topicName: options.pubsub.topicName,
+						pubsub: createPubsubClient(
+							options.endpoints.pubsub,
+							options.pubsub.subscription,
+							tokens,
+						),
+					},
 		store: gmailStore(deps, options.mailboxId),
 		log: log.child({ component: "gmail-connector" }),
 		clock,

@@ -3,6 +3,7 @@ import type {
 	AgentConfig,
 	AgentTurnInput,
 	GatewayEventType,
+	GmailMode,
 	JsonObject,
 	JsonValue,
 	MattermostId,
@@ -15,7 +16,7 @@ import type {
 	WorkerStatus,
 	WorkingSummary,
 } from "@agent-gateway/contracts";
-import { WorkerStatusSchema } from "@agent-gateway/contracts";
+import { GMAIL_MODES, WorkerStatusSchema } from "@agent-gateway/contracts";
 import { sql } from "drizzle-orm";
 import {
 	bigint,
@@ -580,21 +581,31 @@ export const sourceCursors = pgTable("source_cursors", {
  * A watched Gmail mailbox: its history cursor and watch. The cursor moves in the transaction
  * that ingests the messages up to it, so a restart resumes exactly after them.
  */
-export const gmailMailboxes = pgTable("gmail_mailboxes", {
-	/** The Gateway's name for the mailbox (`GMAIL_MAILBOX_ID`), never the address. */
-	mailboxId: text("mailbox_id").primaryKey(),
-	/**
-	 * SHA-256 of the account's address (lowercased): the cursor belongs to that account, and a
-	 * credential of another one is refused rather than read from this cursor. Not the address.
-	 */
-	accountHash: text("account_hash").notNull(),
-	/** Gmail history id every change up to which is ingested; a uint64. */
-	historyId: numeric("history_id", { precision: 20, scale: 0 }).notNull(),
-	watchExpiresAt: timestamp("watch_expires_at", { withTimezone: true }),
-	watchRenewedAt: timestamp("watch_renewed_at", { withTimezone: true }),
-	lastNotificationAt: timestamp("last_notification_at", { withTimezone: true }),
-	lastSyncAt: timestamp("last_sync_at", { withTimezone: true }),
-	/** The last time history was gone and recent messages were listed instead. */
-	lastFullSyncAt: timestamp("last_full_sync_at", { withTimezone: true }),
-	createdAt: createdAt(),
-});
+export const gmailMailboxes = pgTable(
+	"gmail_mailboxes",
+	{
+		/** The Gateway's name for the mailbox (`GMAIL_MAILBOX_ID`), never the address. */
+		mailboxId: text("mailbox_id").primaryKey(),
+		/**
+		 * SHA-256 of the account's address (lowercased): the cursor belongs to that account, and a
+		 * credential of another one is refused rather than read from this cursor. Not the address.
+		 */
+		accountHash: text("account_hash").notNull(),
+		/** Gmail history id every change up to which is ingested; a uint64. */
+		historyId: numeric("history_id", { precision: 20, scale: 0 }).notNull(),
+		watchExpiresAt: timestamp("watch_expires_at", { withTimezone: true }),
+		watchRenewedAt: timestamp("watch_renewed_at", { withTimezone: true }),
+		lastNotificationAt: timestamp("last_notification_at", { withTimezone: true }),
+		lastSyncAt: timestamp("last_sync_at", { withTimezone: true }),
+		/** The last time history was gone and recent messages were listed instead. */
+		lastFullSyncAt: timestamp("last_full_sync_at", { withTimezone: true }),
+		/**
+		 * How the running connector learns of new mail, `poll` or `pubsub`, and how often it syncs:
+		 * recorded by the connector, so health checks what that mode needs.
+		 */
+		mode: text("mode").$type<GmailMode>().notNull().default("pubsub"),
+		syncSeconds: integer("sync_seconds"),
+		createdAt: createdAt(),
+	},
+	() => [check("gmail_mailboxes_mode", oneOf("mode", GMAIL_MODES))],
+);

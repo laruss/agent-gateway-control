@@ -6,6 +6,11 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ### Added
 
+- Gmail connector without Pub/Sub by default: it polls the mailbox's history every minute with
+  a credential that grants `gmail.readonly` only; Pub/Sub push notifications are optional
+  (`gateway gmail authorize --pubsub`, `GMAIL_PUBSUB_*`). `GMAIL_SYNC_SECONDS` replaces
+  `GMAIL_RECONCILE_SECONDS`. The connector records its mode and interval for
+  `gateway health` (migration `0009_gmail_mode`). ADR-017.
 - Gmail connector (`@agent-gateway/connector-gmail`, `apps/connector-gmail`): Gmail watch with
   daily renewal, Pub/Sub pull, history sync with a transactional cursor, periodic
   reconciliation and full sync after a history gap. Mail is normalized to plain text

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
-import { GMAIL_CONNECTOR_SCOPES } from "./auth.ts";
+import { connectorScopes } from "./auth.ts";
 import type { GoogleEndpoints } from "./google-api.ts";
 
 /**
@@ -152,7 +152,7 @@ export function startFakeGoogle(options: FakeGoogleOptions = {}): FakeGoogle {
 	const refreshToken = options.refreshToken ?? "fake-refresh-token";
 	const ackDeadlineMs = options.ackDeadlineMs ?? 1000;
 	const pullWaitMs = options.pullWaitMs ?? 200;
-	let grantedScopes = [...(options.grantedScopes ?? GMAIL_CONNECTOR_SCOPES)];
+	let grantedScopes = [...(options.grantedScopes ?? connectorScopes("pubsub"))];
 	let revoked = false;
 	const accessTokens = new Set<string>();
 	const log: string[] = [];

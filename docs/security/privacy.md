@@ -36,7 +36,7 @@
   and each attachment's name, type and size. Attachment content, labels and read state are not
   stored. Spam, trash, drafts and chats are skipped. Mail that was in the mailbox before the
   connector's first start is not read.
-- Each Pub/Sub notification is stored as a record-only event holding the mailbox id and a
+- With Pub/Sub notifications, each notification is stored as a record-only event holding the mailbox id and a
   history id, not the address. The mailbox's cursor, watch expiry and sync times are kept in
   `gmail_mailboxes`, with a SHA-256 hash of the account's address (to refuse a credential of
   another account), not the address itself.

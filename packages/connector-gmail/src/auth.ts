@@ -1,22 +1,24 @@
 import { createHash, randomBytes } from "node:crypto";
+import type { GmailMode } from "@agent-gateway/contracts";
 import { z } from "zod";
 import { callGoogle, GoogleApiError, type GoogleEndpoints } from "./google-api.ts";
 
-/**
- * The only scopes the connector asks for and accepts: reading mail, and pulling the mailbox's
- * Pub/Sub notifications. Nothing that sends, drafts, modifies or deletes mail.
- */
-export const GMAIL_CONNECTOR_SCOPES: Readonly<string[]> = [
-	"https://www.googleapis.com/auth/gmail.readonly",
-	"https://www.googleapis.com/auth/pubsub",
-];
+/** Reading mail; nothing that sends, drafts, modifies or deletes it. */
+export const GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
+/** Pulling the mailbox's change notifications from Pub/Sub (optional). */
+export const PUBSUB_SCOPE = "https://www.googleapis.com/auth/pubsub";
+
+/** The only scopes the connector asks for and accepts in a mode. */
+export function connectorScopes(mode: GmailMode): Readonly<string[]> {
+	return mode === "pubsub" ? [GMAIL_READ_SCOPE, PUBSUB_SCOPE] : [GMAIL_READ_SCOPE];
+}
 
 /** Why the connector refuses a credential. */
 export type AuthFailure = "revoked" | "scope";
 
 /**
  * The credential cannot be used: revoked or expired (`invalid_grant`), or granting more (or less)
- * than {@link GMAIL_CONNECTOR_SCOPES}. Retrying does not help; the operator must authorize again.
+ * than {@link connectorScopes}. Retrying does not help; the operator must authorize again.
  */
 export class GoogleAuthError extends Error {
 	readonly failure: AuthFailure;
@@ -32,16 +34,16 @@ export class GoogleAuthError extends Error {
  * Scopes a token was granted that are not exactly the connector's: extra ones (a token that can
  * send mail is refused, even though the connector never would) and missing ones.
  */
-export function scopeProblems(granted: string): Readonly<string[]> {
+export function scopeProblems(granted: string, expected: Readonly<string[]>): Readonly<string[]> {
 	const scopes = new Set(granted.split(/\s+/u).filter((scope) => scope !== ""));
 	return [
-		...[...scopes].filter((scope) => !GMAIL_CONNECTOR_SCOPES.includes(scope)).map((s) => `+${s}`),
-		...GMAIL_CONNECTOR_SCOPES.filter((scope) => !scopes.has(scope)).map((s) => `-${s}`),
+		...[...scopes].filter((scope) => !expected.includes(scope)).map((s) => `+${s}`),
+		...expected.filter((scope) => !scopes.has(scope)).map((s) => `-${s}`),
 	];
 }
 
-function checkScopes(granted: string): void {
-	const problems = scopeProblems(granted);
+function checkScopes(granted: string, expected: Readonly<string[]>): void {
+	const problems = scopeProblems(granted, expected);
 	if (problems.length > 0) {
 		throw new GoogleAuthError(
 			"scope",
@@ -73,6 +75,8 @@ export type TokenSourceOptions = Readonly<{
 	 * connector checks that it still belongs to the mailbox's account.
 	 */
 	refreshToken: string;
+	/** Exactly what the token must grant; see {@link connectorScopes}. */
+	scopes: Readonly<string[]>;
 	endpoints: GoogleEndpoints;
 	clock: () => Date;
 }>;
@@ -112,7 +116,7 @@ export function createTokenSource(options: TokenSourceOptions): TokenSource {
 			}
 			throw error;
 		}
-		checkScopes(response.scope);
+		checkScopes(response.scope, options.scopes);
 		cached = {
 			token: response.access_token,
 			expiresAt: options.clock().getTime() + response.expires_in * 1000 - EXPIRY_MARGIN_MS,
@@ -148,6 +152,7 @@ export type AuthorizationRequest = Readonly<{
 	redirectUri: string;
 	state: string;
 	codeChallenge: string;
+	scopes: Readonly<string[]>;
 }>;
 
 /** The consent page the operator opens: offline access, exactly the connector's scopes. */
@@ -160,7 +165,7 @@ export function authorizationUrl(
 		client_id: request.clientId,
 		redirect_uri: request.redirectUri,
 		response_type: "code",
-		scope: GMAIL_CONNECTOR_SCOPES.join(" "),
+		scope: request.scopes.join(" "),
 		access_type: "offline",
 		// Always ask, so Google issues a refresh token even for an earlier grant.
 		prompt: "consent",
@@ -176,6 +181,7 @@ export type CodeExchange = Readonly<{
 	code: string;
 	codeVerifier: string;
 	redirectUri: string;
+	scopes: Readonly<string[]>;
 }>;
 
 /** Trades the consent code for a refresh token; refuses a grant with other scopes. */
@@ -198,7 +204,7 @@ export async function exchangeAuthorizationCode(
 		},
 		TokenResponseSchema,
 	);
-	checkScopes(response.scope);
+	checkScopes(response.scope, exchange.scopes);
 	if (response.refresh_token === undefined) {
 		throw new GoogleAuthError("revoked", "Google returned no refresh token; authorize again");
 	}

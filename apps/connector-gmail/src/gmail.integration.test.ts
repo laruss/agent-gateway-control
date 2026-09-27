@@ -1,4 +1,4 @@
-import { createTokenSource, GMAIL_CONNECTOR_SCOPES } from "@agent-gateway/connector-gmail";
+import { connectorScopes, createTokenSource } from "@agent-gateway/connector-gmail";
 import { type FakeGoogle, startFakeGoogle } from "@agent-gateway/connector-gmail/testing";
 import {
 	eventually,
@@ -20,8 +20,7 @@ async function startApp(): Promise<RunningGmailConnectorApp> {
 	app = await startGmailConnectorApp({
 		connectionString: gateway.postgres.connectionString,
 		mailboxId: "primary",
-		topicName: google.topic,
-		subscription: google.subscription,
+		pubsub: { topicName: google.topic, subscription: google.subscription },
 		client: { clientId: "client-id", clientSecret: "client-secret" },
 		refreshToken: google.refreshToken,
 		endpoints: google.endpoints,
@@ -126,6 +125,9 @@ describe("Gmail connector", () => {
 		const [event] = await messageEvents();
 		expect(event?.trust_level).toBe("external-untrusted");
 		expect(run?.trigger_event_id).toBe(event?.id);
+		expect(await query("select mode, sync_seconds from gmail_mailboxes")).toEqual([
+			{ mode: "pubsub", sync_seconds: 1 },
+		]);
 		const [snapshot] = await query<{ input: { trigger: { trustlevel: string } } }>(
 			"select input from context_snapshots where run_id = $1",
 			[run?.id ?? ""],
@@ -232,7 +234,7 @@ describe("Gmail connector", () => {
 
 	it("has no way to send mail and refuses a credential that could", async () => {
 		expect(
-			GMAIL_CONNECTOR_SCOPES.every(
+			connectorScopes("pubsub").every(
 				(scope) => !/send|compose|modify|insert|mail\.google/u.test(scope),
 			),
 		).toBe(true);
@@ -251,12 +253,13 @@ describe("Gmail connector", () => {
 
 		// A token that could also send mail is not used at all.
 		google.setGrantedScopes([
-			...GMAIL_CONNECTOR_SCOPES,
+			...connectorScopes("pubsub"),
 			"https://www.googleapis.com/auth/gmail.send",
 		]);
 		const tokens = createTokenSource({
 			client: { clientId: "client-id", clientSecret: "client-secret" },
 			refreshToken: google.refreshToken,
+			scopes: connectorScopes("pubsub"),
 			endpoints: google.endpoints,
 			clock: () => new Date(),
 		});
@@ -278,7 +281,7 @@ describe("Gmail connector", () => {
 			"the credential alert",
 		);
 		expect((await app?.readiness())?.find((check) => check.name === "gmail_auth")?.ok).toBe(false);
-		google.setGrantedScopes(GMAIL_CONNECTOR_SCOPES);
+		google.setGrantedScopes(connectorScopes("pubsub"));
 		await eventually(
 			async () => app?.connector.status().authorized === true,
 			15_000,

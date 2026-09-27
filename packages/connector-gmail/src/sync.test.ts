@@ -1,6 +1,6 @@
 import { silentLogger } from "@agent-gateway/logging";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { createTokenSource } from "./auth.ts";
+import { connectorScopes, createTokenSource } from "./auth.ts";
 import { type FakeGoogle, startFakeGoogle } from "./fake-google.ts";
 import { createGmailClient } from "./gmail-client.ts";
 import { type MemoryStore, memoryStore } from "./memory-store.ts";
@@ -21,6 +21,7 @@ function deps() {
 	const tokens = createTokenSource({
 		client: { clientId: "c", clientSecret: "s" },
 		refreshToken: google.refreshToken,
+		scopes: connectorScopes("pubsub"),
 		endpoints: google.endpoints,
 		clock: () => new Date(),
 	});

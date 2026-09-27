@@ -3,6 +3,7 @@ import type {
 	GmailCommitResult,
 	GmailDelta,
 	GmailMailboxId,
+	GmailMode,
 	IngestStatus,
 } from "@agent-gateway/contracts";
 import { gmailMailboxes, withTransaction } from "@agent-gateway/db";
@@ -36,6 +37,9 @@ export type GmailMailboxRecord = Readonly<{
 	lastFullSyncAt: Date | null;
 	/** When the cursor was created (the connector's first start on this mailbox). */
 	createdAt: Date;
+	/** The mode and sync interval the running connector recorded. */
+	mode: GmailMode;
+	syncSeconds: number | null;
 }>;
 
 /** Null before the connector first started the mailbox. */
@@ -148,6 +152,21 @@ export async function commitGmailDelta(
 		}
 		return { committed: true, accepted };
 	});
+}
+
+/** Records how the running connector syncs the mailbox, for health checks. */
+export async function recordGmailMode(
+	deps: ControlPlaneDeps,
+	mailboxId: GmailMailboxId,
+	mode: GmailMode,
+	syncSeconds: number,
+): Promise<void> {
+	await inTransaction(deps, ({ tx }) =>
+		tx.db
+			.update(gmailMailboxes)
+			.set({ mode, syncSeconds })
+			.where(eq(gmailMailboxes.mailboxId, mailboxId)),
+	);
 }
 
 /**

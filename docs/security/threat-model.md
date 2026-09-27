@@ -80,8 +80,9 @@
   both processes run as one user in one working tree, so this boundary does not hold there.
 - Status (Phase 6): the Google refresh token is held only by the Gmail connector process, in
   a mode-0600 file read once at start (a new consent applies after a restart, where the
-  account check runs); `gateway gmail authorize` writes it without printing
-  it. The credential grants reading mail and pulling notifications only. A token with any
+  account check runs); `gateway gmail authorize` writes it without printing it. The
+  credential grants reading mail only (polling, the default; ADR-017), or reading mail and
+  pulling notifications with the optional Pub/Sub mode. A token with any
   other scope (sending, drafts, modification) is refused on every refresh, so a mistaken or
   widened grant cannot give the Gateway send permission. Google API errors are reduced to
   Google's error code before logging; mailbox addresses are not logged, and the mailbox is

@@ -21,4 +21,5 @@ rewritten in substance: a changed decision gets a new ADR that references the ol
 | [013](013-turn-context.md) | Turn context: stored threads, run summaries, reviewed shared memory | Accepted |
 | [014](014-cli-runtime-adapters.md) | CLI runtime adapters: confined processes, policy-mapped tools, optional sessions | Accepted |
 | [015](015-unconfined-runtimes-and-runtime-health.md) | Grok, Kiro, OpenCode and Hermes: tools only where confined; runtime health | Accepted |
-| [016](016-gmail-connector.md) | Gmail connector: watch, Pub/Sub pull, history cursor, read-only credential | Accepted |
+| [016](016-gmail-connector.md) | Gmail connector: watch, Pub/Sub pull, history cursor, read-only credential | Accepted, amended by 017 |
+| [017](017-gmail-polling-by-default.md) | Gmail connector polls by default; Pub/Sub notifications are optional | Accepted |

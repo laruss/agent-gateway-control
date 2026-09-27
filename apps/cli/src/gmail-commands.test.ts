@@ -34,8 +34,9 @@ describe("gmailAuthorize", () => {
 		google = startFakeGoogle();
 		const out = join(mkdtempSync(join(tmpdir(), "gmail-auth-")), "gmail_refresh_token");
 		const lines: string[] = [];
-		const done = gmailAuthorize({ client, out, endpoints: google.endpoints }, (line) =>
-			lines.push(line),
+		const done = gmailAuthorize(
+			{ client, out, endpoints: google.endpoints, pubsub: true },
+			(line) => lines.push(line),
 		);
 		// A request without the run's state is ignored.
 		const forged = await consent(lines, () => ({ code: "fake-code", state: "forged" }));
@@ -52,8 +53,9 @@ describe("gmailAuthorize", () => {
 		google = startFakeGoogle();
 		const out = join(mkdtempSync(join(tmpdir(), "gmail-auth-")), "token");
 		const lines: string[] = [];
-		const done = gmailAuthorize({ client, out, endpoints: google.endpoints }, (line) =>
-			lines.push(line),
+		const done = gmailAuthorize(
+			{ client, out, endpoints: google.endpoints, pubsub: true },
+			(line) => lines.push(line),
 		);
 		const outcome = done.then(
 			() => null,

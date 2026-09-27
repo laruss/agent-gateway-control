@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	authorizationUrl,
+	connectorScopes,
 	createTokenSource,
 	exchangeAuthorizationCode,
-	GMAIL_CONNECTOR_SCOPES,
+	GMAIL_READ_SCOPE,
 	GoogleAuthError,
 	pkcePair,
 	scopeProblems,
@@ -17,29 +18,34 @@ afterEach(async () => {
 });
 
 const client = { clientId: "client-id", clientSecret: "client-secret" };
+const PUBSUB_SCOPES = connectorScopes("pubsub");
 
 describe("scopes", () => {
-	it("asks only for reading mail and pulling notifications", () => {
-		expect(GMAIL_CONNECTOR_SCOPES).toEqual([
+	it("asks only for reading mail, and pulling notifications in the push mode", () => {
+		expect(connectorScopes("poll")).toEqual(["https://www.googleapis.com/auth/gmail.readonly"]);
+		expect(PUBSUB_SCOPES).toEqual([
 			"https://www.googleapis.com/auth/gmail.readonly",
 			"https://www.googleapis.com/auth/pubsub",
 		]);
 		expect(
-			GMAIL_CONNECTOR_SCOPES.some((scope) =>
-				/send|compose|modify|insert|mail\.google/u.test(scope),
-			),
+			PUBSUB_SCOPES.some((scope) => /send|compose|modify|insert|mail\.google/u.test(scope)),
 		).toBe(false);
 	});
 
 	it("reports scopes beyond or missing from the connector's", () => {
-		expect(scopeProblems(GMAIL_CONNECTOR_SCOPES.join(" "))).toEqual([]);
+		expect(scopeProblems(PUBSUB_SCOPES.join(" "), PUBSUB_SCOPES)).toEqual([]);
 		expect(
 			scopeProblems(
-				`${GMAIL_CONNECTOR_SCOPES.join(" ")} https://www.googleapis.com/auth/gmail.send`,
+				`${PUBSUB_SCOPES.join(" ")} https://www.googleapis.com/auth/gmail.send`,
+				PUBSUB_SCOPES,
 			),
 		).toEqual(["+https://www.googleapis.com/auth/gmail.send"]);
-		expect(scopeProblems("https://www.googleapis.com/auth/gmail.readonly")).toEqual([
+		expect(scopeProblems(GMAIL_READ_SCOPE, PUBSUB_SCOPES)).toEqual([
 			"-https://www.googleapis.com/auth/pubsub",
+		]);
+		// A polling connector refuses a token that could also manage Pub/Sub.
+		expect(scopeProblems(PUBSUB_SCOPES.join(" "), connectorScopes("poll"))).toEqual([
+			"+https://www.googleapis.com/auth/pubsub",
 		]);
 	});
 });
@@ -49,6 +55,7 @@ describe("createTokenSource", () => {
 		createTokenSource({
 			client,
 			refreshToken: fake.refreshToken,
+			scopes: PUBSUB_SCOPES,
 			endpoints: fake.endpoints,
 			clock,
 		});
@@ -67,14 +74,11 @@ describe("createTokenSource", () => {
 	it("refuses a revoked credential and one that can do more than read", async () => {
 		google = startFakeGoogle();
 		await expect(source(google).accessToken()).resolves.toMatch(/^fake-access-/u);
-		google.setGrantedScopes([
-			...GMAIL_CONNECTOR_SCOPES,
-			"https://www.googleapis.com/auth/gmail.send",
-		]);
+		google.setGrantedScopes([...PUBSUB_SCOPES, "https://www.googleapis.com/auth/gmail.send"]);
 		const broad = source(google).accessToken();
 		await expect(broad).rejects.toBeInstanceOf(GoogleAuthError);
 		await expect(broad).rejects.toMatchObject({ failure: "scope" });
-		google.setGrantedScopes(GMAIL_CONNECTOR_SCOPES);
+		google.setGrantedScopes(PUBSUB_SCOPES);
 		google.revoke();
 		await expect(source(google).accessToken()).rejects.toMatchObject({ failure: "revoked" });
 	});
@@ -96,6 +100,7 @@ describe("authorization", () => {
 					redirectUri: "http://127.0.0.1:5000/",
 					state: "s1",
 					codeChallenge: pkce.challenge,
+					scopes: PUBSUB_SCOPES,
 				},
 			),
 		);
@@ -103,7 +108,7 @@ describe("authorization", () => {
 			client_id: "client-id",
 			redirect_uri: "http://127.0.0.1:5000/",
 			response_type: "code",
-			scope: GMAIL_CONNECTOR_SCOPES.join(" "),
+			scope: PUBSUB_SCOPES.join(" "),
 			access_type: "offline",
 			prompt: "consent",
 			state: "s1",
@@ -120,6 +125,7 @@ describe("authorization", () => {
 			code: "fake-code",
 			codeVerifier: pkcePair().verifier,
 			redirectUri: "http://127.0.0.1:5000/",
+			scopes: PUBSUB_SCOPES,
 		};
 		await expect(exchangeAuthorizationCode(google.endpoints, exchange)).resolves.toBe(
 			google.refreshToken,

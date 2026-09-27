@@ -24,6 +24,28 @@ function nameSetting(name: string, pattern: RegExp, example: string): string {
 	return value;
 }
 
+/** Pub/Sub notifications when both are set; neither polls the mailbox. */
+function pubsubSettings() {
+	const topic = readSetting("GMAIL_PUBSUB_TOPIC");
+	const subscription = readSetting("GMAIL_PUBSUB_SUBSCRIPTION");
+	if (topic === undefined && subscription === undefined) {
+		return null;
+	}
+	return {
+		topicName: nameSetting("GMAIL_PUBSUB_TOPIC", TOPIC_NAME, "projects/<project>/topics/<topic>"),
+		subscription: nameSetting(
+			"GMAIL_PUBSUB_SUBSCRIPTION",
+			SUBSCRIPTION_NAME,
+			"projects/<project>/subscriptions/<subscription>",
+		),
+	};
+}
+const pubsub = pubsubSettings();
+
+if (readSetting("GMAIL_RECONCILE_SECONDS") !== undefined) {
+	throw new SettingError("GMAIL_RECONCILE_SECONDS was renamed; set GMAIL_SYNC_SECONDS instead");
+}
+
 const mailboxId = GmailMailboxIdSchema.parse(readSetting("GMAIL_MAILBOX_ID") ?? "primary");
 // A file only: the refresh token reads all mail, it never lives in an environment variable.
 const refreshTokenFile = requireSetting("GMAIL_REFRESH_TOKEN_FILE");
@@ -41,12 +63,7 @@ const refreshToken = readRefreshToken();
 const app = await startGmailConnectorApp({
 	connectionString: requireSetting("DATABASE_URL"),
 	mailboxId,
-	topicName: nameSetting("GMAIL_PUBSUB_TOPIC", TOPIC_NAME, "projects/<project>/topics/<topic>"),
-	subscription: nameSetting(
-		"GMAIL_PUBSUB_SUBSCRIPTION",
-		SUBSCRIPTION_NAME,
-		"projects/<project>/subscriptions/<subscription>",
-	),
+	pubsub,
 	client: {
 		clientId: requireSetting("GMAIL_OAUTH_CLIENT_ID"),
 		clientSecret: requireSetting("GMAIL_OAUTH_CLIENT_SECRET"),
@@ -54,7 +71,8 @@ const app = await startGmailConnectorApp({
 	refreshToken,
 	endpoints: GOOGLE_ENDPOINTS,
 	log,
-	reconcileMs: intSetting("GMAIL_RECONCILE_SECONDS", 300) * 1000,
+	// Polling every minute by default; with notifications, a sync every five catches lost ones.
+	reconcileMs: intSetting("GMAIL_SYNC_SECONDS", pubsub === null ? 60 : 300) * 1000,
 });
 const health = startHealthServer({
 	port: intSetting("HEALTH_PORT", 8082),

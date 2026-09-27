@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import {
 	authorizationUrl,
+	connectorScopes,
 	exchangeAuthorizationCode,
 	type GoogleEndpoints,
 	type OAuthClientCredentials,
@@ -13,6 +14,8 @@ export type GmailAuthorizeOptions = Readonly<{
 	/** Where the refresh token is written (mode 0600, atomically). */
 	out: string;
 	endpoints: GoogleEndpoints;
+	/** Also consent to pulling Pub/Sub notifications (the connector's optional push mode). */
+	pubsub: boolean;
 	/** Loopback port for Google's redirect; 0 picks a free one. */
 	port?: number;
 	timeoutMs?: number;
@@ -26,13 +29,14 @@ const PAGE = (text: string) =>
 /**
  * The operator's consent for the Gmail connector: prints Google's consent page, receives the
  * code on a loopback address (PKCE, checked state), exchanges it and stores the refresh token.
- * The token is never printed. Refuses a grant with any scope beyond reading mail and pulling
- * its notifications.
+ * The token is never printed. Refuses a grant with any scope beyond reading mail (and, with
+ * `pubsub`, pulling its notifications).
  */
 export async function gmailAuthorize(
 	options: GmailAuthorizeOptions,
 	print: (line: string) => void,
 ): Promise<void> {
+	const scopes = connectorScopes(options.pubsub ? "pubsub" : "poll");
 	const state = randomBytes(16).toString("base64url");
 	const pkce = pkcePair();
 	let settle: (result: Readonly<{ code: string } | { error: string }>) => void = () => undefined;
@@ -70,6 +74,7 @@ export async function gmailAuthorize(
 				redirectUri,
 				state,
 				codeChallenge: pkce.challenge,
+				scopes,
 			}),
 		);
 		let timer: ReturnType<typeof setTimeout> | undefined;
@@ -86,9 +91,12 @@ export async function gmailAuthorize(
 			code: result.code,
 			codeVerifier: pkce.verifier,
 			redirectUri,
+			scopes,
 		});
 		writeSecretFile(options.out, refreshToken);
-		print(`refresh token stored in ${options.out}; scopes: read mail, pull notifications`);
+		print(
+			`refresh token stored in ${options.out}; scopes: read mail${options.pubsub ? ", pull notifications" : ""}`,
+		);
 	} finally {
 		// Graceful: the browser still gets the page answering its redirect.
 		await server.stop();

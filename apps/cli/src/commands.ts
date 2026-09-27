@@ -56,7 +56,7 @@ import {
 	transactionalJobSink,
 } from "@agent-gateway/queue";
 import { runtimeDoctor } from "@agent-gateway/runtime-sdk";
-import { intSetting, requireSetting } from "@agent-gateway/service";
+import { requireSetting } from "@agent-gateway/service";
 import { createRuntimeAdapter, workspaceRoot } from "@agent-gateway/worker";
 import type { PgBoss } from "pg-boss";
 import { loadConfigDirectory } from "./config-files.ts";
@@ -107,10 +107,11 @@ export const USAGE = `gateway <command>
                                       MATTERMOST_URL and a temporary MATTERMOST_ADMIN_TOKEN)
   mattermost reconcile [--secrets-dir <dir>]
                                       check tokens, bot accounts and memberships
-  gmail authorize --out <file> [--port <n>]
-                                      consent for the Gmail connector (read mail, pull its
-                                      notifications); stores the refresh token in <file> (needs
-                                      GMAIL_OAUTH_CLIENT_ID and GMAIL_OAUTH_CLIENT_SECRET[_FILE])
+  gmail authorize --out <file> [--port <n>] [--pubsub]
+                                      consent for the Gmail connector (read mail; --pubsub also
+                                      pulls its notifications); stores the refresh token in
+                                      <file> (needs GMAIL_OAUTH_CLIENT_ID and
+                                      GMAIL_OAUTH_CLIENT_SECRET[_FILE])
   gmail status                        cursor, watch and last sync of each watched mailbox
   gmail reset <mailbox-id>            forget a mailbox's cursor (e.g. after authorizing another
                                       account); its connector starts it anew at the present
@@ -171,12 +172,9 @@ const UNRESOLVED_FAILED_RUNS = `
 	   order by r.agent_id, r.queued_at desc
 	) latest where latest.status = 'failed'`;
 
-/**
- * A mailbox not synced for three sync intervals counts as failing. The connector syncs every
- * `GMAIL_RECONCILE_SECONDS` (5 min by default) and records every completed sync.
- */
-function gmailSyncStaleMs(): number {
-	return 3 * intSetting("GMAIL_RECONCILE_SECONDS", 300) * 1000;
+/** A mailbox not synced for three of its connector's sync intervals counts as failing. */
+function gmailSyncStaleMs(syncSeconds: number | null): number {
+	return 3 * (syncSeconds ?? 300) * 1000;
 }
 
 /** Opens database and queue connections for commands that need them. */
@@ -279,13 +277,22 @@ async function doctor(session: Session, out: Output): Promise<boolean> {
 	// syncing gets none.
 	const now = Date.now();
 	for (const mailbox of await listGmailMailboxes(session.deps)) {
-		const watchOk = mailbox.watchExpiresAt !== null && mailbox.watchExpiresAt.getTime() > now;
+		// The connector records its mode: only a mailbox with Pub/Sub needs a live watch.
+		const pushed = mailbox.mode === "pubsub";
+		const watchOk =
+			!pushed || (mailbox.watchExpiresAt !== null && mailbox.watchExpiresAt.getTime() > now);
 		const syncOk =
-			mailbox.lastSyncAt !== null && now - mailbox.lastSyncAt.getTime() <= gmailSyncStaleMs();
+			mailbox.lastSyncAt !== null &&
+			now - mailbox.lastSyncAt.getTime() <= gmailSyncStaleMs(mailbox.syncSeconds);
+		const watch = !pushed
+			? "polling"
+			: watchOk
+				? `watch until ${mailbox.watchExpiresAt?.toISOString()}`
+				: "watch not active";
 		checks.push({
 			name: `gmail:${mailbox.mailboxId}`,
 			ok: watchOk && syncOk,
-			detail: `watch ${watchOk ? `until ${mailbox.watchExpiresAt?.toISOString()}` : "not active"}, last sync ${mailbox.lastSyncAt?.toISOString() ?? "never"}`,
+			detail: `${watch}, last sync ${mailbox.lastSyncAt?.toISOString() ?? "never"}`,
 		});
 	}
 	for (const name of deadLetterQueues(RuntimeAdapterIdSchema.options)) {
@@ -340,6 +347,7 @@ export async function runCommand(args: Readonly<string[]>, out: Output): Promise
 				},
 				out: resolve(file),
 				endpoints: GOOGLE_ENDPOINTS,
+				pubsub: args.includes("--pubsub"),
 				...(port === null ? {} : { port }),
 			},
 			out.print,

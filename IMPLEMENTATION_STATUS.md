@@ -1172,7 +1172,8 @@ the round limit: its P2s are fixed and covered by tests)
 
 | Item | State | Evidence |
 |------|-------|----------|
-| OAuth setup docs; `gateway gmail authorize` (loopback, PKCE, state), exactly `gmail.readonly` + `pubsub` | done | [docs/operations/gmail.md](docs/operations/gmail.md), `apps/cli/src/gmail-commands.ts` |
+| Polling by default (`gmail.readonly` only), Pub/Sub push optional ([ADR-017](docs/adr/017-gmail-polling-by-default.md)) | done | `connector.ts`, `gmail-polling.integration.test.ts` |
+| OAuth setup docs; `gateway gmail authorize` (loopback, PKCE, state), exactly `gmail.readonly` (+ `pubsub` with `--pubsub`) | done | [docs/operations/gmail.md](docs/operations/gmail.md), `apps/cli/src/gmail-commands.ts` |
 | Gmail watch lifecycle: created on start, renewed daily and before expiry, alert when renewal fails near expiry | done | `packages/connector-gmail/src/connector.ts` |
 | Pub/Sub pull subscriber: notification stored before acknowledgement, foreign and malformed messages dropped | done | `connector.ts`, `pubsub-client.ts` |
 | Cursor and history delta: per page, ingested with the cursor move in one transaction (compare-and-set) | done | `sync.ts`, `core/src/services/gmail.ts`, migration `0008_gmail_mailboxes` |
@@ -1183,7 +1184,8 @@ the round limit: its P2s are fixed and covered by tests)
 | Health: connector readiness, `gateway gmail status`, Gmail checks in `gateway health` | done | `apps/connector-gmail`, `apps/cli` |
 
 Acceptance (integration tests against a fake Google speaking the REST wire format,
-`apps/connector-gmail/src/gmail.integration.test.ts`):
+`apps/connector-gmail/src/gmail.integration.test.ts` with Pub/Sub,
+`gmail-polling.integration.test.ts` without):
 
 - [x] One incoming email wakes mail-follower once.
 - [x] A duplicate Pub/Sub notification (a redelivery, and a second notification of the same
@@ -1342,3 +1344,15 @@ Known gaps, deferred:
 | 3 | 0 / 4 | 0 / 1 | fixed (one P2 re-rated, not a defect) |
 | 4 | 0 / 3 | 0 / 2 | fixed (one P2 re-rated P3, accepted) |
 | 5 | 0 / 2 | 0 / 1 | fixed, closed |
+
+Follow-up: polling by default ([ADR-017](docs/adr/017-gmail-polling-by-default.md), the owner's
+decision to drop the Pub/Sub setup; IMAP via himalaya was rejected because Gmail's IMAP
+credentials can send mail). One review round (Codex + Opus subagent): 0 P1, Codex 3 P2, Opus
+1 P2 + 3 P3.
+  - Fixed (Codex P2, Opus P2): `gateway health` inferred the mode from past watch renewals,
+    so a mailbox switched to polling failed once the old watch expired, and freshness assumed
+    five minutes. The connector records its mode and interval (migration `0009_gmail_mode`).
+  - Fixed (Codex P2, Opus P3): recovery hints (alert, readiness, guide) name
+    `gateway gmail authorize --pubsub` in the Pub/Sub mode.
+  - Fixed (Opus P3): a connector started with the renamed `GMAIL_RECONCILE_SECONDS` refuses to
+    start.

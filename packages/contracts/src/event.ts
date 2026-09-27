@@ -125,6 +125,14 @@ export const GmailMailboxIdSchema = z
 	.regex(/^[a-z][a-z0-9-]{0,31}$/, "mailbox id like 'primary'");
 export type GmailMailboxId = z.infer<typeof GmailMailboxIdSchema>;
 
+/**
+ * How the Gmail connector learns of new mail: by polling the mailbox's history (the default,
+ * only a read-only credential), or by Gmail's Pub/Sub notifications (faster, needs a topic, a
+ * subscription and the `pubsub` scope).
+ */
+export const GMAIL_MODES = ["poll", "pubsub"] as const;
+export type GmailMode = (typeof GMAIL_MODES)[number];
+
 /** Gmail message and thread ids: opaque strings to Google, URL-safe in practice. */
 const GmailIdSchema = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/, "Gmail id");
 export const GmailHistoryIdSchema = z.string().regex(/^[1-9][0-9]{0,19}$/, "Gmail history id");

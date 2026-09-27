@@ -1,4 +1,4 @@
-import type { GmailMailboxId } from "@agent-gateway/contracts";
+import type { GmailMailboxId, GmailMode } from "@agent-gateway/contracts";
 import { errorFields, type Logger } from "@agent-gateway/logging";
 import { z } from "zod";
 import { GoogleAuthError } from "./auth.ts";
@@ -7,16 +7,25 @@ import { notificationEvent } from "./normalize.ts";
 import type { PubsubClient, ReceivedMessage } from "./pubsub-client.ts";
 import { accountHash, type GmailStore, type SyncResult, syncMailbox } from "./sync.ts";
 
-export type GmailConnectorOptions = Readonly<{
-	mailboxId: GmailMailboxId;
+/** Gmail's change notifications through Pub/Sub, when the connector uses them. */
+export type PubsubNotifications = Readonly<{
 	/** `projects/<project>/topics/<topic>`, which Gmail publishes the mailbox's changes to. */
 	topicName: string;
-	gmail: GmailClient;
 	pubsub: PubsubClient;
+}>;
+
+export type GmailConnectorOptions = Readonly<{
+	mailboxId: GmailMailboxId;
+	gmail: GmailClient;
+	/** Null polls the history every `reconcileMs` instead: no watch, no Pub/Sub. */
+	notifications: PubsubNotifications | null;
 	store: GmailStore;
 	log: Logger;
 	clock?: () => Date;
-	/** Sync from the cursor this often even without notifications (they can be lost). */
+	/**
+	 * Sync from the cursor this often: the polling interval, or with notifications the
+	 * reconciliation that finds what a lost notification announced.
+	 */
 	reconcileMs?: number;
 	/** How often the watch is checked. */
 	watchCheckMs?: number;
@@ -30,8 +39,10 @@ export type GmailConnectorOptions = Readonly<{
 export type GmailConnectorStatus = Readonly<{
 	/** False when Google refused the credential (revoked, or with other scopes). */
 	authorized: boolean;
-	/** The last pull succeeded. */
+	mode: GmailMode;
+	/** With notifications: the last pull succeeded. */
 	pulling: boolean;
+	/** With notifications: when the watch expires. */
 	watchExpiresAt: Date | null;
 	/** The last successful sync (also one that found nothing new). */
 	lastSyncAt: Date | null;
@@ -94,14 +105,15 @@ function parseNotification(message: ReceivedMessage["message"]) {
 }
 
 /**
- * The Gmail connector of one mailbox: keeps the watch renewed, pulls change notifications,
- * records each durably before acknowledging it, and syncs the mailbox's history into events,
- * on every notification and periodically, because Gmail may delay or drop notifications.
+ * The Gmail connector of one mailbox: syncs the mailbox's history into events periodically.
+ * With Pub/Sub notifications it also keeps the watch renewed, pulls the notifications, records
+ * each durably before acknowledging it and syncs on every one; the periodic sync still runs,
+ * because Gmail may delay or drop notifications.
  * Failures are retried with backoff and never stop the process; the status says what is
  * failing, and alerts reach the operator.
  */
 export function startGmailConnector(options: GmailConnectorOptions): RunningGmailConnector {
-	const { mailboxId, gmail, pubsub, store, log } = options;
+	const { mailboxId, gmail, notifications, store, log } = options;
 	const clock = options.clock ?? (() => new Date());
 	const reconcileMs = options.reconcileMs ?? 5 * 60_000;
 	const watchCheckMs = options.watchCheckMs ?? 60 * 60_000;
@@ -129,7 +141,7 @@ export function startGmailConnector(options: GmailConnectorOptions): RunningGmai
 			await store
 				.alert(
 					`gmail:${mailboxId}:auth:${error.failure}:${clock().toISOString().slice(0, 10)}`,
-					`Gmail connector of mailbox '${mailboxId}' cannot use its Google credential: ${error.message}. No mail is read until it is fixed.`,
+					`Gmail connector of mailbox '${mailboxId}' cannot use its Google credential: ${error.message}. No mail is read until it is fixed: run 'gateway gmail authorize${mode === "pubsub" ? " --pubsub" : ""}' and restart the connector.`,
 				)
 				.catch((alertError: unknown) =>
 					log.error("gmail alert failed", { ...errorFields(alertError), mailbox_id: mailboxId }),
@@ -185,6 +197,8 @@ export function startGmailConnector(options: GmailConnectorOptions): RunningGmai
 
 	// Sync: one at a time; a request during a sync runs another one right after it.
 	let syncing: Promise<SyncResult> | null = null;
+	const mode: GmailMode = notifications === null ? "poll" : "pubsub";
+	let modeRecorded = false;
 	let again = false;
 	const runSync = async (): Promise<SyncResult> => {
 		try {
@@ -202,6 +216,11 @@ export function startGmailConnector(options: GmailConnectorOptions): RunningGmai
 				if (result.kind === "synced" || result.kind === "full_sync") {
 					// Health counts syncs that reached the mailbox's present only.
 					lastSyncAt = clock();
+					if (!modeRecorded) {
+						// Once per process, on a cursor that now surely exists.
+						await store.recordMode(mode, Math.ceil(reconcileMs / 1000));
+						modeRecorded = true;
+					}
 				}
 				succeeded();
 				if (result.accepted > 0 || result.kind !== "synced") {
@@ -267,7 +286,10 @@ export function startGmailConnector(options: GmailConnectorOptions): RunningGmai
 			markInitialized();
 			return;
 		}
-		const watch = await gmail.watch(options.topicName);
+		if (notifications === null) {
+			return;
+		}
+		const watch = await gmail.watch(notifications.topicName);
 		// Creates the cursor at the watch's history id on a first start: the first sync then
 		// reads everything the watch notifies about, and nothing races it for the cursor.
 		await store.recordWatch(watch.historyId, watch.expiresAt, identity.hash);
@@ -348,7 +370,7 @@ export function startGmailConnector(options: GmailConnectorOptions): RunningGmai
 			return "retry";
 		}
 	};
-	const pullLoop = async () => {
+	const pullLoop = async (pubsub: PubsubClient) => {
 		await initialized;
 		let failures = 0;
 		while (!signal.aborted && !refused) {
@@ -408,10 +430,24 @@ export function startGmailConnector(options: GmailConnectorOptions): RunningGmai
 		}
 	};
 
-	const loops = [syncLoop(), watchLoop(), pullLoop()];
+	if (notifications === null) {
+		// Polling: nothing to set up first; the first sync starts the cursor.
+		markInitialized();
+	}
+	const loops =
+		notifications === null
+			? [syncLoop()]
+			: [syncLoop(), watchLoop(), pullLoop(notifications.pubsub)];
 	log.info("gmail connector started", { mailbox_id: mailboxId });
 	return {
-		status: () => ({ authorized, pulling, watchExpiresAt, lastSyncAt, lastError }),
+		status: () => ({
+			authorized,
+			mode,
+			pulling,
+			watchExpiresAt,
+			lastSyncAt,
+			lastError,
+		}),
 		// Also from outside, never before the first watch attempt settled the cursor.
 		syncNow: () => initialized.then(syncNow),
 		stop: async () => {
