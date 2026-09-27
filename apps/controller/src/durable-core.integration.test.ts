@@ -1367,18 +1367,43 @@ describe("durable core with the mock runtime", () => {
 
 	it("kill-all stops new runs until released and resumed", async () => {
 		await killAll(gateway.deps(), "test");
-		expect(await agentState("director")).toBe("paused");
-		const event = humanPost("@director are you there?", ["director"]);
-		await ingestEvent(gateway.deps(), event);
-		await Bun.sleep(1500);
-		expect(await runsFor(event.id)).toEqual([]);
+		try {
+			expect(await agentState("director")).toBe("paused");
+			// Work that came first: the run after the release takes it as its trigger and
+			// coalesces the later post, as it would with work left over from earlier tests.
+			await ingestEvent(gateway.deps(), humanPost("@director first", ["director"]));
+			const event = humanPost("@director are you there?", ["director"]);
+			await ingestEvent(gateway.deps(), event);
+			await Bun.sleep(1500);
+			expect(await runsFor(event.id)).toEqual([]);
 
-		await releaseKillSwitch(gateway.deps(), "test");
-		await resumeAgent(gateway.deps(), "director", "test");
-		const run = await finishedRun(event.id, "run after kill-all");
-		expect(run.status).toBe("succeeded");
-		for (const id of ["developer", "finance"]) {
-			await resumeAgent(gateway.deps(), id, "test").catch(() => undefined);
+			await releaseKillSwitch(gateway.deps(), "test");
+			await resumeAgent(gateway.deps(), "director", "test");
+			const handled = await eventually(
+				async () => {
+					const [row] = await query<{ status: string; run_status: string | null }>(
+						`select i.status, r.status as run_status
+						   from agent_inbox i join events e on e.id = i.event_id
+						   left join agent_runs r on r.id = i.run_id
+						  where e.external_id = $1 and i.agent_id = 'director'`,
+						[event.id],
+					);
+					return row?.status === "consumed" &&
+						row.run_status !== "queued" &&
+						row.run_status !== "running"
+						? row
+						: null;
+				},
+				30_000,
+				"run after kill-all",
+			);
+			expect(handled.run_status).toBe("succeeded");
+		} finally {
+			// Kill-all paused every agent: the tests after this one need them back.
+			await releaseKillSwitch(gateway.deps(), "test").catch(() => undefined);
+			for (const id of ["director", "developer", "finance", "research", "mail-follower"]) {
+				await resumeAgent(gateway.deps(), id, "test").catch(() => undefined);
+			}
 		}
 	});
 
