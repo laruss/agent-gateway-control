@@ -1,0 +1,12 @@
+# The image build context: the workspace sources and the lockfile, nothing else.
+*
+!package.json
+!bun.lock
+!tsconfig.base.json
+!apps/
+!packages/
+!deploy/images/bin/
+!scripts/backup-gateway-db.sh
+!LICENSE
+**/node_modules
+**/*.test.ts

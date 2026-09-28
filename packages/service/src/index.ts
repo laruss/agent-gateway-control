@@ -3,3 +3,4 @@ export * from "./metrics.ts";
 export * from "./secrets.ts";
 export * from "./settings.ts";
 export * from "./shutdown.ts";
+export * from "./startup.ts";

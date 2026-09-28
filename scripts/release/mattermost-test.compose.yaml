@@ -1,0 +1,43 @@
+# A throwaway Mattermost for the release install test: the same pinned ESR as the e2e tests,
+# its own database, and the shared `agent-mm` network the Gateway's controller joins.
+name: agent-gateway-test-mattermost
+
+networks:
+  agent-mm:
+    name: agent-mm
+
+services:
+  mattermost-postgres:
+    image: postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+    environment:
+      POSTGRES_DB: mattermost
+      POSTGRES_USER: mattermost
+      POSTGRES_PASSWORD: mattermost-test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mattermost -d mattermost"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  mattermost:
+    image: mattermost/mattermost-team-edition:11.7.11@sha256:7ddc241942476577379614106e16292e23c4d36cde9b30b66899220b706e4b90
+    platform: linux/amd64
+    depends_on:
+      mattermost-postgres:
+        condition: service_healthy
+    environment:
+      MM_SQLSETTINGS_DRIVERNAME: postgres
+      MM_SQLSETTINGS_DATASOURCE: postgres://mattermost:mattermost-test@mattermost-postgres:5432/mattermost?sslmode=disable
+      MM_SERVICESETTINGS_SITEURL: http://mattermost:8065
+      MM_SERVICESETTINGS_ENABLEBOTACCOUNTCREATION: "true"
+      MM_SERVICESETTINGS_ENABLEUSERACCESSTOKENS: "true"
+      MM_TEAMSETTINGS_ENABLEOPENSERVER: "true"
+      MM_RATELIMITSETTINGS_ENABLE: "false"
+      MM_PLUGINSETTINGS_ENABLE: "false"
+      MM_LOGSETTINGS_CONSOLELEVEL: ERROR
+    ports:
+      - "127.0.0.1:8065:8065"
+    networks:
+      default: {}
+      agent-mm:
+        aliases: [mattermost]

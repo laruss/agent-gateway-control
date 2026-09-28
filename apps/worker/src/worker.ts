@@ -5,7 +5,8 @@ import {
 	runQueue,
 	type WorkerStatusReport,
 } from "@agent-gateway/contracts";
-import { errorFields, type Logger } from "@agent-gateway/logging";
+import { requireCompatibleSchema } from "@agent-gateway/db";
+import { errorFields, type Logger, releaseVersion } from "@agent-gateway/logging";
 import { createBoss, directJobSink } from "@agent-gateway/queue";
 import {
 	checkWorkspaceRoot,
@@ -104,6 +105,7 @@ export async function startWorker(options: WorkerOptions): Promise<RunningWorker
 	const heartbeatMs = options.heartbeatMs ?? HEARTBEAT_MS;
 	const reprobeMs = options.reprobeMs ?? REPROBE_MS;
 	const baseLog = options.log.child({ adapter: adapter.id, worker_id: workerId });
+	await requireCompatibleSchema(options.connectionString, releaseVersion());
 	const boss = createBoss(options.connectionString, "client");
 	boss.on("error", (error) => baseLog.error("pg-boss error", { error_message: error.message }));
 	await boss.start();

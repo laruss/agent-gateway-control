@@ -1,6 +1,7 @@
 import { RuntimeAdapterIdSchema } from "@agent-gateway/contracts";
 import { createLogger, serviceVersion } from "@agent-gateway/logging";
 import {
+	claimDeployment,
 	intSetting,
 	MetricsRegistry,
 	onShutdown,
@@ -20,8 +21,10 @@ const log = createLogger({
 
 const metrics = new MetricsRegistry();
 registerProcessMetrics(metrics, { service: "worker", version: serviceVersion() });
+const databaseUrl = requireSetting("DATABASE_URL");
+const deployment = await claimDeployment(log, databaseUrl);
 const worker = await startWorker({
-	connectionString: requireSetting("DATABASE_URL"),
+	connectionString: databaseUrl,
 	adapter: RuntimeAdapterIdSchema.parse(readSetting("WORKER_ADAPTER") ?? "mock"),
 	concurrency: intSetting("WORKER_CONCURRENCY", 1),
 	workspaceRoot: workspaceRoot(),
@@ -40,6 +43,7 @@ log.info("health endpoints listening", { port: health.port });
 onShutdown(log, async () => {
 	await health.stop();
 	await worker.stop();
+	await deployment.release();
 });
 void worker.failed.then(() => {
 	// Fail closed: a supervisor restarts the worker with a clean subscription.

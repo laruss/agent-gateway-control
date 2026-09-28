@@ -26,11 +26,11 @@ import {
 	sweepSchedules,
 } from "@agent-gateway/core";
 import type { OutboxKind } from "@agent-gateway/db";
-import { createServicePool, pendingMigrationCount } from "@agent-gateway/db";
-import { errorFields, type Logger } from "@agent-gateway/logging";
+import { createServicePool, requireCompatibleSchema, schemaCompatibility } from "@agent-gateway/db";
+import { errorFields, type Logger, releaseVersion } from "@agent-gateway/logging";
 import type { RunningListener } from "@agent-gateway/mattermost";
 import { type Deliverer, deliverOutboxItem, reconcileOutbox } from "@agent-gateway/outbox";
-import { createBoss, ensureQueues, transactionalJobSink } from "@agent-gateway/queue";
+import { createBoss, transactionalJobSink } from "@agent-gateway/queue";
 import { gauge, type HealthCheck, MetricsRegistry } from "@agent-gateway/service";
 import type pg from "pg";
 import type { PgBoss } from "pg-boss";
@@ -84,22 +84,24 @@ export function bossJobProbe(boss: PgBoss): JobProbe {
 
 /**
  * The control plane process: consumes worker and tool runner reports, run and wait timeouts,
- * and outbox deliveries. Refuses to start on a database with pending migrations.
+ * and outbox deliveries. Refuses to start on a database this release may not run against.
  */
 export async function startController(options: ControllerOptions): Promise<RunningController> {
 	const { log } = options;
 	const pool: pg.Pool = createServicePool(options.connectionString);
 	// An idle connection lost (a database restart, a failed keepalive) is replaced on next use.
 	pool.on("error", (error) => log.error("database pool error", errorFields(error)));
-	const pending = await pendingMigrationCount(pool);
-	if (pending > 0) {
+	const release = releaseVersion();
+	try {
+		await requireCompatibleSchema(pool, release);
+	} catch (error) {
 		await pool.end();
-		throw new Error(`${pending} database migration(s) pending; run 'gateway db migrate' first`);
+		throw error;
 	}
-	const boss = createBoss(options.connectionString, "service");
+	// The queue schema and the queues come from `gateway db migrate`.
+	const boss = createBoss(options.connectionString, "supervisor");
 	boss.on("error", (error) => log.error("pg-boss error", errorFields(error)));
 	await boss.start();
-	await ensureQueues(boss, RuntimeAdapterIdSchema.options);
 
 	const clock = options.clock ?? (() => new Date());
 	const deps: ControlPlaneDeps = {
@@ -372,8 +374,8 @@ export async function startController(options: ControllerOptions): Promise<Runni
 		try {
 			await pool.query("select 1");
 			checks.push({ name: "postgres", ok: true, detail: "reachable" });
-			const pendingNow = await pendingMigrationCount(pool);
-			checks.push({ name: "migrations", ok: pendingNow === 0, detail: `${pendingNow} pending` });
+			const schemaNow = await schemaCompatibility(pool, release);
+			checks.push({ name: "migrations", ok: schemaNow.ok, detail: schemaNow.detail });
 		} catch (error) {
 			checks.push({
 				name: "postgres",

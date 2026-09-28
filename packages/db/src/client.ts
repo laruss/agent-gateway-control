@@ -1,10 +1,8 @@
 import { createHash } from "node:crypto";
-import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 import pg from "pg";
-import { z } from "zod";
 import * as schema from "./schema.ts";
 
 export type Schema = typeof schema;
@@ -83,34 +81,54 @@ export async function withTransaction<T>(
 	}
 }
 
-/** Applies all pending migrations. Run by `gateway db migrate`, never implicitly at startup. */
-export async function migrateDatabase(pool: pg.Pool): Promise<void> {
-	await migrate(drizzle(pool), { migrationsFolder: MIGRATIONS_FOLDER });
-}
-
-type AppliedMigration = { hash: string };
-
-const JournalSchema = z.object({ entries: z.array(z.object({ tag: z.string() })) });
-
-/** Number of migration files the database has not applied yet. */
-export async function pendingMigrationCount(pool: pg.Pool): Promise<number> {
-	const journal = JournalSchema.parse(
-		await Bun.file(join(MIGRATIONS_FOLDER, "meta", "_journal.json")).json(),
-	);
-	const total = journal.entries.length;
-	const exists = await pool.query<{ exists: boolean }>(
-		"select to_regclass('drizzle.__drizzle_migrations') is not null as exists",
-	);
-	if (exists.rows[0]?.exists !== true) {
-		return total;
-	}
-	const applied = await pool.query<AppliedMigration>(
-		"select hash from drizzle.__drizzle_migrations",
-	);
-	return Math.max(0, total - applied.rows.length);
+/**
+ * Applies all pending migrations of `folder`. Only `migrateSchema` (`gateway db migrate`) and
+ * tests call it, never a service at startup.
+ */
+export async function migrateDatabase(pool: pg.Pool, folder = MIGRATIONS_FOLDER): Promise<void> {
+	await migrate(drizzle(pool), { migrationsFolder: folder });
 }
 
 const ROLE_NAME = /^[a-z_][a-z0-9_]{0,62}$/;
+
+/**
+ * Creates a login role with `password`, or sets the password of an existing one. The role gets
+ * no privileges here: `grantWorkerRole` or `grantToolRunnerRole` limits it afterwards. The
+ * owning role, superusers and roles that bypass row-level security are refused.
+ */
+export async function createLoginRole(
+	pool: pg.Pool,
+	role: string,
+	password: string,
+): Promise<void> {
+	if (!ROLE_NAME.test(role)) {
+		throw new Error(`invalid role name '${role}'`);
+	}
+	const client = await pool.connect();
+	let broken: Error | undefined;
+	try {
+		await client.query("BEGIN");
+		const exists = await client.query("select 1 from pg_roles where rolname = $1", [role]);
+		if (exists.rowCount === 0) {
+			await client.query(`CREATE ROLE ${client.escapeIdentifier(role)} LOGIN`);
+		} else {
+			await refuseUnrestrictableRole(client, role);
+		}
+		await client.query(
+			`ALTER ROLE ${client.escapeIdentifier(role)} LOGIN PASSWORD ${client.escapeLiteral(password)}`,
+		);
+		await client.query("COMMIT");
+	} catch (error) {
+		try {
+			await client.query("ROLLBACK");
+		} catch (rollback) {
+			broken = rollback instanceof Error ? rollback : new Error(String(rollback));
+		}
+		throw error;
+	} finally {
+		client.release(broken);
+	}
+}
 
 /**
  * A role that owns (or belongs to the owner of) the gateway tables, is a superuser, bypasses
@@ -228,6 +246,9 @@ export async function grantWorkerRole(
 	await grantQueueRole(pool, role, [queues], []);
 }
 
+/** Every queue role reads the schema state: a service checks it before it starts. */
+const SCHEMA_STATE_FUNCTION = "gateway_schema_state()";
+
 /** The functions a tool runner may call: the `begin` gate and the stop check (ADR-018). */
 const TOOL_RUNNER_FUNCTIONS = [
 	"gateway_begin_tool_action(uuid, integer, text)",
@@ -318,6 +339,7 @@ async function grantQueueRole(
 		await client.query(
 			`CREATE POLICY ${policy} ON pgboss.job FOR INSERT TO ${quoted} WITH CHECK (name = ANY (ARRAY[${insertable}]))`,
 		);
+		await client.query(`GRANT EXECUTE ON FUNCTION ${SCHEMA_STATE_FUNCTION} TO ${quoted}`);
 		for (const fn of TOOL_RUNNER_FUNCTIONS) {
 			const call = functions.includes(fn) ? "GRANT" : "REVOKE";
 			await client.query(

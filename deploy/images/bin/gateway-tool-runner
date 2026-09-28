@@ -1,0 +1,3 @@
+#!/bin/sh
+# The tool-runner of the Gateway image; the sources run directly under Bun.
+exec bun /opt/agent-gateway/apps/tool-runner/src/main.ts "$@"

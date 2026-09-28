@@ -1,6 +1,7 @@
 import { ToolNamespaceSchema } from "@agent-gateway/contracts";
 import { createLogger, serviceVersion } from "@agent-gateway/logging";
 import {
+	claimDeployment,
 	intSetting,
 	MetricsRegistry,
 	onShutdown,
@@ -44,9 +45,11 @@ const executors = executorRegistry(
 
 const metrics = new MetricsRegistry();
 registerProcessMetrics(metrics, { service: "tool-runner", version: serviceVersion() });
+const databaseUrl = requireSetting("DATABASE_URL");
+const deployment = await claimDeployment(log, databaseUrl);
 const runner = await startToolRunner({
 	metrics,
-	connectionString: requireSetting("DATABASE_URL"),
+	connectionString: databaseUrl,
 	namespaces,
 	executors,
 	log,
@@ -63,4 +66,5 @@ log.info("health endpoints listening", { port: health.port });
 onShutdown(log, async () => {
 	await health.stop();
 	await runner.stop();
+	await deployment.release();
 });

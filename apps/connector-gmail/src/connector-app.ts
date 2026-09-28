@@ -21,8 +21,8 @@ import {
 	recordGmailWatch,
 	startGmailMailbox,
 } from "@agent-gateway/core";
-import { createServicePool, pendingMigrationCount } from "@agent-gateway/db";
-import { errorFields, type Logger } from "@agent-gateway/logging";
+import { createServicePool, requireCompatibleSchema } from "@agent-gateway/db";
+import { errorFields, type Logger, releaseVersion } from "@agent-gateway/logging";
 import { createBoss, transactionalJobSink } from "@agent-gateway/queue";
 import { gauge, type HealthCheck, type MetricsRegistry } from "@agent-gateway/service";
 
@@ -129,10 +129,11 @@ export async function startGmailConnectorApp(
 	const pool = createServicePool(options.connectionString, 4);
 	// An idle connection lost (a database restart, a failed keepalive) is replaced on next use.
 	pool.on("error", (error) => log.error("database pool error", errorFields(error)));
-	const pending = await pendingMigrationCount(pool);
-	if (pending > 0) {
+	try {
+		await requireCompatibleSchema(pool, releaseVersion());
+	} catch (error) {
 		await pool.end();
-		throw new Error(`${pending} database migration(s) pending; run 'gateway db migrate' first`);
+		throw error;
 	}
 	const boss = createBoss(options.connectionString, "client");
 	boss.on("error", (error) => log.error("pg-boss error", errorFields(error)));

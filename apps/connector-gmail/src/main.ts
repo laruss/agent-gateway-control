@@ -2,6 +2,7 @@ import { GOOGLE_ENDPOINTS, SUBSCRIPTION_NAME, TOPIC_NAME } from "@agent-gateway/
 import { GmailMailboxIdSchema } from "@agent-gateway/contracts";
 import { createLogger, serviceVersion } from "@agent-gateway/logging";
 import {
+	claimDeployment,
 	intSetting,
 	MetricsRegistry,
 	onShutdown,
@@ -64,9 +65,11 @@ const refreshToken = readRefreshToken();
 
 const metrics = new MetricsRegistry();
 registerProcessMetrics(metrics, { service: "connector-gmail", version: serviceVersion() });
+const databaseUrl = requireSetting("DATABASE_URL");
+const deployment = await claimDeployment(log, databaseUrl);
 const app = await startGmailConnectorApp({
 	metrics,
-	connectionString: requireSetting("DATABASE_URL"),
+	connectionString: databaseUrl,
 	mailboxId,
 	pubsub,
 	client: {
@@ -90,4 +93,5 @@ log.info("health endpoints listening", { port: health.port });
 onShutdown(log, async () => {
 	await health.stop();
 	await app.stop();
+	await deployment.release();
 });

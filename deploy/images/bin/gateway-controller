@@ -1,0 +1,3 @@
+#!/bin/sh
+# The controller of the Gateway image; the sources run directly under Bun.
+exec bun /opt/agent-gateway/apps/controller/src/main.ts "$@"

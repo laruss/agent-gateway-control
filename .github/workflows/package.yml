@@ -1,0 +1,171 @@
+name: package
+
+# Builds the release images and bundle, and proves them the way an operator would use them:
+# - the images twice, on independent builders without cache: the digests must match;
+# - SBOMs of the images (SPDX, Syft);
+# - the bundle, then a synthetic next release with an expand migration;
+# - the install test on a runner without the checkout: install, smoke mention, versions,
+#   hardening, the Codex sandbox, upgrade to the next release and rollback without a restore.
+# The release workflow calls it with the tag's version and publishes the tested images.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+    inputs:
+      version:
+        description: The release version (X.Y.Z); candidates build as 0.0.1.
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: package-${{ github.ref }}-${{ inputs.version || 'candidate' }}
+  cancel-in-progress: true
+
+env:
+  # A pull request or main build is a candidate: its bundle carries the unreleased changes.
+  VERSION: ${{ inputs.version || '0.0.1' }}
+  CANDIDATE: ${{ inputs.version == '' && '1' || '' }}
+  REGISTRY_IMAGE: registry:3@sha256:852b3e4d378c426dda6b318fe9d9bfe8e92a0eccb9926671ec3d3ea17a196696
+  SYFT_VERSION: 1.52.0
+  SYFT_SHA256: caeedb81fb0491615f1ebd1761e4145d41ee86dd2cc7bf80669f9f5ad9d6133d
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: package.json
+      - run: bun install --frozen-lockfile
+      - name: Start a local registry
+        # The images live here until the release workflow copies them, digests unchanged.
+        run: |
+          mkdir -p "$RUNNER_TEMP/registry"
+          docker run -d --name registry -p 127.0.0.1:5000:5000 \
+            -v "$RUNNER_TEMP/registry:/var/lib/registry" "$REGISTRY_IMAGE"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          name: release
+          driver-opts: network=host
+      - name: Build the images
+        run: scripts/release/build-images.sh "$VERSION" localhost:5000/laruss "$RUNNER_TEMP/images.env"
+      - name: Build them again from scratch and compare
+        run: |
+          docker buildx create --name reproduce --driver docker-container --driver-opt network=host
+          BUILDER=reproduce NO_CACHE=1 scripts/release/build-images.sh "$VERSION" \
+            localhost:5000/reproduce "$RUNNER_TEMP/reproduced.env"
+          diff <(cut -d@ -f2 "$RUNNER_TEMP/images.env") <(cut -d@ -f2 "$RUNNER_TEMP/reproduced.env")
+          echo "the images are reproducible"
+      - name: Install Syft
+        run: |
+          archive="syft_${SYFT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSLo "$RUNNER_TEMP/$archive" \
+            "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/$archive"
+          echo "$SYFT_SHA256  $RUNNER_TEMP/$archive" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" syft
+      - name: SBOMs of the images
+        env:
+          SYFT_REGISTRY_INSECURE_USE_HTTP: "true"
+        run: |
+          mkdir -p "$RUNNER_TEMP/sbom"
+          while IFS== read -r name ref; do
+            image=agent-gateway
+            [[ "$name" == gateway ]] || image="agent-gateway-$name"
+            "$RUNNER_TEMP/syft" scan "registry:$ref" --quiet \
+              --source-name "$image" --source-version "$VERSION" \
+              -o "spdx-json=$RUNNER_TEMP/sbom/$image.spdx.json"
+          done <"$RUNNER_TEMP/images.env"
+          ls -l "$RUNNER_TEMP/sbom"
+      - name: Assemble the bundle
+        run: |
+          gateway="$(grep '^gateway=' "$RUNNER_TEMP/images.env" | cut -d= -f2)"
+          codex="$(grep '^worker-codex=' "$RUNNER_TEMP/images.env" | cut -d= -f2)"
+          scripts/release/write-images-lock.sh "$VERSION" "$GITHUB_SHA" "$gateway" "$codex" \
+            >"$RUNNER_TEMP/images.lock"
+          scripts/release/assemble-bundle.sh "$VERSION" "$RUNNER_TEMP/images.lock" \
+            "$RUNNER_TEMP/sbom" "$RUNNER_TEMP/dist/current"
+      - name: Build a synthetic next release
+        run: |
+          IFS=. read -r major minor patch <<<"$VERSION"
+          next="$major.$minor.$((patch + 1))"
+          tree="$RUNNER_TEMP/next-tree"
+          git worktree add --detach "$tree" HEAD
+          scripts/release/synthetic-next.sh "$tree" "$VERSION" "$next"
+          (cd "$tree" && bun install --frozen-lockfile)
+          scripts/release/build-images.sh "$next" localhost:5000/laruss "$RUNNER_TEMP/next.env" "$tree"
+          gateway="$(grep '^gateway=' "$RUNNER_TEMP/next.env" | cut -d= -f2)"
+          codex="$(grep '^worker-codex=' "$RUNNER_TEMP/next.env" | cut -d= -f2)"
+          scripts/release/write-images-lock.sh "$next" "$GITHUB_SHA" "$gateway" "$codex" \
+            >"$RUNNER_TEMP/next.lock"
+          (cd "$tree" && CANDIDATE= scripts/release/assemble-bundle.sh "$next" \
+            "$RUNNER_TEMP/next.lock" "$RUNNER_TEMP/sbom" "$RUNNER_TEMP/dist/next")
+      - name: Stop the registry
+        run: docker stop registry
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-registry
+          path: ${{ runner.temp }}/registry
+          retention-days: 7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-dist
+          path: |
+            ${{ runner.temp }}/dist
+            ${{ runner.temp }}/images.env
+          retention-days: 7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: install-test
+          path: |
+            scripts/release/install-test.sh
+            scripts/release/mattermost-test.compose.yaml
+          retention-days: 7
+
+  # A clean runner with no checkout: only the bundles, the images and the test harness.
+  install:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-registry
+          path: ${{ runner.temp }}/registry
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-dist
+          path: ${{ runner.temp }}/release
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: install-test
+          path: ${{ runner.temp }}/harness
+      - name: Serve the images
+        run: |
+          docker run -d --name registry -p 127.0.0.1:5000:5000 \
+            -v "$RUNNER_TEMP/registry:/var/lib/registry" "$REGISTRY_IMAGE"
+      - name: Verify the downloads
+        run: |
+          for dir in current next; do
+            (cd "$RUNNER_TEMP/release/dist/$dir" && sha256sum --check --strict SHA256SUMS)
+          done
+      - name: Install, smoke-test, upgrade and roll back
+        env:
+          INSTALL_TEST_DIR: ${{ runner.temp }}/install
+        run: |
+          bash "$RUNNER_TEMP/harness/install-test.sh" \
+            "$(ls "$RUNNER_TEMP"/release/dist/current/agent-gateway-home-server-v*.tar.gz)" \
+            "$(ls "$RUNNER_TEMP"/release/dist/next/agent-gateway-home-server-v*.tar.gz)"
+      - name: Logs of the stack
+        if: failure()
+        run: |
+          for id in $(docker ps -aq); do
+            echo "::group::$(docker inspect --format '{{.Name}}' "$id")"
+            docker logs --tail 200 "$id" 2>&1 | cut -c1-500
+            echo "::endgroup::"
+          done

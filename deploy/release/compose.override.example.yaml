@@ -1,0 +1,18 @@
+# Local changes to the stack, kept beside it: copy to $GATEWAY_HOME/compose.override.yaml and
+# pass it with `bin/agw -f compose.yaml -f $GATEWAY_HOME/compose.override.yaml ...`, or set
+# COMPOSE_FILE in gateway.env. Never edit compose.yaml itself: the next release replaces it.
+
+services:
+  # Health endpoints and metrics for a monitor on the host (loopback only). The release
+  # publishes no port.
+  gateway-controller:
+    ports:
+      - "127.0.0.1:8080:8080"
+  gateway-worker-codex:
+    ports:
+      - "127.0.0.1:8081:8081"
+
+  # More room for a busy worker.
+  # gateway-worker-codex:
+  #   cpus: 4
+  #   mem_limit: 4g

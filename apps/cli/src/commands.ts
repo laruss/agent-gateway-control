@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { userInfo } from "node:os";
 import { resolve } from "node:path";
 import { GOOGLE_ENDPOINTS } from "@agent-gateway/connector-gmail";
@@ -52,21 +53,25 @@ import {
 	showRun,
 } from "@agent-gateway/core";
 import {
+	checkCompatibility,
+	createLoginRole,
 	createPool,
 	grantToolRunnerRole,
 	grantWorkerRole,
-	migrateDatabase,
-	pendingMigrationCount,
+	loadLocalSchema,
+	migrateSchema,
+	readSchemaState,
+	schemaCompatibility,
 } from "@agent-gateway/db";
-import { createLogger, serviceVersion } from "@agent-gateway/logging";
+import { createLogger, releaseVersion, serviceVersion } from "@agent-gateway/logging";
 import {
 	createBoss,
 	deadLetterQueues,
-	ensureQueues,
+	migrateQueues,
 	transactionalJobSink,
 } from "@agent-gateway/queue";
 import { runtimeDoctor } from "@agent-gateway/runtime-sdk";
-import { intSetting, readSetting, requireSetting } from "@agent-gateway/service";
+import { intSetting, readSetting, requireSetting, writeSecretFile } from "@agent-gateway/service";
 import { createRuntimeAdapter, workspaceRoot } from "@agent-gateway/worker";
 import type { PgBoss } from "pg-boss";
 import { type BackupCheckReport, checkBackup, localPgTools } from "./backup.ts";
@@ -93,8 +98,14 @@ export type Session = Readonly<{
 
 export const USAGE = `gateway <command>
 
+  version                             this build's version and the migrations it ships
   health | doctor                     check database, migrations, queues and controls
-  db migrate                          apply database and queue migrations
+  db migrate                          apply database and queue migrations, then certify the
+                                      releases that may run on the result (stop services first)
+  db status                           the database's migrations, the releases certified for
+                                      them, and whether this build may run (exit 1 if not)
+  db create-role <role> <url-file>    create a login role (or give it a new password) and write
+                                      its connection URL to <url-file> (mode 0600)
   db grant-worker <role> <adapter>    limit an existing role to one adapter's worker jobs
   db grant-tool-runner <role> <namespace>[,<namespace>...]
                                       limit an existing role to the tool actions of these
@@ -240,19 +251,16 @@ async function migrate(out: Output): Promise<void> {
 	const connectionString = requireSetting("DATABASE_URL");
 	const pool = createPool(connectionString, 2);
 	try {
-		await migrateDatabase(pool);
+		const certified = await migrateSchema({
+			pool,
+			connectionString,
+			release: releaseVersion(),
+			migrateQueues: () => migrateQueues(connectionString),
+		});
+		out.print(`migrations applied; certified releases: ${certified.join(", ")}`);
 	} finally {
 		await pool.end();
 	}
-	// A service-role boss creates or upgrades the pg-boss schema on start.
-	const boss = createBoss(connectionString, "service");
-	await boss.start();
-	try {
-		await ensureQueues(boss, RuntimeAdapterIdSchema.options);
-	} finally {
-		await boss.stop({ graceful: false });
-	}
-	out.print("migrations applied");
 }
 
 async function doctor(session: Session, out: Output): Promise<boolean> {
@@ -260,8 +268,8 @@ async function doctor(session: Session, out: Output): Promise<boolean> {
 	const checks: { name: string; ok: boolean; detail: string }[] = [];
 	await pool.query("select 1");
 	checks.push({ name: "postgres", ok: true, detail: "reachable" });
-	const pending = await pendingMigrationCount(pool);
-	checks.push({ name: "migrations", ok: pending === 0, detail: `${pending} pending` });
+	const schema = await schemaCompatibility(pool, releaseVersion());
+	checks.push({ name: "migrations", ok: schema.ok, detail: schema.detail });
 	const controls = await pool.query<{ kill_switch: boolean; active_config_version: string | null }>(
 		"select kill_switch, active_config_version from gateway_controls where id = 1",
 	);
@@ -326,7 +334,7 @@ async function doctor(session: Session, out: Output): Promise<boolean> {
 		});
 	}
 	// Checks of tables and queues newer migrations create: skipped until they are applied.
-	if (pending === 0) {
+	if (schema.ok) {
 		// An action that began and never reported may or may not have happened: an operator checks
 		// the provider. One overdue that the sweep has not settled means the controller is behind.
 		const tools = await pool.query<{ unknown: number; overdue: number }>(
@@ -455,6 +463,58 @@ export async function runCommand(args: Readonly<string[]>, out: Output): Promise
 		await migrate(out);
 		return 0;
 	}
+	if (group === "version") {
+		const local = await loadLocalSchema();
+		out.print(
+			json({
+				version: serviceVersion(),
+				release: releaseVersion(),
+				migrations: local.migrations.length,
+				schema_head: local.migrations.at(-1)?.tag ?? null,
+			}),
+		);
+		return 0;
+	}
+	if (group === "db" && action === "status") {
+		const pool = createPool(requireSetting("DATABASE_URL"), 1);
+		try {
+			const local = await loadLocalSchema();
+			const state = await readSchemaState(pool);
+			const release = releaseVersion();
+			const compatibility = checkCompatibility(local, state, release);
+			out.print(
+				json({
+					release,
+					shipped_migrations: local.migrations.length,
+					applied_migrations: state?.hashes.length ?? 0,
+					certified_releases: state?.certified ?? [],
+					compatible: compatibility.ok,
+					detail: compatibility.detail,
+				}),
+			);
+			return compatibility.ok ? 0 : 1;
+		} finally {
+			await pool.end();
+		}
+	}
+	if (group === "db" && action === "create-role") {
+		const connectionString = requireSetting("DATABASE_URL");
+		const role = arg(args, 2, "role");
+		const urlFile = arg(args, 3, "url-file");
+		const password = randomBytes(24).toString("base64url");
+		const pool = createPool(connectionString, 1);
+		try {
+			await createLoginRole(pool, role, password);
+		} finally {
+			await pool.end();
+		}
+		const url = new URL(connectionString);
+		url.username = role;
+		url.password = password;
+		writeSecretFile(urlFile, url.toString());
+		out.print(`role ${role} can log in; its connection URL is in ${urlFile}`);
+		return 0;
+	}
 	if (group === "db" && action === "grant-worker") {
 		const pool = createPool(requireSetting("DATABASE_URL"), 1);
 		try {
@@ -549,6 +609,9 @@ export async function runCommand(args: Readonly<string[]>, out: Output): Promise
 	}
 }
 
+/** Session commands that run whether or not this release may run against the schema. */
+const SCHEMA_EXEMPT_COMMANDS: Readonly<string[]> = ["health", "doctor", "kill-all"];
+
 async function runSessionCommand(
 	session: Session,
 	args: Readonly<string[]>,
@@ -557,7 +620,15 @@ async function runSessionCommand(
 	const { deps, boss } = session;
 	const [group, action] = args;
 	const who = actor();
-	switch (`${group} ${action ?? ""}`.trim()) {
+	const command = `${group} ${action ?? ""}`.trim();
+	// The doctor reports an incompatible schema; kill-all must work whatever the schema.
+	if (!SCHEMA_EXEMPT_COMMANDS.includes(command)) {
+		const schema = await schemaCompatibility(deps.pool, releaseVersion());
+		if (!schema.ok) {
+			throw new Error(`this CLI cannot run against this database: ${schema.detail}`);
+		}
+	}
+	switch (command) {
 		case "health":
 		case "doctor":
 			return (await doctor(session, out)) ? 0 : 1;

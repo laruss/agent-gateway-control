@@ -1,0 +1,10 @@
+#!/bin/sh
+# Runs Docker Compose on this release's stack: `bin/agw up -d`, `bin/agw ps`,
+# `bin/agw run --rm gateway-cli gateway doctor`. The settings come from
+# $GATEWAY_HOME/gateway.env (default /srv/agent-gateway); the project name is fixed, so every
+# release directory manages the same containers and volumes.
+set -eu
+release_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+home=${GATEWAY_HOME:-/srv/agent-gateway}
+exec docker compose --project-name agent-gateway --project-directory "$release_dir" \
+	--env-file "$home/gateway.env" -f "$release_dir/compose.yaml" "$@"

@@ -6,6 +6,7 @@
       "name": "agent-gateway-control",
       "devDependencies": {
         "@agent-gateway/contracts": "workspace:*",
+        "@agent-gateway/db": "workspace:*",
         "@biomejs/biome": "2.5.14",
         "@testcontainers/postgresql": "12.1.0",
         "@types/bun": "1.4.2",
@@ -13,6 +14,7 @@
         "testcontainers": "12.1.0",
         "typescript": "7.0.2",
         "vitest": "5.0.1",
+        "zod": "4.6.5",
       },
     },
     "apps/cli": {
@@ -74,6 +76,7 @@
         "@agent-gateway/logging": "workspace:*",
         "@agent-gateway/mattermost": "workspace:*",
         "@agent-gateway/outbox": "workspace:*",
+        "@agent-gateway/policy": "workspace:*",
         "@agent-gateway/queue": "workspace:*",
         "@agent-gateway/service": "workspace:*",
         "pg": "8.23.0",
@@ -81,7 +84,6 @@
         "zod": "4.6.5",
       },
       "devDependencies": {
-        "@agent-gateway/policy": "workspace:*",
         "@agent-gateway/runtime-mock": "workspace:*",
         "@agent-gateway/runtime-sdk": "workspace:*",
         "@agent-gateway/testkit": "workspace:*",
@@ -94,6 +96,7 @@
       "version": "0.0.0",
       "dependencies": {
         "@agent-gateway/contracts": "workspace:*",
+        "@agent-gateway/db": "workspace:*",
         "@agent-gateway/logging": "workspace:*",
         "@agent-gateway/queue": "workspace:*",
         "@agent-gateway/service": "workspace:*",
@@ -116,6 +119,7 @@
       "version": "0.0.0",
       "dependencies": {
         "@agent-gateway/contracts": "workspace:*",
+        "@agent-gateway/db": "workspace:*",
         "@agent-gateway/logging": "workspace:*",
         "@agent-gateway/queue": "workspace:*",
         "@agent-gateway/runtime-claude": "workspace:*",
@@ -177,6 +181,7 @@
       "version": "0.0.0",
       "dependencies": {
         "@agent-gateway/contracts": "workspace:*",
+        "@agent-gateway/logging": "workspace:*",
         "drizzle-orm": "0.45.3",
         "pg": "8.23.0",
         "zod": "4.6.5",
@@ -309,21 +314,21 @@
       "name": "@agent-gateway/service",
       "version": "0.0.0",
       "dependencies": {
+        "@agent-gateway/db": "workspace:*",
         "@agent-gateway/logging": "workspace:*",
       },
     },
     "packages/testkit": {
       "name": "@agent-gateway/testkit",
       "version": "0.0.0",
-      "dependencies": {
+      "devDependencies": {
         "@testcontainers/postgresql": "12.1.0",
+        "@types/pg": "8.23.1",
         "drizzle-orm": "0.45.3",
         "pg": "8.23.0",
         "pg-boss": "12.34.0",
         "testcontainers": "12.1.0",
-      },
-      "devDependencies": {
-        "@types/pg": "8.23.1",
+        "zod": "4.6.5",
       },
     },
     "packages/tool-broker": {

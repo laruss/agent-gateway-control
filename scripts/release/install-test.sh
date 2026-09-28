@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+# The release install test: installs a release bundle the way INSTALL.md describes, on a host
+# with nothing but Docker, curl and jq (no checkout), and proves it works.
+#
+#   install-test.sh <bundle.tar.gz> [<next bundle.tar.gz>]
+#
+# With one bundle: install, bootstrap a throwaway Mattermost, smoke-test a mention on the mock
+# runtime, and check every service's version, the containers' hardening and the Codex sandbox.
+# With a second bundle (the next release, whose migrations are expand-only): upgrade to it,
+# smoke-test, roll back to the first bundle without a restore, and smoke-test again; no mention
+# is answered twice.
+#
+# Needs root (or sudo) for the ownership of $GATEWAY_HOME, and the images of the bundles'
+# images.lock reachable (a registry). Leaves the stacks running on failure for inspection;
+# `install-test.sh --down` removes them.
+set -euo pipefail
+
+here="$(cd "$(dirname "$0")" && pwd)"
+work="${INSTALL_TEST_DIR:-/tmp/agent-gateway-install-test}"
+export GATEWAY_HOME="$work/home"
+mm_url="http://127.0.0.1:8065"
+sudo_cmd=()
+[[ "$(id -u)" == 0 ]] || sudo_cmd=(sudo)
+
+log() { printf '\n== %s\n' "$*"; }
+fail() {
+	printf 'FAILED: %s\n' "$*" >&2
+	exit 1
+}
+
+mm_compose() { docker compose -f "$here/mattermost-test.compose.yaml" "$@"; }
+
+if [[ "${1:-}" == "--down" ]]; then
+	for release in "$work"/releases/*/; do
+		[[ -x "$release/bin/agw" ]] && "$release/bin/agw" --profile '*' down --volumes --remove-orphans || true
+	done
+	mm_compose down --volumes --remove-orphans || true
+	"${sudo_cmd[@]}" rm -rf "$work"
+	exit 0
+fi
+
+first="${1:?usage: install-test.sh <bundle.tar.gz> [<next bundle.tar.gz>]}"
+next="${2:-}"
+
+# Unpacks a bundle into $work/releases/<version> after checking its own SHA256SUMS; prints the
+# directory.
+unpack() {
+	local bundle="$1" dir
+	mkdir -p "$work/releases"
+	dir="$work/releases/$(basename "$bundle" .tar.gz)"
+	rm -rf "$dir"
+	tar -xzf "$bundle" -C "$work/releases"
+	(cd "$dir" && sha256sum --check --strict --quiet SHA256SUMS) || fail "$bundle: SHA256SUMS"
+	printf '%s' "$dir"
+}
+
+# --- Mattermost, as the operator prepares it before bootstrap ----------------------------------
+mm_api() {
+	local method="$1" path="$2" token="$3" body="${4:-}"
+	curl -sS --fail-with-body -X "$method" "$mm_url/api/v4/$path" \
+		-H "content-type: application/json" \
+		${token:+-H "authorization: Bearer $token"} \
+		${body:+--data "$body"}
+}
+mm_user() {
+	local username="$1" password="$2"
+	mm_api POST users "${admin_token:-}" \
+		"$(jq -nc --arg u "$username" --arg p "$password" '{username: $u, password: $p, email: ($u + "@example.test")}')" \
+		| jq -r .id
+}
+mm_login() {
+	curl -sS --fail-with-body -D - -o /dev/null -X POST "$mm_url/api/v4/users/login" \
+		-H "content-type: application/json" \
+		--data "$(jq -nc --arg u "$1" --arg p "$2" '{login_id: $u, password: $p}')" |
+		tr -d '\r' | awk 'tolower($1) == "token:" { print $2 }'
+}
+
+setup_mattermost() {
+	log "Mattermost"
+	mm_compose up -d --wait mattermost-postgres
+	mm_compose up -d mattermost
+	for _ in $(seq 1 120); do
+		curl -sf "$mm_url/api/v4/system/ping" >/dev/null && break
+		sleep 2
+	done
+	curl -sf "$mm_url/api/v4/system/ping" >/dev/null || fail "Mattermost did not start"
+	password="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')Aa1!"
+	# The first account on a fresh server becomes its system admin.
+	admin_id="$(mm_user sysadmin "$password")"
+	session="$(mm_login sysadmin "$password")"
+	admin_token="$(mm_api POST "users/$admin_id/tokens" "$session" '{"description":"install test"}' | jq -r .token)"
+	team_id="$(mm_api POST teams "$admin_token" '{"name":"autonomous-lab","display_name":"Autonomous Lab","type":"O"}' | jq -r .id)"
+	declare -gA channel_ids=()
+	for name in hq research engineering finance mail approvals gateway-alerts; do
+		channel_ids[$name]="$(mm_api POST channels "$admin_token" \
+			"$(jq -nc --arg t "$team_id" --arg n "$name" '{team_id: $t, name: $n, display_name: $n, type: "O"}')" | jq -r .id)"
+	done
+	for username in owner human; do
+		local id
+		id="$(mm_user "$username" "$password")"
+		mm_api POST "teams/$team_id/members" "$admin_token" "$(jq -nc --arg t "$team_id" --arg u "$id" '{team_id: $t, user_id: $u}')" >/dev/null
+		for channel in "${channel_ids[@]}"; do
+			mm_api POST "channels/$channel/members" "$admin_token" "$(jq -nc --arg u "$id" '{user_id: $u}')" >/dev/null
+		done
+	done
+	human_token="$(mm_login human "$password")"
+}
+
+# --- The Gateway, as INSTALL.md installs it ---------------------------------------------------
+install_release() {
+	local release="$1"
+	log "install $(basename "$release")"
+	"${sudo_cmd[@]}" env GATEWAY_HOME="$GATEWAY_HOME" "$release/bin/init-home.sh"
+	"${sudo_cmd[@]}" sed -i "s#^COMPOSE_PROFILES=.*#COMPOSE_PROFILES=mock#" "$GATEWAY_HOME/gateway.env"
+	"${sudo_cmd[@]}" cp -R "$release/config.example/." "$GATEWAY_HOME/config/"
+	"${sudo_cmd[@]}" chmod -R a+rX "$GATEWAY_HOME/config"
+	agw="$release/bin/agw"
+	"$agw" pull --quiet
+	"$agw" up -d --wait gateway-postgres
+	cli gateway db migrate
+	cli gateway db create-role gateway_worker_mock /secrets/worker-mock/database_url
+	cli gateway db grant-worker gateway_worker_mock mock
+	cli gateway config validate /config --root /config
+	cli gateway config apply /config --root /config --mock-runtimes
+	"$agw" run --rm -e MATTERMOST_ADMIN_TOKEN="$admin_token" gateway-cli gateway mattermost bootstrap
+	cli gateway mattermost reconcile
+	"$agw" up -d --wait
+}
+
+cli() { "$agw" run --rm gateway-cli "$@"; }
+
+# Every running service reports the release's version, in its metrics and its logs.
+check_versions() {
+	local expected="$1" service port
+	log "versions ($expected)"
+	for service in gateway-controller:8080 gateway-worker-mock:8081; do
+		port="${service#*:}"
+		service="${service%%:*}"
+		"$agw" exec -T "$service" bun -e "
+			const text = await (await fetch('http://127.0.0.1:$port/metrics')).text();
+			const line = text.split('\n').find((l) => l.startsWith('gateway_build_info'));
+			console.log(line);
+			if (!line?.includes('version=\"$expected+')) process.exit(1);" || fail "$service version"
+	done
+	cli gateway version | jq -e --arg v "$expected" '.release == $v' >/dev/null || fail "CLI version"
+}
+
+# The containers run as the Gateway user, on a read-only root filesystem, without capabilities.
+check_hardening() {
+	log "hardening"
+	local id inspect
+	for id in $("$agw" ps -q gateway-controller gateway-worker-mock); do
+		inspect="$(docker inspect "$id")"
+		jq -e '.[0].Config.User == "10001:10001"' <<<"$inspect" >/dev/null || fail "user of $id"
+		jq -e '.[0].HostConfig.ReadonlyRootfs == true' <<<"$inspect" >/dev/null || fail "rootfs of $id"
+		jq -e '.[0].HostConfig.CapDrop == ["ALL"] and (.[0].HostConfig.CapAdd // []) == []' <<<"$inspect" >/dev/null ||
+			fail "capabilities of $id"
+		jq -e '.[0].HostConfig.SecurityOpt | index("no-new-privileges:true")' <<<"$inspect" >/dev/null ||
+			fail "no-new-privileges of $id"
+		jq -e '.[0].HostConfig.PidsLimit > 0 and .[0].HostConfig.Memory > 0' <<<"$inspect" >/dev/null ||
+			fail "limits of $id"
+	done
+	# The worker holds no Mattermost secret and cannot reach Mattermost.
+	if "$agw" exec -T gateway-worker-mock sh -c 'ls /run/secrets' | grep -q '^mm_'; then
+		fail "a worker sees bot tokens"
+	fi
+	if "$agw" exec -T gateway-worker-mock bun -e "await fetch('http://mattermost:8065/api/v4/system/ping', { signal: AbortSignal.timeout(3000) })" 2>/dev/null; then
+		fail "a worker reaches Mattermost"
+	fi
+}
+
+# The Codex worker's sandbox, under the stack's own security settings: a command runs, writes
+# only the workspace, and reads neither the login nor the network.
+check_codex_sandbox() {
+	log "Codex sandbox"
+	local result
+	result="$("$agw" --profile codex run --rm --no-deps -T gateway-worker-codex bash -c '
+		set -u
+		ws=/var/lib/agent-gateway/workspaces/sandbox-check; mkdir -p -m 0700 "$ws"; cd "$ws"
+		echo secret > "$CODEX_HOME/login-check"
+		policy="permissions.check.filesystem={\":minimal\"=\"read\", \":slash_tmp\"=\"deny\", \":tmpdir\"=\"deny\", \"$CODEX_HOME\"=\"deny\", \":workspace_roots\"={\".\"=\"write\"}, \"$ws\"=\"write\"}"
+		run() { codex sandbox -c default_permissions=\"check\" -c "$policy" -- "$@" 2>&1; }
+		run sh -c "echo inside > $ws/written; echo ran"
+		run cat "$CODEX_HOME/login-check" && echo LOGIN-READ
+		run sh -c "echo x > /var/lib/agent-gateway/escaped"
+		[ -e /var/lib/agent-gateway/escaped ] && echo ESCAPED
+		run bash -c "exec 3<>/dev/tcp/1.1.1.1/443 && echo NETWORK-OPEN"
+		[ "$(cat "$ws/written")" = inside ] && echo WORKSPACE-OK
+		rm -rf "$ws" "$CODEX_HOME/login-check"')" || true
+	printf '%s\n' "$result"
+	grep -q '^ran$' <<<"$result" || fail "a sandboxed command did not run"
+	grep -q '^WORKSPACE-OK$' <<<"$result" || fail "the sandbox did not write the workspace"
+	! grep -qE 'LOGIN-READ|ESCAPED|NETWORK-OPEN' <<<"$result" || fail "the sandbox leaked"
+}
+
+# A human mentions @director in #hq; the director's bot answers in the thread, once.
+smoke() {
+	local label="$1" root reply
+	log "smoke mention ($label)"
+	root="$(mm_api POST posts "$human_token" \
+		"$(jq -nc --arg c "${channel_ids[hq]}" --arg m "@director install check $label" '{channel_id: $c, message: $m}')" | jq -r .id)"
+	smoke_roots+=("$root")
+	for _ in $(seq 1 90); do
+		reply="$(mm_api GET "posts/$root/thread" "$human_token" |
+			jq -r --arg root "$root" '[.posts[] | select(.id != $root and .props.from_bot == "true")] | length')"
+		[[ "$reply" -ge 1 ]] && break
+		sleep 2
+	done
+	[[ "$reply" -ge 1 ]] || fail "no reply to the $label mention"
+	cli gateway doctor >/dev/null || fail "gateway doctor after $label"
+}
+
+# No mention got a second answer: across upgrades, rollbacks and restarts each root has one.
+check_no_duplicates() {
+	log "no duplicate replies"
+	local root count
+	for root in "${smoke_roots[@]}"; do
+		count="$(mm_api GET "posts/$root/thread" "$human_token" |
+			jq -r --arg root "$root" '[.posts[] | select(.id != $root and .props.from_bot == "true")] | length')"
+		[[ "$count" == 1 ]] || fail "post $root has $count replies"
+	done
+}
+
+smoke_roots=()
+mkdir -p "$work"
+setup_mattermost
+first_release="$(unpack "$first")"
+first_version="$(jq -r .release "$first_release/images.lock")"
+install_release "$first_release"
+check_versions "$first_version"
+check_hardening
+check_codex_sandbox
+smoke "$first_version"
+
+if [[ -n "$next" ]]; then
+	next_release="$(unpack "$next")"
+	next_version="$(jq -r .release "$next_release/images.lock")"
+
+	log "upgrade $first_version -> $next_version (UPGRADE.md)"
+	"$agw" stop
+	agw="$next_release/bin/agw"
+	"$agw" pull --quiet
+	"$agw" up -d --wait gateway-postgres
+	cli gateway db migrate
+	cli gateway db status | jq -e '.compatible' >/dev/null || fail "status after upgrade"
+	"$agw" up -d --wait --remove-orphans
+	check_versions "$next_version"
+	smoke "$next_version"
+
+	log "rollback $next_version -> $first_version (ROLLBACK.md)"
+	"$agw" stop
+	agw="$first_release/bin/agw"
+	cli gateway db status | tee /dev/stderr | jq -e '.compatible' >/dev/null ||
+		fail "the previous release is not certified for the upgraded database"
+	"$agw" up -d --wait --remove-orphans
+	check_versions "$first_version"
+	smoke "$first_version-after-rollback"
+fi
+
+check_no_duplicates
+log "install test passed"

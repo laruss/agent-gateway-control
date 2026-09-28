@@ -4,7 +4,8 @@ import {
 	toolExecuteQueue,
 	toolReportQueue,
 } from "@agent-gateway/contracts";
-import { errorFields, type Logger } from "@agent-gateway/logging";
+import { requireCompatibleSchema } from "@agent-gateway/db";
+import { errorFields, type Logger, releaseVersion } from "@agent-gateway/logging";
 import { createBoss, directJobSink } from "@agent-gateway/queue";
 import { gauge, type HealthCheck, MetricsRegistry } from "@agent-gateway/service";
 import {
@@ -61,6 +62,12 @@ export async function startToolRunner(options: ToolRunnerOptions): Promise<Runni
 		idle_in_transaction_session_timeout: 30_000,
 		connectionTimeoutMillis: 10_000,
 	});
+	try {
+		await requireCompatibleSchema(pool, releaseVersion());
+	} catch (error) {
+		await pool.end();
+		throw error;
+	}
 	const boss = createBoss(options.connectionString, "client");
 	boss.on("error", (error) => log.error("pg-boss error", errorFields(error)));
 	await boss.start();
