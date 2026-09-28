@@ -94,7 +94,8 @@ if [[ "$(wc -l <"$bundle/RELEASE_NOTES.md")" -lt 3 ]]; then
 		printing { print }
 	' "$root/CHANGELOG.md" >"$bundle/RELEASE_NOTES.md"
 fi
-(cd "$root" && bun scripts/release/migrations-report.ts "$version") >"$bundle/MIGRATIONS.md"
+(cd "$root" && bun scripts/release/migrations-report.ts "$version" "$(scripts/release/pgboss-schema.sh)") \
+	>"$bundle/MIGRATIONS.md"
 
 mkdir -p "$bundle/sbom"
 cp "$sbom_dir"/*.spdx.json "$bundle/sbom/"
@@ -111,7 +112,7 @@ tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner \
 	-C "$work" -cf - "$name" | gzip -9n >"$out/$name.tar.gz"
 
 cp "$bundle/compose.yaml" "$bundle/images.lock" "$bundle/RELEASE_NOTES.md" \
-	"$bundle/MIGRATIONS.md" "$bundle/bin/verify-release.sh" "$out/"
+	"$bundle/MIGRATIONS.md" "$out/"
 cp "$bundle"/sbom/*.spdx.json "$out/"
 (cd "$out" && find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\0' | LC_ALL=C sort -z |
 	xargs -0 sha256sum >SHA256SUMS)

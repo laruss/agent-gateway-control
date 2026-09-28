@@ -36,6 +36,9 @@ profile agent-gateway-worker flags=(attach_disconnected,mediate_deleted) {
   # mounts and root.
   mount,
   pivot_root,
+  # bubblewrap creates a user namespace; init-home.sh turns this into "userns," where the kernel
+  # mediates user namespaces.
+  # @userns@
 
   deny /sys/[^f]*/** wklx,
   deny /sys/f[^s]*/** wklx,

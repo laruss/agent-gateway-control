@@ -502,15 +502,16 @@ export async function runCommand(args: Readonly<string[]>, out: Output): Promise
 		const role = arg(args, 2, "role");
 		const urlFile = arg(args, 3, "url-file");
 		const password = randomBytes(24).toString("base64url");
+		// The URL first: a role whose URL could not be written would have a password nobody has.
+		const url = new URL(connectionString);
+		url.username = role;
+		url.password = password;
 		const pool = createPool(connectionString, 1);
 		try {
 			await createLoginRole(pool, role, password);
 		} finally {
 			await pool.end();
 		}
-		const url = new URL(connectionString);
-		url.username = role;
-		url.password = password;
 		writeSecretFile(urlFile, url.toString());
 		out.print(`role ${role} can log in; its connection URL is in ${urlFile}`);
 		return 0;
@@ -620,7 +621,9 @@ async function runSessionCommand(
 	const { deps, boss } = session;
 	const [group, action] = args;
 	const who = actor();
-	const command = `${group} ${action ?? ""}`.trim();
+	// A flag after the group (`kill-all --release`) is not an action.
+	const command =
+		action === undefined || action.startsWith("--") ? `${group}` : `${group} ${action}`;
 	// The doctor reports an incompatible schema; kill-all must work whatever the schema.
 	if (!SCHEMA_EXEMPT_COMMANDS.includes(command)) {
 		const schema = await schemaCompatibility(deps.pool, releaseVersion());

@@ -1,29 +1,21 @@
 #!/bin/sh
-# Verifies a downloaded release before anything from it runs:
+# Verifies an unpacked release bundle, after its archive was verified (INSTALL.md, step 1):
 #
-#   verify-release.sh <version> [dir]
+#   bin/verify-release.sh
 #
-# In <dir> (default: the current directory), with the release's assets downloaded
-# (`gh release download v<version> -R laruss/agent-gateway-control`):
-#   1. SHA256SUMS matches every asset;
-#   2. GitHub's attestations prove the archive and SHA256SUMS were built by this repository's
-#      release workflow from the tag v<version> (needs the gh CLI);
-#   3. every image in images.lock carries a provenance attestation from that workflow.
+#   1. every file of the bundle matches its SHA256SUMS;
+#   2. every image in images.lock carries a build provenance attestation from this repository's
+#      release workflow at the bundle's tag (needs the gh CLI).
 set -eu
-version="${1:?usage: verify-release.sh <version> [dir]}"
-dir="${2:-.}"
+cd "$(dirname -- "$0")/.."
 repo=laruss/agent-gateway-control
 workflow="$repo/.github/workflows/release.yml"
-cd "$dir"
-sha256sum --check --strict SHA256SUMS
-for file in "agent-gateway-home-server-v$version.tar.gz" SHA256SUMS; do
-	gh attestation verify "$file" --repo "$repo" --signer-workflow "$workflow" \
-		--source-ref "refs/tags/v$version" >/dev/null
-	echo "$file: attested by $workflow at v$version"
-done
+version=$(jq -r .release images.lock)
+sha256sum --check --strict --quiet SHA256SUMS
+echo "bundle files: match SHA256SUMS"
 for ref in $(jq -r '.images | to_entries[] | select(.key != "postgres") | .value' images.lock); do
 	gh attestation verify "oci://$ref" --repo "$repo" --signer-workflow "$workflow" \
 		--source-ref "refs/tags/v$version" >/dev/null
-	echo "$ref: attested"
+	echo "$ref: attested by $workflow at v$version"
 done
 echo "release v$version verified"

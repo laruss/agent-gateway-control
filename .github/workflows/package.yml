@@ -96,7 +96,7 @@ jobs:
           next="$major.$minor.$((patch + 1))"
           tree="$RUNNER_TEMP/next-tree"
           git worktree add --detach "$tree" HEAD
-          scripts/release/synthetic-next.sh "$tree" "$VERSION" "$next"
+          scripts/release/synthetic-next.sh "$tree" "$VERSION" "$next" "$(scripts/release/pgboss-schema.sh)"
           (cd "$tree" && bun install --frozen-lockfile)
           scripts/release/build-images.sh "$next" localhost:5000/laruss "$RUNNER_TEMP/next.env" "$tree"
           gateway="$(grep '^gateway=' "$RUNNER_TEMP/next.env" | cut -d= -f2)"
@@ -154,6 +154,10 @@ jobs:
           for dir in current next; do
             (cd "$RUNNER_TEMP/release/dist/$dir" && sha256sum --check --strict SHA256SUMS)
           done
+      - name: Restrict unprivileged user namespaces, as Ubuntu does by default
+        # The worker's AppArmor profile must allow bubblewrap its namespace even so.
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1
       - name: Install, smoke-test, upgrade and roll back
         env:
           INSTALL_TEST_DIR: ${{ runner.temp }}/install

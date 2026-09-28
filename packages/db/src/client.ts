@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, createHmac, pbkdf2Sync, randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
@@ -91,6 +91,20 @@ export async function migrateDatabase(pool: pg.Pool, folder = MIGRATIONS_FOLDER)
 
 const ROLE_NAME = /^[a-z_][a-z0-9_]{0,62}$/;
 
+const SCRAM_ITERATIONS = 4096;
+
+/**
+ * The SCRAM-SHA-256 verifier PostgreSQL stores for a password (RFC 5802, RFC 7677):
+ * `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>`.
+ */
+export function scramVerifier(password: string, salt: Buffer = randomBytes(16)): string {
+	const salted = pbkdf2Sync(password.normalize("NFKC"), salt, SCRAM_ITERATIONS, 32, "sha256");
+	const clientKey = createHmac("sha256", salted).update("Client Key").digest();
+	const storedKey = createHash("sha256").update(clientKey).digest();
+	const serverKey = createHmac("sha256", salted).update("Server Key").digest();
+	return `SCRAM-SHA-256$${SCRAM_ITERATIONS}:${salt.toString("base64")}$${storedKey.toString("base64")}:${serverKey.toString("base64")}`;
+}
+
 /**
  * Creates a login role with `password`, or sets the password of an existing one. The role gets
  * no privileges here: `grantWorkerRole` or `grantToolRunnerRole` limits it afterwards. The
@@ -114,8 +128,9 @@ export async function createLoginRole(
 		} else {
 			await refuseUnrestrictableRole(client, role);
 		}
+		// The server gets a SCRAM verifier, never the password: a logged statement reveals nothing.
 		await client.query(
-			`ALTER ROLE ${client.escapeIdentifier(role)} LOGIN PASSWORD ${client.escapeLiteral(password)}`,
+			`ALTER ROLE ${client.escapeIdentifier(role)} LOGIN PASSWORD ${client.escapeLiteral(scramVerifier(password))}`,
 		);
 		await client.query("COMMIT");
 	} catch (error) {
@@ -246,9 +261,6 @@ export async function grantWorkerRole(
 	await grantQueueRole(pool, role, [queues], []);
 }
 
-/** Every queue role reads the schema state: a service checks it before it starts. */
-const SCHEMA_STATE_FUNCTION = "gateway_schema_state()";
-
 /** The functions a tool runner may call: the `begin` gate and the stop check (ADR-018). */
 const TOOL_RUNNER_FUNCTIONS = [
 	"gateway_begin_tool_action(uuid, integer, text)",
@@ -339,7 +351,6 @@ async function grantQueueRole(
 		await client.query(
 			`CREATE POLICY ${policy} ON pgboss.job FOR INSERT TO ${quoted} WITH CHECK (name = ANY (ARRAY[${insertable}]))`,
 		);
-		await client.query(`GRANT EXECUTE ON FUNCTION ${SCHEMA_STATE_FUNCTION} TO ${quoted}`);
 		for (const fn of TOOL_RUNNER_FUNCTIONS) {
 			const call = functions.includes(fn) ? "GRANT" : "REVOKE";
 			await client.query(

@@ -111,36 +111,61 @@ install_release() {
 	local release="$1"
 	log "install $(basename "$release")"
 	"${sudo_cmd[@]}" env GATEWAY_HOME="$GATEWAY_HOME" "$release/bin/init-home.sh"
-	"${sudo_cmd[@]}" sed -i "s#^COMPOSE_PROFILES=.*#COMPOSE_PROFILES=mock#" "$GATEWAY_HOME/gateway.env"
+	"${sudo_cmd[@]}" sed -i "s#^COMPOSE_PROFILES=.*#COMPOSE_PROFILES=mock,tools#" "$GATEWAY_HOME/gateway.env"
 	"${sudo_cmd[@]}" cp -R "$release/config.example/." "$GATEWAY_HOME/config/"
-	"${sudo_cmd[@]}" chmod -R a+rX "$GATEWAY_HOME/config"
 	agw="$release/bin/agw"
 	"$agw" pull --quiet
 	"$agw" up -d --wait gateway-postgres
 	cli gateway db migrate
 	cli gateway db create-role gateway_worker_mock /secrets/worker-mock/database_url
 	cli gateway db grant-worker gateway_worker_mock mock
+	cli gateway db create-role gateway_worker_codex /secrets/worker-codex/database_url
+	cli gateway db grant-worker gateway_worker_codex codex
+	cli gateway db create-role gateway_tool_runner /secrets/tool-runner/database_url
+	cli gateway db grant-tool-runner gateway_tool_runner finance
 	cli gateway config validate /config --root /config
 	cli gateway config apply /config --root /config --mock-runtimes
 	"$agw" run --rm -e MATTERMOST_ADMIN_TOKEN="$admin_token" gateway-cli gateway mattermost bootstrap
 	cli gateway mattermost reconcile
-	"$agw" up -d --wait
+	# The Codex worker runs without a login here: its probe fails, so it never becomes ready,
+	# but it starts under its security profiles and reports its version.
+	start_services
 }
 
 cli() { "$agw" run --rm gateway-cli "$@"; }
+
+# UPGRADE.md, step 2: every Gateway service stops, the database keeps running.
+stop_services() {
+	"$agw" --profile codex stop gateway-controller gateway-worker-codex gateway-worker-mock \
+		gateway-tool-runner
+}
+start_services() {
+	"$agw" up -d --wait --remove-orphans
+	"$agw" --profile codex up -d gateway-worker-codex
+}
+# UPGRADE.md, step 4: the limited roles get the new release's queues.
+regrant() {
+	cli gateway db grant-worker gateway_worker_mock mock
+	cli gateway db grant-worker gateway_worker_codex codex
+	cli gateway db grant-tool-runner gateway_tool_runner finance
+}
 
 # Every running service reports the release's version, in its metrics and its logs.
 check_versions() {
 	local expected="$1" service port
 	log "versions ($expected)"
-	for service in gateway-controller:8080 gateway-worker-mock:8081; do
+	for service in gateway-controller:8080 gateway-worker-mock:8081 gateway-tool-runner:8083 gateway-worker-codex:8081; do
 		port="${service#*:}"
 		service="${service%%:*}"
-		"$agw" exec -T "$service" bun -e "
-			const text = await (await fetch('http://127.0.0.1:$port/metrics')).text();
-			const line = text.split('\n').find((l) => l.startsWith('gateway_build_info'));
-			console.log(line);
-			if (!line?.includes('version=\"$expected+')) process.exit(1);" || fail "$service version"
+		for _ in $(seq 1 30); do
+			"$agw" exec -T "$service" bun -e "
+				const text = await (await fetch('http://127.0.0.1:$port/metrics')).text();
+				const line = text.split('\n').find((l) => l.startsWith('gateway_build_info'));
+				console.log(line);
+				if (!line?.includes('version=\"$expected+')) process.exit(1);" 2>/dev/null && continue 2
+			sleep 2
+		done
+		fail "$service version"
 	done
 	cli gateway version | jq -e --arg v "$expected" '.release == $v' >/dev/null || fail "CLI version"
 }
@@ -149,7 +174,7 @@ check_versions() {
 check_hardening() {
 	log "hardening"
 	local id inspect
-	for id in $("$agw" ps -q gateway-controller gateway-worker-mock); do
+	for id in $("$agw" --profile codex ps -q gateway-controller gateway-worker-mock gateway-tool-runner gateway-worker-codex); do
 		inspect="$(docker inspect "$id")"
 		jq -e '.[0].Config.User == "10001:10001"' <<<"$inspect" >/dev/null || fail "user of $id"
 		jq -e '.[0].HostConfig.ReadonlyRootfs == true' <<<"$inspect" >/dev/null || fail "rootfs of $id"
@@ -182,8 +207,10 @@ check_codex_sandbox() {
 		run() { codex sandbox -c default_permissions=\"check\" -c "$policy" -- "$@" 2>&1; }
 		run sh -c "echo inside > $ws/written; echo ran"
 		run cat "$CODEX_HOME/login-check" && echo LOGIN-READ
-		run sh -c "echo x > /var/lib/agent-gateway/escaped"
-		[ -e /var/lib/agent-gateway/escaped ] && echo ESCAPED
+		# Outside the workspace, in a directory the worker itself may write.
+		run sh -c "echo x > /var/lib/agent-gateway/workspaces/escaped"
+		[ -e /var/lib/agent-gateway/workspaces/escaped ] && echo ESCAPED
+		rm -f /var/lib/agent-gateway/workspaces/escaped
 		run bash -c "exec 3<>/dev/tcp/1.1.1.1/443 && echo NETWORK-OPEN"
 		[ "$(cat "$ws/written")" = inside ] && echo WORKSPACE-OK
 		rm -rf "$ws" "$CODEX_HOME/login-check"')" || true
@@ -229,6 +256,10 @@ first_version="$(jq -r .release "$first_release/images.lock")"
 install_release "$first_release"
 check_versions "$first_version"
 check_hardening
+log "migrate refused while services run"
+if cli gateway db migrate; then
+	fail "db migrate ran under live services"
+fi
 check_codex_sandbox
 smoke "$first_version"
 
@@ -237,22 +268,23 @@ if [[ -n "$next" ]]; then
 	next_version="$(jq -r .release "$next_release/images.lock")"
 
 	log "upgrade $first_version -> $next_version (UPGRADE.md)"
-	"$agw" stop
+	stop_services
 	agw="$next_release/bin/agw"
+	"${sudo_cmd[@]}" env GATEWAY_HOME="$GATEWAY_HOME" "$next_release/bin/init-home.sh"
 	"$agw" pull --quiet
-	"$agw" up -d --wait gateway-postgres
 	cli gateway db migrate
+	regrant
 	cli gateway db status | jq -e '.compatible' >/dev/null || fail "status after upgrade"
-	"$agw" up -d --wait --remove-orphans
+	start_services
 	check_versions "$next_version"
 	smoke "$next_version"
 
 	log "rollback $next_version -> $first_version (ROLLBACK.md)"
-	"$agw" stop
+	stop_services
 	agw="$first_release/bin/agw"
 	cli gateway db status | tee /dev/stderr | jq -e '.compatible' >/dev/null ||
 		fail "the previous release is not certified for the upgraded database"
-	"$agw" up -d --wait --remove-orphans
+	start_services
 	check_versions "$first_version"
 	smoke "$first_version-after-rollback"
 fi

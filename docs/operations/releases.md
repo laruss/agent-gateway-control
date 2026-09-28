@@ -13,7 +13,6 @@ are in the bundle's `UPGRADE.md` and `ROLLBACK.md`.
 | `compose.yaml`, `images.lock` | The stack and its images by digest, readable before download |
 | `RELEASE_NOTES.md`, `MIGRATIONS.md` | The changelog section; the migrations and which earlier releases stay certified |
 | `agent-gateway.spdx.json`, `agent-gateway-worker-codex.spdx.json` | SBOMs of the images (SPDX 2.3) |
-| `verify-release.sh` | Checks the checksums and GitHub's attestations |
 | `SHA256SUMS` | Checksums of every asset |
 
 Images: `ghcr.io/laruss/agent-gateway` and `ghcr.io/laruss/agent-gateway-worker-codex`, tagged
@@ -52,8 +51,11 @@ anonymous pulls before it publishes anything.
    ships:
 
    ```json
-   "releases": [{ "version": "X.Y.Z", "head": "<last migration tag>" }]
+   "releases": [{ "version": "X.Y.Z", "head": "<last migration tag>", "pgboss_schema": 42 }]
    ```
+
+   `pgboss_schema` is what `scripts/release/pgboss-schema.sh` prints for the locked pg-boss;
+   the release workflow checks both values.
 
 4. Check each new migration's kind. `expand` only if the previous release keeps working on the
    migrated schema, reading and writing. A `contract` means no rollback without a restore:
@@ -72,7 +74,8 @@ anonymous pulls before it publishes anything.
 
    ```bash
    gh release download vX.Y.Z -R laruss/agent-gateway-control -D /tmp/vX.Y.Z
-   cd /tmp/vX.Y.Z && sha256sum --check SHA256SUMS && sh verify-release.sh X.Y.Z
+   # then INSTALL.md, step 1: attestations of the archive and SHA256SUMS, the checksums,
+   # and bin/verify-release.sh in the unpacked bundle
    ```
 
 A failed release is fixed with a new patch version; a published version is never rebuilt or

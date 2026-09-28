@@ -30,13 +30,15 @@ describe("checkCompatibility", () => {
 			ok: false,
 			reason: "not-migrated",
 		});
-		expect(checkCompatibility(schema, { hashes: [], certified: [] }, "0.1.0")).toMatchObject({
+		expect(
+			checkCompatibility(schema, { hashes: [], pgbossSchema: 42, certified: [] }, "0.1.0"),
+		).toMatchObject({
 			reason: "not-migrated",
 		});
 	});
 
 	it("reports pending migrations", () => {
-		const state = { hashes: ["hash-0000"], certified: ["0.1.0"] };
+		const state = { hashes: ["hash-0000"], pgbossSchema: 42, certified: ["0.1.0"] };
 		expect(checkCompatibility(schema, state, "0.1.0")).toMatchObject({
 			ok: false,
 			reason: "pending",
@@ -45,7 +47,7 @@ describe("checkCompatibility", () => {
 	});
 
 	it("refuses a history that differs from the shipped one", () => {
-		const state = { hashes: ["hash-0000", "other"], certified: ["0.1.0"] };
+		const state = { hashes: ["hash-0000", "other"], pgbossSchema: 42, certified: ["0.1.0"] };
 		expect(checkCompatibility(schema, state, "0.1.0")).toMatchObject({
 			ok: false,
 			reason: "diverged",
@@ -53,7 +55,7 @@ describe("checkCompatibility", () => {
 	});
 
 	it("runs a release only where it is certified", () => {
-		const state = { hashes: hashes(schema), certified: ["0.1.0"] };
+		const state = { hashes: hashes(schema), pgbossSchema: 42, certified: ["0.1.0"] };
 		expect(checkCompatibility(schema, state, "0.1.0").ok).toBe(true);
 		expect(checkCompatibility(schema, state, "0.2.0")).toMatchObject({
 			ok: false,
@@ -62,7 +64,11 @@ describe("checkCompatibility", () => {
 	});
 
 	it("runs a release on a newer history it is certified for", () => {
-		const newer = { hashes: [...hashes(schema), "hash-0002"], certified: ["0.1.0", "0.2.0"] };
+		const newer = {
+			hashes: [...hashes(schema), "hash-0002"],
+			pgbossSchema: 42,
+			certified: ["0.1.0", "0.2.0"],
+		};
 		expect(checkCompatibility(schema, newer, "0.1.0")).toEqual({
 			ok: true,
 			detail: "certified for 1 newer migration(s)",
@@ -75,9 +81,17 @@ describe("checkCompatibility", () => {
 
 	it("runs a development build on exactly its own history", () => {
 		expect(
-			checkCompatibility(schema, { hashes: hashes(schema), certified: [] }, DEVELOPMENT_VERSION).ok,
+			checkCompatibility(
+				schema,
+				{ hashes: hashes(schema), pgbossSchema: 42, certified: [] },
+				DEVELOPMENT_VERSION,
+			).ok,
 		).toBe(true);
-		const newer = { hashes: [...hashes(schema), "hash-0002"], certified: [DEVELOPMENT_VERSION] };
+		const newer = {
+			hashes: [...hashes(schema), "hash-0002"],
+			pgbossSchema: 42,
+			certified: [DEVELOPMENT_VERSION],
+		};
 		expect(checkCompatibility(schema, newer, DEVELOPMENT_VERSION)).toMatchObject({
 			ok: false,
 			reason: "uncertified",
@@ -90,27 +104,38 @@ describe("releasesToCertify", () => {
 		const schema = local(
 			[...base, migration("0002", "expand"), migration("0003", "expand")],
 			[
-				{ version: "0.1.0", head: "0001" },
-				{ version: "0.2.0", head: "0002" },
+				{ version: "0.1.0", head: "0001", pgboss_schema: 42 },
+				{ version: "0.2.0", head: "0002", pgboss_schema: 42 },
 			],
 		);
-		expect(releasesToCertify(schema, "0.3.0")).toEqual(["0.1.0", "0.2.0", "0.3.0"]);
+		expect(releasesToCertify(schema, "0.3.0", 42)).toEqual(["0.1.0", "0.2.0", "0.3.0"]);
 	});
 
 	it("does not certify a release a later contract migration breaks", () => {
 		const schema = local(
 			[...base, migration("0002", "contract"), migration("0003", "expand")],
 			[
-				{ version: "0.1.0", head: "0001" },
-				{ version: "0.2.0", head: "0002" },
+				{ version: "0.1.0", head: "0001", pgboss_schema: 42 },
+				{ version: "0.2.0", head: "0002", pgboss_schema: 42 },
 			],
 		);
-		expect(releasesToCertify(schema, "0.3.0")).toEqual(["0.2.0", "0.3.0"]);
+		expect(releasesToCertify(schema, "0.3.0", 42)).toEqual(["0.2.0", "0.3.0"]);
+	});
+
+	it("does not certify a release on another pg-boss schema: pg-boss would refuse it", () => {
+		const schema = local(
+			[...base, migration("0002", "expand")],
+			[
+				{ version: "0.1.0", head: "0001", pgboss_schema: 41 },
+				{ version: "0.2.0", head: "0002", pgboss_schema: 42 },
+			],
+		);
+		expect(releasesToCertify(schema, "0.3.0", 42)).toEqual(["0.2.0", "0.3.0"]);
 	});
 
 	it("certifies a release migrating its own head", () => {
-		const schema = local(base, [{ version: "0.1.0", head: "0001" }]);
-		expect(releasesToCertify(schema, "0.1.0")).toEqual(["0.1.0"]);
+		const schema = local(base, [{ version: "0.1.0", head: "0001", pgboss_schema: 42 }]);
+		expect(releasesToCertify(schema, "0.1.0", 42)).toEqual(["0.1.0"]);
 	});
 });
 

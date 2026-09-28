@@ -21,8 +21,17 @@ export const CompatibilityManifestSchema = z.strictObject({
 	format: z.literal(1),
 	/** Every migration by its journal tag. */
 	migrations: z.record(z.string(), z.enum(MIGRATION_KINDS)),
-	/** Published releases and the last migration each shipped. */
-	releases: z.array(z.strictObject({ version: z.string().regex(SEMVER), head: z.string() })),
+	/**
+	 * Published releases: the last migration each shipped, and the pg-boss schema version it
+	 * runs on (pg-boss refuses any other, so a release is certified only on its own).
+	 */
+	releases: z.array(
+		z.strictObject({
+			version: z.string().regex(SEMVER),
+			head: z.string(),
+			pgboss_schema: z.number().int().positive(),
+		}),
+	),
 });
 export type CompatibilityManifest = z.infer<typeof CompatibilityManifestSchema>;
 
@@ -36,12 +45,13 @@ export type LocalSchema = Readonly<{
 }>;
 
 const JournalSchema = z.object({
-	entries: z.array(z.object({ idx: z.number(), tag: z.string() })),
+	entries: z.array(z.object({ idx: z.number(), when: z.number(), tag: z.string() })),
 });
 
 /**
  * Reads the shipped migrations. A hash is the SHA-256 of the SQL file, as the migrator stores
  * it. Every migration must have a kind, and every release a known head, in release order.
+ * Migration times must increase: the migrator skips one dated before the last applied.
  */
 export async function loadLocalSchema(folder = MIGRATIONS_FOLDER): Promise<LocalSchema> {
 	const journal = JournalSchema.parse(await Bun.file(join(folder, "meta", "_journal.json")).json());
@@ -49,7 +59,12 @@ export async function loadLocalSchema(folder = MIGRATIONS_FOLDER): Promise<Local
 		await Bun.file(join(folder, "compatibility.json")).json(),
 	);
 	const migrations: LocalMigration[] = [];
+	let when = Number.NEGATIVE_INFINITY;
 	for (const entry of [...journal.entries].sort((a, b) => a.idx - b.idx)) {
+		if (entry.when <= when) {
+			throw new Error(`migration ${entry.tag} is not dated after the one before it`);
+		}
+		when = entry.when;
 		const kind = manifest.migrations[entry.tag];
 		if (kind === undefined) {
 			throw new Error(`migration ${entry.tag} has no kind in compatibility.json`);
@@ -74,25 +89,41 @@ export async function loadLocalSchema(folder = MIGRATIONS_FOLDER): Promise<Local
 	return { folder, migrations, releases: manifest.releases };
 }
 
-/** Identifies a whole migration history; the same as `gateway_schema_state()` computes. */
-export function historyFingerprint(hashes: Readonly<string[]>): string {
-	return createHash("sha256").update(hashes.join("\n")).digest("hex");
+/**
+ * Identifies a whole schema: the migration history and the pg-boss schema version (`null`
+ * before pg-boss is installed). The same as `gateway_schema_state()` computes.
+ */
+export function historyFingerprint(
+	hashes: Readonly<string[]>,
+	pgbossSchema: number | null,
+): string {
+	return createHash("sha256")
+		.update(`${hashes.join("\n")}\npgboss:${pgbossSchema ?? "none"}`)
+		.digest("hex");
 }
 
-/** A database's migrations and the releases certified for them. */
+/** A database's migrations, its pg-boss schema version and the releases certified for them. */
 export type SchemaState = Readonly<{
 	hashes: Readonly<string[]>;
+	pgbossSchema: number | null;
 	certified: Readonly<string[]>;
 }>;
 
-const SchemaStateSchema = z.object({
-	hashes: z.array(z.string()),
-	certified: z.array(z.string()),
-});
+const SchemaStateSchema = z
+	.object({
+		hashes: z.array(z.string()),
+		pgboss_schema: z.number().int().nullable(),
+		certified: z.array(z.string()),
+	})
+	.transform((state) => ({
+		hashes: state.hashes,
+		pgbossSchema: state.pgboss_schema,
+		certified: state.certified,
+	}));
 
 /**
- * Reads the database's schema state through `gateway_schema_state()`, which the restricted
- * worker and tool runner roles may call. `undefined`: the database predates it (or is empty),
+ * Reads the database's schema state through `gateway_schema_state()`, which every role may
+ * call, the restricted worker and tool runner roles included. `undefined`: the database predates it (or is empty),
  * so it needs `gateway db migrate`.
  */
 export async function readSchemaState(pool: pg.Pool): Promise<SchemaState | undefined> {
@@ -172,27 +203,39 @@ export function checkCompatibility(
 }
 
 /**
- * The releases a migrate by `release` certifies for the full local history: itself, and every
- * published release whose later migrations are all `expand`.
+ * The releases a migrate by `release` certifies for the full local history on pg-boss schema
+ * `pgbossSchema`: itself, and every published release on the same pg-boss schema whose later
+ * migrations are all `expand`.
  */
-export function releasesToCertify(local: LocalSchema, release: string): string[] {
+export function releasesToCertify(
+	local: LocalSchema,
+	release: string,
+	pgbossSchema: number,
+): string[] {
 	const certified = new Set<string>([release]);
 	for (const published of local.releases) {
 		const head = local.migrations.findIndex((m) => m.tag === published.head);
-		if (local.migrations.slice(head + 1).every((m) => m.kind === "expand")) {
+		if (
+			published.pgboss_schema === pgbossSchema &&
+			local.migrations.slice(head + 1).every((m) => m.kind === "expand")
+		) {
 			certified.add(published.version);
 		}
 	}
 	return [...certified].sort();
 }
 
-/** Records the certificates for the database's current history (the local one). */
+/** Records the certificates for the database's current schema (the local history). */
 export async function certifyReleases(
 	client: pg.PoolClient | pg.Pool,
 	local: LocalSchema,
+	pgbossSchema: number,
 	releases: Readonly<string[]>,
 ): Promise<void> {
-	const fingerprint = historyFingerprint(local.migrations.map((m) => m.hash));
+	const fingerprint = historyFingerprint(
+		local.migrations.map((m) => m.hash),
+		pgbossSchema,
+	);
 	await client.query(
 		`insert into schema_certifications (release, fingerprint)
 		 select unnest($1::text[]), $2 on conflict do nothing`,
@@ -235,7 +278,11 @@ export async function migrateSchema(options: MigrateSchemaOptions): Promise<stri
 	const local = options.local ?? (await loadLocalSchema());
 	return withExclusiveDeploymentLock(options.connectionString, async () => {
 		const before = await appliedHashes(options.pool);
-		const check = checkCompatibility(local, { hashes: before, certified: [] }, DEVELOPMENT_VERSION);
+		const check = checkCompatibility(
+			local,
+			{ hashes: before, pgbossSchema: null, certified: [] },
+			DEVELOPMENT_VERSION,
+		);
 		if (!check.ok && (check.reason === "diverged" || check.reason === "uncertified")) {
 			throw new Error(
 				check.reason === "diverged"
@@ -245,12 +292,19 @@ export async function migrateSchema(options: MigrateSchemaOptions): Promise<stri
 		}
 		await migrateDatabase(options.pool, local.folder);
 		const after = await appliedHashes(options.pool);
-		if (historyFingerprint(after) !== historyFingerprint(local.migrations.map((m) => m.hash))) {
+		if (after.join("\n") !== local.migrations.map((m) => m.hash).join("\n")) {
 			throw new Error("the applied migrations do not match this release's after migrating");
 		}
 		await options.migrateQueues();
-		const releases = releasesToCertify(local, options.release);
-		await certifyReleases(options.pool, local, releases);
+		const pgboss = await options.pool.query<{ version: number }>(
+			"select version from pgboss.version",
+		);
+		const pgbossSchema = pgboss.rows[0]?.version;
+		if (pgbossSchema === undefined) {
+			throw new Error("the queue schema has no version after migrating");
+		}
+		const releases = releasesToCertify(local, options.release, pgbossSchema);
+		await certifyReleases(options.pool, local, pgbossSchema, releases);
 		return releases;
 	});
 }

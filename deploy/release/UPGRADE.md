@@ -26,9 +26,13 @@ cd /srv/agent-gateway/releases/agent-gateway-home-server-v$new
 bin/agw run --rm gateway-cli backup-gateway-db.sh /backups
 bin/agw run --rm -e BACKUP_DIR=/backups gateway-cli gateway backup check --record
 
-# 4. Pull the new images and migrate. `db migrate` refuses while a service is still connected.
+# 4. Refresh the host setup (reloads the workers' AppArmor profile; keeps existing files),
+#    pull the new images and migrate. `db migrate` refuses while a service is still connected.
+#    Then give the limited roles the new release's queues.
+sudo bin/init-home.sh
 bin/agw pull
 bin/agw run --rm gateway-cli gateway db migrate
+bin/agw run --rm gateway-cli gateway db grant-worker gateway_worker_codex codex
 bin/agw run --rm gateway-cli gateway db status
 
 # 5. Rebuild operator-built images (Claude Code) on the new gateway image, if you use them
@@ -52,4 +56,6 @@ Then post a mention in Mattermost and check the reply. If anything fails, go to 
   MIGRATIONS.md says so.
 - Releases are upgraded one at a time, in order. Skipping a release is allowed when every
   release in between is expand-only; otherwise upgrade through each.
+- A release that changes pg-boss's queue schema certifies no earlier release: pg-boss refuses
+  a schema of another version. MIGRATIONS.md says so.
 - A PostgreSQL major upgrade is never part of a Gateway release; it gets its own procedure.

@@ -23,19 +23,25 @@ source checkout. Upgrades are in [UPGRADE.md](UPGRADE.md), rollbacks in
 
 ## 1. Download and verify
 
+Verify the archive with the `gh` you trust before running anything from it:
+
 ```bash
 version=X.Y.Z
+repo=laruss/agent-gateway-control
 mkdir -p /srv/agent-gateway/releases && cd /srv/agent-gateway/releases
-gh release download "v$version" -R laruss/agent-gateway-control -D "download-v$version"
+gh release download "v$version" -R "$repo" -D "download-v$version"
 cd "download-v$version"
-sha256sum --check --strict SHA256SUMS           # every asset is what the release lists
-sh verify-release.sh "$version"                 # GitHub attestations of the archive and images
+for file in "agent-gateway-home-server-v$version.tar.gz" SHA256SUMS; do
+  gh attestation verify "$file" --repo "$repo" \
+    --signer-workflow "$repo/.github/workflows/release.yml" --source-ref "refs/tags/v$version"
+done
+sha256sum --check --strict SHA256SUMS       # the other assets match the attested checksums
 tar -xzf "agent-gateway-home-server-v$version.tar.gz" -C ..
 cd "../agent-gateway-home-server-v$version"
-sha256sum --check --strict SHA256SUMS           # every file of the bundle
+bin/verify-release.sh                       # the bundle's files, and the images' attestations
 ```
 
-`verify-release.sh` checks that the archive, `SHA256SUMS` and every image in `images.lock` were
+The attestations prove that the archive, `SHA256SUMS` and every image in `images.lock` were
 built by this repository's release workflow from the tag `v$version`. Continue only if every
 check passes.
 
@@ -73,8 +79,10 @@ bin/agw run --rm gateway-cli gateway config validate /config --root /config
 bin/agw run --rm gateway-cli gateway config apply /config --root /config
 ```
 
-The Gmail connector and the tool runner get their roles the same way (`db create-role`, then
-`db grant-tool-runner` for the tool runner; see `gateway --help`).
+The tool runner gets a role the same way (`db create-role`, then
+`db grant-tool-runner gateway_tool_runner finance`). The Gmail connector writes the events it
+ingests and uses the owner's connection: copy `secrets/controller/database_url` into
+`secrets/gmail/`.
 
 ## 4. Mattermost bots
 
@@ -129,6 +137,11 @@ confine the commands a runtime runs (namespaces and mounts inside its own user n
 profile is not loaded does not start. They mount only their own secrets and
 volumes, and they are not on the Mattermost network. No container gets the Docker socket, and
 no port is published.
+
+The containers run as uid `10001` (PostgreSQL as `70`), and the secret files belong to those
+ids: keep them free of host accounts, which could otherwise read the secrets. The services'
+metrics are reachable by the other containers on `agent-control`; they hold counts and agent
+ids, no content.
 
 **Egress.** Workers, the Gmail connector and the tool runner reach the internet through the
 `egress` network. The Mattermost network is closed to them, but its public URL, the host's

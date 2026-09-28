@@ -14,7 +14,7 @@ Every service serves these endpoints on `HEALTH_HOST` (loopback by default) and 
 
 | Service | Default port | Ready when |
 |---------|--------------|------------|
-| controller | 8080 | PostgreSQL reachable, no pending migration, the Mattermost listener connected (in `mattermost` mode) |
+| controller | 8080 | PostgreSQL reachable, the schema certified for its release (`gateway db status`), the Mattermost listener connected (in `mattermost` mode) |
 | worker | 8081 | the runtime probe passes and the worker takes jobs of the probed version |
 | connector-gmail | 8082 | PostgreSQL reachable, the credential accepted, notifications pulled and the watch active (Pub/Sub mode), the last sync recent |
 | tool-runner | 8083 | PostgreSQL reachable and not stopping |

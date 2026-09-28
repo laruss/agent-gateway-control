@@ -107,14 +107,16 @@ PostgreSQL keeps the five capabilities its entrypoint needs to prepare the data 
   1. applies N's migrations, then the pg-boss schema and the queues;
   2. certifies N, and every listed release whose later migrations are all `expand`.
 
-  A certificate binds the release to the fingerprint of the whole applied history
-  (`schema_certifications`).
+  A certificate binds the release to the fingerprint of the whole applied history and the
+  pg-boss schema version (`schema_certifications`). pg-boss refuses a schema of another
+  version whatever the Gateway certifies, so each listed release records its `pgboss_schema`,
+  and one on another version is not certified.
 - **A service asks one question at start:** does the database certify my release for this
   exact history, and does that history begin with my own migrations, unchanged?
-  - The answer comes from `gateway_schema_state()`, a security-definer function the restricted
-    worker and tool runner roles may call.
+  - The answer comes from `gateway_schema_state()`, a security-definer function every role may
+    call: it returns only migration hashes and version numbers.
   - A development build (`0.0.0`) runs only on exactly its own history.
-  - The controller, the workers, the Gmail connector, the tool runner and the mutating CLI
+  - The controller, the workers, the Gmail connector, the tool runner and the CLI's session
     commands all refuse otherwise. `gateway doctor` and `kill-all` still work.
 - **N−1 needs no knowledge of N.** It reads N's certificate. An older `db migrate` refuses a
   database with migrations it does not ship: a rollback never migrates down.
@@ -126,7 +128,10 @@ PostgreSQL keeps the five capabilities its entrypoint needs to prepare the data 
 - **The deployment lock.** Every service holds an advisory lock shared for its lifetime.
   `db migrate` takes it exclusively and refuses while any service is connected. Upgrades are
   therefore planned downtime, enforced: stop, back up, migrate, start. A service that loses its
-  lock connection exits, and its restart policy brings it back.
+  lock connection exits, and its restart policy brings it back; a heartbeat every 15 seconds
+  notices a silently dropped connection.
+- **Roles.** `gateway db create-role` creates a login role and writes its connection URL into a
+  secret file; the server receives a SCRAM verifier, never the password.
 
 ### The release
 

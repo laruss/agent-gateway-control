@@ -4,6 +4,7 @@ import { join } from "node:path";
 import {
 	CompatibilityManifestSchema,
 	checkCompatibility,
+	createLoginRole,
 	createPool,
 	DeploymentLockError,
 	holdDeploymentLock,
@@ -19,6 +20,9 @@ import { startTestPostgres, type TestPostgres } from "@agent-gateway/testkit";
 import type pg from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
+
+/** The queue schema version the installed pg-boss creates. */
+const PGBOSS_SCHEMA = 42;
 
 const JournalSchema = z.looseObject({
 	entries: z.array(z.looseObject({ idx: z.number(), when: z.number(), tag: z.string() })),
@@ -100,7 +104,11 @@ describe("gateway db migrate and the schema rules", () => {
 		expect(await migrate("0.1.0")).toEqual(["0.1.0"]);
 		const state = await readSchemaState(pool);
 		// The database computes the same fingerprint: the certificate is found through it.
-		expect(state).toEqual({ hashes: current.migrations.map((m) => m.hash), certified: ["0.1.0"] });
+		expect(state).toEqual({
+			hashes: current.migrations.map((m) => m.hash),
+			pgbossSchema: PGBOSS_SCHEMA,
+			certified: ["0.1.0"],
+		});
 		expect(checkCompatibility(current, state, "0.1.0").ok).toBe(true);
 		expect(checkCompatibility(current, state, "0.2.0")).toMatchObject({ reason: "uncertified" });
 		const queues = await pool.query<{ n: number }>("select count(*)::int as n from pgboss.queue");
@@ -112,7 +120,11 @@ describe("gateway db migrate and the schema rules", () => {
 	it("lets the previous release run after an expand-only upgrade, and refuses its migrate", async () => {
 		await migrate("0.1.0");
 		const folder = await nextRelease("expand", [
-			{ version: "0.1.0", head: current.migrations.at(-1)?.tag ?? "" },
+			{
+				version: "0.1.0",
+				head: current.migrations.at(-1)?.tag ?? "",
+				pgboss_schema: PGBOSS_SCHEMA,
+			},
 		]);
 		folders.push(folder);
 		const next = await loadLocalSchema(folder);
@@ -134,7 +146,11 @@ describe("gateway db migrate and the schema rules", () => {
 	it("does not certify the previous release after a contract migration", async () => {
 		await migrate("0.1.0");
 		const folder = await nextRelease("contract", [
-			{ version: "0.1.0", head: current.migrations.at(-1)?.tag ?? "" },
+			{
+				version: "0.1.0",
+				head: current.migrations.at(-1)?.tag ?? "",
+				pgboss_schema: PGBOSS_SCHEMA,
+			},
 		]);
 		folders.push(folder);
 		expect(await migrate("0.2.0", await loadLocalSchema(folder))).toEqual(["0.2.0"]);
@@ -142,6 +158,19 @@ describe("gateway db migrate and the schema rules", () => {
 			ok: false,
 			reason: "uncertified",
 		});
+	});
+
+	it("does not certify the previous release when it ran on another pg-boss schema", async () => {
+		await migrate("0.1.0");
+		const folder = await nextRelease("expand", [
+			{
+				version: "0.1.0",
+				head: current.migrations.at(-1)?.tag ?? "",
+				pgboss_schema: PGBOSS_SCHEMA - 1,
+			},
+		]);
+		folders.push(folder);
+		expect(await migrate("0.2.0", await loadLocalSchema(folder))).toEqual(["0.2.0"]);
 	});
 
 	it("refuses a database whose history differs from the shipped one", async () => {
@@ -180,6 +209,26 @@ describe("gateway db migrate and the schema rules", () => {
 		await lock.release();
 		await migrate("0.1.0");
 		expect(lost).toEqual([]);
+	});
+
+	it("creates a login role from a SCRAM verifier, which logs in with its password", async () => {
+		await createLoginRole(pool, "gateway_login_check", "a-password-1");
+		const url = new URL(postgres.connectionString);
+		url.username = "gateway_login_check";
+		url.password = "a-password-1";
+		const role = createPool(url.toString(), 1);
+		try {
+			const who = await role.query<{ user: string }>("select current_user as user");
+			expect(who.rows[0]?.user).toBe("gateway_login_check");
+		} finally {
+			await role.end();
+		}
+		const stored = await pool.query<{ rolpassword: string }>(
+			"select rolpassword from pg_authid where rolname = 'gateway_login_check'",
+		);
+		expect(stored.rows[0]?.rolpassword).toMatch(/^SCRAM-SHA-256\$4096:/);
+		// The owner is refused: its privileges must not be touched.
+		await expect(createLoginRole(pool, "gateway", "x")).rejects.toThrow("owns the gateway tables");
 	});
 
 	it("tells a service when its deployment lock is gone", async () => {

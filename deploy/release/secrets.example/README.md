@@ -22,7 +22,7 @@ $GATEWAY_HOME/secrets/
   worker-mock/                only for the smoke test
     database_url
   gmail/
-    database_url
+    database_url              a copy of the controller's (the connector writes events)
     gmail_oauth_client_id
     gmail_oauth_client_secret
     gmail_refresh_token       written by `gateway gmail authorize`

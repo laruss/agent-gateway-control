@@ -37,6 +37,10 @@ jobs:
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main ||
             { echo "::error::$tag is not on main"; exit 1; }
           echo "version=${tag#v}" >>"$GITHUB_OUTPUT"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: package.json
+      - run: bun install --frozen-lockfile
       - name: The changelog and the migration manifest name this release
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -45,10 +49,11 @@ jobs:
             { echo "::error::CHANGELOG.md has no section for $VERSION"; exit 1; }
           migrations=packages/db/migrations
           head="$(jq -r '.entries[-1].tag' "$migrations/meta/_journal.json")"
-          jq -e --arg v "$VERSION" --arg head "$head" \
-            '.releases | map(select(.version == $v and .head == $head)) | length == 1' \
+          pgboss="$(scripts/release/pgboss-schema.sh)"
+          jq -e --arg v "$VERSION" --arg head "$head" --argjson pgboss "$pgboss" \
+            '.releases | map(select(.version == $v and .head == $head and .pgboss_schema == $pgboss)) | length == 1' \
             "$migrations/compatibility.json" >/dev/null ||
-            { echo "::error::compatibility.json must list $VERSION with head $head"; exit 1; }
+            { echo "::error::compatibility.json must list $VERSION with head $head and pgboss_schema $pgboss"; exit 1; }
 
   ci:
     needs: validate
@@ -173,6 +178,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cd "$RUNNER_TEMP/dist"
+          # A rerun replaces its own unpublished draft; a published release is never touched.
+          if draft="$(gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            [[ "$draft" == true ]] || { echo "::error::v$VERSION is already published"; exit 1; }
+            gh release delete "v$VERSION" --repo "$GITHUB_REPOSITORY" --yes
+          fi
           gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
             --title "Agent Gateway $VERSION" --notes-file RELEASE_NOTES.md ./*
           gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" --json assets \
