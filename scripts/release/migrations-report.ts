@@ -4,15 +4,13 @@ import { loadLocalSchema, releasesToCertify } from "@agent-gateway/db";
  * Prints MIGRATIONS.md for a release bundle: the migrations the release ships, their kinds,
  * and which earlier releases may still run after this release migrated the database.
  */
-const [version, pgbossArgument] = process.argv.slice(2);
-const pgbossSchema = Number(pgbossArgument);
-if (version === undefined || !Number.isInteger(pgbossSchema)) {
-	throw new Error("usage: migrations-report.ts <version> <pg-boss schema>");
+const version = process.argv[2];
+if (version === undefined) {
+	throw new Error("usage: migrations-report.ts <version>");
 }
 const local = await loadLocalSchema();
-const certified = releasesToCertify(local, version, pgbossSchema).filter(
-	(release) => release !== version,
-);
+const pgbossSchema = local.pgbossSchema;
+const certified = releasesToCertify(local, version).filter((release) => release !== version);
 const lines = [
 	`# Database migrations of release ${version}`,
 	"",

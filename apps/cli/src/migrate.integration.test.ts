@@ -21,9 +21,6 @@ import type pg from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 
-/** The queue schema version the installed pg-boss creates. */
-const PGBOSS_SCHEMA = 42;
-
 const JournalSchema = z.looseObject({
 	entries: z.array(z.looseObject({ idx: z.number(), when: z.number(), tag: z.string() })),
 });
@@ -106,7 +103,8 @@ describe("gateway db migrate and the schema rules", () => {
 		// The database computes the same fingerprint: the certificate is found through it.
 		expect(state).toEqual({
 			hashes: current.migrations.map((m) => m.hash),
-			pgbossSchema: PGBOSS_SCHEMA,
+			// The manifest names the queue schema the installed pg-boss really creates.
+			pgbossSchema: current.pgbossSchema,
 			certified: ["0.1.0"],
 		});
 		expect(checkCompatibility(current, state, "0.1.0").ok).toBe(true);
@@ -123,7 +121,7 @@ describe("gateway db migrate and the schema rules", () => {
 			{
 				version: "0.1.0",
 				head: current.migrations.at(-1)?.tag ?? "",
-				pgboss_schema: PGBOSS_SCHEMA,
+				pgboss_schema: current.pgbossSchema,
 			},
 		]);
 		folders.push(folder);
@@ -149,7 +147,7 @@ describe("gateway db migrate and the schema rules", () => {
 			{
 				version: "0.1.0",
 				head: current.migrations.at(-1)?.tag ?? "",
-				pgboss_schema: PGBOSS_SCHEMA,
+				pgboss_schema: current.pgbossSchema,
 			},
 		]);
 		folders.push(folder);
@@ -166,11 +164,22 @@ describe("gateway db migrate and the schema rules", () => {
 			{
 				version: "0.1.0",
 				head: current.migrations.at(-1)?.tag ?? "",
-				pgboss_schema: PGBOSS_SCHEMA - 1,
+				pgboss_schema: current.pgbossSchema - 1,
 			},
 		]);
 		folders.push(folder);
 		expect(await migrate("0.2.0", await loadLocalSchema(folder))).toEqual(["0.2.0"]);
+	});
+
+	it("refuses to migrate a queue schema newer than its pg-boss, and runs nothing on it", async () => {
+		await migrate("0.1.0");
+		await pool.query("update pgboss.version set version = version + 1");
+		expect(checkCompatibility(current, await readSchemaState(pool), "0.1.0")).toMatchObject({
+			ok: false,
+			reason: "uncertified",
+		});
+		await expect(migrate("0.1.0")).rejects.toThrow("the queue schema is newer");
+		expect(checkCompatibility(current, await readSchemaState(pool), "0.1.0").ok).toBe(false);
 	});
 
 	it("refuses a database whose history differs from the shipped one", async () => {
@@ -196,10 +205,13 @@ describe("gateway db migrate and the schema rules", () => {
 				},
 			}),
 		).rejects.toThrow("queue schema failed");
-		expect(checkCompatibility(current, await readSchemaState(pool), "0.1.0")).toMatchObject({
-			ok: false,
-			reason: "uncertified",
-		});
+		// Neither the release nor a development build runs on the half-migrated database.
+		for (const release of ["0.1.0", "0.0.0"]) {
+			expect(checkCompatibility(current, await readSchemaState(pool), release)).toMatchObject({
+				ok: false,
+				reason: "pending",
+			});
+		}
 	});
 
 	it("refuses to migrate while a service holds the deployment lock", async () => {

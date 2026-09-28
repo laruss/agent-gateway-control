@@ -53,10 +53,13 @@ State lives in `$GATEWAY_HOME` (default `/srv/agent-gateway`), outside every rel
 directory: upgrades and rollbacks switch the release directory and keep the state.
 
 ```bash
-sudo bin/init-home.sh                 # directories, owners, the database password and URL
-sudo cp -R config.example/. /srv/agent-gateway/config/
-sudo "$EDITOR" /srv/agent-gateway/gateway.env /srv/agent-gateway/config/organization.yaml
+export GATEWAY_HOME=/srv/agent-gateway
+sudo GATEWAY_HOME="$GATEWAY_HOME" bin/init-home.sh   # directories, owners, the database password and URL
+sudo cp -R config.example/. "$GATEWAY_HOME/config/"
+sudo "$EDITOR" "$GATEWAY_HOME/gateway.env" "$GATEWAY_HOME/config/organization.yaml"
 ```
+
+`sudo` drops your environment: pass `GATEWAY_HOME` to it explicitly, as above.
 
 - `gateway.env`: `MATTERMOST_URL` (as the controller reaches it on the shared network),
   `MATTERMOST_NETWORK`, and `COMPOSE_PROFILES` (the workers and connectors to run).
@@ -65,7 +68,7 @@ sudo "$EDITOR" /srv/agent-gateway/gateway.env /srv/agent-gateway/config/organiza
 - `secrets/`: one directory per service ([secrets.example/README.md](secrets.example/README.md)).
   Each service mounts only its own, read-only.
 
-Set `GATEWAY_HOME` in your shell if you chose another path; `bin/agw` reads it.
+Keep `GATEWAY_HOME` set in your shell for the commands below; `bin/agw` reads it.
 
 ## 3. Database, roles and configuration
 

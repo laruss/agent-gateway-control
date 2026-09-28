@@ -54,8 +54,9 @@ anonymous pulls before it publishes anything.
    "releases": [{ "version": "X.Y.Z", "head": "<last migration tag>", "pgboss_schema": 42 }]
    ```
 
-   `pgboss_schema` is what `scripts/release/pgboss-schema.sh` prints for the locked pg-boss;
-   the release workflow checks both values.
+   `pgboss_schema` is the manifest's top-level `pgboss_schema`: the queue schema of the locked
+   pg-boss, which an integration test keeps equal to what pg-boss installs. The release
+   workflow checks both values.
 
 4. Check each new migration's kind. `expand` only if the previous release keeps working on the
    migrated schema, reading and writing. A `contract` means no rollback without a restore:

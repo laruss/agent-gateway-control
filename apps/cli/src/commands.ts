@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { renameSync, rmSync } from "node:fs";
 import { userInfo } from "node:os";
 import { resolve } from "node:path";
 import { GOOGLE_ENDPOINTS } from "@agent-gateway/connector-gmail";
@@ -58,6 +59,7 @@ import {
 	createPool,
 	grantToolRunnerRole,
 	grantWorkerRole,
+	holdDeploymentLock,
 	loadLocalSchema,
 	migrateSchema,
 	readSchemaState,
@@ -502,17 +504,23 @@ export async function runCommand(args: Readonly<string[]>, out: Output): Promise
 		const role = arg(args, 2, "role");
 		const urlFile = arg(args, 3, "url-file");
 		const password = randomBytes(24).toString("base64url");
-		// The URL first: a role whose URL could not be written would have a password nobody has.
 		const url = new URL(connectionString);
 		url.username = role;
 		url.password = password;
+		// The new URL is written beside the old one first and replaces it only once the password
+		// changed: a failure on either side never leaves the service a URL that no longer works.
+		const pending = `${urlFile}.pending`;
+		writeSecretFile(pending, url.toString());
 		const pool = createPool(connectionString, 1);
 		try {
 			await createLoginRole(pool, role, password);
+		} catch (error) {
+			rmSync(pending, { force: true });
+			throw error;
 		} finally {
 			await pool.end();
 		}
-		writeSecretFile(urlFile, url.toString());
+		renameSync(pending, urlFile);
 		out.print(`role ${role} can log in; its connection URL is in ${urlFile}`);
 		return 0;
 	}
@@ -618,19 +626,36 @@ async function runSessionCommand(
 	args: Readonly<string[]>,
 	out: Output,
 ): Promise<number> {
-	const { deps, boss } = session;
 	const [group, action] = args;
-	const who = actor();
 	// A flag after the group (`kill-all --release`) is not an action.
 	const command =
 		action === undefined || action.startsWith("--") ? `${group}` : `${group} ${action}`;
 	// The doctor reports an incompatible schema; kill-all must work whatever the schema.
-	if (!SCHEMA_EXEMPT_COMMANDS.includes(command)) {
-		const schema = await schemaCompatibility(deps.pool, releaseVersion());
+	if (SCHEMA_EXEMPT_COMMANDS.includes(command)) {
+		return dispatchSessionCommand(session, command, args, out);
+	}
+	// Like a service, a command holds the deployment lock: no migration runs under it.
+	const lock = await holdDeploymentLock(requireSetting("DATABASE_URL"), () => undefined);
+	try {
+		const schema = await schemaCompatibility(session.deps.pool, releaseVersion());
 		if (!schema.ok) {
 			throw new Error(`this CLI cannot run against this database: ${schema.detail}`);
 		}
+		return await dispatchSessionCommand(session, command, args, out);
+	} finally {
+		await lock.release();
 	}
+}
+
+async function dispatchSessionCommand(
+	session: Session,
+	command: string,
+	args: Readonly<string[]>,
+	out: Output,
+): Promise<number> {
+	const { deps, boss } = session;
+	const [, action] = args;
+	const who = actor();
 	switch (command) {
 		case "health":
 		case "doctor":

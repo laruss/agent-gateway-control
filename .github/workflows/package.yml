@@ -96,7 +96,7 @@ jobs:
           next="$major.$minor.$((patch + 1))"
           tree="$RUNNER_TEMP/next-tree"
           git worktree add --detach "$tree" HEAD
-          scripts/release/synthetic-next.sh "$tree" "$VERSION" "$next" "$(scripts/release/pgboss-schema.sh)"
+          scripts/release/synthetic-next.sh "$tree" "$VERSION" "$next"
           (cd "$tree" && bun install --frozen-lockfile)
           scripts/release/build-images.sh "$next" localhost:5000/laruss "$RUNNER_TEMP/next.env" "$tree"
           gateway="$(grep '^gateway=' "$RUNNER_TEMP/next.env" | cut -d= -f2)"

@@ -205,6 +205,11 @@ check_codex_sandbox() {
 		echo secret > "$CODEX_HOME/login-check"
 		policy="permissions.check.filesystem={\":minimal\"=\"read\", \":slash_tmp\"=\"deny\", \":tmpdir\"=\"deny\", \"$CODEX_HOME\"=\"deny\", \":workspace_roots\"={\".\"=\"write\"}, \"$ws\"=\"write\"}"
 		run() { codex sandbox -c default_permissions=\"check\" -c "$policy" -- "$@" 2>&1; }
+		# Controls: without the sandbox the same write and connection succeed, so their absence
+		# below is the sandbox and not the setup.
+		echo control > /var/lib/agent-gateway/workspaces/escaped && echo CONTROL-WRITE
+		rm -f /var/lib/agent-gateway/workspaces/escaped
+		bash -c "exec 3<>/dev/tcp/1.1.1.1/443" 2>/dev/null && echo CONTROL-NETWORK
 		run sh -c "echo inside > $ws/written; echo ran"
 		run cat "$CODEX_HOME/login-check" && echo LOGIN-READ
 		# Outside the workspace, in a directory the worker itself may write.
@@ -215,6 +220,8 @@ check_codex_sandbox() {
 		[ "$(cat "$ws/written")" = inside ] && echo WORKSPACE-OK
 		rm -rf "$ws" "$CODEX_HOME/login-check"')" || true
 	printf '%s\n' "$result"
+	grep -q '^CONTROL-WRITE$' <<<"$result" || fail "the control write failed"
+	grep -q '^CONTROL-NETWORK$' <<<"$result" || fail "the control connection failed: no egress"
 	grep -q '^ran$' <<<"$result" || fail "a sandboxed command did not run"
 	grep -q '^WORKSPACE-OK$' <<<"$result" || fail "the sandbox did not write the workspace"
 	! grep -qE 'LOGIN-READ|ESCAPED|NETWORK-OPEN' <<<"$result" || fail "the sandbox leaked"
@@ -234,7 +241,9 @@ smoke() {
 		sleep 2
 	done
 	[[ "$reply" -ge 1 ]] || fail "no reply to the $label mention"
-	cli gateway doctor >/dev/null || fail "gateway doctor after $label"
+	# Every check passes but Codex's: its worker has no login here, and says so.
+	{ cli gateway doctor || true; } | jq -e '[.. | objects | select(.ok == false) | .name] == ["runtime:codex"]' >/dev/null ||
+		fail "gateway doctor after $label"
 }
 
 # No mention got a second answer: across upgrades, rollbacks and restarts each root has one.
@@ -257,9 +266,10 @@ install_release "$first_release"
 check_versions "$first_version"
 check_hardening
 log "migrate refused while services run"
-if cli gateway db migrate; then
+if refusal="$(cli gateway db migrate 2>&1)"; then
 	fail "db migrate ran under live services"
 fi
+grep -q "stop them before migrating" <<<"$refusal" || fail "db migrate failed for another reason: $refusal"
 check_codex_sandbox
 smoke "$first_version"
 

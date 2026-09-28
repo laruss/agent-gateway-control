@@ -1,5 +1,6 @@
 {
   "format": 1,
+  "pgboss_schema": 42,
   "migrations": {
     "0000_initial": "pre-release",
     "0001_audit_log_append_only": "pre-release",

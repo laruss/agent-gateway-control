@@ -19,6 +19,11 @@ const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 
 export const CompatibilityManifestSchema = z.strictObject({
 	format: z.literal(1),
+	/**
+	 * The queue schema version this build's pg-boss creates; an integration test checks it
+	 * against the installed pg-boss.
+	 */
+	pgboss_schema: z.number().int().positive(),
 	/** Every migration by its journal tag. */
 	migrations: z.record(z.string(), z.enum(MIGRATION_KINDS)),
 	/**
@@ -40,6 +45,7 @@ export type LocalMigration = Readonly<{ tag: string; hash: string; kind: Migrati
 /** The migrations this build ships, in order, with their kinds and published releases. */
 export type LocalSchema = Readonly<{
 	folder: string;
+	pgbossSchema: number;
 	migrations: Readonly<LocalMigration[]>;
 	releases: CompatibilityManifest["releases"];
 }>;
@@ -86,7 +92,7 @@ export async function loadLocalSchema(folder = MIGRATIONS_FOLDER): Promise<Local
 		}
 		previous = head;
 	}
-	return { folder, migrations, releases: manifest.releases };
+	return { folder, pgbossSchema: manifest.pgboss_schema, migrations, releases: manifest.releases };
 }
 
 /**
@@ -177,6 +183,20 @@ export function checkCompatibility(
 		return { ok: false, reason: "pending", detail: `${pending} pending migration(s)` };
 	}
 	const newer = -pending;
+	// pg-boss runs only on its own queue schema version, whatever the Gateway certifies.
+	if (state.pgbossSchema !== local.pgbossSchema) {
+		return state.pgbossSchema === null || state.pgbossSchema < local.pgbossSchema
+			? {
+					ok: false,
+					reason: "pending",
+					detail: `the queue schema is not migrated (pg-boss schema ${state.pgbossSchema ?? "missing"}, this build needs ${local.pgbossSchema}); run 'gateway db migrate'`,
+				}
+			: {
+					ok: false,
+					reason: "uncertified",
+					detail: `the queue schema is newer (pg-boss schema ${state.pgbossSchema}, this build runs on ${local.pgbossSchema})`,
+				};
+	}
 	if (release === DEVELOPMENT_VERSION) {
 		return newer === 0
 			? { ok: true, detail: "0 pending" }
@@ -203,20 +223,16 @@ export function checkCompatibility(
 }
 
 /**
- * The releases a migrate by `release` certifies for the full local history on pg-boss schema
- * `pgbossSchema`: itself, and every published release on the same pg-boss schema whose later
+ * The releases a migrate by `release` certifies for the full local history and this build's
+ * pg-boss schema: itself, and every published release on the same pg-boss schema whose later
  * migrations are all `expand`.
  */
-export function releasesToCertify(
-	local: LocalSchema,
-	release: string,
-	pgbossSchema: number,
-): string[] {
+export function releasesToCertify(local: LocalSchema, release: string): string[] {
 	const certified = new Set<string>([release]);
 	for (const published of local.releases) {
 		const head = local.migrations.findIndex((m) => m.tag === published.head);
 		if (
-			published.pgboss_schema === pgbossSchema &&
+			published.pgboss_schema === local.pgbossSchema &&
 			local.migrations.slice(head + 1).every((m) => m.kind === "expand")
 		) {
 			certified.add(published.version);
@@ -229,18 +245,29 @@ export function releasesToCertify(
 export async function certifyReleases(
 	client: pg.PoolClient | pg.Pool,
 	local: LocalSchema,
-	pgbossSchema: number,
 	releases: Readonly<string[]>,
 ): Promise<void> {
 	const fingerprint = historyFingerprint(
 		local.migrations.map((m) => m.hash),
-		pgbossSchema,
+		local.pgbossSchema,
 	);
 	await client.query(
 		`insert into schema_certifications (release, fingerprint)
 		 select unnest($1::text[]), $2 on conflict do nothing`,
 		[releases, fingerprint],
 	);
+}
+
+/** The installed queue schema version, `null` before pg-boss is installed. */
+async function pgbossSchemaVersion(pool: pg.Pool): Promise<number | null> {
+	const exists = await pool.query<{ exists: boolean }>(
+		"select to_regclass('pgboss.version') is not null as exists",
+	);
+	if (exists.rows[0]?.exists !== true) {
+		return null;
+	}
+	const result = await pool.query<{ version: number }>("select version from pgboss.version");
+	return result.rows[0]?.version ?? null;
 }
 
 /** The applied migration hashes in order, read by the owning role. */
@@ -278,9 +305,10 @@ export async function migrateSchema(options: MigrateSchemaOptions): Promise<stri
 	const local = options.local ?? (await loadLocalSchema());
 	return withExclusiveDeploymentLock(options.connectionString, async () => {
 		const before = await appliedHashes(options.pool);
+		// The domain history only; the queue schema is checked on its own below.
 		const check = checkCompatibility(
 			local,
-			{ hashes: before, pgbossSchema: null, certified: [] },
+			{ hashes: before, pgbossSchema: local.pgbossSchema, certified: [] },
 			DEVELOPMENT_VERSION,
 		);
 		if (!check.ok && (check.reason === "diverged" || check.reason === "uncertified")) {
@@ -290,21 +318,26 @@ export async function migrateSchema(options: MigrateSchemaOptions): Promise<stri
 					: `the database has migrations this release does not ship; migrate it with the newer release`,
 			);
 		}
+		const queueSchema = await pgbossSchemaVersion(options.pool);
+		if (queueSchema !== null && queueSchema > local.pgbossSchema) {
+			throw new Error(
+				`the queue schema is newer than this release's (pg-boss schema ${queueSchema}); migrate it with the newer release`,
+			);
+		}
 		await migrateDatabase(options.pool, local.folder);
 		const after = await appliedHashes(options.pool);
 		if (after.join("\n") !== local.migrations.map((m) => m.hash).join("\n")) {
 			throw new Error("the applied migrations do not match this release's after migrating");
 		}
 		await options.migrateQueues();
-		const pgboss = await options.pool.query<{ version: number }>(
-			"select version from pgboss.version",
-		);
-		const pgbossSchema = pgboss.rows[0]?.version;
-		if (pgbossSchema === undefined) {
-			throw new Error("the queue schema has no version after migrating");
+		const migratedQueueSchema = await pgbossSchemaVersion(options.pool);
+		if (migratedQueueSchema !== local.pgbossSchema) {
+			throw new Error(
+				`the queue schema is at pg-boss schema ${migratedQueueSchema ?? "missing"} after migrating, not ${local.pgbossSchema}`,
+			);
 		}
-		const releases = releasesToCertify(local, options.release, pgbossSchema);
-		await certifyReleases(options.pool, local, pgbossSchema, releases);
+		const releases = releasesToCertify(local, options.release);
+		await certifyReleases(options.pool, local, releases);
 		return releases;
 	});
 }

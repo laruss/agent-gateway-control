@@ -17,7 +17,7 @@ const migration = (tag: string, kind: LocalMigration["kind"]): LocalMigration =>
 const local = (
 	migrations: Readonly<LocalMigration[]>,
 	releases: LocalSchema["releases"] = [],
-): LocalSchema => ({ folder: "/unused", migrations, releases });
+): LocalSchema => ({ folder: "/unused", pgbossSchema: 42, migrations, releases });
 
 const base = [migration("0000", "pre-release"), migration("0001", "expand")];
 const hashes = (schema: LocalSchema) => schema.migrations.map((m) => m.hash);
@@ -79,6 +79,21 @@ describe("checkCompatibility", () => {
 		});
 	});
 
+	it("needs the queue schema of this build's pg-boss", () => {
+		const migrated = { hashes: hashes(schema), certified: ["0.1.0"] };
+		expect(
+			checkCompatibility(schema, { ...migrated, pgbossSchema: null }, DEVELOPMENT_VERSION),
+		).toMatchObject({ ok: false, reason: "pending" });
+		expect(checkCompatibility(schema, { ...migrated, pgbossSchema: 41 }, "0.1.0")).toMatchObject({
+			ok: false,
+			reason: "pending",
+		});
+		expect(checkCompatibility(schema, { ...migrated, pgbossSchema: 43 }, "0.1.0")).toMatchObject({
+			ok: false,
+			reason: "uncertified",
+		});
+	});
+
 	it("runs a development build on exactly its own history", () => {
 		expect(
 			checkCompatibility(
@@ -108,7 +123,7 @@ describe("releasesToCertify", () => {
 				{ version: "0.2.0", head: "0002", pgboss_schema: 42 },
 			],
 		);
-		expect(releasesToCertify(schema, "0.3.0", 42)).toEqual(["0.1.0", "0.2.0", "0.3.0"]);
+		expect(releasesToCertify(schema, "0.3.0")).toEqual(["0.1.0", "0.2.0", "0.3.0"]);
 	});
 
 	it("does not certify a release a later contract migration breaks", () => {
@@ -119,7 +134,7 @@ describe("releasesToCertify", () => {
 				{ version: "0.2.0", head: "0002", pgboss_schema: 42 },
 			],
 		);
-		expect(releasesToCertify(schema, "0.3.0", 42)).toEqual(["0.2.0", "0.3.0"]);
+		expect(releasesToCertify(schema, "0.3.0")).toEqual(["0.2.0", "0.3.0"]);
 	});
 
 	it("does not certify a release on another pg-boss schema: pg-boss would refuse it", () => {
@@ -130,12 +145,12 @@ describe("releasesToCertify", () => {
 				{ version: "0.2.0", head: "0002", pgboss_schema: 42 },
 			],
 		);
-		expect(releasesToCertify(schema, "0.3.0", 42)).toEqual(["0.2.0", "0.3.0"]);
+		expect(releasesToCertify(schema, "0.3.0")).toEqual(["0.2.0", "0.3.0"]);
 	});
 
 	it("certifies a release migrating its own head", () => {
 		const schema = local(base, [{ version: "0.1.0", head: "0001", pgboss_schema: 42 }]);
-		expect(releasesToCertify(schema, "0.1.0", 42)).toEqual(["0.1.0"]);
+		expect(releasesToCertify(schema, "0.1.0")).toEqual(["0.1.0"]);
 	});
 });
 

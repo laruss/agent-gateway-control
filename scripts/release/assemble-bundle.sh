@@ -94,8 +94,7 @@ if [[ "$(wc -l <"$bundle/RELEASE_NOTES.md")" -lt 3 ]]; then
 		printing { print }
 	' "$root/CHANGELOG.md" >"$bundle/RELEASE_NOTES.md"
 fi
-(cd "$root" && bun scripts/release/migrations-report.ts "$version" "$(scripts/release/pgboss-schema.sh)") \
-	>"$bundle/MIGRATIONS.md"
+(cd "$root" && bun scripts/release/migrations-report.ts "$version") >"$bundle/MIGRATIONS.md"
 
 mkdir -p "$bundle/sbom"
 cp "$sbom_dir"/*.spdx.json "$bundle/sbom/"

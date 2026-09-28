@@ -29,10 +29,12 @@ bin/agw run --rm -e BACKUP_DIR=/backups gateway-cli gateway backup check --recor
 # 4. Refresh the host setup (reloads the workers' AppArmor profile; keeps existing files),
 #    pull the new images and migrate. `db migrate` refuses while a service is still connected.
 #    Then give the limited roles the new release's queues.
-sudo bin/init-home.sh
+sudo GATEWAY_HOME="$GATEWAY_HOME" bin/init-home.sh
 bin/agw pull
 bin/agw run --rm gateway-cli gateway db migrate
 bin/agw run --rm gateway-cli gateway db grant-worker gateway_worker_codex codex
+#    ... and every other limited role you created (grant-worker for each worker's role,
+#    grant-tool-runner for the tool runner's), with the same arguments as at install.
 bin/agw run --rm gateway-cli gateway db status
 
 # 5. Rebuild operator-built images (Claude Code) on the new gateway image, if you use them

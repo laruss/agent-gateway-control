@@ -20,7 +20,10 @@ agent-gateway-home-server-v$new/bin/agw stop gateway-controller gateway-worker-c
 agent-gateway-home-server-v$old/bin/agw run --rm gateway-cli gateway db status
 #    "compatible": true  -> continue; false -> restore instead (below).
 
-# 3. Start the previous release: its compose.yaml pins its own images by digest.
+# 3. Give the limited roles the previous release's queue grants (grant-worker and
+#    grant-tool-runner, as at install, with the previous release's CLI), then start it: its
+#    compose.yaml pins its own images by digest.
+agent-gateway-home-server-v$old/bin/agw run --rm gateway-cli gateway db grant-worker gateway_worker_codex codex
 agent-gateway-home-server-v$old/bin/agw up -d --wait --remove-orphans
 agent-gateway-home-server-v$old/bin/agw run --rm gateway-cli gateway doctor
 ```
