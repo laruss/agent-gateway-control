@@ -1,6 +1,6 @@
-# Local changes to the stack, kept beside it: copy to $GATEWAY_HOME/compose.override.yaml and
-# pass it with `bin/agw -f compose.yaml -f $GATEWAY_HOME/compose.override.yaml ...`, or set
-# COMPOSE_FILE in gateway.env. Never edit compose.yaml itself: the next release replaces it.
+# Local changes to the stack: copy to $GATEWAY_HOME/compose.override.yaml, and bin/agw applies
+# it on top of every release's compose.yaml. Never edit compose.yaml itself: the next release
+# replaces it.
 
 services:
   # Health endpoints and metrics for a monitor on the host (loopback only). The release

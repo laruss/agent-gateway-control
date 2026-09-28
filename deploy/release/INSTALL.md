@@ -115,8 +115,15 @@ settings.
 ### Gmail (optional)
 
 Put the OAuth client of type "Desktop app" into `secrets/gmail/gmail_oauth_client_id` and
-`gmail_oauth_client_secret` (mode 0600, owner 10001), copy `secrets/controller/database_url`
-into `secrets/gmail/`, then authorize the mailbox:
+`gmail_oauth_client_secret`, and copy the controller's database URL next to them, each mode
+0600 and owned by the services' user:
+
+```bash
+sudo install -m 0600 -o 10001 -g 10001 "$GATEWAY_HOME/secrets/controller/database_url" \
+  "$GATEWAY_HOME/secrets/gmail/database_url"
+```
+
+Then authorize the mailbox:
 
 ```bash
 bin/gmail-authorize.sh            # --pubsub with Pub/Sub notifications

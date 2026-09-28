@@ -74,7 +74,13 @@ import {
 	transactionalJobSink,
 } from "@agent-gateway/queue";
 import { runtimeDoctor } from "@agent-gateway/runtime-sdk";
-import { intSetting, readSetting, requireSetting, writeSecretFile } from "@agent-gateway/service";
+import {
+	intSetting,
+	readSetting,
+	requireSetting,
+	secretFileExists,
+	writeSecretFile,
+} from "@agent-gateway/service";
 import { createRuntimeAdapter, workspaceRoot } from "@agent-gateway/worker";
 import type { PgBoss } from "pg-boss";
 import { type BackupCheckReport, checkBackup, localPgTools } from "./backup.ts";
@@ -514,6 +520,10 @@ export async function runCommand(args: Readonly<string[]>, out: Output): Promise
 		// The new URL is written beside the old one first and replaces it only once the password
 		// changed: a failure on either side never leaves the service a URL that no longer works.
 		const pending = `${urlFile}.pending`;
+		// A pending file left by an interrupted rotation may hold the only working URL.
+		if (secretFileExists(pending)) {
+			throw new Error(`${pending} is left from an earlier change; move it to ${urlFile} first`);
+		}
 		writeSecretFile(pending, url.toString());
 		const pool = createPool(connectionString, 1);
 		try {

@@ -35,9 +35,9 @@ export async function holdDeploymentLock(
 		keepAliveInitialDelayMillis: 10_000,
 		query_timeout: HEARTBEAT_TIMEOUT_MS,
 	});
-	await client.connect();
 	let released = false;
 	try {
+		await client.connect();
 		const result = await client.query<{ locked: boolean }>(
 			"select pg_try_advisory_lock_shared(hashtextextended($1, 0)) as locked",
 			[DEPLOYMENT_LOCK],
