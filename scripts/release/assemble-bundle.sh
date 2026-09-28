@@ -64,8 +64,9 @@ cp -R "$root/deploy/release/secrets.example" "$bundle/secrets.example"
 cp "$root/deploy/release/gateway.env.example" "$root/deploy/release/compose.override.example.yaml" \
 	"$root/deploy/release/INSTALL.md" "$root/deploy/release/UPGRADE.md" \
 	"$root/deploy/release/ROLLBACK.md" "$bundle/"
-mkdir -p "$bundle/seccomp"
+mkdir -p "$bundle/seccomp" "$bundle/apparmor"
 cp "$root/deploy/images/seccomp/worker-sandbox.json" "$bundle/seccomp/"
+cp "$root/deploy/images/apparmor/agent-gateway-worker" "$bundle/apparmor/"
 cp "$root/LICENSE" "$bundle/LICENSE"
 
 # The example configuration, with its prompts where `--root /config` finds them.

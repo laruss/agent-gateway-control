@@ -8,6 +8,11 @@ Mattermost. See [docs/about.md](docs/about.md).
 - Bun 1.4+ (the exact version is pinned in `package.json#packageManager`)
 - Docker (for integration tests via Testcontainers)
 
+## Installing
+
+A server installs a GitHub Release (container images and a bundle), not a checkout: see
+[deploy/release/INSTALL.md](deploy/release/INSTALL.md).
+
 ## Development
 
 ```bash
@@ -40,6 +45,8 @@ See [local development](docs/operations/local-development.md) for the full walkt
 - [Observability, alerts and retention](docs/operations/observability.md)
 - [Backups of the Gateway database](docs/operations/backups.md)
 - [Security scans](docs/operations/security-scans.md)
+- [Releases](docs/operations/releases.md); installing on a server:
+  [deploy/release/INSTALL.md](deploy/release/INSTALL.md)
 - [Privacy notes](docs/security/privacy.md)
 - [Implementation status](IMPLEMENTATION_STATUS.md)
 

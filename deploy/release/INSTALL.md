@@ -122,8 +122,11 @@ Every container:
 The PostgreSQL container keeps the few capabilities its entrypoint needs to prepare its data
 directory.
 
-The runtime workers use `seccomp/worker-sandbox.json`: Docker's default profile plus the calls
-bubblewrap needs to confine the commands a runtime runs. They mount only their own secrets and
+The runtime workers use `seccomp/worker-sandbox.json` and, on AppArmor hosts (Ubuntu, Debian),
+`apparmor/agent-gateway-worker`: Docker's default profiles plus only what bubblewrap needs to
+confine the commands a runtime runs (namespaces and mounts inside its own user namespace).
+`init-home.sh` installs the AppArmor profile into `/etc/apparmor.d` and loads it; a worker whose
+profile is not loaded does not start. They mount only their own secrets and
 volumes, and they are not on the Mattermost network. No container gets the Docker socket, and
 no port is published.
 

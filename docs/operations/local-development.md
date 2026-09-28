@@ -12,8 +12,13 @@ Everything below runs on a laptop with Bun and Docker. Two ways to run it:
 ```bash
 cp .env.example .env          # development values only; bun loads .env automatically
 bun run dev:infra             # PostgreSQL 17.6 on 127.0.0.1:5433, Mattermost on 127.0.0.1:8065
-bun run gateway db migrate    # database migrations and the pg-boss schema
+bun run gateway db migrate    # database migrations, the pg-boss schema and the queues
 ```
+
+Only `db migrate` changes the schema, and it refuses while a service is connected: stop
+`bun run dev` (and any worker) first. Services refuse to start against a database whose
+migrations differ from the checkout's; `bun run gateway db status` shows why
+([ADR-020](../adr/020-release-pipeline.md)).
 
 The Compose file uses fixed development passwords and binds to the loopback interface. It is
 not a deployment: production reads `DATABASE_URL_FILE` from a secret file (every setting `X`
@@ -289,3 +294,8 @@ bun run gateway db grant-tool-runner gateway_tool_runner finance
 
 Change `packages/db/src/schema.ts`, then `bun run db:generate` creates a new migration. Never
 edit a committed migration. CI fails when the schema and the migrations disagree.
+
+Give every new migration its kind in `packages/db/migrations/compatibility.json`: `expand` when
+the previous release keeps working on the migrated schema (new tables, nullable columns, new
+functions), `contract` when it does not (drops, renames, stricter constraints). A contract
+means a rollback needs a restore; see [releases](releases.md).

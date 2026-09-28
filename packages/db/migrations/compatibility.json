@@ -1,20 +1,21 @@
 {
-  "format": 1,
-  "migrations": {
-    "0000_initial": "pre-release",
-    "0001_audit_log_append_only": "pre-release",
-    "0002_events_subject_index": "pre-release",
-    "0003_directory_team_kind": "pre-release",
-    "0004_config_generation": "pre-release",
-    "0005_thread_context": "pre-release",
-    "0006_bind_reply_waits": "pre-release",
-    "0007_runtime_workers": "pre-release",
-    "0008_gmail_mailboxes": "pre-release",
-    "0009_gmail_mode": "pre-release",
-    "0010_approvals_and_tool_actions": "pre-release",
-    "0011_approval_guards": "pre-release",
-    "0012_traces_retention_alerts": "pre-release",
-    "0013_schema_certifications": "expand"
-  },
-  "releases": []
+	"format": 1,
+	"migrations": {
+		"0000_initial": "pre-release",
+		"0001_audit_log_append_only": "pre-release",
+		"0002_events_subject_index": "pre-release",
+		"0003_directory_team_kind": "pre-release",
+		"0004_config_generation": "pre-release",
+		"0005_thread_context": "pre-release",
+		"0006_bind_reply_waits": "pre-release",
+		"0007_runtime_workers": "pre-release",
+		"0008_gmail_mailboxes": "pre-release",
+		"0009_gmail_mode": "pre-release",
+		"0010_approvals_and_tool_actions": "pre-release",
+		"0011_approval_guards": "pre-release",
+		"0012_traces_retention_alerts": "pre-release",
+		"0013_schema_certifications": "expand",
+		"0014_schema_state": "expand"
+	},
+	"releases": []
 }

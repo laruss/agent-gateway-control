@@ -99,6 +99,13 @@
       "when": 1790620800410,
       "tag": "0013_schema_certifications",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1790623181056,
+      "tag": "0014_schema_state",
+      "breakpoints": true
     }
   ]
 }

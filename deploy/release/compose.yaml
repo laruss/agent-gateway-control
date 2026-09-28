@@ -129,8 +129,8 @@ services:
       gateway-postgres:
         condition: service_healthy
 
-  # Runs agents on Codex. Its seccomp profile adds only what bubblewrap needs to confine the
-  # commands Codex runs (seccomp/worker-sandbox.json); log in once with
+  # Runs agents on Codex. Its seccomp and AppArmor profiles add only what bubblewrap needs to
+  # confine the commands Codex runs (seccomp/, apparmor/); log in once with
   # `bin/agw run --rm gateway-worker-codex codex login --device-auth` or set CODEX_API_KEY_FILE.
   gateway-worker-codex:
     <<: *hardening
@@ -139,6 +139,9 @@ services:
     security_opt:
       - no-new-privileges:true
       - seccomp=./seccomp/worker-sandbox.json
+      # On AppArmor hosts: Docker's default profile plus bubblewrap's mounts, loaded by
+      # bin/init-home.sh. Ignored where AppArmor is off.
+      - apparmor=agent-gateway-worker
     environment:
       <<: *gateway-environment
       DATABASE_URL_FILE: /run/secrets/database_url
@@ -174,6 +177,9 @@ services:
     security_opt:
       - no-new-privileges:true
       - seccomp=./seccomp/worker-sandbox.json
+      # On AppArmor hosts: Docker's default profile plus bubblewrap's mounts, loaded by
+      # bin/init-home.sh. Ignored where AppArmor is off.
+      - apparmor=agent-gateway-worker
     environment:
       <<: *gateway-environment
       DATABASE_URL_FILE: /run/secrets/database_url
