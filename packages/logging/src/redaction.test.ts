@@ -16,7 +16,7 @@ describe("redactText", () => {
 		["a Google access token", `ya29.${"a0Ad".repeat(10)}`, REDACTED],
 		[
 			"a JWT",
-			"id eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJlLXZhbHVl done",
+			`id ${["eyJhbGciOiJSUzI1NiJ9", "eyJzdWIiOiIxMjM0In0", "c2lnbmF0dXJlLXZhbHVl"].join(".")} done`,
 			`id ${REDACTED} done`,
 		],
 		["a fine-grained GitHub token", `github_pat_${"A1".repeat(20)}`, REDACTED],

@@ -48,7 +48,10 @@ reason. Never except a real secret: rotate it, then remove it from history.
 - **A Gitleaks false positive** (a test fixture shaped like a token): prefer changing the fixture
   so it no longer looks like a real token. Otherwise add a `.gitleaks.toml` that extends the
   default rules (`[extend] useDefault = true`) with an `[[allowlists]]` entry limited to that
-  path and pattern, and a description.
+  path and pattern, and a description. A fixture already in the history cannot be changed
+  there: after changing it, list that one finding's fingerprint
+  (`<commit>:<file>:<rule>:<line>`, shown by `--report-format json`) in `.gitleaksignore` with
+  a comment. Any other finding, in the same file too, still fails the scan.
 
 Current exceptions (see `osv-scanner.toml` for the reasons):
 
@@ -58,3 +61,5 @@ Current exceptions (see `osv-scanner.toml` for the reasons):
 - `ssh2`, `cpu-features`, `buildcheck`: MIT, declared in a legacy field.
 - `lightningcss`: MPL-2.0, a development-only build tool of vite (used by vitest), unmodified
   and not shipped.
+- `.gitleaksignore`: a fake JWT fixture in `packages/logging/src/redaction.test.ts` at commit
+  `981a5de`; the fixture is now assembled at runtime.
