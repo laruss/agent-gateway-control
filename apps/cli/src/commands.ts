@@ -410,7 +410,7 @@ async function doctor(session: Session, out: Output): Promise<boolean> {
 async function recordBackupCheck(report: BackupCheckReport, maxAgeHours: number): Promise<void> {
 	const failed = report.checks.filter((check) => !check.ok);
 	const session = await openSession();
-	const lock = await holdDeploymentLock(requireSetting("DATABASE_URL"), () => undefined);
+	const lock = await holdDeploymentLock(requireSetting("DATABASE_URL"), exitOnLostLock);
 	try {
 		await recordMaintenanceResult(session.deps, "backup", {
 			ok: report.ok,
@@ -522,7 +522,14 @@ export async function runCommand(args: Readonly<string[]>, out: Output): Promise
 		} finally {
 			await pool.end();
 		}
-		renameSync(pending, urlFile);
+		try {
+			renameSync(pending, urlFile);
+		} catch (error) {
+			throw new Error(
+				`the password changed, but ${urlFile} could not be replaced; the working URL is in ${pending}: move it there`,
+				{ cause: error },
+			);
+		}
 		out.print(`role ${role} can log in; its connection URL is in ${urlFile}`);
 		return 0;
 	}
@@ -620,6 +627,12 @@ export async function runCommand(args: Readonly<string[]>, out: Output): Promise
 	}
 }
 
+/** A command that lost the deployment lock stops at once: a migration may start now. */
+function exitOnLostLock(error: Error): void {
+	process.stderr.write(`gateway: the deployment lock was lost (${error.message}); stopping\n`);
+	process.exit(1);
+}
+
 /** Session commands that run whether or not this release may run against the schema. */
 const SCHEMA_EXEMPT_COMMANDS: Readonly<string[]> = ["health", "doctor", "kill-all"];
 
@@ -637,7 +650,7 @@ async function runSessionCommand(
 		return dispatchSessionCommand(session, command, args, out);
 	}
 	// Like a service, a command holds the deployment lock: no migration runs under it.
-	const lock = await holdDeploymentLock(requireSetting("DATABASE_URL"), () => undefined);
+	const lock = await holdDeploymentLock(requireSetting("DATABASE_URL"), exitOnLostLock);
 	try {
 		const schema = await schemaCompatibility(session.deps.pool, releaseVersion());
 		if (!schema.ok) {

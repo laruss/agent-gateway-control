@@ -106,7 +106,8 @@ export function scramVerifier(password: string, salt: Buffer = randomBytes(16)):
 }
 
 /**
- * Creates a login role with `password`, or sets the password of an existing one. The role gets
+ * Creates a login role with `password`, or sets the password of an existing one that nothing
+ * is connected as. The role gets
  * no privileges here: `grantWorkerRole` or `grantToolRunnerRole` limits it afterwards. The
  * owning role, superusers and roles that bypass row-level security are refused.
  */
@@ -127,6 +128,16 @@ export async function createLoginRole(
 			await client.query(`CREATE ROLE ${client.escapeIdentifier(role)} LOGIN`);
 		} else {
 			await refuseUnrestrictableRole(client, role);
+			// A running service keeps the URL it read at start: its next connection would fail.
+			const sessions = await client.query(
+				"select 1 from pg_stat_activity where usename = $1 limit 1",
+				[role],
+			);
+			if ((sessions.rowCount ?? 0) > 0) {
+				throw new Error(
+					`role '${role}' is connected; stop the service that uses it before changing its password`,
+				);
+			}
 		}
 		// The server gets a SCRAM verifier, never the password: a logged statement reveals nothing.
 		await client.query(

@@ -239,6 +239,16 @@ describe("gateway db migrate and the schema rules", () => {
 			"select rolpassword from pg_authid where rolname = 'gateway_login_check'",
 		);
 		expect(stored.rows[0]?.rolpassword).toMatch(/^SCRAM-SHA-256\$4096:/);
+		// A role in use keeps its password: the service using it would lose the database.
+		const connected = createPool(url.toString(), 1);
+		try {
+			await connected.query("select 1");
+			await expect(createLoginRole(pool, "gateway_login_check", "another")).rejects.toThrow(
+				"is connected",
+			);
+		} finally {
+			await connected.end();
+		}
 		// The owner is refused: its privileges must not be touched.
 		await expect(createLoginRole(pool, "gateway", "x")).rejects.toThrow("owns the gateway tables");
 	});
