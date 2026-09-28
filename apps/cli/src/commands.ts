@@ -410,6 +410,7 @@ async function doctor(session: Session, out: Output): Promise<boolean> {
 async function recordBackupCheck(report: BackupCheckReport, maxAgeHours: number): Promise<void> {
 	const failed = report.checks.filter((check) => !check.ok);
 	const session = await openSession();
+	const lock = await holdDeploymentLock(requireSetting("DATABASE_URL"), () => undefined);
 	try {
 		await recordMaintenanceResult(session.deps, "backup", {
 			ok: report.ok,
@@ -421,6 +422,7 @@ async function recordBackupCheck(report: BackupCheckReport, maxAgeHours: number)
 			detail: { max_age_hours: maxAgeHours, backup: report.backup },
 		});
 	} finally {
+		await lock.release();
 		await session.close();
 	}
 }

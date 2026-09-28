@@ -294,6 +294,7 @@ if [[ -n "$next" ]]; then
 	agw="$first_release/bin/agw"
 	cli gateway db status | tee /dev/stderr | jq -e '.compatible' >/dev/null ||
 		fail "the previous release is not certified for the upgraded database"
+	regrant
 	start_services
 	check_versions "$first_version"
 	smoke "$first_version-after-rollback"

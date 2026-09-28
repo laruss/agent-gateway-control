@@ -126,7 +126,8 @@ PostgreSQL keeps the five capabilities its entrypoint needs to prepare the data 
   supervises) and in every client; the queue schema changes only in `db migrate`. The pg-boss
   version stays fixed across a rollback window: its own schema check cannot be certified away.
 - **The deployment lock.** Every service holds an advisory lock shared for its lifetime.
-  `db migrate` takes it exclusively and refuses while any service is connected. Upgrades are
+  `db migrate` takes it exclusively and refuses while any service is connected. The CLI's
+  session commands hold it shared too, except `doctor`/`health` and `kill-all`. Upgrades are
   therefore planned downtime, enforced: stop, back up, migrate, start. A service that loses its
   lock connection exits, and its restart policy brings it back; a heartbeat every 15 seconds
   notices a silently dropped connection.

@@ -189,7 +189,7 @@ jobs:
             --jq '.assets[].name' | sort >"$RUNNER_TEMP/uploaded"
           find . -maxdepth 1 -type f -printf '%P\n' | sort | diff - "$RUNNER_TEMP/uploaded"
           # Only the highest version is the latest: a patch of an older line is not.
-          highest="$(git -C "$GITHUB_WORKSPACE" tag --list 'v*' | grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' | sort -V | tail -1)"
+          highest="$({ echo "v$VERSION"; gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases --limit 1000 --json tagName --jq '.[].tagName'; } | grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' | sort -V | tail -1)"
           latest=false
           [[ "$highest" == "v$VERSION" ]] && latest=true
           gh release edit "v$VERSION" --repo "$GITHUB_REPOSITORY" --draft=false --latest="$latest"

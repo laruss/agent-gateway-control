@@ -22,11 +22,14 @@ cd /srv/agent-gateway/releases/agent-gateway-home-server-v$new
 ../agent-gateway-home-server-v$old/bin/agw stop gateway-controller gateway-worker-codex \
   gateway-worker-claude-code gateway-worker-mock gateway-connector-gmail gateway-tool-runner
 
-# 3. Back up and verify the backup (the way back if a restore is ever needed).
-bin/agw run --rm gateway-cli backup-gateway-db.sh /backups
-bin/agw run --rm -e BACKUP_DIR=/backups gateway-cli gateway backup check --record
+# 3. Back up and verify the backup (the way back if a restore is ever needed), still with the
+#    running release's CLI: the new one does not run on the old schema.
+../agent-gateway-home-server-v$old/bin/agw run --rm gateway-cli backup-gateway-db.sh /backups
+../agent-gateway-home-server-v$old/bin/agw run --rm -e BACKUP_DIR=/backups gateway-cli \
+  gateway backup check --record
 
-# 4. Refresh the host setup (reloads the workers' AppArmor profile; keeps existing files),
+# 4. `db migrate` refuses while any service or other CLI command is connected: finish those
+#    first (a cron job's `gateway health` included). Refresh the host setup (reloads the workers' AppArmor profile; keeps existing files),
 #    pull the new images and migrate. `db migrate` refuses while a service is still connected.
 #    Then give the limited roles the new release's queues.
 sudo GATEWAY_HOME="$GATEWAY_HOME" bin/init-home.sh
