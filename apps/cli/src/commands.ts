@@ -57,6 +57,7 @@ import {
 	checkCompatibility,
 	createLoginRole,
 	createPool,
+	type DeploymentLock,
 	grantToolRunnerRole,
 	grantWorkerRole,
 	holdDeploymentLock,
@@ -65,7 +66,7 @@ import {
 	readSchemaState,
 	schemaCompatibility,
 } from "@agent-gateway/db";
-import { createLogger, releaseVersion, serviceVersion } from "@agent-gateway/logging";
+import { createLogger, redactText, releaseVersion, serviceVersion } from "@agent-gateway/logging";
 import {
 	createBoss,
 	deadLetterQueues,
@@ -410,8 +411,9 @@ async function doctor(session: Session, out: Output): Promise<boolean> {
 async function recordBackupCheck(report: BackupCheckReport, maxAgeHours: number): Promise<void> {
 	const failed = report.checks.filter((check) => !check.ok);
 	const session = await openSession();
-	const lock = await holdDeploymentLock(requireSetting("DATABASE_URL"), exitOnLostLock);
+	let lock: DeploymentLock | undefined;
 	try {
+		lock = await holdDeploymentLock(requireSetting("DATABASE_URL"), exitOnLostLock);
 		await recordMaintenanceResult(session.deps, "backup", {
 			ok: report.ok,
 			error: report.ok
@@ -422,7 +424,7 @@ async function recordBackupCheck(report: BackupCheckReport, maxAgeHours: number)
 			detail: { max_age_hours: maxAgeHours, backup: report.backup },
 		});
 	} finally {
-		await lock.release();
+		await lock?.release();
 		await session.close();
 	}
 }
@@ -629,12 +631,16 @@ export async function runCommand(args: Readonly<string[]>, out: Output): Promise
 
 /** A command that lost the deployment lock stops at once: a migration may start now. */
 function exitOnLostLock(error: Error): void {
-	process.stderr.write(`gateway: the deployment lock was lost (${error.message}); stopping\n`);
+	process.stderr.write(
+		`gateway: the deployment lock was lost (${redactText(error.message)}); stopping\n`,
+	);
 	process.exit(1);
 }
 
 /** Session commands that run whether or not this release may run against the schema. */
 const SCHEMA_EXEMPT_COMMANDS: Readonly<string[]> = ["health", "doctor", "kill-all"];
+/** Read-only reports: they need no deployment lock and run during a migration too. */
+const READ_ONLY_COMMANDS: Readonly<string[]> = ["health", "doctor"];
 
 async function runSessionCommand(
 	session: Session,
@@ -645,16 +651,18 @@ async function runSessionCommand(
 	// A flag after the group (`kill-all --release`) is not an action.
 	const command =
 		action === undefined || action.startsWith("--") ? `${group}` : `${group} ${action}`;
-	// The doctor reports an incompatible schema; kill-all must work whatever the schema.
-	if (SCHEMA_EXEMPT_COMMANDS.includes(command)) {
+	if (READ_ONLY_COMMANDS.includes(command)) {
 		return dispatchSessionCommand(session, command, args, out);
 	}
-	// Like a service, a command holds the deployment lock: no migration runs under it.
+	// Like a service, a command that writes holds the deployment lock: no migration runs under
+	// it. The doctor reports an incompatible schema; kill-all works whatever the schema.
 	const lock = await holdDeploymentLock(requireSetting("DATABASE_URL"), exitOnLostLock);
 	try {
-		const schema = await schemaCompatibility(session.deps.pool, releaseVersion());
-		if (!schema.ok) {
-			throw new Error(`this CLI cannot run against this database: ${schema.detail}`);
+		if (!SCHEMA_EXEMPT_COMMANDS.includes(command)) {
+			const schema = await schemaCompatibility(session.deps.pool, releaseVersion());
+			if (!schema.ok) {
+				throw new Error(`this CLI cannot run against this database: ${schema.detail}`);
+			}
 		}
 		return await dispatchSessionCommand(session, command, args, out);
 	} finally {

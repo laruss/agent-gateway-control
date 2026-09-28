@@ -28,9 +28,9 @@ cd /srv/agent-gateway/releases/agent-gateway-home-server-v$new
 ../agent-gateway-home-server-v$old/bin/agw run --rm -e BACKUP_DIR=/backups gateway-cli \
   gateway backup check --record
 
-# 4. `db migrate` refuses while any service or other CLI command is connected: finish those
-#    first (a cron job's `gateway health` included). Refresh the host setup (reloads the workers' AppArmor profile; keeps existing files),
-#    pull the new images and migrate. `db migrate` refuses while a service is still connected.
+# 4. Refresh the host setup (reloads the workers' AppArmor profile; keeps existing files),
+#    pull the new images and migrate. `db migrate` refuses while a service or another CLI
+#    command runs (`doctor` and `health` do not count); finish those first.
 #    Then give the limited roles the new release's queues.
 sudo GATEWAY_HOME="$GATEWAY_HOME" bin/init-home.sh
 bin/agw pull

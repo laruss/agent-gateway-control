@@ -25,8 +25,8 @@ All notable changes are documented here. The project follows Semantic Versioning
   root.
 - Schema compatibility: every migration is `expand` or `contract`
   (`packages/db/migrations/compatibility.json`); `gateway db migrate` certifies the releases
-  that may run on the result, and every service and mutating CLI command refuses a database it
-  is not certified for. A rollback by one release after expand-only migrations needs no
+  that may run on the result, and every service and CLI session command refuses a database
+  it is not certified for. A rollback by one release after expand-only migrations needs no
   restore. New commands `gateway db status`, `gateway db create-role` and `gateway version`.
 - The deployment lock: services hold it shared, `gateway db migrate` exclusively, so a
   migration never runs under live services.

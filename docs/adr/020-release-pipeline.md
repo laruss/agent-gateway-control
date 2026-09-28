@@ -127,7 +127,7 @@ PostgreSQL keeps the five capabilities its entrypoint needs to prepare the data 
   version stays fixed across a rollback window: its own schema check cannot be certified away.
 - **The deployment lock.** Every service holds an advisory lock shared for its lifetime.
   `db migrate` takes it exclusively and refuses while any service is connected. The CLI's
-  session commands hold it shared too, except `doctor`/`health` and `kill-all`. Upgrades are
+  session commands hold it shared too, except the read-only `doctor` and `health`. Upgrades are
   therefore planned downtime, enforced: stop, back up, migrate, start. A service that loses its
   lock connection exits, and its restart policy brings it back; a heartbeat every 15 seconds
   notices a silently dropped connection.
@@ -159,7 +159,8 @@ PostgreSQL keeps the five capabilities its entrypoint needs to prepare the data 
   signed and verified with `gh attestation verify` (`verify-release.sh`).
 - **The bundle:**
   - the Compose stack with every image by digest, and `images.lock`;
-  - the helpers: `agw`, `init-home.sh`, `verify-release.sh`, the backup script;
+  - the helpers: `agw`, `init-home.sh`, `verify-release.sh`, `gmail-authorize.sh`, the backup
+    script;
   - the seccomp profile and the Claude Code recipe;
   - the example configuration with its prompts, the schemas and the secrets layout;
   - `INSTALL.md`, `UPGRADE.md`, `ROLLBACK.md`, `MIGRATIONS.md` (generated from the manifest)

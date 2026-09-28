@@ -279,6 +279,12 @@ if [[ -n "$next" ]]; then
 
 	log "upgrade $first_version -> $next_version (UPGRADE.md)"
 	stop_services
+	# Step 3: the pre-upgrade backup, with the running release's CLI, verified and recorded.
+	cli backup-gateway-db.sh /backups
+	"$agw" run --rm -e BACKUP_DIR=/backups gateway-cli gateway backup check --record ||
+		fail "the pre-upgrade backup does not pass its check"
+	"${sudo_cmd[@]}" sh -c "ls '$GATEWAY_HOME'/backups/gateway-*.dump '$GATEWAY_HOME'/backups/gateway-*.manifest.json" >/dev/null ||
+		fail "the pre-upgrade backup files are missing"
 	agw="$next_release/bin/agw"
 	"${sudo_cmd[@]}" env GATEWAY_HOME="$GATEWAY_HOME" "$next_release/bin/init-home.sh"
 	"$agw" pull --quiet

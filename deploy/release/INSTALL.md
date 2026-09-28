@@ -112,6 +112,21 @@ bin/agw run --rm gateway-worker-codex gateway runtime doctor codex
 The doctor must pass on this host: it proves the sandbox works under the worker's security
 settings.
 
+### Gmail (optional)
+
+Put the OAuth client of type "Desktop app" into `secrets/gmail/gmail_oauth_client_id` and
+`gmail_oauth_client_secret` (mode 0600, owner 10001), copy `secrets/controller/database_url`
+into `secrets/gmail/`, then authorize the mailbox:
+
+```bash
+bin/gmail-authorize.sh            # --pubsub with Pub/Sub notifications
+```
+
+It prints Google's consent address. Google sends the browser back to
+`http://127.0.0.1:8765` on the Docker host; from another machine, forward the port first
+(`ssh -L 8765:127.0.0.1:8765 <host>`). The refresh token lands in
+`secrets/gmail/gmail_refresh_token`. Add `gmail` to `COMPOSE_PROFILES`.
+
 ## 6. Start
 
 ```bash
