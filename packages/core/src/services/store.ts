@@ -9,6 +9,7 @@ import {
 } from "@agent-gateway/contracts";
 import {
 	type AgentState,
+	agentRuns,
 	agents,
 	auditLog,
 	configVersions,
@@ -20,6 +21,7 @@ import {
 	type OutboxKind,
 	outbox,
 } from "@agent-gateway/db";
+import { childTraceparent } from "@agent-gateway/logging";
 import { and, asc, count, eq, inArray, isNull, max, or } from "drizzle-orm";
 import type { RoutingAgent } from "../routing.ts";
 import type { AgentRecord } from "../turn-context.ts";
@@ -250,6 +252,8 @@ export type OutboxDraft = Readonly<{
 	idempotencyKey: string;
 	runId?: string;
 	maxAttempts?: number;
+	/** The trace the delivery belongs to; by default the run's, else a new one. */
+	traceparent?: string | null;
 }>;
 
 /**
@@ -257,6 +261,7 @@ export type OutboxDraft = Readonly<{
  * with the same idempotency key is a no-op; returns the new item's id, or null for a duplicate.
  */
 export async function enqueueOutbox(uow: UnitOfWork, draft: OutboxDraft): Promise<string | null> {
+	const parent = draft.traceparent ?? (await runTraceparent(uow, draft.runId ?? null));
 	const inserted = await uow.tx.db
 		.insert(outbox)
 		.values({
@@ -268,6 +273,7 @@ export async function enqueueOutbox(uow: UnitOfWork, draft: OutboxDraft): Promis
 			maxAttempts: draft.maxAttempts ?? 8,
 			nextAttemptAt: uow.now,
 			createdAt: uow.now,
+			traceparent: childTraceparent(parent),
 		})
 		.onConflictDoNothing({ target: outbox.idempotencyKey })
 		.returning({ id: outbox.id });
@@ -279,6 +285,21 @@ export async function enqueueOutbox(uow: UnitOfWork, draft: OutboxDraft): Promis
 	return item.id;
 }
 
+/** The trace context of a run, if it has one. */
+export async function runTraceparent(
+	uow: UnitOfWork,
+	runId: string | null,
+): Promise<string | null> {
+	if (runId === null) {
+		return null;
+	}
+	const [run] = await uow.tx.db
+		.select({ traceparent: agentRuns.traceparent })
+		.from(agentRuns)
+		.where(eq(agentRuns.id, runId));
+	return run?.traceparent ?? null;
+}
+
 /** Posts a diagnostic to the alerts channel through the outbox, once per key. */
 export async function raiseAlert(
 	uow: UnitOfWork,
@@ -287,6 +308,16 @@ export async function raiseAlert(
 	detail: JsonObject = {},
 ): Promise<void> {
 	uow.deps.log.warn(message, { alert_key: key });
+	await postAlert(uow, `alert:${key}`, message, detail);
+}
+
+/** Enqueues one alert post; a second one with the same idempotency key is a no-op. */
+export async function postAlert(
+	uow: UnitOfWork,
+	idempotencyKey: string,
+	message: string,
+	detail: JsonObject = {},
+): Promise<void> {
 	const config = await loadActiveConfig(uow.tx.db);
 	const channelName = config?.organization.mattermost.alerts_channel ?? null;
 	const channels = await loadTeamChannels(uow.tx.db);
@@ -300,7 +331,7 @@ export async function raiseAlert(
 		kind: "mattermost.alert",
 		destination: `channel/${channelName ?? "unconfigured"}`,
 		payload,
-		idempotencyKey: `alert:${key}`,
+		idempotencyKey,
 	});
 }
 

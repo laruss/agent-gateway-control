@@ -24,3 +24,4 @@ rewritten in substance: a changed decision gets a new ADR that references the ol
 | [016](016-gmail-connector.md) | Gmail connector: watch, Pub/Sub pull, history cursor, read-only credential | Accepted, amended by 017 |
 | [017](017-gmail-polling-by-default.md) | Gmail connector polls by default; Pub/Sub notifications are optional | Accepted |
 | [018](018-approval-decisions-and-tool-broker.md) | Approval decisions in the card thread, a separate tool runner, daily budgets | Accepted |
+| [019](019-observability-and-retention.md) | Metrics, trace-correlated logs, alert conditions, retention, backup checks | Accepted |

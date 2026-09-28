@@ -21,10 +21,10 @@ import {
 	recordGmailWatch,
 	startGmailMailbox,
 } from "@agent-gateway/core";
-import { createPool, pendingMigrationCount } from "@agent-gateway/db";
+import { createServicePool, pendingMigrationCount } from "@agent-gateway/db";
 import { errorFields, type Logger } from "@agent-gateway/logging";
 import { createBoss, transactionalJobSink } from "@agent-gateway/queue";
-import type { HealthCheck } from "@agent-gateway/service";
+import { gauge, type HealthCheck, type MetricsRegistry } from "@agent-gateway/service";
 
 export type GmailConnectorAppOptions = Readonly<{
 	connectionString: string;
@@ -40,6 +40,8 @@ export type GmailConnectorAppOptions = Readonly<{
 	reconcileMs?: number;
 	retryMinMs?: number;
 	retryMaxMs?: number;
+	/** Where the connector's gauges go. */
+	metrics?: MetricsRegistry;
 }>;
 
 export type RunningGmailConnectorApp = Readonly<{
@@ -124,7 +126,9 @@ export async function startGmailConnectorApp(
 	options: GmailConnectorAppOptions,
 ): Promise<RunningGmailConnectorApp> {
 	const { log } = options;
-	const pool = createPool(options.connectionString, 4);
+	const pool = createServicePool(options.connectionString, 4);
+	// An idle connection lost (a database restart, a failed keepalive) is replaced on next use.
+	pool.on("error", (error) => log.error("database pool error", errorFields(error)));
 	const pending = await pendingMigrationCount(pool);
 	if (pending > 0) {
 		await pool.end();
@@ -171,6 +175,29 @@ export async function startGmailConnectorApp(
 		reconcileMs,
 		...(options.retryMinMs === undefined ? {} : { retryMinMs: options.retryMinMs }),
 		...(options.retryMaxMs === undefined ? {} : { retryMaxMs: options.retryMaxMs }),
+	});
+	options.metrics?.collect(() => {
+		const status = connector.status();
+		const seconds = (date: Date | null) =>
+			date === null ? [] : [{ labels: {}, value: date.getTime() / 1000 }];
+		return [
+			gauge("gateway_gmail_authorized", "1 while Google accepts the credential.", [
+				{ labels: {}, value: status.authorized ? 1 : 0 },
+			]),
+			gauge(
+				"gateway_gmail_last_sync_timestamp_seconds",
+				"When the mailbox was last synced.",
+				seconds(status.lastSyncAt),
+			),
+			gauge(
+				"gateway_gmail_watch_expiry_timestamp_seconds",
+				"When the Gmail watch expires (notification mode).",
+				seconds(status.watchExpiresAt),
+			),
+			gauge("gateway_gmail_pulling", "1 while notifications are pulled (notification mode).", [
+				{ labels: {}, value: status.pulling ? 1 : 0 },
+			]),
+		];
 	});
 	const readiness = async (): Promise<Readonly<HealthCheck[]>> => {
 		const checks: HealthCheck[] = [];

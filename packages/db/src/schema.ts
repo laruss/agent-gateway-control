@@ -195,6 +195,11 @@ export const events = pgTable(
 		contentHash: text("content_hash"),
 		senderAgentId: text("sender_agent_id"),
 		receivedAt: timestamp("received_at", { withTimezone: true }).notNull().defaultNow(),
+		/**
+		 * Retention removed the content: the payload keeps only the ids readers join on
+		 * (`channel_id`, `root_id`, `post_id`); the hashes stay for dedupe.
+		 */
+		contentExpiredAt: timestamp("content_expired_at", { withTimezone: true }),
 	},
 	(t) => [
 		uniqueIndex("events_source_external_id").on(t.source, t.externalId),
@@ -205,6 +210,7 @@ export const events = pgTable(
 		index("events_causation").on(t.causationId).where(sql`${t.causationId} is not null`),
 		/** Finds the events of one Mattermost post (`channel/<id>/post/<id>`). */
 		index("events_subject").on(t.source, t.subject),
+		index("events_retention").on(t.receivedAt).where(sql`${t.contentExpiredAt} is null`),
 		/** Finds the posts of one Mattermost thread: channel, then root (a root is its own). */
 		index("events_thread")
 			.on(
@@ -276,10 +282,19 @@ export const agentRuns = pgTable(
 		parentRunId: uuid("parent_run_id"),
 		/** pg-boss job id of the current attempt, for cancellation. */
 		jobId: text("job_id"),
+		/** W3C trace context of the run: a span in its trigger event's trace. */
+		traceparent: text("traceparent"),
+		/** Retention removed the result, summary and error detail. */
+		contentExpiredAt: timestamp("content_expired_at", { withTimezone: true }),
 	},
 	(t) => [
 		index("agent_runs_agent").on(t.agentId, t.queuedAt),
 		index("agent_runs_correlation").on(t.correlationId),
+		index("agent_runs_retention").on(t.finishedAt).where(sql`${t.contentExpiredAt} is null`),
+		/** The invalid-output alert counts recent ones per runtime. */
+		index("agent_runs_invalid_output")
+			.on(t.runtimeAdapter)
+			.where(sql`${t.errorCode} = 'invalid_output'`),
 		// max_active_runs = 1 in the MVP: at most one queued or running run per agent.
 		uniqueIndex("agent_runs_one_active")
 			.on(t.agentId)
@@ -309,6 +324,10 @@ export const agentInbox = pgTable(
 	},
 	(t) => [
 		uniqueIndex("agent_inbox_unique").on(t.agentId, t.eventId),
+		/** Retention asks, per event, whether work still needs it. */
+		index("agent_inbox_event").on(t.eventId),
+		/** Retention asks which waits still have work waiting. */
+		index("agent_inbox_open_wait").on(t.waitId).where(sql`${t.status} in ('pending', 'claimed')`),
 		index("agent_inbox_pending").on(t.agentId, t.status, t.priority, t.availableAt),
 		check("agent_inbox_status", oneOf("status", INBOX_STATUSES)),
 	],
@@ -398,28 +417,33 @@ export const waitSubscriptions = pgTable(
 	(t) => [
 		index("wait_subscriptions_active").on(t.status, t.correlationId),
 		index("wait_subscriptions_agent").on(t.agentId, t.status),
+		index("wait_subscriptions_created_by").on(t.createdByRunId),
 		check("wait_subscriptions_status", oneOf("status", WAIT_STATUSES)),
 	],
 );
 
-export const contextSnapshots = pgTable("context_snapshots", {
-	id: uuid("id").primaryKey().defaultRandom(),
-	agentId: text("agent_id")
-		.notNull()
-		.references(() => agents.id),
-	runId: uuid("run_id")
-		.notNull()
-		.unique()
-		.references(() => agentRuns.id),
-	configVersion: text("config_version").notNull(),
-	threadRef: text("thread_ref"),
-	/** The exact input handed to the runtime; contains no secrets by construction. */
-	input: jsonb("input").$type<AgentTurnInput>().notNull(),
-	/** The authority the result is checked against, fixed when the run was scheduled. */
-	authority: jsonb("authority").$type<TurnAuthorityContext>().notNull(),
-	sizeBytes: integer("size_bytes").notNull(),
-	createdAt: createdAt(),
-});
+export const contextSnapshots = pgTable(
+	"context_snapshots",
+	{
+		id: uuid("id").primaryKey().defaultRandom(),
+		agentId: text("agent_id")
+			.notNull()
+			.references(() => agents.id),
+		runId: uuid("run_id")
+			.notNull()
+			.unique()
+			.references(() => agentRuns.id),
+		configVersion: text("config_version").notNull(),
+		threadRef: text("thread_ref"),
+		/** The exact input handed to the runtime; contains no secrets by construction. */
+		input: jsonb("input").$type<AgentTurnInput>().notNull(),
+		/** The authority the result is checked against, fixed when the run was scheduled. */
+		authority: jsonb("authority").$type<TurnAuthorityContext>().notNull(),
+		sizeBytes: integer("size_bytes").notNull(),
+		createdAt: createdAt(),
+	},
+	(t) => [index("context_snapshots_created").on(t.createdAt)],
+);
 
 export const memoryItems = pgTable(
 	"memory_items",
@@ -507,9 +531,14 @@ export const outbox = pgTable(
 		runId: uuid("run_id").references(() => agentRuns.id),
 		createdAt: createdAt(),
 		sentAt: timestamp("sent_at", { withTimezone: true }),
+		/** W3C trace context of the delivery: a span in the trace of what enqueued it. */
+		traceparent: text("traceparent"),
+		/** Retention removed the payload of a sent or dead item; it can no longer be redriven. */
+		contentExpiredAt: timestamp("content_expired_at", { withTimezone: true }),
 	},
 	(t) => [
 		index("outbox_due").on(t.status, t.nextAttemptAt),
+		index("outbox_retention").on(t.status, t.createdAt).where(sql`${t.contentExpiredAt} is null`),
 		check("outbox_status", oneOf("status", OUTBOX_STATUSES)),
 		check("outbox_kind", oneOf("kind", OUTBOX_KINDS)),
 	],
@@ -564,10 +593,13 @@ export const policyDecisions = pgTable(
 		policyVersion: text("policy_version").notNull(),
 		inputRedacted: jsonb("input_redacted").$type<JsonObject>().notNull(),
 		createdAt: createdAt(),
+		/** Retention removed the input. */
+		contentExpiredAt: timestamp("content_expired_at", { withTimezone: true }),
 	},
 	(t) => [
 		index("policy_decisions_run").on(t.runId),
 		check("policy_decisions_decision", oneOf("decision", POLICY_DECISIONS)),
+		index("policy_decisions_retention").on(t.createdAt).where(sql`${t.contentExpiredAt} is null`),
 	],
 );
 
@@ -606,6 +638,8 @@ export const toolActions = pgTable(
 		receipt: jsonb("receipt").$type<ToolReceipt>(),
 		errorRedacted: text("error_redacted"),
 		createdAt: createdAt(),
+		/** W3C trace context of the execution: a span in the requesting run's trace. */
+		traceparent: text("traceparent"),
 	},
 	(t) => [
 		index("tool_actions_open").on(t.status, t.deadlineAt),
@@ -713,3 +747,35 @@ export const gmailMailboxes = pgTable(
 	},
 	() => [check("gmail_mailboxes_mode", oneOf("mode", GMAIL_MODES))],
 );
+
+export const ALERT_STATES = ["firing", "resolved"] as const;
+export type AlertState = (typeof ALERT_STATES)[number];
+
+/**
+ * An alert raised while a condition holds, as opposed to a one-time notice: it fires once when
+ * the condition starts, reminds while it lasts, and is resolved (and may fire again) when it
+ * ends. `episode` counts the times it fired.
+ */
+export const alertStates = pgTable(
+	"alert_states",
+	{
+		key: text("key").primaryKey(),
+		state: text("state").$type<AlertState>().notNull(),
+		episode: integer("episode").notNull(),
+		message: text("message").notNull(),
+		firedAt: timestamp("fired_at", { withTimezone: true }).notNull(),
+		notifiedAt: timestamp("notified_at", { withTimezone: true }).notNull(),
+		resolvedAt: timestamp("resolved_at", { withTimezone: true }),
+	},
+	() => [check("alert_states_state", oneOf("state", ALERT_STATES))],
+);
+
+/** The last run of each maintenance task (retention, backup check): its health and metrics. */
+export const maintenanceStatus = pgTable("maintenance_status", {
+	task: text("task").primaryKey(),
+	lastRunAt: timestamp("last_run_at", { withTimezone: true }).notNull(),
+	lastSuccessAt: timestamp("last_success_at", { withTimezone: true }),
+	lastErrorRedacted: text("last_error_redacted"),
+	/** What the last run did, e.g. rows expired per table. */
+	detail: jsonb("detail").$type<JsonObject>().notNull().default({}),
+});

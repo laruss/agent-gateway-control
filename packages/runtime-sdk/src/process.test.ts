@@ -1,8 +1,13 @@
-import { chmod, mkdir, mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createRunWorkspace, removeRunWorkspace, runTempDir } from "./environment.ts";
+import {
+	createRunWorkspace,
+	pruneRunWorkspaces,
+	removeRunWorkspace,
+	runTempDir,
+} from "./environment.ts";
 import { RunProcesses, runProcess } from "./process.ts";
 
 const RUN_ID = "7d1f2c3e-4b5a-4c6d-8e9f-0a1b2c3d4e5f";
@@ -92,6 +97,20 @@ describe("removeRunWorkspace", () => {
 		await chmod(locked, 0o500);
 		await removeRunWorkspace(workspace);
 		await expect(readdir(workspace)).rejects.toThrow();
+	});
+});
+
+describe("pruneRunWorkspaces", () => {
+	it("removes only run workspaces older than the window", async () => {
+		const root = join(dir, "prune");
+		const old = await createRunWorkspace(root, "developer", RUN_ID, 1);
+		const fresh = await createRunWorkspace(root, "developer", RUN_ID, 2);
+		await mkdir(join(root, "developer", "keep-me"));
+		const past = new Date(Date.now() - 3 * 60 * 60 * 1000);
+		await utimes(old, past, past);
+		expect(await pruneRunWorkspaces(root, 2 * 60 * 60 * 1000)).toBe(1);
+		const left = await readdir(join(root, "developer"));
+		expect(left.sort()).toEqual(["keep-me", fresh.split("/").at(-1)].sort());
 	});
 });
 

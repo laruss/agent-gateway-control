@@ -6,7 +6,7 @@ import {
 	type Transaction,
 	withTransaction,
 } from "@agent-gateway/db";
-import { type Logger, redactForStorage } from "@agent-gateway/logging";
+import { type Logger, redactForStorage, traceFields } from "@agent-gateway/logging";
 import { and, eq, gte, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
 import type pg from "pg";
 
@@ -109,7 +109,11 @@ export async function deliverOutboxItem(
 		attempt: claimed.attempts,
 		createdAt: claimed.createdAt,
 	};
-	const log = deps.log.child({ outbox_id: item.id, run_id: claimed.runId ?? undefined });
+	const log = deps.log.child({
+		outbox_id: item.id,
+		run_id: claimed.runId ?? undefined,
+		...traceFields(claimed.traceparent),
+	});
 
 	// Fencing: only the holder of this claim may settle the item. After an expired lease a newer
 	// claim bumped `attempts`, and a late settle of the old one changes nothing.
@@ -215,6 +219,8 @@ export async function reconcileOutbox(
 			.set({
 				status: "dead",
 				lockedUntil: null,
+				// When it died: retention keeps a dead payload for its period from here.
+				nextAttemptAt: now,
 				lastErrorRedacted: "lease expired on the last attempt",
 			})
 			.where(

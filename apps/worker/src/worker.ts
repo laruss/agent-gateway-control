@@ -9,9 +9,11 @@ import { errorFields, type Logger } from "@agent-gateway/logging";
 import { createBoss, directJobSink } from "@agent-gateway/queue";
 import {
 	checkWorkspaceRoot,
+	pruneRunWorkspaces,
 	type RuntimeAdapter,
 	type RuntimeProbeResult,
 } from "@agent-gateway/runtime-sdk";
+import { gauge, type HealthCheck, MetricsRegistry } from "@agent-gateway/service";
 import { createRuntimeAdapter } from "./adapters.ts";
 import { processRunJob } from "./run-job.ts";
 
@@ -35,12 +37,17 @@ export type WorkerOptions = Readonly<{
 	heartbeatMs?: number;
 	/** How often a ready runtime is probed again. An unavailable one is probed every heartbeat. */
 	reprobeMs?: number;
+	/** Where the worker's metrics go; a registry of its own by default. */
+	metrics?: MetricsRegistry;
 }>;
 
 export type RunningWorker = Readonly<{
 	/** The version of the last probe, "unknown" before a probe succeeded. */
 	runtimeVersion: () => string;
 	ready: () => boolean;
+	/** Ready: the runtime probe passes and the worker takes jobs of the current version. */
+	readiness: () => Promise<Readonly<HealthCheck[]>>;
+	metrics: MetricsRegistry;
 	/**
 	 * Resolves when the worker gave up for good: a subscription it had to drop could not be
 	 * removed, so it stopped everything. The host exits and its supervisor starts a fresh one.
@@ -52,6 +59,9 @@ export type RunningWorker = Readonly<{
 const HEARTBEAT_MS = 30_000;
 const REPROBE_MS = 300_000;
 const PINNED_REPROBE_MS = 60_000;
+/** Run workspaces untouched this long are a crashed worker's leftovers (runs last up to 24 h). */
+const STALE_WORKSPACE_MS = 48 * 60 * 60 * 1000;
+const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 /** How long a worker giving up waits for its cancelled turns. */
 const GIVE_UP_WAIT_MS = 15_000;
 
@@ -77,6 +87,19 @@ export async function startWorker(options: WorkerOptions): Promise<RunningWorker
 	const adapter = options.runtime ?? createRuntimeAdapter(options.adapter);
 	await checkWorkspaceRoot(options.workspaceRoot);
 	const workerId = randomUUID();
+	const prune = async () => {
+		try {
+			const removed = await pruneRunWorkspaces(options.workspaceRoot, STALE_WORKSPACE_MS);
+			if (removed > 0) {
+				options.log.warn("removed stale run workspaces", { count: removed });
+			}
+		} catch (error) {
+			options.log.error("stale workspace cleanup failed", errorFields(error));
+		}
+	};
+	await prune();
+	const pruneTimer = setInterval(() => void prune(), PRUNE_INTERVAL_MS);
+	pruneTimer.unref();
 	const pinned = options.pinnedVersion ?? null;
 	const heartbeatMs = options.heartbeatMs ?? HEARTBEAT_MS;
 	const reprobeMs = options.reprobeMs ?? REPROBE_MS;
@@ -100,6 +123,25 @@ export async function startWorker(options: WorkerOptions): Promise<RunningWorker
 	let sequence = 0;
 	let timer: ReturnType<typeof setInterval> | undefined;
 	const inFlight = new Set<Readonly<{ controller: AbortController; running: Promise<void> }>>();
+	const metrics = options.metrics ?? new MetricsRegistry();
+	const runOutcomes = metrics.counter(
+		"gateway_worker_run_jobs_total",
+		"Run attempts this worker processed, by adapter and outcome.",
+	);
+	const runDurations = metrics.histogram(
+		"gateway_worker_run_job_duration_seconds",
+		"Time a run attempt took in this worker, by adapter.",
+	);
+	const takingJobs = () =>
+		!stopping && probe.ok && workId !== null && workVersion === probe.runtimeVersion;
+	metrics.collect(() => [
+		gauge("gateway_worker_run_jobs_active", "Run attempts in progress.", [
+			{ labels: { adapter: adapter.id }, value: inFlight.size },
+		]),
+		gauge("gateway_worker_ready", "1 while the runtime probe passes and jobs are taken.", [
+			{ labels: { adapter: adapter.id }, value: takingJobs() ? 1 : 0 },
+		]),
+	]);
 
 	const report = async (status: WorkerStatusReport["status"]) => {
 		const data: WorkerStatusReport = {
@@ -152,9 +194,14 @@ export async function startWorker(options: WorkerOptions): Promise<RunningWorker
 						),
 					};
 					inFlight.add(entry);
+					const started = Date.now();
 					try {
-						await running;
+						runOutcomes.inc({ adapter: adapter.id, outcome: await running });
+					} catch (error) {
+						runOutcomes.inc({ adapter: adapter.id, outcome: "error" });
+						throw error;
 					} finally {
+						runDurations.observe((Date.now() - started) / 1000, { adapter: adapter.id });
 						inFlight.delete(entry);
 						job.signal.removeEventListener("abort", abort);
 					}
@@ -229,8 +276,7 @@ export async function startWorker(options: WorkerOptions): Promise<RunningWorker
 			});
 		}
 		if (!stopping) {
-			const readyNow = probe.ok && workId !== null && workVersion === probe.runtimeVersion;
-			await report(readyNow ? "ready" : "unavailable");
+			await report(takingJobs() ? "ready" : "unavailable");
 		}
 	};
 
@@ -241,6 +287,7 @@ export async function startWorker(options: WorkerOptions): Promise<RunningWorker
 	const giveUp = async (error: unknown) => {
 		stopping = true;
 		clearInterval(timer);
+		clearInterval(pruneTimer);
 		baseLog.error("could not stop taking jobs; stopping the worker", errorFields(error));
 		// Stop the turns first: their CLIs run in process groups of their own and would outlive
 		// the worker. Cancelling is bounded by the kill grace.
@@ -273,10 +320,24 @@ export async function startWorker(options: WorkerOptions): Promise<RunningWorker
 	return {
 		runtimeVersion: () => probe.runtimeVersion,
 		ready: () => workId !== null,
+		readiness: async () => [
+			{
+				name: "runtime",
+				ok: probe.ok,
+				detail: `${adapter.id} ${probe.runtimeVersion}: ${probe.detail}`,
+			},
+			{
+				name: "jobs",
+				ok: takingJobs(),
+				detail: stopping ? "stopping" : workId === null ? "not taking jobs" : "taking jobs",
+			},
+		],
+		metrics,
 		failed,
 		stop: async () => {
 			stopping = true;
 			clearInterval(timer);
+			clearInterval(pruneTimer);
 			// A check in flight could report "ready" after "stopped"; a probe that hangs gets 5 s.
 			await Promise.race([current, Bun.sleep(5_000)]);
 			// No new jobs from here on; running ones finish within the graceful stop below.

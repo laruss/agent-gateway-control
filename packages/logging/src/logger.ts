@@ -1,4 +1,4 @@
-import { type LogValue, redactText, redactValue } from "./redact.ts";
+import { type LogValue, redactText, redactValue, truncateText } from "./redact.ts";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
@@ -38,12 +38,58 @@ export type LoggerOptions = Readonly<{
 	write?: (line: string) => void;
 }>;
 
+/** Longest serialized log line; a longer one keeps only its standard and correlation fields. */
+export const MAX_LOG_LINE = 32 * 1024;
+
+/** Fields a line cut for its size still carries. */
+const KEPT_FIELDS: Readonly<string[]> = [
+	"timestamp",
+	"level",
+	"service",
+	"version",
+	"environment",
+	"message",
+	"event_id",
+	"run_id",
+	"agent_id",
+	"job_id",
+	"correlation_id",
+	"trace_id",
+	"span_id",
+	"error_code",
+];
+
 /** Describes an error for a log line without its stack's local values. */
 export function errorFields(error: unknown): LogFields {
 	if (error instanceof Error) {
-		return { error_name: error.name, error_message: redactText(error.message) };
+		const code = "code" in error && typeof error.code === "string" ? error.code : undefined;
+		return {
+			error_name: error.name,
+			error_message: redactText(error.message),
+			...(code === undefined ? {} : { error_code: truncateText(redactText(code), 64) }),
+		};
 	}
 	return { error_message: redactText(String(error)) };
+}
+
+/** The line as JSON, cut to its standard and correlation fields when it is too long. */
+function serializeLine(line: LogValue): string {
+	const json = JSON.stringify(line);
+	if (
+		json.length <= MAX_LOG_LINE ||
+		line === null ||
+		typeof line !== "object" ||
+		Array.isArray(line)
+	) {
+		return json;
+	}
+	const kept: { [key: string]: LogValue } = { truncated: true };
+	for (const [key, value] of Object.entries(line)) {
+		if (KEPT_FIELDS.includes(key)) {
+			kept[key] = value;
+		}
+	}
+	return JSON.stringify(kept);
 }
 
 /** JSON lines logger with mandatory redaction. */
@@ -65,7 +111,7 @@ export function createLogger(options: LoggerOptions, bound: LogFields = {}): Log
 			environment: options.environment,
 			message,
 		});
-		write(JSON.stringify(line));
+		write(serializeLine(line));
 	};
 
 	return {

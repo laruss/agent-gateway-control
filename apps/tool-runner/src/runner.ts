@@ -6,7 +6,7 @@ import {
 } from "@agent-gateway/contracts";
 import { errorFields, type Logger } from "@agent-gateway/logging";
 import { createBoss, directJobSink } from "@agent-gateway/queue";
-import type { HealthCheck } from "@agent-gateway/service";
+import { gauge, type HealthCheck, MetricsRegistry } from "@agent-gateway/service";
 import {
 	type BeginToolAction,
 	processToolJob,
@@ -23,9 +23,12 @@ export type ToolRunnerOptions = Readonly<{
 	concurrency?: number;
 	/** Queue polling interval; lower in tests. */
 	pollingIntervalSeconds?: number;
+	/** Where the runner's metrics go; a registry of its own by default. */
+	metrics?: MetricsRegistry;
 }>;
 
 export type RunningToolRunner = Readonly<{
+	metrics: MetricsRegistry;
 	readiness: () => Promise<Readonly<HealthCheck[]>>;
 	stop: () => Promise<void>;
 }>;
@@ -49,12 +52,35 @@ export async function startToolRunner(options: ToolRunnerOptions): Promise<Runni
 			);
 		}
 	}
-	const pool = new pg.Pool({ connectionString: options.connectionString, max: 2 });
+	// The runner's statements are short; one that hangs is cut off rather than holding the action.
+	const pool = new pg.Pool({
+		connectionString: options.connectionString,
+		max: 2,
+		statement_timeout: 30_000,
+		lock_timeout: 15_000,
+		idle_in_transaction_session_timeout: 30_000,
+		connectionTimeoutMillis: 10_000,
+	});
 	const boss = createBoss(options.connectionString, "client");
 	boss.on("error", (error) => log.error("pg-boss error", errorFields(error)));
 	await boss.start();
 	const reports = directJobSink(boss);
 	const inFlight = new Set<AbortController>();
+	let stopping = false;
+	const metrics = options.metrics ?? new MetricsRegistry();
+	const outcomes = metrics.counter(
+		"gateway_tool_jobs_total",
+		"Tool jobs processed, by namespace and outcome.",
+	);
+	const durations = metrics.histogram(
+		"gateway_tool_job_duration_seconds",
+		"Time from taking a tool job to its report, by namespace.",
+	);
+	metrics.collect(() => [
+		gauge("gateway_tool_jobs_active", "Tool jobs in progress.", [
+			{ labels: {}, value: inFlight.size },
+		]),
+	]);
 
 	const begin: BeginToolAction = async (actionId, attempt, hash) => {
 		const result = await pool.query<{ verdict: string; idempotency_key: string | null }>(
@@ -103,8 +129,9 @@ export async function startToolRunner(options: ToolRunnerOptions): Promise<Runni
 				const abort = () => controller.abort();
 				job.signal.addEventListener("abort", abort, { once: true });
 				inFlight.add(controller);
+				const started = Date.now();
 				try {
-					await processToolJob(
+					const outcome = await processToolJob(
 						{
 							namespace,
 							executors: options.executors,
@@ -116,7 +143,12 @@ export async function startToolRunner(options: ToolRunnerOptions): Promise<Runni
 						job.data,
 						controller.signal,
 					);
+					outcomes.inc({ namespace, outcome });
+				} catch (error) {
+					outcomes.inc({ namespace, outcome: "error" });
+					throw error;
 				} finally {
+					durations.observe((Date.now() - started) / 1000, { namespace });
 					inFlight.delete(controller);
 					job.signal.removeEventListener("abort", abort);
 				}
@@ -129,7 +161,11 @@ export async function startToolRunner(options: ToolRunnerOptions): Promise<Runni
 	});
 
 	return {
+		metrics,
 		readiness: async () => {
+			if (stopping) {
+				return [{ name: "runner", ok: false, detail: "stopping" }];
+			}
 			try {
 				await pool.query("select 1");
 				return [{ name: "postgres", ok: true, detail: "reachable" }];
@@ -144,6 +180,7 @@ export async function startToolRunner(options: ToolRunnerOptions): Promise<Runni
 			}
 		},
 		stop: async () => {
+			stopping = true;
 			for (const namespace of options.namespaces) {
 				await boss.offWork(toolExecuteQueue(namespace), { wait: false }).catch(() => undefined);
 			}

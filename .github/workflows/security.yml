@@ -1,0 +1,69 @@
+name: security
+
+# Secret scan over the whole git history and a vulnerability and license scan of bun.lock.
+# Scanner binaries are pinned by version and verified against their release checksums.
+# Local runs and exceptions: docs/operations/security-scans.md.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Daily: new advisories arrive without a push.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks
+        run: |
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSLo "$RUNNER_TEMP/$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/$archive"
+          echo "$GITLEAKS_SHA256  $RUNNER_TEMP/$archive" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" gitleaks
+      - name: Scan the git history
+        # Findings are redacted in the log; any finding or scanner error fails the job.
+        run: |
+          "$RUNNER_TEMP/gitleaks" git --redact --no-banner --exit-code 1 .
+
+  osv:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      OSV_SCANNER_VERSION: 2.6.0
+      OSV_SCANNER_SHA256: ca69b3d3cd08f889a49dc0a383122f71cc528b83803671df5fd874d97485b108
+      # SPDX identifiers allowed in the dependency tree; anything else, or no license, fails.
+      # Exceptions live in osv-scanner.toml.
+      ALLOWED_LICENSES: MIT,Apache-2.0,ISC,BSD-3-Clause,BlueOak-1.0.0,CC0-1.0,Unlicense
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Install OSV-Scanner
+        run: |
+          curl -fsSLo "$RUNNER_TEMP/osv-scanner" \
+            "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          echo "$OSV_SCANNER_SHA256  $RUNNER_TEMP/osv-scanner" | sha256sum --check --strict
+          chmod +x "$RUNNER_TEMP/osv-scanner"
+      - name: Scan bun.lock for vulnerabilities and licenses
+        # Development dependencies included. Any vulnerability not excepted in osv-scanner.toml,
+        # any license outside the allowlist, and any scanner error fail the job.
+        run: |
+          "$RUNNER_TEMP/osv-scanner" scan source \
+            --config osv-scanner.toml \
+            --lockfile bun.lock \
+            --licenses="$ALLOWED_LICENSES"

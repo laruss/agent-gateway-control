@@ -263,3 +263,8 @@ export function mentionedNames(text: string): Readonly<string[]> {
 /** Arbitrary JSON object payload. Never used in model-facing schemas. */
 export const JsonObjectSchema = z.record(z.string(), z.json());
 export type JsonObject = z.infer<typeof JsonObjectSchema>;
+
+/** W3C trace context `traceparent` header value. */
+export const TraceparentSchema = z
+	.string()
+	.regex(/^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/, "W3C traceparent");

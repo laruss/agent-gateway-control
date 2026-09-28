@@ -29,7 +29,7 @@ import {
 	withTransaction,
 } from "@agent-gateway/db";
 import { canonicalHash } from "@agent-gateway/events";
-import { and, asc, desc, eq, inArray, ne, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import { nextAgentState, requireTransition } from "../state-machine.ts";
 import { revokeQueuedActions, sweepApprovals, withdrawOpenApprovals } from "./approvals.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
@@ -678,6 +678,19 @@ export async function redriveRun(
 		if (run.status !== "failed" || latest?.id !== run.id) {
 			throw new AdminError(`run '${runId}' is not the agent's latest failed run`);
 		}
+		// Retention keeps the events of pending work and of FAILED agents; one that lost its
+		// content anyway (the agent failed again later) has nothing left to redo.
+		const [expired] = await db
+			.select({ id: events.id })
+			.from(agentInbox)
+			.innerJoin(events, eq(events.id, agentInbox.eventId))
+			.where(and(eq(agentInbox.runId, run.id), isNotNull(events.contentExpiredAt)))
+			.limit(1);
+		if (expired !== undefined) {
+			throw new AdminError(
+				`run '${runId}' cannot be redriven: its content expired under retention`,
+			);
+		}
 		await db
 			.update(agentInbox)
 			.set({ status: "pending", runId: null })
@@ -719,11 +732,24 @@ export async function showEvent(deps: ControlPlaneDeps, id: string) {
 			.select()
 			.from(events)
 			.where(isUuid ? or(eq(events.id, id), eq(events.externalId, id)) : eq(events.externalId, id));
-		return rows.map((row) => ({
-			id: row.id,
-			receivedAt: row.receivedAt,
-			event: toGatewayEvent(row),
-		}));
+		// An event whose content retention removed is no longer a valid envelope: its columns
+		// are shown instead.
+		return rows.map((row) =>
+			row.contentExpiredAt === null
+				? { id: row.id, receivedAt: row.receivedAt, event: toGatewayEvent(row) }
+				: {
+						id: row.id,
+						receivedAt: row.receivedAt,
+						contentExpiredAt: row.contentExpiredAt,
+						event: null,
+						externalId: row.externalId,
+						source: row.source,
+						type: row.type,
+						subject: row.subject,
+						correlationId: row.correlationId,
+						payload: row.payload,
+					},
+		);
 	});
 }
 
@@ -841,10 +867,14 @@ export async function redriveOutbox(
 				nextAttemptAt: uow.now,
 				lockedUntil: null,
 			})
-			.where(and(eq(outbox.id, outboxId), eq(outbox.status, "dead")))
+			.where(
+				and(eq(outbox.id, outboxId), eq(outbox.status, "dead"), isNull(outbox.contentExpiredAt)),
+			)
 			.returning({ id: outbox.id });
 		if (item === undefined) {
-			throw new AdminError(`outbox item '${outboxId}' does not exist or is not dead`);
+			throw new AdminError(
+				`outbox item '${outboxId}' does not exist, is not dead, or its payload expired under retention`,
+			);
 		}
 		await uow.jobs.send(QUEUES.outboxDeliver, { outboxId });
 		await audit(uow, actor, "outbox.redrive", "outbox", outboxId);

@@ -1,9 +1,11 @@
 import { ToolNamespaceSchema } from "@agent-gateway/contracts";
-import { createLogger } from "@agent-gateway/logging";
+import { createLogger, serviceVersion } from "@agent-gateway/logging";
 import {
 	intSetting,
+	MetricsRegistry,
 	onShutdown,
 	readSetting,
+	registerProcessMetrics,
 	requireSetting,
 	startHealthServer,
 } from "@agent-gateway/service";
@@ -11,7 +13,7 @@ import { executorRegistry, sandboxExecutors } from "@agent-gateway/tool-broker";
 import { startToolRunner } from "./runner.ts";
 
 const environment = readSetting("GATEWAY_ENV") ?? "unset";
-const log = createLogger({ service: "tool-runner", version: "0.0.0", environment });
+const log = createLogger({ service: "tool-runner", version: serviceVersion(), environment });
 
 /** The namespaces this runner serves, e.g. `finance`; its database role must match. */
 const namespaces = requireSetting("TOOL_RUNNER_NAMESPACES")
@@ -40,7 +42,10 @@ const executors = executorRegistry(
 		: [],
 );
 
+const metrics = new MetricsRegistry();
+registerProcessMetrics(metrics, { service: "tool-runner", version: serviceVersion() });
 const runner = await startToolRunner({
+	metrics,
 	connectionString: requireSetting("DATABASE_URL"),
 	namespaces,
 	executors,
@@ -51,6 +56,7 @@ const health = startHealthServer({
 	port: intSetting("HEALTH_PORT", 8083),
 	hostname: readSetting("HEALTH_HOST") ?? "127.0.0.1",
 	readiness: runner.readiness,
+	metrics: () => metrics.render(),
 });
 log.info("health endpoints listening", { port: health.port });
 

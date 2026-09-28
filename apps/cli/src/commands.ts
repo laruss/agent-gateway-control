@@ -34,8 +34,10 @@ import {
 	listRuns,
 	listToolActions,
 	listWaits,
+	MAINTENANCE_STALE_MS,
 	MEMORY_REVIEW_STATUSES,
 	pauseAgent,
+	recordMaintenanceResult,
 	redriveOutbox,
 	redriveRun,
 	releaseKillSwitch,
@@ -56,7 +58,7 @@ import {
 	migrateDatabase,
 	pendingMigrationCount,
 } from "@agent-gateway/db";
-import { createLogger } from "@agent-gateway/logging";
+import { createLogger, serviceVersion } from "@agent-gateway/logging";
 import {
 	createBoss,
 	deadLetterQueues,
@@ -64,9 +66,10 @@ import {
 	transactionalJobSink,
 } from "@agent-gateway/queue";
 import { runtimeDoctor } from "@agent-gateway/runtime-sdk";
-import { requireSetting } from "@agent-gateway/service";
+import { intSetting, readSetting, requireSetting } from "@agent-gateway/service";
 import { createRuntimeAdapter, workspaceRoot } from "@agent-gateway/worker";
 import type { PgBoss } from "pg-boss";
+import { type BackupCheckReport, checkBackup, localPgTools } from "./backup.ts";
 import { loadConfigDirectory } from "./config-files.ts";
 import { gmailAuthorize } from "./gmail-commands.ts";
 import { mattermostBootstrap, mattermostReconcile } from "./mattermost-commands.ts";
@@ -135,6 +138,12 @@ export const USAGE = `gateway <command>
                                       preflight of a runtime on this host, configured like
                                       its worker: version, auth, a real structured turn,
                                       cancel, session resume, policy risks (spends turns)
+  backup check [--dir <dir>] [--max-age-hours <n>] [--restore-test] [--record]
+                                      verify the newest backup in BACKUP_DIR: manifest, age,
+                                      checksum, identity, schema, archive; --restore-test
+                                      restores it into BACKUP_RESTORE_DATABASE_URL (emptied
+                                      first); --record stores the result, and the controller
+                                      alerts on a failure or when checks stop passing
   kill-all [--release]`;
 
 function actor(): string {
@@ -199,7 +208,12 @@ export async function openSession(): Promise<Session> {
 	const pool = createPool(connectionString, 2);
 	const boss = createBoss(connectionString, "client");
 	await boss.start();
-	const log = createLogger({ service: "cli", version: "0.0.0", environment: "cli", level: "warn" });
+	const log = createLogger({
+		service: "cli",
+		version: serviceVersion(),
+		environment: "cli",
+		level: "warn",
+	});
 	return {
 		deps: {
 			pool,
@@ -336,6 +350,36 @@ async function doctor(session: Session, out: Output): Promise<boolean> {
 					? `no hold on ${budgets.day}`
 					: `held on ${budgets.day}: ${held.map((agent) => `@${agent.agentId}`).join(", ")}`,
 		});
+		const firing = await pool.query<{ key: string }>(
+			"select key from alert_states where state = 'firing' order by key",
+		);
+		checks.push({
+			name: "alerts",
+			ok: firing.rows.length === 0,
+			detail:
+				firing.rows.length === 0
+					? "no condition holds"
+					: `firing: ${firing.rows.map((alert) => alert.key).join(", ")}`,
+		});
+		// The controller applies retention hourly; a run that has not succeeded for three hours
+		// means content piles up (and the alert sweep says so too).
+		const [retention] = (
+			await pool.query<{ last_success_at: Date | null; last_error_redacted: string | null }>(
+				"select last_success_at, last_error_redacted from maintenance_status where task = 'retention'",
+			)
+		).rows;
+		const retentionOk =
+			retention === undefined ||
+			(retention.last_success_at !== null &&
+				now - retention.last_success_at.getTime() <= MAINTENANCE_STALE_MS);
+		checks.push({
+			name: "retention",
+			ok: retentionOk,
+			detail:
+				retention === undefined
+					? "not run yet (the controller runs it hourly)"
+					: `last success ${retention.last_success_at?.toISOString() ?? "never"}${retention.last_error_redacted === null ? "" : `; last error: ${retention.last_error_redacted}`}`,
+		});
 	}
 	for (const name of deadLetterQueues(RuntimeAdapterIdSchema.options)) {
 		const jobs = await session.boss.findJobs(name, { queued: true }).catch(() => null);
@@ -347,6 +391,57 @@ async function doctor(session: Session, out: Output): Promise<boolean> {
 	}
 	out.print(json({ checks }));
 	return checks.every((check) => check.ok);
+}
+
+/**
+ * Stores a backup check's result for the controller: it alerts while the last check failed, or
+ * when none passed within the maximum age (a check that stopped running included).
+ */
+async function recordBackupCheck(report: BackupCheckReport, maxAgeHours: number): Promise<void> {
+	const failed = report.checks.filter((check) => !check.ok);
+	const session = await openSession();
+	try {
+		await recordMaintenanceResult(session.deps, "backup", {
+			ok: report.ok,
+			error: report.ok
+				? null
+				: `${report.backup === null ? "" : `${report.backup}: `}${failed
+						.map((check) => `${check.name} (${check.detail})`)
+						.join("; ")}`,
+			detail: { max_age_hours: maxAgeHours, backup: report.backup },
+		});
+	} finally {
+		await session.close();
+	}
+}
+
+/** `gateway backup check`: verifies the newest backup; exit code 1 when a check fails. */
+async function backupCheck(args: Readonly<string[]>, out: Output): Promise<number> {
+	const dir = flag(args, "dir") ?? readSetting("BACKUP_DIR");
+	if (dir === undefined) {
+		throw new UsageError("missing --dir <dir> (or BACKUP_DIR)");
+	}
+	const hoursFlag = flag(args, "max-age-hours");
+	const maxAgeHours =
+		hoursFlag === null ? intSetting("BACKUP_MAX_AGE_HOURS", 26) : Number(hoursFlag);
+	if (!Number.isInteger(maxAgeHours) || maxAgeHours < 1) {
+		throw new UsageError("the maximum age must be a positive whole number of hours");
+	}
+	const now = new Date();
+	const report = await checkBackup({
+		dir: resolve(dir),
+		maxAgeHours,
+		restoreTest: args.includes("--restore-test"),
+		liveUrl: readSetting("DATABASE_URL") ?? null,
+		scratchUrl: readSetting("BACKUP_RESTORE_DATABASE_URL") ?? null,
+		tools: localPgTools(),
+		now,
+	});
+	out.print(json(report));
+	if (args.includes("--record")) {
+		await recordBackupCheck(report, maxAgeHours);
+	}
+	return report.ok ? 0 : 1;
 }
 
 /** Runs one command. Returns the process exit code. */
@@ -429,6 +524,9 @@ export async function runCommand(args: Readonly<string[]>, out: Output): Promise
 		});
 		out.print(json(report));
 		return report.ok ? 0 : 1;
+	}
+	if (group === "backup" && action === "check") {
+		return backupCheck(args, out);
 	}
 	if (group === "config" && (action === "validate" || action === "apply")) {
 		const input = loadConfigDirectory(arg(args, 2, "dir"), resolve(flag(args, "root") ?? "."));

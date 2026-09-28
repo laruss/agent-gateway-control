@@ -9,6 +9,7 @@ import {
 } from "@agent-gateway/contracts";
 import {
 	agentInbox,
+	agentRuns,
 	eventRoutes,
 	events,
 	waitSubscriptions,
@@ -20,6 +21,7 @@ import {
 	GATEWAY_SOURCE,
 	payloadHash,
 } from "@agent-gateway/events";
+import { childTraceparent, parseTraceparent } from "@agent-gateway/logging";
 import { and, eq } from "drizzle-orm";
 import { type Route, type RoutingAgent, routeEvent, wakePriority } from "../routing.ts";
 import type { ActiveWait } from "../waits.ts";
@@ -97,6 +99,28 @@ export async function ingestEventIf(
 	});
 }
 
+const RUN_CAUSATION = /^run:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/iu;
+
+/**
+ * The trace an event is stored in: its own valid `traceparent`; else, for an event a run caused
+ * (an agent's signed post, an approval's outcome), a span in that run's trace; else a new trace.
+ * Trace context is diagnostic only: a forged one joins log lines, it grants nothing.
+ */
+async function eventTraceparent(uow: UnitOfWork, event: GatewayEvent): Promise<string> {
+	if (parseTraceparent(event.traceparent) !== null) {
+		return childTraceparent(event.traceparent);
+	}
+	const runId = RUN_CAUSATION.exec(event.causationid ?? "")?.[1];
+	if (runId === undefined) {
+		return childTraceparent(null);
+	}
+	const [run] = await uow.tx.db
+		.select({ traceparent: agentRuns.traceparent })
+		.from(agentRuns)
+		.where(eq(agentRuns.id, runId));
+	return childTraceparent(run?.traceparent ?? null);
+}
+
 /** The event, validated, if an external source may ingest it; throws otherwise. */
 export function externalEvent(event: GatewayEvent): GatewayEvent {
 	const valid = GatewayEventSchema.parse(event);
@@ -131,7 +155,7 @@ export async function ingestInTransaction(
 			time: new Date(event.time),
 			correlationId: event.correlationid,
 			causationId: event.causationid,
-			traceparent: event.traceparent ?? null,
+			traceparent: await eventTraceparent(uow, event),
 			trustLevel: event.trustlevel,
 			hop: event.hop,
 			payload: event.data,

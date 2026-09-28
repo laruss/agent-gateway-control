@@ -22,8 +22,8 @@ agent-gateway-control/
 │   ├── queue/               # pg-boss queues, retry/DLQ policies, transactional send (done)
 │   ├── events/              # canonical JSON, hashes, CloudEvents helpers            (done)
 │   ├── outbox/              # leased, idempotent side-effect delivery                (done)
-│   ├── logging/             # JSON logs with mandatory redaction                     (done)
-│   ├── service/             # settings (`X_FILE` secrets), health server, shutdown   (done)
+│   ├── logging/             # JSON logs with mandatory redaction, trace context      (done)
+│   ├── service/             # settings, health server, metrics registry, shutdown     (done)
 │   ├── runtime-sdk/         # adapter contract, turn execution, process control,     (done)
 │   │                        #   workspaces, tool grants, doctor, contract/live suites
 │   ├── runtime-mock/        # scenario-driven mock runtime                           (done)
@@ -47,8 +47,8 @@ agent-gateway-control/
 ├── prompts/examples/        # constitution and agent roles
 ├── deploy/dev/              # development Compose (PostgreSQL, Mattermost)
 ├── docs/                    # about, assumptions, adr/, operations/, security/
-├── scripts/                 # maintenance scripts (JSON Schema generation)
-└── .github/workflows/       # CI
+├── scripts/                 # maintenance scripts (JSON Schema generation, database backup)
+└── .github/workflows/       # CI, e2e and security scans
 ```
 
 ## Dependency boundaries

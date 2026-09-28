@@ -31,8 +31,10 @@ Acceptance:
 Known gaps, deferred:
 
 - CI has no secret scan, dependency/license scan, migration test or build step yet
-  (migrations arrive in Phase 1; scans before Phase 9).
+  (migrations arrive in Phase 1; scans before Phase 9). Scans and the migration check are done
+  since Phase 8; the build step comes with the release pipeline.
 - GitHub Actions are pinned by tag, not by commit SHA. Pin by SHA before the first release.
+  Pinned since Phase 8.
 
 ## Deliberate design choices
 
@@ -200,7 +202,7 @@ Known gaps, deferred:
   and memory came in Phase 3; workspaces come with the coding runtimes.
 - Approval decisions (grant/deny) arrive with the Mattermost approval flow (Phase 7); until then
   an approval request expires and resumes the agent with a timeout. Done in Phase 7.
-- `/metrics` is served but empty; metrics come with observability work.
+- `/metrics` is served but empty; metrics come with observability work. Done in Phase 8.
 - Provider sessions are stored when returned but not resumed yet (`continueTurn` unused).
   Resumed since Phase 4.
 - `max_active_runs` is limited to 1.
@@ -1218,7 +1220,8 @@ Known gaps, deferred:
 - Attachment scanning and handing attachments to tools (after Phase 7: the tool broker executes
   approved actions only, no tool reads mail attachments yet).
 - One mailbox per connector process; several mailboxes run several processes.
-- Retention of stored mail (Phase 8).
+- Retention of stored mail (Phase 8). Done in Phase 8: event payloads expire after
+  `organization.retention.event_content_days`.
 - A Google OAuth app left in "Testing" status issues refresh tokens that expire after seven
   days; publishing it needs a home page, a privacy policy link and an authorized domain.
 
@@ -1494,3 +1497,152 @@ Known gaps, deferred:
     post (e2e test).
   - Fixed (Opus P3): stale comments about failures "before `begin`".
 
+
+## Phase 8 - Observability and operational hardening
+
+Status: **done** (review closed after round 5, the round limit: its two P2 are fixed and covered
+by the operations integration test)
+
+| Item | State | Evidence |
+|------|-------|----------|
+| Structured logs and redaction: real service version, headers, Google tokens, JWTs, GitHub fine-grained tokens, secret query parameters and email addresses redacted; strings, arrays and lines bounded; health details sanitized | done | `packages/logging`, `packages/service/src/health.ts` |
+| Metrics: a Prometheus registry; `/metrics` on the controller (database gauges with a collection-success flag), worker, Gmail connector and tool runner; process and build gauges | done | `packages/service/src/metrics.ts`, `apps/controller/src/metrics.ts` |
+| Traces: W3C trace context from an event through its runs, attempts, deliveries, the agents' posts and tool actions; `trace_id`/`span_id` in log lines | done | `packages/logging/src/trace.ts`, `ingest.ts`, `scheduler.ts`, migration `0012_traces_retention_alerts` |
+| Alerts: condition episodes (fire, remind every 6 h, resolve, fire again) for Mattermost disconnects, dead letters, dead outbox items, budgets at 80%, repeated invalid output, Gmail watch expiry, stale retention and backup checks | done | `core/src/services/alerts.ts`, [docs/operations/observability.md](docs/operations/observability.md) |
+| Resource limits: service pool timeouts, a turn input cap, removal of crashed workers' workspaces | done | `packages/db/src/client.ts`, `scheduler.ts`, `pruneRunWorkspaces` |
+| Readiness and liveness: the worker has health endpoints (probe and subscription); the tool runner is not ready while stopping | done | `apps/worker/src/main.ts`, `apps/tool-runner/src/runner.ts` |
+| Retention jobs: `organization.retention`, hourly in the controller, in batches; content removed in place, pending and FAILED work kept, approvals, tool actions and the audit log kept | done | `core/src/services/retention.ts` |
+| Backup check: `gateway backup check` (manifest, age, checksum, identity, schema, archive, optional restore test), `--record` for the alert sweep, reference producer `scripts/backup-gateway-db.sh` | done | `apps/cli/src/backup.ts`, [docs/operations/backups.md](docs/operations/backups.md) |
+| Security scans: Gitleaks over the history and OSV-Scanner (vulnerabilities and licenses) on push, pull request and daily; every Action pinned by SHA | done | `.github/workflows/security.yml`, `osv-scanner.toml`, [docs/operations/security-scans.md](docs/operations/security-scans.md) |
+| `gateway doctor`: firing alerts and retention | done | `apps/cli/src/commands.ts` |
+
+No acceptance criteria were set for this phase in advance. The criteria below were proposed by the
+advisor (Codex astra) and are checked by tests
+(`apps/controller/src/operations.integration.test.ts`, `apps/cli/src/backup.integration.test.ts`,
+the unit tests of `packages/logging` and `packages/service`):
+
+- [x] Every service exposes metrics; a failed database collection is reported as a failure,
+  not as zeros.
+- [x] Trace lineage holds across an event, its runs, their jobs, deliveries, the next agent's
+  post and run, and the tool action of an approval.
+- [x] Secret and personal-data fixtures are redacted in logs, stored errors and health details.
+- [x] Retention removes old content while keeping dedupe, pending work, a FAILED agent's
+  redrivable work, approvals and unknown outcomes; it runs once per interval.
+- [x] Missing, stale, corrupt and truncated backups fail the check; an isolated restore passes
+  its invariants and a restore into the live database is refused.
+- [x] Alert conditions fire, remind, resolve and fire again; a Mattermost outage fires only
+  after two minutes and survives a controller restart.
+- [x] Scanners pass on the repository and fail on a seeded license violation.
+
+Deliberate choices in this phase ([ADR-019](docs/adr/019-observability-and-retention.md),
+advised by Codex astra):
+
+- A small metrics registry instead of a client library; database gauges from the controller
+  only.
+- Trace-correlated logging without a span exporter.
+- Retention removes content in place and keeps records (approvals, tool actions, audit log).
+  Turn inputs go with run content (30 days), not after 7: the previous run's summary depends on
+  its snapshot.
+- Backups are verified, not made; `--record` feeds the alert sweep.
+- Container hardening goes with the release images (next phase).
+
+Known gaps, deferred:
+
+- Container hardening (non-root, read-only rootfs, capabilities, CPU, memory and PID limits,
+  networks) and per-run containment of unconfined runtimes: the release images. The earlier
+  "Phase 8" references in this file for container confinement move there.
+- No span export; a tracing backend can be added later on the same trace context.
+- No alert route independent of Mattermost and the database; external monitoring watches the
+  health endpoints and the exit codes of `gateway health` and `gateway backup check`.
+- Approval requests, tool actions and the audit log grow without bound.
+- Posts whose content expired are no longer part of a later turn's thread context.
+- Alert conditions assume one controller per deployment: with several, each would judge the
+  Mattermost outage by its own listener.
+
+### Phase 8 review log
+
+- Round 1 (Codex, Opus):
+  - Fixed (Codex P1, Opus P1): a restore test could empty the live database when the URLs
+    differed by an alias and `pg_control_system()` was closed to the role. It now proves the
+    scratch database is another one with a probe table invisible through `DATABASE_URL`, and
+    refuses without it.
+  - Fixed (Codex P1): a `?password=` query parameter reached `pg_restore`'s command line; it
+    moves to `PGPASSWORD`, and the backup script refuses it.
+  - Fixed (Codex P2): retention kept every event of a FAILED agent forever; only its latest
+    run's events are kept now.
+  - Fixed (Codex P2): a reachable live database that could not be queried let the identity
+    check pass as skipped; it fails now.
+  - Fixed (Opus P2): expired events broke `gateway events show` and late wait matching (they no
+    longer parse as envelopes); `events show` prints their columns, and wait matching skips
+    them.
+  - Fixed (Opus P2): the edits and deletions of a protected post expired before the post, so a
+    turn could show a pre-edit text; they are protected with it.
+  - Fixed (Opus P2): a first retention run still in progress looked like a stale one; a task
+    that never succeeded counts from its first run, and reconcile ticks no longer overlap.
+  - Fixed (Opus P2): `gateway_queue_oldest_job_seconds` counted jobs scheduled for later; it
+    counts due jobs only.
+  - Fixed (Opus P3): retention locks rows `for no key update`, so foreign key checks are not
+    blocked; indexes for the invalid-output alert and the snapshot step; a Mattermost outage
+    ends only after the listener stayed connected for two minutes.
+  - Kept (Opus P3): protected old events are scanned again by each retention batch; they are
+    few (pending work and failed runs).
+- Round 2 (Codex, Opus):
+  - Fixed (Opus P2): sampling the listener once a tick made every start-up and short blip look
+    like a two-minute outage. A new outage needs the listener disconnected for two minutes now;
+    only an outage that fired waits for two stable minutes before it resolves.
+  - Fixed (Opus P2): retention inside the reconcile tick, with the overlap guard, held up
+    recovery, approvals, alerts and outbox reconciliation; it has its own loop now, and `stop`
+    waits for both loops' passes in flight.
+  - Fixed (Codex P2): a causation id that only looked like a run id failed the ingest on the
+    UUID column; only a real UUID is looked up.
+  - Fixed (Codex P2): a backup with the same migration count but another latest migration
+    passed the schema check; it fails now.
+  - Fixed (Codex P2): the metrics collection is bounded as a whole (3 s, connection included),
+    so a saturated pool still reports `gateway_metrics_collection_success 0` in time; the
+    oldest-job gauge counts due retries too; overlapping scrapes read their own cache entry.
+  - Fixed (Opus P3): the scratch URL may carry only `sslmode` and `password`, so node-postgres
+    (the probe) and libpq (the restore) connect to the same database; other query parameters
+    keep their encoding; the backup script's password match stops at the host.
+  - Kept (Opus P3): email addresses are redacted in CLI error output too (privacy over
+    convenience).
+- Round 3 (Opus: no P1/P2):
+  - Fixed (Opus P3): a reconnect between two ticks restarts the stable period of an outage;
+    retention stops between batches when the controller stops; the scratch URL must name its
+    host, and `pg_restore` gets no libpq target variables from the environment; an encoded
+    `password` parameter name is removed too; the backup script handles an empty user and a
+    literal backslash in the password; a reminder after a restart names the earlier outage start.
+- Round 3 (Codex):
+  - Fixed (Codex P2): a wait timeout left in a paused agent's inbox lost its thread when the
+    creating run's snapshot expired; runs whose waits still have work waiting keep their
+    content and snapshot.
+  - Fixed (Codex P2): an item that died after a long outage lost its payload at once; dead
+    payloads are counted from the last attempt.
+  - Fixed (Codex P2): a timed-out metrics collection kept running while the next scrape began
+    another; a collection stays shared until it settles.
+- Round 4 (Opus: no P1/P2):
+  - Fixed (Opus P3): the scratch URL must name its host, user and database, so neither client
+    falls back to its own defaults; indexes for retention's open-wait lookups; the service pool
+    has a client-side query timeout and TCP keepalive against silent partitions; the backup
+    script also refuses an encoded `password` parameter name.
+  - Kept (Opus P3): a run stopped between batches records a success; the rest is picked up by
+    the next run.
+- Round 4 (Codex):
+  - Fixed (Codex P1): the restore probe could read a lagging standby behind `DATABASE_URL` and
+    take "not found" as proof; it now asks in one statement whether the server answering is in
+    recovery, and refuses a standby.
+  - Fixed (Codex P2): a retention pass longer than the interval could be joined by a second one;
+    an advisory lock is held for the whole pass.
+  - Fixed (Codex P2): a migration applied during `pg_dump` left the manifest describing another
+    schema; the script checks the schema again after the dump and fails.
+  - Kept (Codex P2): several controllers would each judge the Mattermost outage by their own
+    listener. The deployment runs one controller (known gap).
+- Round 5 (Opus: no P1/P2):
+  - Fixed (Opus P3): a retention lock client whose unlock failed is closed, not pooled; a
+    transaction client that cannot roll back is closed too; the controller's and the Gmail
+    connector's pools log a lost idle connection instead of crashing; the backup script's
+    query check survives a literal backslash.
+- Round 5 (Codex), the round limit:
+  - Fixed (Codex P2): an item the reconcile declared dead after repeated lease expiries kept an
+    old `next_attempt_at` and could lose its payload at once; dying now dates it.
+  - Fixed (Codex P2): a retention pass interrupted by a stopping controller was recorded as a
+    success; it is not, and it is due again at once.

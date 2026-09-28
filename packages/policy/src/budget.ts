@@ -84,3 +84,31 @@ export function budgetHold(
 export function utcDay(at: Date): string {
 	return at.toISOString().slice(0, 10);
 }
+
+/** Share of a daily limit at which a scope's consumption is reported, before it holds. */
+export const BUDGET_WARNING_RATIO = 0.8;
+
+/**
+ * How close a scope is to its daily limit: the most consumed metric, as a share of its limit,
+ * when that share reaches {@link BUDGET_WARNING_RATIO}. Null below it or without a limit. Pure.
+ */
+export function budgetPressure(
+	totals: UsageTotals,
+	budget: DailyBudget | undefined,
+): Readonly<{ ratio: number; reason: string }> | null {
+	const shares: { ratio: number; reason: string }[] = [];
+	if (budget?.cost_usd !== undefined && budget.cost_usd > 0) {
+		shares.push({
+			ratio: totals.costUsd / budget.cost_usd,
+			reason: `cost ${totals.costUsd.toFixed(2)} of ${budget.cost_usd} USD`,
+		});
+	}
+	if (budget?.tokens !== undefined && budget.tokens > 0) {
+		shares.push({
+			ratio: totals.tokens / budget.tokens,
+			reason: `${totals.tokens} of ${budget.tokens} tokens`,
+		});
+	}
+	const top = shares.sort((a, b) => b.ratio - a.ratio)[0];
+	return top === undefined || top.ratio < BUDGET_WARNING_RATIO ? null : top;
+}

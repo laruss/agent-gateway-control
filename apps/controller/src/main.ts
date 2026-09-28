@@ -1,10 +1,12 @@
-import { createLogger } from "@agent-gateway/logging";
+import { createLogger, serviceVersion } from "@agent-gateway/logging";
 import { assertRoutingKey } from "@agent-gateway/mattermost";
 import { dryRunDeliverers } from "@agent-gateway/outbox";
 import {
 	intSetting,
+	MetricsRegistry,
 	onShutdown,
 	readSetting,
+	registerProcessMetrics,
 	requireSetting,
 	startHealthServer,
 } from "@agent-gateway/service";
@@ -14,7 +16,7 @@ import { loopbackApprovalCardDeliverer, loopbackPostDeliverer } from "./loopback
 import { bridgeDeliverers, type MattermostBridgeOptions } from "./mattermost-bridge.ts";
 
 const environment = readSetting("GATEWAY_ENV") ?? "unset";
-const log = createLogger({ service: "controller", version: "0.0.0", environment });
+const log = createLogger({ service: "controller", version: serviceVersion(), environment });
 
 /**
  * Outbox delivery mode, required explicitly:
@@ -63,16 +65,20 @@ const deliverers: ControllerOptions["deliverers"] = (deps) => {
 		: dryRunDeliverers(log);
 };
 
+const metrics = new MetricsRegistry();
+registerProcessMetrics(metrics, { service: "controller", version: serviceVersion() });
 const controller = await startController({
 	connectionString: requireSetting("DATABASE_URL"),
 	log,
 	deliverers,
+	metrics,
 	...(bridge === null ? {} : { mattermost: bridge }),
 });
 const health = startHealthServer({
 	port: intSetting("HEALTH_PORT", 8080),
 	hostname: readSetting("HEALTH_HOST") ?? "127.0.0.1",
 	readiness: controller.readiness,
+	metrics: () => metrics.render(),
 });
 log.info("health endpoints listening", { port: health.port });
 

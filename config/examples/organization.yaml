@@ -36,6 +36,16 @@ organization:
     global_daily: { cost_usd: 20 }
     # Kiro reports no usage: 'hold' would stop its agents after their first run each day.
     unmetered: allow
+  # Days message content is kept (at least 8 each); the values below are the defaults.
+  retention:
+    event_content_days: 30
+    run_content_days: 30
+    outbox_sent_days: 8
+    outbox_dead_days: 30
+    policy_input_days: 30
+    thread_summary_days: 90
+    inactive_memory_days: 30
+    usage_days: 400
 
 mattermost:
   team: autonomous-lab

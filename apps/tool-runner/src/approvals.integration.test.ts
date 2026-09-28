@@ -273,6 +273,21 @@ describe("approvals and the tool broker", () => {
 		expect(payments.effects()).toHaveLength(1);
 		expect(payments.effects()[0]?.params).toMatchObject({ amount: "10.00", currency: "EUR" });
 		expect(await status(approval.id)).toEqual({ status: "granted", action: "succeeded" });
+		// The execution is a span of the requesting run's trace, and so is its job.
+		const [traces] = await query<{ run: string; action: string; job: string | null }>(
+			`select r.traceparent as run, t.traceparent as action,
+			        (select data->>'traceparent' from pgboss.job j
+			          where j.name = 'tool.execute.finance' and j.data->>'actionId' = t.id::text
+			          limit 1) as job
+			   from tool_actions t join approval_requests a on a.id = t.approval_id
+			   join agent_runs r on r.id = a.run_id where a.id = $1`,
+			[approval.id],
+		);
+		const traceId = (value: string | null | undefined) => value?.split("-")[1] ?? null;
+		expect(traceId(traces?.run)).toMatch(/^[0-9a-f]{32}$/u);
+		expect(traceId(traces?.action)).toBe(traceId(traces?.run));
+		expect(traceId(traces?.job)).toBe(traceId(traces?.run));
+		expect(traces?.action).not.toBe(traces?.run);
 
 		// The same post again, and a second decision: nothing more happens.
 		expect(await decide(approve)).toBe("replayed");

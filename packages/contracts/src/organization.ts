@@ -89,6 +89,34 @@ export const OrganizationBudgetsSchema = z.strictObject({
 });
 export type OrganizationBudgets = z.infer<typeof OrganizationBudgetsSchema>;
 
+/** Days of one retention period; at least 8, longer than the longest wait (7 days). */
+const retentionDays = (fallback: number) => z.int().min(8).max(3650).default(fallback);
+
+/**
+ * How long the Gateway keeps message content, in days; the controller removes it hourly.
+ * Identifiers, hashes and statuses stay, so dedupe, routing and the audit trail keep working.
+ * Approval requests, tool actions and the audit log are records and are kept.
+ */
+export const OrganizationRetentionSchema = z.strictObject({
+	/** Event payloads (posts, mail): only the ids readers join on remain. */
+	event_content_days: retentionDays(30),
+	/** Finished runs' results, summaries, error details and exact turn inputs. */
+	run_content_days: retentionDays(30),
+	/** Payloads of delivered outbox items. */
+	outbox_sent_days: retentionDays(8),
+	/** Payloads of outbox items that could not be delivered. */
+	outbox_dead_days: retentionDays(30),
+	/** Inputs of policy decisions. */
+	policy_input_days: retentionDays(30),
+	/** Summaries of threads without activity. */
+	thread_summary_days: retentionDays(90),
+	/** Rejected and superseded memory items. */
+	inactive_memory_days: retentionDays(30),
+	/** The usage ledger. */
+	usage_days: retentionDays(400),
+});
+export type OrganizationRetention = z.infer<typeof OrganizationRetentionSchema>;
+
 export const OrganizationConfigSchema = z.strictObject({
 	schema_version: z.literal(1),
 	organization: z.strictObject({
@@ -103,6 +131,7 @@ export const OrganizationConfigSchema = z.strictObject({
 		rules: z.array(OrganizationRuleSchema).max(100),
 		default_limits: OrganizationLimitsSchema,
 		budgets: OrganizationBudgetsSchema.optional(),
+		retention: OrganizationRetentionSchema.prefault({}),
 	}),
 	mattermost: OrganizationMattermostSchema,
 });

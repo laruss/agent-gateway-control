@@ -7,7 +7,7 @@ import {
 	toolNamespace,
 	withoutUnsafeCharacters,
 } from "@agent-gateway/contracts";
-import { errorFields, type Logger, redactForStorage } from "@agent-gateway/logging";
+import { errorFields, type Logger, redactForStorage, traceFields } from "@agent-gateway/logging";
 import { actionParamIssues, approvalActionHash } from "@agent-gateway/policy";
 import type { ToolExecutors } from "./executor.ts";
 
@@ -64,7 +64,11 @@ export async function processToolJob(
 		return "invalid_job";
 	}
 	const job = parsed.data;
-	const log = deps.log.child({ tool_action_id: job.actionId, action_type: job.actionType });
+	const log = deps.log.child({
+		tool_action_id: job.actionId,
+		action_type: job.actionType,
+		...traceFields(job.traceparent),
+	});
 	const send = async (report: ToolReport) => {
 		await deps.report(report);
 		log.info("tool action reported", { outcome: report.kind });

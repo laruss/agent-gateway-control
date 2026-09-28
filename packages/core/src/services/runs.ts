@@ -314,6 +314,7 @@ async function applyFailure(
 			input,
 			timeoutSeconds,
 			startAfter,
+			traceparent: run.traceparent,
 		});
 		await audit(uow, "system", "run.retry", "run", run.id, {
 			attempt,

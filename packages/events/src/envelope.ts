@@ -106,6 +106,8 @@ export type InternalEventInit = Readonly<{
 	causationid: string | null;
 	hop: number;
 	data: JsonObject;
+	/** The trace of the work that caused the event, if known. */
+	traceparent?: string | null;
 }>;
 
 /** An event emitted by the Gateway itself; always system-trusted. */
@@ -123,5 +125,8 @@ export function internalEvent(init: InternalEventInit): GatewayEvent {
 		trustlevel: "system-trusted",
 		hop: init.hop,
 		data: init.data,
+		...(init.traceparent === undefined || init.traceparent === null
+			? {}
+			: { traceparent: init.traceparent }),
 	};
 }

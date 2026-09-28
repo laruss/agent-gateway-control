@@ -56,7 +56,8 @@ curl -s localhost:8080/health/ready
 | `MATTERMOST_URL` | required with `mattermost` | Mattermost base URL |
 | `GATEWAY_ROUTING_KEY` | required with `mattermost` | HMAC key of agent routing props (use `_FILE`) |
 | `SECRETS_DIR` | unset | directory standing in for `/run/secrets/` (bot tokens) |
-| `HEALTH_PORT` / `HEALTH_HOST` | `8080` / `127.0.0.1` | controller health endpoints |
+| `HEALTH_PORT` / `HEALTH_HOST` | `8080` / `127.0.0.1` | health and metrics endpoints of the controller; the worker defaults to `8081`, the Gmail connector to `8082`, the tool runner to `8083` ([observability](observability.md)) |
+| `GATEWAY_VERSION` / `GATEWAY_COMMIT` | `0.0.0` / unset | the version in log lines and `gateway_build_info` |
 | `WORKER_ADAPTER` | `mock` | runtime adapter the worker serves: `mock`, `codex`, `claude-code`, `grok`, `kiro`, `opencode-go` or `hermes` |
 | `WORKER_RUNTIME_VERSION` | unset | exact runtime version the worker was verified with, e.g. `grok/1.0.41`; any other makes the runtime unavailable |
 | `WORKER_CONCURRENCY` | `1` | parallel runs per worker process |

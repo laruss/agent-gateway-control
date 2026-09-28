@@ -7,6 +7,7 @@ import {
 	safeText,
 	TimestampSchema,
 	ToolNameSchema,
+	TraceparentSchema,
 	UuidSchema,
 } from "./common.ts";
 
@@ -92,6 +93,8 @@ export const ToolActionJobSchema = z.strictObject({
 	immutableActionHash: Sha256HexSchema,
 	/** Past it `begin` refuses and the controller settles the action. */
 	deadline: TimestampSchema,
+	/** The execution's trace context, for the runner's log lines; absent on older jobs. */
+	traceparent: TraceparentSchema.optional(),
 });
 export type ToolActionJob = z.infer<typeof ToolActionJobSchema>;
 

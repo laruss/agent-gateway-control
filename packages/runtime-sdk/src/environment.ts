@@ -163,6 +163,40 @@ export async function removeRunWorkspace(path: string): Promise<void> {
 	}
 }
 
+const RUN_WORKSPACE = /^run-[0-9a-f-]{36}-\d+$/u;
+
+/**
+ * Removes run workspaces a crashed worker left behind: `<root>/<agent>/run-*` directories not
+ * changed for `olderThanMs`. Pass more than the longest run, so a live run of another worker
+ * sharing the root is never touched. Returns how many were removed.
+ */
+export async function pruneRunWorkspaces(
+	root: string,
+	olderThanMs: number,
+	now = Date.now(),
+): Promise<number> {
+	let removed = 0;
+	const agents = await readdir(root, { withFileTypes: true }).catch(() => []);
+	for (const agent of agents) {
+		if (!agent.isDirectory() || !AgentIdSchema.safeParse(agent.name).success) {
+			continue;
+		}
+		const agentDir = join(root, agent.name);
+		for (const entry of await readdir(agentDir, { withFileTypes: true }).catch(() => [])) {
+			if (!entry.isDirectory() || !RUN_WORKSPACE.test(entry.name)) {
+				continue;
+			}
+			const path = join(agentDir, entry.name);
+			const stat = await lstat(path).catch(() => null);
+			if (stat !== null && now - stat.mtimeMs > olderThanMs) {
+				await removeRunWorkspace(path);
+				removed += 1;
+			}
+		}
+	}
+	return removed;
+}
+
 /**
  * Gateway tool names that grant a runtime's built-in tools. Everything else an agent does
  * (posting, memory, mail, finance) goes through its structured result and the Gateway.

@@ -1,0 +1,36 @@
+# OSV-Scanner configuration, read by the security workflow (docs/operations/security-scans.md).
+# Every exception names its reason; vulnerability exceptions expire and must be reviewed again.
+
+# esbuild's development server answers cross-origin requests (moderate). esbuild 0.18 comes only
+# through drizzle-kit (@esbuild-kit/core-utils), a development tool that never starts that server.
+[[IgnoredVulns]]
+id = "GHSA-67mh-4wv8-2f99"
+ignoreUntil = 2026-12-31
+reason = "dev-only: esbuild 0.18 via drizzle-kit, whose esbuild dev server is never started"
+
+# Our own workspace packages are MIT, like the repository (LICENSE); their package.json files
+# carry no license field.
+[[PackageOverrides]]
+name = "@agent-gateway/.*"
+nameIsRegex = true
+ecosystem = "npm"
+license.override = ["MIT"]
+reason = "workspace packages of this repository, MIT"
+
+# These declare MIT in the legacy `licenses` array, which the scanner does not read; each ships
+# an MIT LICENSE file. Development only: testcontainers -> dockerode -> docker-modem -> ssh2.
+[[PackageOverrides]]
+name = "ssh2|cpu-features|buildcheck"
+nameIsRegex = true
+ecosystem = "npm"
+license.override = ["MIT"]
+reason = "MIT per the package's LICENSE file (legacy licenses field)"
+
+# lightningcss is MPL-2.0 (file-level copyleft). It is a development-only build tool of vite,
+# which vitest uses; it is never modified or shipped with the Gateway.
+[[PackageOverrides]]
+name = "lightningcss(-.+)?"
+nameIsRegex = true
+ecosystem = "npm"
+license.ignore = true
+reason = "MPL-2.0, dev-only (vitest -> vite), unmodified and not distributed"

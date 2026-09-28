@@ -6,6 +6,7 @@ import {
 	JsonObjectSchema,
 	MattermostIdSchema,
 	TimestampSchema,
+	TraceparentSchema,
 	type TrustLevel,
 	TrustLevelSchema,
 } from "./common.ts";
@@ -265,11 +266,6 @@ const APPROVAL_DATA_SCHEMAS: Readonly<Partial<Record<GatewayEventType, z.ZodType
 	"approval.denied": ApprovalDecisionDataSchema,
 	"approval.resolved": ApprovalResolvedDataSchema,
 };
-
-/** W3C trace context `traceparent` header value. */
-export const TraceparentSchema = z
-	.string()
-	.regex(/^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/, "W3C traceparent");
 
 /**
  * CloudEvents 1.0 envelope with Agent Gateway extensions

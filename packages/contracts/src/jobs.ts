@@ -1,6 +1,12 @@
 import { z } from "zod";
 import { SessionPolicySchema } from "./agent-config.ts";
-import { AgentIdSchema, type JsonObject, type RuntimeAdapterId, UuidSchema } from "./common.ts";
+import {
+	AgentIdSchema,
+	type JsonObject,
+	type RuntimeAdapterId,
+	TraceparentSchema,
+	UuidSchema,
+} from "./common.ts";
 import type {
 	ToolDeadLetterQueueName,
 	ToolExecuteQueueName,
@@ -93,6 +99,8 @@ export const RunJobSchema = z.strictObject({
 	timeoutSeconds: z.int().min(1).max(86_400),
 	runtime: RunRuntimeSchema,
 	input: AgentTurnInputSchema,
+	/** The attempt's trace context, for the worker's log lines; absent on older jobs. */
+	traceparent: TraceparentSchema.optional(),
 });
 export type RunJob = z.infer<typeof RunJobSchema>;
 

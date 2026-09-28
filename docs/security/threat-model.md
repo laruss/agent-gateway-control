@@ -1,6 +1,6 @@
 # Threat model (draft)
 
-- Status: Draft, updated through Phase 7
+- Status: Draft, updated through Phase 8
 
 ## Assets
 
@@ -92,6 +92,13 @@
   widened grant cannot give the Gateway send permission. Google API errors are reduced to
   Google's error code before logging; mailbox addresses are not logged, and the mailbox is
   named by the operator's id (`GMAIL_MAILBOX_ID`) in events and alerts.
+- Status (Phase 8): redaction also covers `Authorization` and API key headers in text, Google
+  refresh and access tokens, JWTs, fine-grained GitHub tokens, secret URL query parameters and
+  email addresses. It bounds strings, arrays and lines, and applies to health details as well as
+  to logs and stored errors. Gitleaks scans the whole git history on every push, pull request
+  and daily. Retention removes message content (posts, mail, run results, turn inputs) after
+  its configured period, so a database backup holds less of it
+  ([ADR-019](../adr/019-observability-and-retention.md)).
 
 ### T4. Compromised runtime worker
 
@@ -125,6 +132,12 @@
   cannot publish execute jobs (row-level security on the job table), and a fetched job
   authorizes nothing: the runner recomputes the hash, and `begin` checks the approval, the
   hash, the deadline, the agent and the kill switch under the controls row.
+- Status (Phase 8): the services' database pools cut off long statements, lock waits and idle
+  transactions; a turn input above 2 MiB is refused; workspaces a crashed worker left behind are
+  removed. Container hardening (non-root, read-only rootfs, dropped capabilities, CPU, memory
+  and PID limits, separate networks) and per-run containment of the unconfined runtimes are
+  part of the release images; a limit on the worker container alone does not stop a detached
+  command of one run.
 
 ### T5. Supply chain
 
@@ -132,6 +145,9 @@
 - Dependency lifecycle scripts are blocked by bun by default (`trustedDependencies` is empty).
 - SBOM, checksums, provenance, install by digest, never `latest`.
 - Status: lockfile and exact versions in Phase 0; release pipeline in Phase 9.
+- Status (Phase 8): every GitHub Action is pinned by commit SHA. OSV-Scanner checks `bun.lock`
+  (development dependencies included) for vulnerabilities and licenses against an allowlist,
+  and exceptions expire ([security scans](../operations/security-scans.md)).
 
 ### T6. Runaway spend
 
@@ -149,12 +165,18 @@
   run, retry or redrive until the UTC day changes or the limit is raised; unmetered attempts
   hold the agent unless `unmetered: allow`. Work in flight is not stopped, so a limit can be
   overshot by the runs already started.
+- Status (Phase 8): an alert fires at 80% of a daily budget, before the hold, and is resolved
+  when usage falls below it (the next day). Metrics report today's cost and tokens.
 
 ### T7. Home server exposure
 
 - Only the reverse proxy on 80/443 is exposed; admin API on localhost/VPN; firewall
   deny-by-default.
 - SSH keys only, a dedicated service user, regular backups and restore tests.
+- Status (Phase 8): health and metrics endpoints bind to loopback unless `HEALTH_HOST` says
+  otherwise, and carry no credentials. `gateway backup check` verifies backups, optionally with
+  a restore into a scratch database, and the controller alerts when the recorded check fails or
+  goes stale.
 
 ### T8. Forged approval
 

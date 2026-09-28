@@ -16,7 +16,7 @@ import {
 	toolActions,
 	withTransaction,
 } from "@agent-gateway/db";
-import { errorFields, redactForStorage } from "@agent-gateway/logging";
+import { childTraceparent, errorFields, redactForStorage } from "@agent-gateway/logging";
 import {
 	approvalActionHash,
 	approvalCode,
@@ -44,6 +44,7 @@ import {
 	loadOwnerUserIds,
 	lockAgent,
 	raiseAlert,
+	runTraceparent,
 } from "./store.ts";
 
 /** How long a granted action may take to begin; `begin` refuses after it. */
@@ -323,6 +324,7 @@ async function grant(uow: UnitOfWork, approval: ApprovalRow, reply: ApprovalRepl
 			configVersion: config.version,
 			deadlineAt: deadline,
 			createdAt: uow.now,
+			traceparent: childTraceparent(await runTraceparent(uow, approval.runId)),
 		})
 		.returning();
 	if (action === undefined) {
@@ -362,6 +364,7 @@ async function enqueueToolAction(uow: UnitOfWork, action: ToolActionRow): Promis
 		actionParams: action.actionParams,
 		immutableActionHash: action.immutableActionHash,
 		deadline: action.deadlineAt.toISOString(),
+		...(action.traceparent === null ? {} : { traceparent: childTraceparent(action.traceparent) }),
 	};
 	const expireInSeconds = Math.ceil(
 		(action.deadlineAt.getTime() - uow.now.getTime() + TOOL_RUN_GRACE_MS) / 1000,

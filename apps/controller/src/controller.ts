@@ -19,20 +19,23 @@ import {
 	type JobProbe,
 	reconcileRunsAndWaits,
 	recordWorkerStatus,
+	runRetentionIfDue,
+	sweepAlertConditions,
 	sweepApprovals,
 	sweepRuntimeHealth,
 	sweepSchedules,
 } from "@agent-gateway/core";
 import type { OutboxKind } from "@agent-gateway/db";
-import { createPool, pendingMigrationCount } from "@agent-gateway/db";
+import { createServicePool, pendingMigrationCount } from "@agent-gateway/db";
 import { errorFields, type Logger } from "@agent-gateway/logging";
 import type { RunningListener } from "@agent-gateway/mattermost";
 import { type Deliverer, deliverOutboxItem, reconcileOutbox } from "@agent-gateway/outbox";
 import { createBoss, ensureQueues, transactionalJobSink } from "@agent-gateway/queue";
-import type { HealthCheck } from "@agent-gateway/service";
+import { gauge, type HealthCheck, MetricsRegistry } from "@agent-gateway/service";
 import type pg from "pg";
 import type { PgBoss } from "pg-boss";
 import { type MattermostBridgeOptions, startBridgeListener } from "./mattermost-bridge.ts";
+import { registerControllerMetrics } from "./metrics.ts";
 
 export type ControllerOptions = Readonly<{
 	connectionString: string;
@@ -47,8 +50,12 @@ export type ControllerOptions = Readonly<{
 	runtimeStableMs?: number;
 	/** Queue polling interval; lower in tests. */
 	pollingIntervalSeconds?: number;
+	/** How often retention removes expired content; hourly by default. */
+	retentionIntervalMs?: number;
 	/** Listen to Mattermost; without it no Mattermost event reaches the Gateway. */
 	mattermost?: MattermostBridgeOptions;
+	/** Where the controller's metrics go; a registry of its own by default. */
+	metrics?: MetricsRegistry;
 }>;
 
 export type RunningController = Readonly<{
@@ -57,6 +64,7 @@ export type RunningController = Readonly<{
 	/** The Mattermost listener, when one runs. */
 	listener: RunningListener | null;
 	readiness: () => Promise<Readonly<HealthCheck[]>>;
+	metrics: MetricsRegistry;
 	stop: () => Promise<void>;
 }>;
 
@@ -80,7 +88,9 @@ export function bossJobProbe(boss: PgBoss): JobProbe {
  */
 export async function startController(options: ControllerOptions): Promise<RunningController> {
 	const { log } = options;
-	const pool: pg.Pool = createPool(options.connectionString);
+	const pool: pg.Pool = createServicePool(options.connectionString);
+	// An idle connection lost (a database restart, a failed keepalive) is replaced on next use.
+	pool.on("error", (error) => log.error("database pool error", errorFields(error)));
 	const pending = await pendingMigrationCount(pool);
 	if (pending > 0) {
 		await pool.end();
@@ -99,6 +109,24 @@ export async function startController(options: ControllerOptions): Promise<Runni
 		random: options.random ?? Math.random,
 		log,
 	};
+	const metrics = options.metrics ?? new MetricsRegistry();
+	registerControllerMetrics(metrics, pool, clock);
+	const reportsApplied = metrics.counter(
+		"gateway_run_reports_total",
+		"Worker run reports applied, by adapter, kind and outcome.",
+	);
+	const toolReportsApplied = metrics.counter(
+		"gateway_tool_reports_total",
+		"Tool runner reports applied, by namespace, kind and outcome.",
+	);
+	const deliveries = metrics.counter(
+		"gateway_outbox_deliveries_total",
+		"Outbox delivery attempts, by outcome.",
+	);
+	const sweepFailures = metrics.counter(
+		"gateway_reconcile_failures_total",
+		"Failed reconciliation steps, by step.",
+	);
 	const outboxDeps = { pool, deliverers: options.deliverers(deps), clock, log };
 	const polling = { pollingIntervalSeconds: options.pollingIntervalSeconds ?? 2 };
 	const runtimeHealthOptions =
@@ -139,6 +167,7 @@ export async function startController(options: ControllerOptions): Promise<Runni
 					return;
 				}
 				const outcome = await handleRunReport(deps, report.data, adapter);
+				reportsApplied.inc({ adapter, kind: report.data.kind, outcome });
 				log.info("run report applied", { job_id: job.id, run_id: report.data.runId, outcome });
 			},
 		);
@@ -162,6 +191,7 @@ export async function startController(options: ControllerOptions): Promise<Runni
 					return;
 				}
 				const outcome = await handleToolReport(deps, namespace, report.data);
+				toolReportsApplied.inc({ namespace, kind: report.data.kind, outcome });
 				log.info("tool report applied", {
 					job_id: job.id,
 					tool_action_id: report.data.actionId,
@@ -186,7 +216,11 @@ export async function startController(options: ControllerOptions): Promise<Runni
 		async ([job]) => {
 			if (job !== undefined) {
 				const { outboxId } = OutboxDeliverJobSchema.parse(job.data);
-				const outcome = await deliverOutboxItem(outboxDeps, outboxId);
+				const outcome = await deliverOutboxItem(outboxDeps, outboxId).catch((error: Error) => {
+					deliveries.inc({ outcome: "retryable_failure" });
+					throw error;
+				});
+				deliveries.inc({ outcome });
 				if (outcome === "not_due") {
 					// Inside its backoff: come back when it is due, without spending a job retry.
 					const due = await pool.query<{ next_attempt_at: Date }>(
@@ -206,13 +240,48 @@ export async function startController(options: ControllerOptions): Promise<Runni
 	);
 
 	const probe = bossJobProbe(boss);
-	const reconcile = async () => {
+	// The listener starts below; the sweep reads it through this binding.
+	let listener: RunningListener | null = null;
+	// Not connected until the listener says so: a restart does not resolve a lasting outage.
+	let disconnectedSince: Date | null = options.mattermost === undefined ? null : deps.clock();
+	let connectedSince: Date | null = null;
+	let seenReconnects = 0;
+	// Each loop runs one pass at a time; `stop` waits for the pass in flight.
+	let reconciling: Promise<void> | null = null;
+	const reconcile = (): Promise<void> => {
+		reconciling ??= reconcileOnce().finally(() => {
+			reconciling = null;
+		});
+		return reconciling;
+	};
+	// Retention has its own loop: a long first run must not hold up recovery, approvals, alerts
+	// and outbox reconciliation.
+	let retaining: Promise<void> | null = null;
+	let stopping = false;
+	const retain = (): Promise<void> => {
+		retaining ??= (async () => {
+			try {
+				const expired = await runRetentionIfDue(deps, options.retentionIntervalMs, () => stopping);
+				if (expired !== null) {
+					log.info("retention applied", { ...expired });
+				}
+			} catch (error) {
+				sweepFailures.inc({ step: "retention" });
+				log.error("retention failed", errorFields(error));
+			}
+		})().finally(() => {
+			retaining = null;
+		});
+		return retaining;
+	};
+	const reconcileOnce = async () => {
 		try {
 			const lost = await reconcileRunsAndWaits(deps, probe);
 			if (lost.lostAttempts > 0 || lost.requeuedWaitTimeouts > 0) {
 				log.warn("recovered runs or waits whose jobs were lost", { ...lost });
 			}
 		} catch (error) {
+			sweepFailures.inc({ step: "run_waits" });
 			log.error("run and wait reconciliation failed", errorFields(error));
 		}
 		try {
@@ -221,6 +290,7 @@ export async function startController(options: ControllerOptions): Promise<Runni
 				log.warn("started runs for inbox work left behind", { count: started });
 			}
 		} catch (error) {
+			sweepFailures.inc({ step: "schedules" });
 			log.error("schedule sweep failed", errorFields(error));
 		}
 		try {
@@ -229,6 +299,7 @@ export async function startController(options: ControllerOptions): Promise<Runni
 				log.info("settled or resolved approvals", { count: settled });
 			}
 		} catch (error) {
+			sweepFailures.inc({ step: "approvals" });
 			log.error("approval sweep failed", errorFields(error));
 		}
 		try {
@@ -237,7 +308,35 @@ export async function startController(options: ControllerOptions): Promise<Runni
 				log.warn("runtimes without a ready worker", { adapters: unavailable.join(",") });
 			}
 		} catch (error) {
+			sweepFailures.inc({ step: "runtime_health" });
 			log.error("runtime health sweep failed", errorFields(error));
+		}
+		try {
+			if (listener !== null) {
+				const now = deps.clock();
+				const status = listener.status();
+				// A reconnect between two ticks restarts the stable period: it was a drop too.
+				if (status.reconnects !== seenReconnects) {
+					seenReconnects = status.reconnects;
+					connectedSince = null;
+				}
+				if (status.connected) {
+					connectedSince ??= now;
+					disconnectedSince = null;
+				} else {
+					connectedSince = null;
+					disconnectedSince ??= now;
+				}
+			}
+			const transitions = await sweepAlertConditions(deps, {
+				mattermost: options.mattermost === undefined ? null : { disconnectedSince, connectedSince },
+			});
+			for (const [key, transition] of Object.entries(transitions)) {
+				log.warn(`alert ${transition}`, { alert_key: key });
+			}
+		} catch (error) {
+			sweepFailures.inc({ step: "alerts" });
+			log.error("alert sweep failed", errorFields(error));
 		}
 		try {
 			const requeued = await reconcileOutbox(outboxDeps, (tx) =>
@@ -247,13 +346,26 @@ export async function startController(options: ControllerOptions): Promise<Runni
 				log.warn("re-enqueued outbox deliveries", { count: requeued });
 			}
 		} catch (error) {
+			sweepFailures.inc({ step: "outbox" });
 			log.error("outbox reconciliation failed", errorFields(error));
 		}
 	};
 	await reconcile();
 	const timer = setInterval(() => void reconcile(), options.reconcileIntervalMs ?? 60_000);
-	const listener =
+	void retain();
+	const retentionTimer = setInterval(() => void retain(), options.reconcileIntervalMs ?? 60_000);
+	listener =
 		options.mattermost === undefined ? null : startBridgeListener(deps, options.mattermost, log);
+
+	metrics.collect(() =>
+		listener === null
+			? []
+			: [
+					gauge("gateway_mattermost_connected", "1 while the listener's WebSocket is up.", [
+						{ labels: {}, value: listener.status().connected ? 1 : 0 },
+					]),
+				],
+	);
 
 	const readiness = async (): Promise<Readonly<HealthCheck[]>> => {
 		const checks: HealthCheck[] = [];
@@ -288,8 +400,12 @@ export async function startController(options: ControllerOptions): Promise<Runni
 		boss,
 		listener,
 		readiness,
+		metrics,
 		stop: async () => {
+			stopping = true;
 			clearInterval(timer);
+			clearInterval(retentionTimer);
+			await Promise.allSettled([reconciling, retaining]);
 			await listener?.stop();
 			await boss.stop({ graceful: true, timeout: 30_000 });
 			await pool.end();

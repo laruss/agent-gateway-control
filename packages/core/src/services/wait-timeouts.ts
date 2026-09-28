@@ -37,7 +37,11 @@ export async function handleWaitTimeout(
 		await lockConfigShared(uow);
 		await lockAgent(tx.db, owner.agentId);
 		const [wait] = await tx.db
-			.select({ wait: waitSubscriptions, hop: agentRuns.hop })
+			.select({
+				wait: waitSubscriptions,
+				hop: agentRuns.hop,
+				traceparent: agentRuns.traceparent,
+			})
 			.from(waitSubscriptions)
 			.innerJoin(agentRuns, eq(agentRuns.id, waitSubscriptions.createdByRunId))
 			.where(eq(waitSubscriptions.id, job.waitId))
@@ -71,6 +75,7 @@ export async function handleWaitTimeout(
 				causationid: null,
 				hop: wait.hop,
 				data: { agent_id: wait.wait.agentId, wait_id: job.waitId },
+				traceparent: wait.traceparent,
 			}),
 		);
 		return result.status === "accepted" ? "timed_out" : "ignored";

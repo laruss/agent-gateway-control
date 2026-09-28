@@ -6,6 +6,44 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ### Added
 
+- Observability (ADR-019):
+  - metrics on every service's `/metrics` (Prometheus text format), with database gauges
+    from the controller and a collection-success flag;
+  - a health server for the worker (port 8081);
+  - W3C trace context carried from an event through its runs, attempts, deliveries, agent posts
+    and tool actions, with `trace_id` and `span_id` in log lines;
+  - log redaction of headers, Google tokens, JWTs, fine-grained GitHub tokens, secret query
+    parameters and email addresses; bounded log lines; the service version in every line
+    (`GATEWAY_VERSION`, `GATEWAY_COMMIT`).
+- Alert conditions: a lasting problem fires once, reminds every 6 hours and is resolved when it
+  ends. It covers:
+  - Mattermost disconnects;
+  - dead letters and dead outbox items;
+  - budgets at 80%;
+  - repeated invalid output;
+  - Gmail watch expiry;
+  - retention and backup checks.
+
+  `gateway doctor` lists firing alerts.
+- Retention (`organization.retention`): the controller removes message content after its
+  period, hourly and in batches. Identifiers and hashes stay for dedupe. Pending work and a
+  FAILED agent's latest run are kept, and so are approvals, tool actions and the audit log.
+- `gateway backup check`: verifies the newest backup (manifest, age, checksum, database
+  identity, schema, archive) and optionally restores it into a scratch database. `--record`
+  lets the controller alert on a failed or stale check. `scripts/backup-gateway-db.sh` is a
+  reference producer.
+- Resource limits:
+  - statement, lock and idle-transaction timeouts on the services' database pools;
+  - a 2 MiB turn input cap;
+  - removal of run workspaces a crashed worker left behind.
+- Security scans in CI (`security.yml`): Gitleaks over the git history and OSV-Scanner over
+  `bun.lock` with a license allowlist, on push, pull request and daily. Every GitHub Action is
+  pinned by commit SHA.
+- Migration `0012_traces_retention_alerts`:
+  - `traceparent` on runs, outbox items and tool actions;
+  - `content_expired_at` markers;
+  - `alert_states` and `maintenance_status`.
+
 - Approval decisions and the tool broker. An owner decides in the approval card's thread with
   `approve <code>` or `deny <code>`. The listener hands the reply to a dedicated decision path
   that checks the owner (fresh account lookup, approver snapshot and current owners), the

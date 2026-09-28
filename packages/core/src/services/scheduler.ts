@@ -26,6 +26,7 @@ import {
 	withTransaction,
 } from "@agent-gateway/db";
 import { mattermostPost } from "@agent-gateway/events";
+import { childTraceparent } from "@agent-gateway/logging";
 import {
 	and,
 	asc,
@@ -382,12 +383,25 @@ export async function scheduleAgent(
 		return { skipped: "context_unavailable" };
 	}
 
+	// A backstop behind the context budgets: a turn input this large means a budget failed, and
+	// it would be copied into the snapshot, the job and the runtime's prompt.
+	const inputBytes = Buffer.byteLength(JSON.stringify(built.context.input), "utf8");
+	if (inputBytes > MAX_TURN_INPUT_BYTES) {
+		await raiseAlert(
+			uow,
+			`context:${agentId}:${trigger.event.id}`,
+			`Cannot start a run of @${agentId}: its turn input is ${inputBytes} bytes, over the limit of ${MAX_TURN_INPUT_BYTES}.`,
+		);
+		return { skipped: "context_unavailable" };
+	}
+
 	const [{ generation } = { generation: 0 }] = await db
 		.select({ generation: count() })
 		.from(agentRuns)
 		.where(and(eq(agentRuns.agentId, agentId), eq(agentRuns.triggerEventId, trigger.event.id)));
 	const adapter: RuntimeAdapterId = agent.config.runtime.adapter;
 	const deadline = new Date(built.context.input.deadline);
+	const traceparent = childTraceparent(triggerEvent.traceparent);
 	await db.insert(agentRuns).values({
 		id: runId,
 		agentId,
@@ -404,6 +418,7 @@ export async function scheduleAgent(
 		timeoutAt: deadline,
 		timeoutSeconds: agent.config.runtime.timeout_seconds,
 		parentRunId: redrive?.runId ?? null,
+		traceparent,
 	});
 	const input = built.context.input;
 	await db.insert(contextSnapshots).values({
@@ -413,7 +428,7 @@ export async function scheduleAgent(
 		threadRef: context.threadRef === null ? null : formatThreadRef(context.threadRef),
 		input,
 		authority: built.context.authority,
-		sizeBytes: JSON.stringify(input).length,
+		sizeBytes: inputBytes,
 		createdAt: uow.now,
 	});
 	await db
@@ -443,6 +458,7 @@ export async function scheduleAgent(
 		input,
 		timeoutSeconds: agent.config.runtime.timeout_seconds,
 		startAfter: null,
+		traceparent,
 	});
 	await audit(uow, "system", "run.scheduled", "run", runId, {
 		agent_id: agentId,
@@ -452,6 +468,9 @@ export async function scheduleAgent(
 	});
 	return { runId };
 }
+
+/** The largest turn input a run starts with, serialized. */
+export const MAX_TURN_INPUT_BYTES = 2 * 1024 * 1024;
 
 export type AttemptInit = Readonly<{
 	runId: string;
@@ -465,6 +484,8 @@ export type AttemptInit = Readonly<{
 	input: JsonObject;
 	timeoutSeconds: number;
 	startAfter: Date | null;
+	/** The run's trace context; every attempt is a span of its own in it. */
+	traceparent: string | null;
 }>;
 
 /**
@@ -541,6 +562,7 @@ export async function enqueueAttempt(uow: UnitOfWork, init: AttemptInit): Promis
 			timeoutSeconds: init.timeoutSeconds,
 			runtime,
 			input: init.input,
+			traceparent: childTraceparent(init.traceparent),
 		},
 		{
 			...(init.startAfter === null ? {} : { startAfter: init.startAfter }),

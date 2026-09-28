@@ -7,7 +7,7 @@ import {
 	normalizeApprovalCode,
 	parseApprovalCommand,
 } from "./approval-code.ts";
-import { budgetHold, meteredUsage, type UsageTotals, utcDay } from "./budget.ts";
+import { budgetHold, budgetPressure, meteredUsage, type UsageTotals, utcDay } from "./budget.ts";
 import { approvedActionIssues, evaluateTool, riskLevelFor } from "./tools.ts";
 
 const finance = {
@@ -229,6 +229,17 @@ describe("budgets", () => {
 		expect(budgetHold({ ...budgets, unmetered: "allow" }, unmetered, none)).toBeNull();
 		expect(budgetHold({ unmetered: "hold" }, unmetered, none)).toBeNull();
 		expect(budgetHold(undefined, { ...none, costUsd: 1e9 }, none)).toBeNull();
+	});
+
+	it("reports a scope at 80% of its limit, by its most used metric", () => {
+		const budget = { cost_usd: 10, tokens: 1000 };
+		expect(budgetPressure({ ...none, costUsd: 7.9 }, budget)).toBeNull();
+		expect(budgetPressure({ ...none, costUsd: 8, tokens: 900 }, budget)).toEqual({
+			ratio: 0.9,
+			reason: "900 of 1000 tokens",
+		});
+		expect(budgetPressure({ ...none, costUsd: 12 }, budget)?.ratio).toBe(1.2);
+		expect(budgetPressure({ ...none, costUsd: 100 }, undefined)).toBeNull();
 	});
 
 	it("books by UTC day", () => {

@@ -1,11 +1,13 @@
 import { GOOGLE_ENDPOINTS, SUBSCRIPTION_NAME, TOPIC_NAME } from "@agent-gateway/connector-gmail";
 import { GmailMailboxIdSchema } from "@agent-gateway/contracts";
-import { createLogger } from "@agent-gateway/logging";
+import { createLogger, serviceVersion } from "@agent-gateway/logging";
 import {
 	intSetting,
+	MetricsRegistry,
 	onShutdown,
 	readSecretFile,
 	readSetting,
+	registerProcessMetrics,
 	requireSetting,
 	SettingError,
 	secretFileState,
@@ -14,7 +16,7 @@ import {
 import { startGmailConnectorApp } from "./connector-app.ts";
 
 const environment = readSetting("GATEWAY_ENV") ?? "unset";
-const log = createLogger({ service: "connector-gmail", version: "0.0.0", environment });
+const log = createLogger({ service: "connector-gmail", version: serviceVersion(), environment });
 
 function nameSetting(name: string, pattern: RegExp, example: string): string {
 	const value = requireSetting(name);
@@ -60,7 +62,10 @@ const readRefreshToken = () => {
 };
 const refreshToken = readRefreshToken();
 
+const metrics = new MetricsRegistry();
+registerProcessMetrics(metrics, { service: "connector-gmail", version: serviceVersion() });
 const app = await startGmailConnectorApp({
+	metrics,
 	connectionString: requireSetting("DATABASE_URL"),
 	mailboxId,
 	pubsub,
@@ -78,6 +83,7 @@ const health = startHealthServer({
 	port: intSetting("HEALTH_PORT", 8082),
 	hostname: readSetting("HEALTH_HOST") ?? "127.0.0.1",
 	readiness: app.readiness,
+	metrics: () => metrics.render(),
 });
 log.info("health endpoints listening", { port: health.port });
 

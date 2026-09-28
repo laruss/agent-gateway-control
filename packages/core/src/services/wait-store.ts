@@ -1,7 +1,7 @@
 import type { GatewayEvent, Uuid } from "@agent-gateway/contracts";
 import { agentInbox, agentRuns, eventRoutes, events, waitSubscriptions } from "@agent-gateway/db";
 import { mattermostPost } from "@agent-gateway/events";
-import { and, eq, gte, inArray, isNotNull, ne, or, sql } from "drizzle-orm";
+import { and, eq, gte, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import { routeEvent } from "../routing.ts";
 import { type ActiveWait, waitMatches } from "../waits.ts";
 import { deletedPosts } from "./context-store.ts";
@@ -219,9 +219,14 @@ export async function matchMissedAnswers(
 		.select()
 		.from(events)
 		.where(
-			or(
-				inArray(events.id, pendingEventIds),
-				and(inArray(events.correlationId, correlations), gte(events.receivedAt, since)),
+			and(
+				// Retention keeps what a wait still needs only while it is pending; an older
+				// event whose content expired answers nothing.
+				isNull(events.contentExpiredAt),
+				or(
+					inArray(events.id, pendingEventIds),
+					and(inArray(events.correlationId, correlations), gte(events.receivedAt, since)),
+				),
 			),
 		)
 		.orderBy(events.receivedAt, events.id);

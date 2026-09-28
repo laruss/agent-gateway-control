@@ -1,6 +1,7 @@
 export * from "./outcome.ts";
 export * from "./routing.ts";
 export * from "./services/admin.ts";
+export * from "./services/alerts.ts";
 export {
 	ApprovalCardPendingError,
 	approvalPending,
@@ -21,6 +22,7 @@ export * from "./services/ingest.ts";
 export * from "./services/mattermost-bridge.ts";
 export { decideMemory, listMemory, MEMORY_REVIEW_STATUSES } from "./services/memory.ts";
 export * from "./services/reconcile.ts";
+export * from "./services/retention.ts";
 export * from "./services/runs.ts";
 export * from "./services/runtime-health.ts";
 export * from "./services/scheduler.ts";

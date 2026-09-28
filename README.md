@@ -37,6 +37,9 @@ See [local development](docs/operations/local-development.md) for the full walkt
 - [Mattermost bootstrap and operation](docs/operations/mattermost.md)
 - [Gmail connector setup and operation](docs/operations/gmail.md)
 - [Approvals, the tool runner and budgets](docs/operations/approvals.md)
+- [Observability, alerts and retention](docs/operations/observability.md)
+- [Backups of the Gateway database](docs/operations/backups.md)
+- [Security scans](docs/operations/security-scans.md)
 - [Privacy notes](docs/security/privacy.md)
 - [Implementation status](IMPLEMENTATION_STATUS.md)
 

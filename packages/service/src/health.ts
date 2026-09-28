@@ -1,3 +1,5 @@
+import { redactText, truncateText } from "@agent-gateway/logging";
+
 export type HealthCheck = Readonly<{ name: string; ok: boolean; detail: string }>;
 
 export type HealthServerOptions = Readonly<{
@@ -12,14 +14,23 @@ export type HealthServerOptions = Readonly<{
 
 export type HealthServer = Readonly<{ port: number; stop: () => Promise<void> }>;
 
+/** Health details leave the process: redacted and bounded like log lines. */
+function sanitized(check: HealthCheck): HealthCheck {
+	return { ...check, detail: truncateText(redactText(check.detail), 500) };
+}
+
 async function safeChecks(
 	readiness: HealthServerOptions["readiness"],
 ): Promise<Readonly<HealthCheck[]>> {
 	try {
-		return await readiness();
+		return (await readiness()).map(sanitized);
 	} catch (error) {
 		return [
-			{ name: "readiness", ok: false, detail: error instanceof Error ? error.message : "failed" },
+			sanitized({
+				name: "readiness",
+				ok: false,
+				detail: error instanceof Error ? error.message : "failed",
+			}),
 		];
 	}
 }

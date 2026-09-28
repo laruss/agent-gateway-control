@@ -1,7 +1,7 @@
 import type { z } from "zod";
 import type { AgentConfig } from "./agent-config.ts";
 import type { GmailMessageData } from "./event.ts";
-import type { OrganizationConfig } from "./organization.ts";
+import { type OrganizationConfig, OrganizationRetentionSchema } from "./organization.ts";
 import type { AgentTurnResult, PublicMessage } from "./turn.ts";
 import type { WaitCondition } from "./wait.ts";
 
@@ -98,6 +98,7 @@ export function organization(): OrganizationConfig {
 				max_runs_per_agent_per_hour: 30,
 				default_run_timeout_seconds: 1800,
 			},
+			retention: OrganizationRetentionSchema.parse({}),
 		},
 		mattermost: {
 			team: "lab",

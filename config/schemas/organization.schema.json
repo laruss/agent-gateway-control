@@ -135,6 +135,61 @@
             }
           },
           "additionalProperties": false
+        },
+        "retention": {
+          "default": {},
+          "type": "object",
+          "properties": {
+            "event_content_days": {
+              "default": 30,
+              "type": "integer",
+              "minimum": 8,
+              "maximum": 3650
+            },
+            "run_content_days": {
+              "default": 30,
+              "type": "integer",
+              "minimum": 8,
+              "maximum": 3650
+            },
+            "outbox_sent_days": {
+              "default": 8,
+              "type": "integer",
+              "minimum": 8,
+              "maximum": 3650
+            },
+            "outbox_dead_days": {
+              "default": 30,
+              "type": "integer",
+              "minimum": 8,
+              "maximum": 3650
+            },
+            "policy_input_days": {
+              "default": 30,
+              "type": "integer",
+              "minimum": 8,
+              "maximum": 3650
+            },
+            "thread_summary_days": {
+              "default": 90,
+              "type": "integer",
+              "minimum": 8,
+              "maximum": 3650
+            },
+            "inactive_memory_days": {
+              "default": 30,
+              "type": "integer",
+              "minimum": 8,
+              "maximum": 3650
+            },
+            "usage_days": {
+              "default": 400,
+              "type": "integer",
+              "minimum": 8,
+              "maximum": 3650
+            }
+          },
+          "additionalProperties": false
         }
       },
       "required": [

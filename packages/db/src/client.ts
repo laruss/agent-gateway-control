@@ -22,6 +22,34 @@ export function createPool(connectionString: string, max = 10): pg.Pool {
 	return new pg.Pool({ connectionString, max });
 }
 
+/**
+ * Limits a long-running service's connections put on its own statements: a statement, a lock
+ * wait or an idle transaction that runs long is a defect, and cut off before it holds locks and
+ * connections for good. Migrations and restores use {@link createPool}, without limits.
+ */
+export const SERVICE_DATABASE_LIMITS = {
+	statementTimeoutMs: 60_000,
+	lockTimeoutMs: 30_000,
+	idleInTransactionTimeoutMs: 60_000,
+	connectionTimeoutMs: 10_000,
+} as const;
+
+/** A pool for a long-running service, with {@link SERVICE_DATABASE_LIMITS}. */
+export function createServicePool(connectionString: string, max = 10): pg.Pool {
+	return new pg.Pool({
+		connectionString,
+		max,
+		statement_timeout: SERVICE_DATABASE_LIMITS.statementTimeoutMs,
+		lock_timeout: SERVICE_DATABASE_LIMITS.lockTimeoutMs,
+		idle_in_transaction_session_timeout: SERVICE_DATABASE_LIMITS.idleInTransactionTimeoutMs,
+		connectionTimeoutMillis: SERVICE_DATABASE_LIMITS.connectionTimeoutMs,
+		// A silent network partition fails a statement shortly after the server would have
+		// cancelled it, not when the OS gives up on the connection.
+		query_timeout: SERVICE_DATABASE_LIMITS.statementTimeoutMs + 5_000,
+		keepAlive: true,
+	});
+}
+
 export function createDatabase(pool: pg.Pool): Database {
 	return drizzle(pool, { schema });
 }
@@ -36,16 +64,22 @@ export async function withTransaction<T>(
 	work: (transaction: Transaction) => Promise<T>,
 ): Promise<T> {
 	const client = await pool.connect();
+	let broken: Error | undefined;
 	try {
 		await client.query("BEGIN");
 		const result = await work({ db: drizzle(client, { schema }), client });
 		await client.query("COMMIT");
 		return result;
 	} catch (error) {
-		await client.query("ROLLBACK");
+		try {
+			await client.query("ROLLBACK");
+		} catch (rollback) {
+			// A client that cannot even roll back (a lost connection) is closed, not pooled.
+			broken = rollback instanceof Error ? rollback : new Error(String(rollback));
+		}
 		throw error;
 	} finally {
-		client.release();
+		client.release(broken);
 	}
 }
 
@@ -227,6 +261,7 @@ async function grantQueueRole(
 		throw new Error(`invalid role name '${role}'`);
 	}
 	const client = await pool.connect();
+	let broken: Error | undefined;
 	try {
 		const quoted = client.escapeIdentifier(role);
 		await client.query("BEGIN");
@@ -292,9 +327,14 @@ async function grantQueueRole(
 		await verifyWorkerPrivileges(client, role, allowedTables);
 		await client.query("COMMIT");
 	} catch (error) {
-		await client.query("ROLLBACK");
+		try {
+			await client.query("ROLLBACK");
+		} catch (rollback) {
+			// A client that cannot even roll back (a lost connection) is closed, not pooled.
+			broken = rollback instanceof Error ? rollback : new Error(String(rollback));
+		}
 		throw error;
 	} finally {
-		client.release();
+		client.release(broken);
 	}
 }

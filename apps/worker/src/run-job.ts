@@ -5,7 +5,7 @@ import {
 	type RuntimeSessionHandle,
 	reportQueue,
 } from "@agent-gateway/contracts";
-import type { Logger } from "@agent-gateway/logging";
+import { type Logger, traceFields } from "@agent-gateway/logging";
 import {
 	createRunWorkspace,
 	executeTurn,
@@ -57,6 +57,7 @@ export async function processRunJob(
 		run_id: runId,
 		agent_id: agentId,
 		correlation_id: parsed.data.input.trigger.correlationid,
+		...traceFields(parsed.data.traceparent),
 	});
 	const send = (report: RunReport) => host.reports.send(reportQueue(adapter.id), report);
 
