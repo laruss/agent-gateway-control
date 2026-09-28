@@ -2,6 +2,7 @@ import {
 	QUEUES,
 	type QueueName,
 	type RuntimeAdapterId,
+	RuntimeAdapterIdSchema,
 	reportQueue,
 	runDeadLetterQueue,
 	runQueue,
@@ -11,6 +12,7 @@ import {
 	toolReportQueue,
 } from "@agent-gateway/contracts";
 import type { PgBoss } from "pg-boss";
+import { createBoss } from "./boss.ts";
 
 type QueuePolicy = Readonly<{
 	retryLimit: number;
@@ -147,5 +149,19 @@ export async function ensureQueues(
 			deadLetter: toolDeadLetterQueue(namespace),
 		});
 		await ensureQueue(boss, toolReportQueue(namespace), REPORT_POLICY);
+	}
+}
+
+/**
+ * Creates or upgrades the pg-boss schema and every queue. Part of `gateway db migrate`, after
+ * the domain migrations; services never change the queue schema.
+ */
+export async function migrateQueues(connectionString: string): Promise<void> {
+	const boss = createBoss(connectionString, "migrator");
+	await boss.start();
+	try {
+		await ensureQueues(boss, RuntimeAdapterIdSchema.options);
+	} finally {
+		await boss.stop({ graceful: false });
 	}
 }

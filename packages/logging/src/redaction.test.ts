@@ -8,7 +8,7 @@ import {
 	redactText,
 	redactValue,
 } from "./redact.ts";
-import { DEVELOPMENT_VERSION, serviceVersion } from "./version.ts";
+import { DEVELOPMENT_VERSION, releaseVersion, serviceVersion } from "./version.ts";
 
 describe("redactText", () => {
 	it.each([
@@ -117,5 +117,18 @@ describe("serviceVersion", () => {
 			serviceVersion({ GATEWAY_VERSION: "1.2.3", GATEWAY_COMMIT: "0123456789abcdef0123" }),
 		).toBe("1.2.3+0123456789ab");
 		expect(serviceVersion({ GATEWAY_VERSION: " ", GATEWAY_COMMIT: "" })).toBe(DEVELOPMENT_VERSION);
+	});
+});
+
+describe("releaseVersion", () => {
+	it("is the release version, or the development version when unset", () => {
+		expect(releaseVersion({})).toBe(DEVELOPMENT_VERSION);
+		expect(releaseVersion({ GATEWAY_VERSION: " 1.2.3 ", GATEWAY_COMMIT: "abc" })).toBe("1.2.3");
+	});
+
+	it("refuses a version that could match another release's certificate by mistake", () => {
+		for (const version of ["v1.2.3", "1.2", "01.2.3", "1.2.3-rc.1", "1.2.3+abc"]) {
+			expect(() => releaseVersion({ GATEWAY_VERSION: version })).toThrow("not a release version");
+		}
 	});
 });

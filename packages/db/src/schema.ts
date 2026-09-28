@@ -779,3 +779,19 @@ export const maintenanceStatus = pgTable("maintenance_status", {
 	/** What the last run did, e.g. rows expired per table. */
 	detail: jsonb("detail").$type<JsonObject>().notNull().default({}),
 });
+
+/**
+ * Which releases may run against which migration history: `gateway db migrate` of a release
+ * certifies itself and the earlier releases its migrations stay compatible with. A release
+ * starts only against a history it is certified for (see `compatibility.ts`).
+ */
+export const schemaCertifications = pgTable(
+	"schema_certifications",
+	{
+		release: text("release").notNull(),
+		/** `historyFingerprint` of the applied migrations. */
+		fingerprint: text("fingerprint").notNull(),
+		certifiedAt: timestamp("certified_at", { withTimezone: true }).notNull().defaultNow(),
+	},
+	(t) => [primaryKey({ columns: [t.release, t.fingerprint] })],
+);

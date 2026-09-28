@@ -1,10 +1,8 @@
-import { createHash } from "node:crypto";
-import { join } from "node:path";
+import { createHash, createHmac, pbkdf2Sync, randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 import pg from "pg";
-import { z } from "zod";
 import * as schema from "./schema.ts";
 
 export type Schema = typeof schema;
@@ -83,34 +81,80 @@ export async function withTransaction<T>(
 	}
 }
 
-/** Applies all pending migrations. Run by `gateway db migrate`, never implicitly at startup. */
-export async function migrateDatabase(pool: pg.Pool): Promise<void> {
-	await migrate(drizzle(pool), { migrationsFolder: MIGRATIONS_FOLDER });
-}
-
-type AppliedMigration = { hash: string };
-
-const JournalSchema = z.object({ entries: z.array(z.object({ tag: z.string() })) });
-
-/** Number of migration files the database has not applied yet. */
-export async function pendingMigrationCount(pool: pg.Pool): Promise<number> {
-	const journal = JournalSchema.parse(
-		await Bun.file(join(MIGRATIONS_FOLDER, "meta", "_journal.json")).json(),
-	);
-	const total = journal.entries.length;
-	const exists = await pool.query<{ exists: boolean }>(
-		"select to_regclass('drizzle.__drizzle_migrations') is not null as exists",
-	);
-	if (exists.rows[0]?.exists !== true) {
-		return total;
-	}
-	const applied = await pool.query<AppliedMigration>(
-		"select hash from drizzle.__drizzle_migrations",
-	);
-	return Math.max(0, total - applied.rows.length);
+/**
+ * Applies all pending migrations of `folder`. Only `migrateSchema` (`gateway db migrate`) and
+ * tests call it, never a service at startup.
+ */
+export async function migrateDatabase(pool: pg.Pool, folder = MIGRATIONS_FOLDER): Promise<void> {
+	await migrate(drizzle(pool), { migrationsFolder: folder });
 }
 
 const ROLE_NAME = /^[a-z_][a-z0-9_]{0,62}$/;
+
+const SCRAM_ITERATIONS = 4096;
+
+/**
+ * The SCRAM-SHA-256 verifier PostgreSQL stores for a password (RFC 5802, RFC 7677):
+ * `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>`.
+ */
+export function scramVerifier(password: string, salt: Buffer = randomBytes(16)): string {
+	const salted = pbkdf2Sync(password.normalize("NFKC"), salt, SCRAM_ITERATIONS, 32, "sha256");
+	const clientKey = createHmac("sha256", salted).update("Client Key").digest();
+	const storedKey = createHash("sha256").update(clientKey).digest();
+	const serverKey = createHmac("sha256", salted).update("Server Key").digest();
+	return `SCRAM-SHA-256$${SCRAM_ITERATIONS}:${salt.toString("base64")}$${storedKey.toString("base64")}:${serverKey.toString("base64")}`;
+}
+
+/**
+ * Creates a login role with `password`, or sets the password of an existing one that nothing
+ * is connected as. The role gets
+ * no privileges here: `grantWorkerRole` or `grantToolRunnerRole` limits it afterwards. The
+ * owning role, superusers and roles that bypass row-level security are refused.
+ */
+export async function createLoginRole(
+	pool: pg.Pool,
+	role: string,
+	password: string,
+): Promise<void> {
+	if (!ROLE_NAME.test(role)) {
+		throw new Error(`invalid role name '${role}'`);
+	}
+	const client = await pool.connect();
+	let broken: Error | undefined;
+	try {
+		await client.query("BEGIN");
+		const exists = await client.query("select 1 from pg_roles where rolname = $1", [role]);
+		if (exists.rowCount === 0) {
+			await client.query(`CREATE ROLE ${client.escapeIdentifier(role)} LOGIN`);
+		} else {
+			await refuseUnrestrictableRole(client, role);
+			// A running service keeps the URL it read at start: its next connection would fail.
+			const sessions = await client.query(
+				"select 1 from pg_stat_activity where usename = $1 limit 1",
+				[role],
+			);
+			if ((sessions.rowCount ?? 0) > 0) {
+				throw new Error(
+					`role '${role}' is connected; stop the service that uses it before changing its password`,
+				);
+			}
+		}
+		// The server gets a SCRAM verifier, never the password: a logged statement reveals nothing.
+		await client.query(
+			`ALTER ROLE ${client.escapeIdentifier(role)} LOGIN PASSWORD ${client.escapeLiteral(scramVerifier(password))}`,
+		);
+		await client.query("COMMIT");
+	} catch (error) {
+		try {
+			await client.query("ROLLBACK");
+		} catch (rollback) {
+			broken = rollback instanceof Error ? rollback : new Error(String(rollback));
+		}
+		throw error;
+	} finally {
+		client.release(broken);
+	}
+}
 
 /**
  * A role that owns (or belongs to the owner of) the gateway tables, is a superuser, bypasses

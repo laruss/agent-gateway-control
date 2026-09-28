@@ -14,14 +14,15 @@
     "@agent-gateway/contracts": "workspace:*",
     "@agent-gateway/core": "workspace:*",
     "@agent-gateway/db": "workspace:*",
+    "@agent-gateway/events": "workspace:*",
     "@agent-gateway/logging": "workspace:*",
     "@agent-gateway/mattermost": "workspace:*",
     "@agent-gateway/outbox": "workspace:*",
+    "@agent-gateway/policy": "workspace:*",
     "@agent-gateway/queue": "workspace:*",
     "@agent-gateway/service": "workspace:*",
-    "pg-boss": "12.34.0",
     "pg": "8.23.0",
-    "@agent-gateway/events": "workspace:*",
+    "pg-boss": "12.34.0",
     "zod": "4.6.5"
   },
   "devDependencies": {
@@ -29,7 +30,6 @@
     "@agent-gateway/runtime-mock": "workspace:*",
     "@agent-gateway/runtime-sdk": "workspace:*",
     "@agent-gateway/testkit": "workspace:*",
-    "@agent-gateway/worker": "workspace:*",
-    "@agent-gateway/policy": "workspace:*"
+    "@agent-gateway/worker": "workspace:*"
   }
 }

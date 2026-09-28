@@ -2,6 +2,7 @@ import { createLogger, serviceVersion } from "@agent-gateway/logging";
 import { assertRoutingKey } from "@agent-gateway/mattermost";
 import { dryRunDeliverers } from "@agent-gateway/outbox";
 import {
+	claimDeployment,
 	intSetting,
 	MetricsRegistry,
 	onShutdown,
@@ -67,8 +68,10 @@ const deliverers: ControllerOptions["deliverers"] = (deps) => {
 
 const metrics = new MetricsRegistry();
 registerProcessMetrics(metrics, { service: "controller", version: serviceVersion() });
+const databaseUrl = requireSetting("DATABASE_URL");
+const deployment = await claimDeployment(log, databaseUrl);
 const controller = await startController({
-	connectionString: requireSetting("DATABASE_URL"),
+	connectionString: databaseUrl,
 	log,
 	deliverers,
 	metrics,
@@ -85,4 +88,5 @@ log.info("health endpoints listening", { port: health.port });
 onShutdown(log, async () => {
 	await health.stop();
 	await controller.stop();
+	await deployment.release();
 });

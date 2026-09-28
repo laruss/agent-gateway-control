@@ -1,3 +1,5 @@
+import { randomBytes } from "node:crypto";
+import { renameSync, rmSync } from "node:fs";
 import { userInfo } from "node:os";
 import { resolve } from "node:path";
 import { GOOGLE_ENDPOINTS } from "@agent-gateway/connector-gmail";
@@ -52,21 +54,33 @@ import {
 	showRun,
 } from "@agent-gateway/core";
 import {
+	checkCompatibility,
+	createLoginRole,
 	createPool,
+	type DeploymentLock,
 	grantToolRunnerRole,
 	grantWorkerRole,
-	migrateDatabase,
-	pendingMigrationCount,
+	holdDeploymentLock,
+	loadLocalSchema,
+	migrateSchema,
+	readSchemaState,
+	schemaCompatibility,
 } from "@agent-gateway/db";
-import { createLogger, serviceVersion } from "@agent-gateway/logging";
+import { createLogger, redactText, releaseVersion, serviceVersion } from "@agent-gateway/logging";
 import {
 	createBoss,
 	deadLetterQueues,
-	ensureQueues,
+	migrateQueues,
 	transactionalJobSink,
 } from "@agent-gateway/queue";
 import { runtimeDoctor } from "@agent-gateway/runtime-sdk";
-import { intSetting, readSetting, requireSetting } from "@agent-gateway/service";
+import {
+	intSetting,
+	readSetting,
+	requireSetting,
+	secretFileExists,
+	writeSecretFile,
+} from "@agent-gateway/service";
 import { createRuntimeAdapter, workspaceRoot } from "@agent-gateway/worker";
 import type { PgBoss } from "pg-boss";
 import { type BackupCheckReport, checkBackup, localPgTools } from "./backup.ts";
@@ -93,8 +107,14 @@ export type Session = Readonly<{
 
 export const USAGE = `gateway <command>
 
+  version                             this build's version and the migrations it ships
   health | doctor                     check database, migrations, queues and controls
-  db migrate                          apply database and queue migrations
+  db migrate                          apply database and queue migrations, then certify the
+                                      releases that may run on the result (stop services first)
+  db status                           the database's migrations, the releases certified for
+                                      them, and whether this build may run (exit 1 if not)
+  db create-role <role> <url-file>    create a login role (or give it a new password) and write
+                                      its connection URL to <url-file> (mode 0600)
   db grant-worker <role> <adapter>    limit an existing role to one adapter's worker jobs
   db grant-tool-runner <role> <namespace>[,<namespace>...]
                                       limit an existing role to the tool actions of these
@@ -240,19 +260,16 @@ async function migrate(out: Output): Promise<void> {
 	const connectionString = requireSetting("DATABASE_URL");
 	const pool = createPool(connectionString, 2);
 	try {
-		await migrateDatabase(pool);
+		const certified = await migrateSchema({
+			pool,
+			connectionString,
+			release: releaseVersion(),
+			migrateQueues: () => migrateQueues(connectionString),
+		});
+		out.print(`migrations applied; certified releases: ${certified.join(", ")}`);
 	} finally {
 		await pool.end();
 	}
-	// A service-role boss creates or upgrades the pg-boss schema on start.
-	const boss = createBoss(connectionString, "service");
-	await boss.start();
-	try {
-		await ensureQueues(boss, RuntimeAdapterIdSchema.options);
-	} finally {
-		await boss.stop({ graceful: false });
-	}
-	out.print("migrations applied");
 }
 
 async function doctor(session: Session, out: Output): Promise<boolean> {
@@ -260,8 +277,8 @@ async function doctor(session: Session, out: Output): Promise<boolean> {
 	const checks: { name: string; ok: boolean; detail: string }[] = [];
 	await pool.query("select 1");
 	checks.push({ name: "postgres", ok: true, detail: "reachable" });
-	const pending = await pendingMigrationCount(pool);
-	checks.push({ name: "migrations", ok: pending === 0, detail: `${pending} pending` });
+	const schema = await schemaCompatibility(pool, releaseVersion());
+	checks.push({ name: "migrations", ok: schema.ok, detail: schema.detail });
 	const controls = await pool.query<{ kill_switch: boolean; active_config_version: string | null }>(
 		"select kill_switch, active_config_version from gateway_controls where id = 1",
 	);
@@ -326,7 +343,7 @@ async function doctor(session: Session, out: Output): Promise<boolean> {
 		});
 	}
 	// Checks of tables and queues newer migrations create: skipped until they are applied.
-	if (pending === 0) {
+	if (schema.ok) {
 		// An action that began and never reported may or may not have happened: an operator checks
 		// the provider. One overdue that the sweep has not settled means the controller is behind.
 		const tools = await pool.query<{ unknown: number; overdue: number }>(
@@ -400,7 +417,9 @@ async function doctor(session: Session, out: Output): Promise<boolean> {
 async function recordBackupCheck(report: BackupCheckReport, maxAgeHours: number): Promise<void> {
 	const failed = report.checks.filter((check) => !check.ok);
 	const session = await openSession();
+	let lock: DeploymentLock | undefined;
 	try {
+		lock = await holdDeploymentLock(requireSetting("DATABASE_URL"), exitOnLostLock);
 		await recordMaintenanceResult(session.deps, "backup", {
 			ok: report.ok,
 			error: report.ok
@@ -411,6 +430,7 @@ async function recordBackupCheck(report: BackupCheckReport, maxAgeHours: number)
 			detail: { max_age_hours: maxAgeHours, backup: report.backup },
 		});
 	} finally {
+		await lock?.release();
 		await session.close();
 	}
 }
@@ -453,6 +473,76 @@ export async function runCommand(args: Readonly<string[]>, out: Output): Promise
 	}
 	if (group === "db" && action === "migrate") {
 		await migrate(out);
+		return 0;
+	}
+	if (group === "version") {
+		const local = await loadLocalSchema();
+		out.print(
+			json({
+				version: serviceVersion(),
+				release: releaseVersion(),
+				migrations: local.migrations.length,
+				schema_head: local.migrations.at(-1)?.tag ?? null,
+			}),
+		);
+		return 0;
+	}
+	if (group === "db" && action === "status") {
+		const pool = createPool(requireSetting("DATABASE_URL"), 1);
+		try {
+			const local = await loadLocalSchema();
+			const state = await readSchemaState(pool);
+			const release = releaseVersion();
+			const compatibility = checkCompatibility(local, state, release);
+			out.print(
+				json({
+					release,
+					shipped_migrations: local.migrations.length,
+					applied_migrations: state?.hashes.length ?? 0,
+					certified_releases: state?.certified ?? [],
+					compatible: compatibility.ok,
+					detail: compatibility.detail,
+				}),
+			);
+			return compatibility.ok ? 0 : 1;
+		} finally {
+			await pool.end();
+		}
+	}
+	if (group === "db" && action === "create-role") {
+		const connectionString = requireSetting("DATABASE_URL");
+		const role = arg(args, 2, "role");
+		const urlFile = arg(args, 3, "url-file");
+		const password = randomBytes(24).toString("base64url");
+		const url = new URL(connectionString);
+		url.username = role;
+		url.password = password;
+		// The new URL is written beside the old one first and replaces it only once the password
+		// changed: a failure on either side never leaves the service a URL that no longer works.
+		const pending = `${urlFile}.pending`;
+		// A pending file left by an interrupted rotation may hold the only working URL.
+		if (secretFileExists(pending)) {
+			throw new Error(`${pending} is left from an earlier change; move it to ${urlFile} first`);
+		}
+		writeSecretFile(pending, url.toString());
+		const pool = createPool(connectionString, 1);
+		try {
+			await createLoginRole(pool, role, password);
+		} catch (error) {
+			rmSync(pending, { force: true });
+			throw error;
+		} finally {
+			await pool.end();
+		}
+		try {
+			renameSync(pending, urlFile);
+		} catch (error) {
+			throw new Error(
+				`the password changed, but ${urlFile} could not be replaced; the working URL is in ${pending}: move it there`,
+				{ cause: error },
+			);
+		}
+		out.print(`role ${role} can log in; its connection URL is in ${urlFile}`);
 		return 0;
 	}
 	if (group === "db" && action === "grant-worker") {
@@ -549,15 +639,57 @@ export async function runCommand(args: Readonly<string[]>, out: Output): Promise
 	}
 }
 
+/** A command that lost the deployment lock stops at once: a migration may start now. */
+function exitOnLostLock(error: Error): void {
+	process.stderr.write(
+		`gateway: the deployment lock was lost (${redactText(error.message)}); stopping\n`,
+	);
+	process.exit(1);
+}
+
+/** Session commands that run whether or not this release may run against the schema. */
+const SCHEMA_EXEMPT_COMMANDS: Readonly<string[]> = ["health", "doctor", "kill-all"];
+/** Read-only reports: they need no deployment lock and run during a migration too. */
+const READ_ONLY_COMMANDS: Readonly<string[]> = ["health", "doctor"];
+
 async function runSessionCommand(
 	session: Session,
 	args: Readonly<string[]>,
 	out: Output,
 ): Promise<number> {
-	const { deps, boss } = session;
 	const [group, action] = args;
+	// A flag after the group (`kill-all --release`) is not an action.
+	const command =
+		action === undefined || action.startsWith("--") ? `${group}` : `${group} ${action}`;
+	if (READ_ONLY_COMMANDS.includes(command)) {
+		return dispatchSessionCommand(session, command, args, out);
+	}
+	// Like a service, a command that writes holds the deployment lock: no migration runs under
+	// it. The doctor reports an incompatible schema; kill-all works whatever the schema.
+	const lock = await holdDeploymentLock(requireSetting("DATABASE_URL"), exitOnLostLock);
+	try {
+		if (!SCHEMA_EXEMPT_COMMANDS.includes(command)) {
+			const schema = await schemaCompatibility(session.deps.pool, releaseVersion());
+			if (!schema.ok) {
+				throw new Error(`this CLI cannot run against this database: ${schema.detail}`);
+			}
+		}
+		return await dispatchSessionCommand(session, command, args, out);
+	} finally {
+		await lock.release();
+	}
+}
+
+async function dispatchSessionCommand(
+	session: Session,
+	command: string,
+	args: Readonly<string[]>,
+	out: Output,
+): Promise<number> {
+	const { deps, boss } = session;
+	const [, action] = args;
 	const who = actor();
-	switch (`${group} ${action ?? ""}`.trim()) {
+	switch (command) {
 		case "health":
 		case "doctor":
 			return (await doctor(session, out)) ? 0 : 1;

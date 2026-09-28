@@ -11,10 +11,11 @@ import {
 	runQueue,
 } from "@agent-gateway/contracts";
 import { applyConfig, type ControlPlaneDeps, setDirectoryEntry } from "@agent-gateway/core";
-import { createPool, grantWorkerRole, migrateDatabase } from "@agent-gateway/db";
-import { silentLogger } from "@agent-gateway/logging";
+import { createPool, grantWorkerRole, migrateSchema } from "@agent-gateway/db";
+import { DEVELOPMENT_VERSION, silentLogger } from "@agent-gateway/logging";
 import type { Deliverer } from "@agent-gateway/outbox";
 import { dryRunDeliverers } from "@agent-gateway/outbox";
+import { migrateQueues } from "@agent-gateway/queue";
 import { startTestPostgres, type TestPostgres } from "@agent-gateway/testkit";
 import { type RunningWorker, startWorker } from "@agent-gateway/worker";
 import type pg from "pg";
@@ -93,7 +94,12 @@ export type TestGateway = Readonly<{
 export async function startTestGateway(options: TestGatewayOptions = {}): Promise<TestGateway> {
 	const postgres = await startTestPostgres();
 	const pool = createPool(postgres.connectionString, 4);
-	await migrateDatabase(pool);
+	await migrateSchema({
+		pool,
+		connectionString: postgres.connectionString,
+		release: DEVELOPMENT_VERSION,
+		migrateQueues: () => migrateQueues(postgres.connectionString),
+	});
 
 	const workerUrl = new URL(postgres.connectionString);
 	workerUrl.username = WORKER_ROLE;

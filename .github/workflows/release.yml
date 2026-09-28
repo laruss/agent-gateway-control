@@ -1,0 +1,195 @@
+name: release
+
+# Publishes a release from a SemVer tag vX.Y.Z (see docs/operations/releases.md):
+# 1. checks the tag, the changelog and the migration manifest;
+# 2. runs CI, the e2e suite and the security scans again on the tagged commit;
+# 3. builds and tests the images and the bundle (package.yml);
+# 4. copies the tested images to GHCR unchanged, attests them (provenance and SBOM), assembles
+#    the bundle for the GHCR images, attests it, and publishes the GitHub Release.
+# Nothing here deploys anywhere: an operator installs a release by hand.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+      - id: version
+        name: The tag is a release version on main
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
+            { echo "::error::$tag is not vX.Y.Z"; exit 1; }
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main ||
+            { echo "::error::$tag is not on main"; exit 1; }
+          echo "version=${tag#v}" >>"$GITHUB_OUTPUT"
+      - name: The changelog and the migration manifest name this release
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          grep -q "^## \[$VERSION\]" CHANGELOG.md ||
+            { echo "::error::CHANGELOG.md has no section for $VERSION"; exit 1; }
+          migrations=packages/db/migrations
+          head="$(jq -r '.entries[-1].tag' "$migrations/meta/_journal.json")"
+          pgboss="$(jq -r .pgboss_schema "$migrations/compatibility.json")"
+          jq -e --arg v "$VERSION" --arg head "$head" --argjson pgboss "$pgboss" \
+            '.releases | map(select(.version == $v and .head == $head and .pgboss_schema == $pgboss)) | length == 1' \
+            "$migrations/compatibility.json" >/dev/null ||
+            { echo "::error::compatibility.json must list $VERSION with head $head and pgboss_schema $pgboss"; exit 1; }
+
+  ci:
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+  e2e:
+    needs: validate
+    uses: ./.github/workflows/e2e.yml
+  security:
+    needs: validate
+    uses: ./.github/workflows/security.yml
+  package:
+    needs: validate
+    uses: ./.github/workflows/package.yml
+    with:
+      version: ${{ needs.validate.outputs.version }}
+
+  publish:
+    needs: [validate, ci, e2e, security, package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+      REGISTRY_IMAGE: registry:3@sha256:852b3e4d378c426dda6b318fe9d9bfe8e92a0eccb9926671ec3d3ea17a196696
+      GHCR: ghcr.io/laruss
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          # This job's token can write releases and packages; nothing below needs git access.
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: package.json
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-registry
+          path: ${{ runner.temp }}/registry
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-dist
+          path: ${{ runner.temp }}/tested
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: copy
+        name: Copy the tested images to GHCR, digests unchanged
+        run: |
+          docker run -d --name registry -p 127.0.0.1:5000:5000 \
+            -v "$RUNNER_TEMP/registry:/var/lib/registry" "$REGISTRY_IMAGE"
+          : >"$RUNNER_TEMP/ghcr.env"
+          while IFS== read -r name ref; do
+            digest="${ref#*@}"
+            repository="$GHCR/${ref#localhost:5000/laruss/}"
+            repository="${repository%@*}"
+            skopeo copy --all --preserve-digests --src-tls-verify=false \
+              "docker://$ref" "docker://$repository:$VERSION"
+            copied="$(skopeo inspect --raw "docker://$repository@$digest" | sha256sum | cut -d' ' -f1)"
+            [[ "sha256:$copied" == "$digest" ]] || { echo "::error::$name changed digest"; exit 1; }
+            echo "$name=$repository@$digest" >>"$RUNNER_TEMP/ghcr.env"
+            echo "${name//-/_}_name=$repository" >>"$GITHUB_OUTPUT"
+            echo "${name//-/_}_digest=$digest" >>"$GITHUB_OUTPUT"
+          done <"$RUNNER_TEMP/tested/images.env"
+          cat "$RUNNER_TEMP/ghcr.env"
+      - name: Attest the gateway image
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ steps.copy.outputs.gateway_name }}
+          subject-digest: ${{ steps.copy.outputs.gateway_digest }}
+          push-to-registry: true
+      - name: Attest the gateway image's SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ steps.copy.outputs.gateway_name }}
+          subject-digest: ${{ steps.copy.outputs.gateway_digest }}
+          sbom-path: ${{ runner.temp }}/tested/dist/current/agent-gateway.spdx.json
+          push-to-registry: true
+      - name: Attest the Codex worker image
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ steps.copy.outputs.worker_codex_name }}
+          subject-digest: ${{ steps.copy.outputs.worker_codex_digest }}
+          push-to-registry: true
+      - name: Attest the Codex worker image's SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ steps.copy.outputs.worker_codex_name }}
+          subject-digest: ${{ steps.copy.outputs.worker_codex_digest }}
+          sbom-path: ${{ runner.temp }}/tested/dist/current/agent-gateway-worker-codex.spdx.json
+          push-to-registry: true
+      - name: Assemble the bundle for the GHCR images
+        run: |
+          gateway="$(grep '^gateway=' "$RUNNER_TEMP/ghcr.env" | cut -d= -f2)"
+          codex="$(grep '^worker-codex=' "$RUNNER_TEMP/ghcr.env" | cut -d= -f2)"
+          scripts/release/write-images-lock.sh "$VERSION" "$GITHUB_SHA" "$gateway" "$codex" \
+            >"$RUNNER_TEMP/images.lock"
+          mkdir -p "$RUNNER_TEMP/sbom"
+          cp "$RUNNER_TEMP"/tested/dist/current/*.spdx.json "$RUNNER_TEMP/sbom/"
+          scripts/release/assemble-bundle.sh "$VERSION" "$RUNNER_TEMP/images.lock" \
+            "$RUNNER_TEMP/sbom" "$RUNNER_TEMP/dist"
+      - name: Attest the bundle
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            ${{ runner.temp }}/dist/agent-gateway-home-server-v*.tar.gz
+            ${{ runner.temp }}/dist/SHA256SUMS
+            ${{ runner.temp }}/dist/images.lock
+            ${{ runner.temp }}/dist/compose.yaml
+      - name: The images are public
+        run: |
+          docker logout ghcr.io
+          while IFS== read -r name ref; do
+            docker pull --quiet "$ref" >/dev/null ||
+              { echo "::error::$ref cannot be pulled anonymously; make the GHCR package public"; exit 1; }
+          done <"$RUNNER_TEMP/ghcr.env"
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd "$RUNNER_TEMP/dist"
+          # A rerun replaces its own unpublished draft; a published release is never touched.
+          if draft="$(gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            [[ "$draft" == true ]] || { echo "::error::v$VERSION is already published"; exit 1; }
+            gh release delete "v$VERSION" --repo "$GITHUB_REPOSITORY" --yes
+          fi
+          gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+            --title "Agent Gateway $VERSION" --notes-file RELEASE_NOTES.md ./*
+          gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[].name' | sort >"$RUNNER_TEMP/uploaded"
+          find . -maxdepth 1 -type f -printf '%P\n' | sort | diff - "$RUNNER_TEMP/uploaded"
+          # Only the highest version is the latest: a patch of an older line is not.
+          highest="$({ echo "v$VERSION"; gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases --limit 1000 --json tagName --jq '.[].tagName'; } | grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' | sort -V | tail -1)"
+          latest=false
+          [[ "$highest" == "v$VERSION" ]] && latest=true
+          gh release edit "v$VERSION" --repo "$GITHUB_REPOSITORY" --draft=false --latest="$latest"

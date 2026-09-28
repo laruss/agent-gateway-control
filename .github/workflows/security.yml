@@ -7,6 +7,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The release workflow runs it again on the tagged commit.
+  workflow_call:
   schedule:
     # Daily: new advisories arrive without a push.
     - cron: "17 4 * * *"

@@ -138,6 +138,14 @@
   and PID limits, separate networks) and per-run containment of the unconfined runtimes are
   part of the release images; a limit on the worker container alone does not stop a detached
   command of one run.
+- Status (Phase 9): the release stack runs every container as uid 10001 (the services refuse
+  root), on a read-only root filesystem, without capabilities, with `no-new-privileges`, CPU,
+  memory and PID limits and no published port. A worker mounts only its own secrets and
+  volumes and is not on the Mattermost network; host firewall rules close its egress to the
+  LAN. The Codex worker's seccomp profile adds only the namespace and mount calls bubblewrap
+  needs, and the install test proves the sandbox inside the container: no login, no writes
+  outside the workspace, no network. Grok, Kiro, OpenCode and Hermes ship no image until
+  per-run containment exists ([ADR-020](../adr/020-release-pipeline.md)).
 
 ### T5. Supply chain
 
@@ -148,6 +156,13 @@
 - Status (Phase 8): every GitHub Action is pinned by commit SHA. OSV-Scanner checks `bun.lock`
   (development dependencies included) for vulnerabilities and licenses against an allowlist,
   and exceptions expire ([security scans](../operations/security-scans.md)).
+- Status (Phase 9): images build from digest-pinned bases, a fixed Debian snapshot with exact
+  package versions, `bun.lock` without install scripts, and runtime CLIs checked by SHA-256.
+  They reproduce bit for bit (CI builds twice and compares). The release publishes the tested
+  image bytes, with build provenance and SPDX SBOM attestations, a checksummed and attested
+  bundle, and `images.lock`; the stack runs every image by digest. Claude Code is never
+  redistributed: the operator builds its worker from a pinned, checksummed binary
+  ([ADR-020](../adr/020-release-pipeline.md)).
 
 ### T6. Runaway spend
 

@@ -6,6 +6,38 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ### Added
 
+- The release pipeline (ADR-020):
+  - release images `agent-gateway` (controller, CLI, Gmail connector, tool runner, mock
+    worker) and `agent-gateway-worker-codex`, linux/amd64, reproducible bit for bit from pinned
+    inputs (base image digest, Debian snapshot, `bun.lock`, checksummed CLI archives);
+  - SPDX SBOMs, build provenance and SBOM attestations, and a checksummed, attested bundle:
+    the Compose stack by digest (`images.lock`), `bin/agw`, `init-home.sh`,
+    `verify-release.sh`, `INSTALL.md`, `UPGRADE.md`, `ROLLBACK.md`, `MIGRATIONS.md` and a
+    recipe for an operator-built Claude Code worker;
+  - `package.yml` on every change: build twice and compare, bundle, and an install test on a
+    runner without the checkout (smoke mention, versions, hardening, the Codex sandbox,
+    upgrade and rollback);
+  - `release.yml` on a `vX.Y.Z` tag: CI again, then GHCR, attestations and the GitHub
+    Release.
+- Hardened containers: uid 10001, read-only root filesystem, no capabilities,
+  `no-new-privileges`, CPU/memory/PID limits, separate networks, and a seccomp profile that
+  lets bubblewrap confine a runtime's commands inside the container. Services refuse to run as
+  root.
+- Schema compatibility: every migration is `expand` or `contract`
+  (`packages/db/migrations/compatibility.json`); `gateway db migrate` certifies the releases
+  that may run on the result, and every service and CLI session command refuses a database
+  it is not certified for. A rollback by one release after expand-only migrations needs no
+  restore. New commands `gateway db status`, `gateway db create-role` and `gateway version`.
+- The deployment lock: services hold it shared, `gateway db migrate` exclusively, so a
+  migration never runs under live services.
+
+### Changed
+
+- The controller no longer migrates the pg-boss schema or creates queues on start;
+  `gateway db migrate` does both. Run it before starting a new version.
+- `@agent-gateway/testkit`'s packages are development dependencies, and the controller
+  declares `@agent-gateway/policy`, which it loads at run time.
+
 - Observability (ADR-019):
   - metrics on every service's `/metrics` (Prometheus text format), with database gauges
     from the controller and a collection-success flag;

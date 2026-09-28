@@ -1,0 +1,3 @@
+#!/bin/sh
+# The connector-gmail of the Gateway image; the sources run directly under Bun.
+exec bun /opt/agent-gateway/apps/connector-gmail/src/main.ts "$@"

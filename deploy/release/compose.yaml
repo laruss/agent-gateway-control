@@ -1,0 +1,288 @@
+# Agent Gateway home server stack, release @VERSION@. Generated from deploy/release/compose.yaml:
+# every image is pinned by digest (images.lock). Run it through bin/agw, which sets the project
+# name and the settings file (see INSTALL.md); state lives outside the release directory, so an
+# upgrade or a rollback only swaps this file.
+name: agent-gateway
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  init: true
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "5"
+
+x-gateway-environment: &gateway-environment
+  GATEWAY_ENV: production
+  TZ: UTC
+
+networks:
+  # The Gateway database and the services; nothing here reaches beyond the stack.
+  agent-control:
+    internal: true
+  # Shared with the Mattermost stack: the controller and the CLI (bootstrap) reach Mattermost.
+  agent-mm:
+    external: true
+    name: ${MATTERMOST_NETWORK:-agent-mm}
+  # Outbound internet for the runtimes, Google and tool providers. Workers are not on agent-mm;
+  # block the host's and Mattermost's addresses from this network (INSTALL.md, "Egress").
+  egress: {}
+
+volumes:
+  postgres-data:
+    name: agent-gateway-postgres
+  codex-home:
+    name: agent-gateway-codex-home
+  codex-workspaces:
+    name: agent-gateway-codex-workspaces
+  claude-home:
+    name: agent-gateway-claude-home
+  claude-workspaces:
+    name: agent-gateway-claude-workspaces
+
+services:
+  gateway-postgres:
+    <<: *hardening
+    image: "@POSTGRES_IMAGE@"
+    # The entrypoint prepares the data directory as root, then runs PostgreSQL as its own user.
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+    environment:
+      POSTGRES_DB: gateway
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      TZ: UTC
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ${GATEWAY_HOME:?set GATEWAY_HOME}/secrets/postgres:/run/secrets:ro
+    tmpfs:
+      - /var/run/postgresql:size=16m,mode=0775,uid=70,gid=70
+      - /tmp:size=64m,nosuid,nodev
+    networks: [agent-control]
+    shm_size: 256m
+    cpus: 2
+    mem_limit: 1g
+    pids_limit: 256
+    stop_grace_period: 60s
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # Administration: `bin/agw run --rm gateway-cli gateway <command>`. It owns the database and
+  # writes the bot tokens during `gateway mattermost bootstrap`, so it mounts the controller's
+  # secrets writable.
+  gateway-cli:
+    <<: *hardening
+    image: "@GATEWAY_IMAGE@"
+    profiles: [cli]
+    restart: "no"
+    command: ["gateway", "--help"]
+    environment:
+      <<: *gateway-environment
+      DATABASE_URL_FILE: /run/secrets/database_url
+      MATTERMOST_URL: ${MATTERMOST_URL:-}
+      SECRETS_DIR: /run/secrets
+    volumes:
+      - ${GATEWAY_HOME}/secrets/controller:/run/secrets
+      - ${GATEWAY_HOME}/secrets:/secrets
+      - ${GATEWAY_HOME}/config:/config:ro
+      - ${GATEWAY_HOME}/backups:/backups
+    tmpfs:
+      - /tmp:size=256m,nosuid,nodev
+    networks: [agent-control, agent-mm]
+    depends_on:
+      gateway-postgres:
+        condition: service_healthy
+
+  gateway-controller:
+    <<: *hardening
+    image: "@GATEWAY_IMAGE@"
+    command: ["gateway-controller"]
+    environment:
+      <<: *gateway-environment
+      DATABASE_URL_FILE: /run/secrets/database_url
+      OUTBOX_DELIVERY: mattermost
+      MATTERMOST_URL: ${MATTERMOST_URL:?set MATTERMOST_URL}
+      GATEWAY_ROUTING_KEY_FILE: /run/secrets/gateway_routing_key
+    volumes:
+      - ${GATEWAY_HOME}/secrets/controller:/run/secrets:ro
+    tmpfs:
+      - /tmp:size=64m,nosuid,nodev,noexec
+    networks: [agent-control, agent-mm]
+    cpus: 1
+    mem_limit: 512m
+    pids_limit: 128
+    stop_grace_period: 30s
+    healthcheck: &health
+      test: ["CMD", "gateway-healthcheck", "8080"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      gateway-postgres:
+        condition: service_healthy
+
+  # Runs agents on Codex. Its seccomp and AppArmor profiles add only what bubblewrap needs to
+  # confine the commands Codex runs (seccomp/, apparmor/); log in once with
+  # `bin/agw run --rm gateway-worker-codex codex login --device-auth` or set CODEX_API_KEY_FILE.
+  gateway-worker-codex:
+    <<: *hardening
+    image: "@WORKER_CODEX_IMAGE@"
+    profiles: [codex]
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=./seccomp/worker-sandbox.json
+      # On AppArmor hosts: Docker's default profile plus bubblewrap's mounts, loaded by
+      # bin/init-home.sh. Ignored where AppArmor is off.
+      - apparmor=agent-gateway-worker
+    environment:
+      <<: *gateway-environment
+      DATABASE_URL_FILE: /run/secrets/database_url
+      HEALTH_PORT: "8081"
+      WORKER_CONCURRENCY: ${CODEX_WORKER_CONCURRENCY:-1}
+      CODEX_API_KEY_FILE: ${CODEX_API_KEY_FILE:-}
+    volumes:
+      - ${GATEWAY_HOME}/secrets/worker-codex:/run/secrets:ro
+      - codex-home:/var/lib/agent-gateway/codex-home
+      - codex-workspaces:/var/lib/agent-gateway/workspaces
+    tmpfs:
+      - /tmp:size=512m,nosuid,nodev
+    networks: [agent-control, egress]
+    cpus: 2
+    mem_limit: 2g
+    pids_limit: 256
+    # A run in progress is cancelled on stop and retried from the queue by the next worker.
+    stop_grace_period: 60s
+    healthcheck:
+      <<: *health
+      test: ["CMD", "gateway-healthcheck", "8081"]
+    depends_on:
+      gateway-postgres:
+        condition: service_healthy
+
+  # Runs agents on Claude Code, from an image you build yourself: Claude Code may not be
+  # redistributed, so no release image carries it (runtimes/claude-code/README.md). Set
+  # CLAUDE_CODE_WORKER_IMAGE to your build, by digest.
+  gateway-worker-claude-code:
+    <<: *hardening
+    image: ${CLAUDE_CODE_WORKER_IMAGE:-set-CLAUDE_CODE_WORKER_IMAGE}
+    profiles: [claude-code]
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=./seccomp/worker-sandbox.json
+      # On AppArmor hosts: Docker's default profile plus bubblewrap's mounts, loaded by
+      # bin/init-home.sh. Ignored where AppArmor is off.
+      - apparmor=agent-gateway-worker
+    environment:
+      <<: *gateway-environment
+      DATABASE_URL_FILE: /run/secrets/database_url
+      HEALTH_PORT: "8081"
+      WORKER_CONCURRENCY: ${CLAUDE_CODE_WORKER_CONCURRENCY:-1}
+      ANTHROPIC_API_KEY_FILE: ${ANTHROPIC_API_KEY_FILE:-}
+      CLAUDE_CODE_OAUTH_TOKEN_FILE: ${CLAUDE_CODE_OAUTH_TOKEN_FILE:-}
+    volumes:
+      - ${GATEWAY_HOME}/secrets/worker-claude-code:/run/secrets:ro
+      - claude-home:/var/lib/agent-gateway/claude-home
+      - claude-workspaces:/var/lib/agent-gateway/workspaces
+    tmpfs:
+      - /tmp:size=512m,nosuid,nodev
+    networks: [agent-control, egress]
+    cpus: 2
+    mem_limit: 2g
+    pids_limit: 256
+    stop_grace_period: 60s
+    healthcheck:
+      <<: *health
+      test: ["CMD", "gateway-healthcheck", "8081"]
+    depends_on:
+      gateway-postgres:
+        condition: service_healthy
+
+  # The mock runtime: answers every turn without a model. For the install smoke test and for
+  # trying the stack; agents reach it only when the config is applied with --mock-runtimes.
+  gateway-worker-mock:
+    <<: *hardening
+    image: "@GATEWAY_IMAGE@"
+    profiles: [mock]
+    command: ["gateway-worker"]
+    environment:
+      <<: *gateway-environment
+      DATABASE_URL_FILE: /run/secrets/database_url
+      WORKER_ADAPTER: mock
+      WORKER_WORKSPACE_ROOT: /tmp/workspaces
+    volumes:
+      - ${GATEWAY_HOME}/secrets/worker-mock:/run/secrets:ro
+    tmpfs:
+      - /tmp:size=64m,nosuid,nodev,noexec,uid=10001,gid=10001,mode=0700
+    networks: [agent-control]
+    cpus: 0.5
+    mem_limit: 256m
+    pids_limit: 64
+    healthcheck:
+      <<: *health
+      test: ["CMD", "gateway-healthcheck", "8081"]
+    depends_on:
+      gateway-postgres:
+        condition: service_healthy
+
+  gateway-connector-gmail:
+    <<: *hardening
+    image: "@GATEWAY_IMAGE@"
+    profiles: [gmail]
+    command: ["gateway-connector-gmail"]
+    environment:
+      <<: *gateway-environment
+      DATABASE_URL_FILE: /run/secrets/database_url
+      GMAIL_OAUTH_CLIENT_ID_FILE: /run/secrets/gmail_oauth_client_id
+      GMAIL_OAUTH_CLIENT_SECRET_FILE: /run/secrets/gmail_oauth_client_secret
+      GMAIL_REFRESH_TOKEN_FILE: /run/secrets/gmail_refresh_token
+      GMAIL_MAILBOX_ID: ${GMAIL_MAILBOX_ID:-primary}
+      GMAIL_PUBSUB_TOPIC: ${GMAIL_PUBSUB_TOPIC:-}
+      GMAIL_PUBSUB_SUBSCRIPTION: ${GMAIL_PUBSUB_SUBSCRIPTION:-}
+      HEALTH_PORT: "8082"
+    volumes:
+      - ${GATEWAY_HOME}/secrets/gmail:/run/secrets:ro
+    tmpfs:
+      - /tmp:size=32m,nosuid,nodev,noexec
+    networks: [agent-control, egress]
+    cpus: 0.5
+    mem_limit: 256m
+    pids_limit: 128
+    healthcheck:
+      <<: *health
+      test: ["CMD", "gateway-healthcheck", "8082"]
+    depends_on:
+      gateway-postgres:
+        condition: service_healthy
+
+  gateway-tool-runner:
+    <<: *hardening
+    image: "@GATEWAY_IMAGE@"
+    profiles: [tools]
+    command: ["gateway-tool-runner"]
+    environment:
+      <<: *gateway-environment
+      DATABASE_URL_FILE: /run/secrets/database_url
+      TOOL_RUNNER_NAMESPACES: ${TOOL_RUNNER_NAMESPACES:-finance}
+      HEALTH_PORT: "8083"
+    volumes:
+      - ${GATEWAY_HOME}/secrets/tool-runner:/run/secrets:ro
+    tmpfs:
+      - /tmp:size=32m,nosuid,nodev,noexec
+    networks: [agent-control, egress]
+    cpus: 0.5
+    mem_limit: 256m
+    pids_limit: 128
+    healthcheck:
+      <<: *health
+      test: ["CMD", "gateway-healthcheck", "8083"]
+    depends_on:
+      gateway-postgres:
+        condition: service_healthy

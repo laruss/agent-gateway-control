@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "@agent-gateway/contracts": "workspace:*",
+    "@agent-gateway/db": "workspace:*",
     "@agent-gateway/logging": "workspace:*",
     "@agent-gateway/queue": "workspace:*",
     "@agent-gateway/runtime-claude": "workspace:*",
@@ -15,8 +16,8 @@
     "@agent-gateway/runtime-grok": "workspace:*",
     "@agent-gateway/runtime-hermes": "workspace:*",
     "@agent-gateway/runtime-kiro": "workspace:*",
-    "@agent-gateway/runtime-opencode": "workspace:*",
     "@agent-gateway/runtime-mock": "workspace:*",
+    "@agent-gateway/runtime-opencode": "workspace:*",
     "@agent-gateway/runtime-sdk": "workspace:*",
     "@agent-gateway/service": "workspace:*",
     "pg-boss": "12.34.0"

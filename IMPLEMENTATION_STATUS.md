@@ -1646,3 +1646,115 @@ Known gaps, deferred:
     old `next_attempt_at` and could lose its payload at once; dying now dates it.
   - Fixed (Codex P2): a retention pass interrupted by a stopping controller was recorded as a
     success; it is not, and it is due again at once.
+
+## Phase 9 - GitHub release pipeline
+
+Status: **done** (review closed after round 5, the round limit: its two P2 are fixed; no release
+tagged yet)
+
+| Item | State | Evidence |
+|------|-------|----------|
+| Reproducible containers: `agent-gateway` and `agent-gateway-worker-codex` from a digest-pinned `oven/bun`, a fixed Debian snapshot with exact versions, `bun.lock` without install scripts and checksummed Codex archives; timestamps from the commit; CI builds twice on independent builders and compares digests | done | `deploy/images/Dockerfile`, `scripts/release/build-images.sh`, `.github/workflows/package.yml` |
+| GHCR publishing: the tested image bytes are copied with their digests unchanged; anonymous pulls are checked | done | `.github/workflows/release.yml` |
+| SBOM: SPDX 2.3 from Syft per image, shipped in the bundle and attested | done | `package.yml`, `release.yml` |
+| Attestations and checksums: build provenance and SBOM attestations for the images; the archive, `SHA256SUMS`, `images.lock` and `compose.yaml` attested; `verify-release.sh` checks them | done | `release.yml`, `deploy/release/bin/verify-release.sh` |
+| Release bundle: the hardened Compose stack by digest, `agw`, `init-home.sh`, the seccomp profile, the example configuration with prompts, schemas, the secrets layout, the Claude Code worker recipe, SBOMs; reproducible archive | done | `deploy/release/`, `scripts/release/assemble-bundle.sh` |
+| Upgrade and rollback docs: `INSTALL.md`, `UPGRADE.md`, `ROLLBACK.md`, `MIGRATIONS.md` (generated), `RELEASE_NOTES.md` (from the changelog); maintainer guide | done | `deploy/release/*.md`, [docs/operations/releases.md](docs/operations/releases.md) |
+| Exact image lock: `images.lock` with every image (PostgreSQL too) by digest and the runtime pins; the stack refers to images only by digest | done | `scripts/release/write-images-lock.sh` |
+| Schema rules: migration kinds, certificates written by `gateway db migrate`, the schema gate in every service and mutating CLI command, `gateway db status`; services never migrate (pg-boss `migrate: false`); the deployment lock | done | `packages/db/src/compatibility.ts`, `deployment-lock.ts`, migrations `0013`, `0014` |
+| Container hardening (deferred from Phase 8): uid 10001 and a root refusal, read-only root filesystem, no capabilities, `no-new-privileges`, limits, separate networks, the worker seccomp profile for bubblewrap | done | `deploy/release/compose.yaml`, `deploy/images/seccomp/worker-sandbox.json`, `packages/service/src/startup.ts` |
+| `gateway version`, `gateway db create-role` | done | `apps/cli/src/commands.ts` |
+
+Acceptance (the install test, `scripts/release/install-test.sh`, runs in `package.yml` on a
+runner without the checkout; the schema rules also in `apps/cli/src/migrate.integration.test.ts`):
+
+- [x] A clean machine installs from the release without a source checkout: the bundle and
+  the images only, following INSTALL.md (home, database, roles, configuration, Mattermost
+  bootstrap), and a mention in Mattermost is answered by the agent's bot.
+- [x] Release versions are reported by all services: `gateway_build_info` of every running
+  service and `gateway version` carry `X.Y.Z+<commit>`; an image without a version does not
+  build.
+- [x] The previous release can be restored under documented schema rules: after an upgrade to
+  a release with an expand migration, the previous release's stack starts again on the
+  migrated database without a restore, and no mention is answered twice. A contract migration,
+  a changed history, an uncertified release and an interrupted migration are refused.
+
+Deliberate choices in this phase ([ADR-020](docs/adr/020-release-pipeline.md), advised by Codex
+astra):
+
+- One shared gateway image plus a Codex worker image; separate containers keep the secrets
+  apart.
+- Claude Code is built by the operator from a recipe (its license forbids redistribution);
+  Grok, Kiro, OpenCode and Hermes ship no image until per-run containment exists.
+- linux/amd64 only.
+- Certificates in the database instead of migration counts: an older release needs no
+  knowledge of a newer one.
+- Planned downtime for every upgrade, enforced by the deployment lock.
+- GitHub attestations, no cosign.
+
+Known gaps, deferred:
+
+- The database owner is PostgreSQL's superuser in the stack; separating a non-login owner from
+  the controller's runtime role needs row-level security policies for the controller.
+- Worker egress to the LAN and to Mattermost's public URL is closed by host firewall rules
+  (INSTALL.md), not by the stack.
+- Claude Code's Bash sandbox may not start inside the container; agents without `tests.run`
+  are unaffected, and `gateway runtime doctor` shows it.
+- Per-run containment of the unconfined runtimes remains open; their agents cannot be released.
+- No release has been tagged yet: the first `vX.Y.Z` also needs the one-time repository setup
+  (immutable releases, a tag ruleset, public GHCR packages).
+
+### Phase 9 review log
+
+- Round 1 (Codex + Opus subagent): Codex 5 P1, Opus 1 P1 + 2 P2 + 8 P3. Fixed:
+  - the install guide ran a downloaded script before verifying its provenance;
+  - the configuration directory was unreadable to the CLI container, and the install test
+    hid it;
+  - existing worker roles could not call `gateway_schema_state()`;
+  - the AppArmor profile lacked `userns` where the kernel mediates it;
+  - the manifest was not formatted;
+  - the Gmail connector's role;
+  - the pg-boss schema version was not bound to the certificates;
+  - migration times must increase;
+  - SCRAM verifiers for new roles;
+  - `kill-all --release` did not match its command;
+  - a heartbeat on the deployment lock;
+  - the install test also starts the Codex worker and the tool runner and checks that
+    `db migrate` refuses under live services;
+  - the upgrade and rollback steps for grants and the AppArmor profile;
+  - a publish rerun replaces its own draft.
+- Round 2: Codex 3 P2, Opus 1 P2 + 7 P3. Fixed:
+  - an older release's migrate certified itself on a newer pg-boss schema; the manifest now
+    records the build's own pg-boss schema, an integration test checks it, and every check
+    requires it;
+  - a half-migrated development database counted as compatible;
+  - `create-role` could leave a service with a stale URL;
+  - `sudo` dropped `GATEWAY_HOME`;
+  - CLI session commands hold the deployment lock;
+  - the install test's refusal and sandbox checks have positive controls;
+  - the publish job has no persisted credentials and runs no install scripts;
+  - `--latest` only for the highest release.
+- Round 3: Codex 3 P2, Opus 0 P1/P2 + 6 P3. Fixed:
+  - a CLI command that lost its lock carried on;
+  - the password of a role in use could change;
+  - a failed rename after a password change hid the working URL;
+  - the upgrade's backup ran with the new CLI;
+  - the rollback test skipped the grants;
+  - a time-of-day-dependent alert test from Phase 8 failed after 20:00 UTC.
+- Round 4: Codex 4 P2, Opus 0 P1/P2 + 5 P3. Fixed:
+  - kill-all ran without the deployment lock;
+  - `backup check --record` could leave its session open;
+  - Gmail consent had no working path from the release (`bin/gmail-authorize.sh`, a host
+    loopback callback);
+  - the install test takes and verifies the pre-upgrade backup.
+- Round 5: Codex 2 P2, Opus 0 P1/P2 + 3 P3. Fixed:
+  - a retried `create-role` could erase the pending working URL;
+  - `bin/agw` ignored an override file;
+  - smaller documentation and cleanup gaps.
+- Kept P3:
+  - `openSession` starts a pg-boss client before `doctor` and `kill-all`, so both fail with
+    pg-boss's own error on a queue schema of another version;
+  - the release workflow cannot prove in advance that the repository enables immutable
+    releases;
+  - the Gmail connector, which needs a real Google account, is not started in the install
+    test.

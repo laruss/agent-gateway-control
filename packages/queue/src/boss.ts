@@ -2,21 +2,25 @@ import type { JobSink, QueueName, SendOptions } from "@agent-gateway/contracts";
 import type pg from "pg";
 import { PgBoss } from "pg-boss";
 
-export type BossRole = "service" | "client";
+export type BossRole = "migrator" | "supervisor" | "client";
 
 /**
- * A service instance supervises queues (maintenance, expiration); a client instance, such as
- * the CLI, only sends and inspects jobs.
+ * - `migrator` (`gateway db migrate` only) creates or upgrades the queue schema;
+ * - `supervisor` (the controller) runs queue maintenance and expiration on the schema as it is;
+ * - `client` (workers, the tool runner, the CLI) only sends, fetches and inspects jobs.
+ *
+ * Only the migrator changes the schema: a service started against a queue schema it does not
+ * match fails instead of migrating it under other running services.
  */
-export function createBoss(connectionString: string, role: BossRole = "service"): PgBoss {
-	const client = role === "client";
+export function createBoss(connectionString: string, role: BossRole): PgBoss {
+	const supervisor = role === "supervisor";
 	return new PgBoss({
 		connectionString,
 		schema: "pgboss",
-		max: client ? 2 : 10,
-		supervise: !client,
-		schedule: !client,
-		migrate: !client,
+		max: role === "client" ? 2 : 10,
+		supervise: supervisor,
+		schedule: supervisor,
+		migrate: role === "migrator",
 	});
 }
 

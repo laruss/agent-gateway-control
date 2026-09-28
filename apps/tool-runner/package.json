@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@agent-gateway/contracts": "workspace:*",
+    "@agent-gateway/db": "workspace:*",
     "@agent-gateway/logging": "workspace:*",
     "@agent-gateway/queue": "workspace:*",
     "@agent-gateway/service": "workspace:*",

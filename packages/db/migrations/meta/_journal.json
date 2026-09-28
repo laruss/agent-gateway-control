@@ -92,6 +92,20 @@
       "when": 1790617486091,
       "tag": "0012_traces_retention_alerts",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1790620800410,
+      "tag": "0013_schema_certifications",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1790623181056,
+      "tag": "0014_schema_state",
+      "breakpoints": true
     }
   ]
 }

@@ -233,14 +233,6 @@ describe("operations: traces, alerts, retention and metrics", () => {
 			);
 			const transitions = await sweepAlertConditions(at(now), { mattermost: null });
 			expect(transitions["maintenance:probe"]).toBeUndefined();
-			expect(
-				(
-					await sweepAlertConditions(at(new Date(now.getTime() + 4 * 3_600_000)), {
-						mattermost: null,
-					})
-				)["maintenance:probe"],
-			).toBe("fired");
-			await gateway.pool.query("delete from maintenance_status where task = 'probe'");
 			expect(transitions).toMatchObject({
 				"budget:global": "fired",
 				"maintenance:backup": "fired",
@@ -255,6 +247,15 @@ describe("operations: traces, alerts, retention and metrics", () => {
 				"budget:global": "resolved",
 				"maintenance:backup": "resolved",
 			});
+			// Last: four hours later may be another UTC day, which would reset the budget.
+			expect(
+				(
+					await sweepAlertConditions(at(new Date(now.getTime() + 4 * 3_600_000)), {
+						mattermost: null,
+					})
+				)["maintenance:probe"],
+			).toBe("fired");
+			await gateway.pool.query("delete from maintenance_status where task = 'probe'");
 		});
 
 		it("removes old content but keeps dedupe, pending work and a failed agent's work", async () => {
