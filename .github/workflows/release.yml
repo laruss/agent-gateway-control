@@ -110,6 +110,7 @@ jobs:
         run: |
           docker run -d --name registry -p 127.0.0.1:5000:5000 \
             -v "$RUNNER_TEMP/registry:/var/lib/registry" "$REGISTRY_IMAGE"
+          set -o pipefail
           jq -r 'to_entries[] | [.key, .value.ref] | @tsv' "$RUNNER_TEMP/tested/images.json" |
             while IFS=$'\t' read -r name ref; do
               digest="${ref#*@}"

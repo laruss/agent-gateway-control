@@ -8,7 +8,7 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 - The release pipeline (ADR-020):
   - release images `agent-gateway` (controller, CLI, Gmail connector, tool runner, mock
-    worker) and `agent-gateway-worker-codex`, linux/amd64, reproducible bit for bit from pinned
+    worker) and `agent-gateway-worker-codex`, reproducible bit for bit from pinned
     inputs (base image digest, Debian snapshot, `bun.lock`, checksummed CLI archives);
   - SPDX SBOMs, build provenance and SBOM attestations, and a checksummed, attested bundle:
     the Compose stack by digest (`images.lock`), `bin/agw`, `init-home.sh`,

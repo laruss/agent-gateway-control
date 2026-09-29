@@ -14,8 +14,16 @@ workflow="$repo/.github/workflows/release.yml"
 version=$(jq -r .release images.lock)
 sha256sum --check --strict --quiet SHA256SUMS
 echo "bundle files: match SHA256SUMS"
-for name in $(jq -r '.manifests | keys[]' images.lock); do
+jq -e '.format == 2' images.lock >/dev/null || {
+	echo "images.lock: not format 2" >&2
+	exit 1
+}
+for name in $(jq -r '.images | keys - ["postgres"] | .[]' images.lock); do
 	ref=$(jq -r --arg n "$name" '.images[$n]' images.lock)
+	jq -e --arg n "$name" '.manifests[$n] | length > 0' images.lock >/dev/null || {
+		echo "images.lock: no platform manifests for $name" >&2
+		exit 1
+	}
 	gh attestation verify "oci://$ref" --repo "$repo" --signer-workflow "$workflow" \
 		--source-ref "refs/tags/v$version" >/dev/null
 	echo "$ref: attested by $workflow at v$version"

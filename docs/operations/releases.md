@@ -112,4 +112,5 @@ network. Set `CANDIDATE=1` to assemble a bundle for a version the changelog does
 - **Seccomp profile:** `bun scripts/generate-seccomp-profile.ts` rewrites
   `deploy/images/seccomp/worker-sandbox.json` from the pinned moby revision; change the
   revision and its checksum in the script to follow Docker's default profile.
-- **Actions and tools:** every action is pinned by commit SHA, and Syft by version and SHA-256.
+- **Actions and tools:** every action is pinned by commit SHA, Syft by version and SHA-256,
+  and BuildKit and QEMU's binfmt image (`package.yml`) by digest.

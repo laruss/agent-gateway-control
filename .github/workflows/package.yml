@@ -31,6 +31,8 @@ env:
   # A pull request or main build is a candidate: its bundle carries the unreleased changes.
   VERSION: ${{ inputs.version || '0.0.1' }}
   CANDIDATE: ${{ inputs.version == '' && '1' || '' }}
+  # Both builders run the same pinned BuildKit: a rebuild later reproduces the published digests.
+  BUILDKIT_IMAGE: moby/buildkit:v0.33.0@sha256:6c2fa84a6b61ccd72899dde4239f8d5717f05f9a8ca6f3cad185fb1a95a94de3
   REGISTRY_IMAGE: registry:3@sha256:852b3e4d378c426dda6b318fe9d9bfe8e92a0eccb9926671ec3d3ea17a196696
   BINFMT_IMAGE: tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
   SYFT_VERSION: 1.52.0
@@ -64,14 +66,17 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           name: release
-          driver-opts: network=host
+          driver-opts: |
+            network=host
+            image=${{ env.BUILDKIT_IMAGE }}
       - name: Build the images
         run: |
           mkdir -p "$RUNNER_TEMP/images"
           scripts/release/build-images.sh "$VERSION" localhost:5000/laruss "$RUNNER_TEMP/images/current.env"
       - name: Build them again from scratch and compare
         run: |
-          docker buildx create --name reproduce --driver docker-container --driver-opt network=host
+          docker buildx create --name reproduce --driver docker-container \
+            --driver-opt network=host --driver-opt "image=$BUILDKIT_IMAGE"
           BUILDER=reproduce NO_CACHE=1 scripts/release/build-images.sh "$VERSION" \
             localhost:5000/reproduce "$RUNNER_TEMP/reproduced.env"
           diff <(cut -d@ -f2 "$RUNNER_TEMP/images/current.env") <(cut -d@ -f2 "$RUNNER_TEMP/reproduced.env")
@@ -154,6 +159,7 @@ jobs:
         env:
           SYFT_REGISTRY_INSECURE_USE_HTTP: "true"
         run: |
+          set -o pipefail
           mkdir -p "$RUNNER_TEMP/sbom"
           jq -r 'to_entries[] | .key as $name | .value.ref as $ref
             | .value.platforms | to_entries[] | [$name, ($ref | sub("@.*"; "")), .key, .value] | @tsv' \

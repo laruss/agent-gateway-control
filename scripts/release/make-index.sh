@@ -35,7 +35,7 @@ while IFS== read -r -u 3 name target_ref; do
 	platforms='{}'
 	for spec in "$@"; do
 		platform="${spec%%=*}"
-		ref="$(grep "^$name=" "${spec#*=}" | cut -d= -f2)"
+		ref="$(grep "^$name=" "${spec#*=}" | cut -d= -f2 || true)"
 		[[ "$ref" =~ @sha256:[0-9a-f]{64}$ ]] || {
 			echo "$platform: $name is not pinned by digest: $ref" >&2
 			exit 2
