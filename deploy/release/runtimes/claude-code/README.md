@@ -9,11 +9,12 @@ Code is subject to Anthropic's terms, which you accept yourself.
 
 ```bash
 gateway_image=$(jq -r .images.gateway ../../images.lock)
-docker buildx build --platform linux/amd64 --build-arg GATEWAY_IMAGE="$gateway_image" \
+docker buildx build --build-arg GATEWAY_IMAGE="$gateway_image" \
   -t <your registry>/agent-gateway-worker-claude-code:<release> --push .
 ```
 
-The Dockerfile checks the binary's SHA-256 (Anthropic's release manifest for the pinned
+It builds for the Docker host's platform (add `--platform linux/amd64` or `linux/arm64` for
+another). The Dockerfile checks the binary's SHA-256 (Anthropic's release manifest for the pinned
 version), installs bubblewrap and socat from the gateway image's fixed Debian snapshot, and sets
 `WORKER_RUNTIME_VERSION`: the worker refuses any other Claude Code version. Push it to a
 registry you control and put its digest in `gateway.env`:

@@ -88,7 +88,7 @@ USER 10001:10001
 CMD ["gateway", "version"]
 
 # The Codex CLI, per architecture: the release archive of openai/codex, checked by SHA-256.
-# Releases build linux/amd64 only; arm64 serves local development.
+# Releases build both, each on a runner of its own platform.
 FROM scratch AS codex-amd64
 ADD --checksum=sha256:aff46539a83aff86e3c62c592bce2c50d95391f9df289afaf03a50c01d14533d \
 	https://github.com/openai/codex/releases/download/rust-v0.156.1/codex-x86_64-unknown-linux-musl.tar.gz \

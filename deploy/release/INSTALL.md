@@ -7,9 +7,9 @@ source checkout. Upgrades are in [UPGRADE.md](UPGRADE.md), rollbacks in
 
 ## What you need
 
-- A Linux host, `linux/amd64`, with Docker Engine 27 or later and Compose v2.30 or later. The
-  images are built for amd64 only; check with `docker info --format '{{.Architecture}}'`
-  (`x86_64`).
+- A Linux host, `linux/amd64` or `linux/arm64`, with Docker Engine 27 or later and Compose
+  v2.30 or later; Docker pulls the host's platform from each image. On macOS, run them in a
+  Linux VM: the worker's sandbox needs the VM's seccomp and, where it has one, AppArmor.
 - `curl`, `jq` and `sha256sum`; the [GitHub CLI](https://cli.github.com) (`gh`) to verify the
   attestations.
 - A running Mattermost (a supported ESR) on a Docker network the Gateway joins
@@ -38,7 +38,7 @@ done
 sha256sum --check --strict SHA256SUMS       # the other assets match the attested checksums
 tar -xzf "agent-gateway-home-server-v$version.tar.gz" -C ..
 cd "../agent-gateway-home-server-v$version"
-bin/verify-release.sh                       # the bundle's files, and the images' attestations
+bin/verify-release.sh                       # the bundle's files, the images' attestations and platforms
 ```
 
 The attestations prove that the archive, `SHA256SUMS` and every image in `images.lock` were
