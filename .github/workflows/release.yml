@@ -4,8 +4,9 @@ name: release
 # 1. checks the tag, the changelog and the migration manifest;
 # 2. runs CI, the e2e suite and the security scans again on the tagged commit;
 # 3. builds and tests the images and the bundle (package.yml);
-# 4. copies the tested images to GHCR unchanged, attests them (provenance and SBOM), assembles
-#    the bundle for the GHCR images, attests it, and publishes the GitHub Release.
+# 4. copies the tested images to GHCR unchanged, attests them (the provenance of each index, an
+#    SBOM of each platform's image), assembles the bundle for the GHCR images, attests it, and
+#    publishes the GitHub Release.
 # Nothing here deploys anywhere: an operator installs a release by hand.
 on:
   push:
@@ -105,35 +106,50 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: copy
         name: Copy the tested images to GHCR, digests unchanged
+        # Each image is an index over its platforms' manifests; skopeo copies all of them.
         run: |
           docker run -d --name registry -p 127.0.0.1:5000:5000 \
             -v "$RUNNER_TEMP/registry:/var/lib/registry" "$REGISTRY_IMAGE"
-          : >"$RUNNER_TEMP/ghcr.env"
-          while IFS== read -r name ref; do
-            digest="${ref#*@}"
-            repository="$GHCR/${ref#localhost:5000/laruss/}"
-            repository="${repository%@*}"
-            skopeo copy --all --preserve-digests --src-tls-verify=false \
-              "docker://$ref" "docker://$repository:$VERSION"
-            copied="$(skopeo inspect --raw "docker://$repository@$digest" | sha256sum | cut -d' ' -f1)"
-            [[ "sha256:$copied" == "$digest" ]] || { echo "::error::$name changed digest"; exit 1; }
-            echo "$name=$repository@$digest" >>"$RUNNER_TEMP/ghcr.env"
-            echo "${name//-/_}_name=$repository" >>"$GITHUB_OUTPUT"
-            echo "${name//-/_}_digest=$digest" >>"$GITHUB_OUTPUT"
-          done <"$RUNNER_TEMP/tested/images.env"
-          cat "$RUNNER_TEMP/ghcr.env"
+          set -o pipefail
+          jq -r 'to_entries[] | [.key, .value.ref] | @tsv' "$RUNNER_TEMP/tested/images.json" |
+            while IFS=$'\t' read -r name ref; do
+              digest="${ref#*@}"
+              repository="$GHCR/${ref#localhost:5000/laruss/}"
+              repository="${repository%@*}"
+              skopeo copy --all --preserve-digests --src-tls-verify=false \
+                "docker://$ref" "docker://$repository:$VERSION" </dev/null
+              copied="$(skopeo inspect --raw "docker://$repository@$digest" </dev/null | sha256sum | cut -d' ' -f1)"
+              [[ "sha256:$copied" == "$digest" ]] || { echo "::error::$name changed digest"; exit 1; }
+              key="${name//-/_}"
+              echo "${key}_name=$repository" >>"$GITHUB_OUTPUT"
+              echo "${key}_digest=$digest" >>"$GITHUB_OUTPUT"
+              for arch in amd64 arm64; do
+                platform_digest="$(jq -r --arg n "$name" --arg p "linux/$arch" '.[$n].platforms[$p]' \
+                  "$RUNNER_TEMP/tested/images.json")"
+                echo "${key}_${arch}=$platform_digest" >>"$GITHUB_OUTPUT"
+              done
+            done
+          jq --arg ghcr "$GHCR" 'map_values(.ref |= sub("^localhost:5000/laruss"; $ghcr))' \
+            "$RUNNER_TEMP/tested/images.json" | tee "$RUNNER_TEMP/ghcr.json"
       - name: Attest the gateway image
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ steps.copy.outputs.gateway_name }}
           subject-digest: ${{ steps.copy.outputs.gateway_digest }}
           push-to-registry: true
-      - name: Attest the gateway image's SBOM
+      - name: Attest the gateway image's SBOM, linux/amd64
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ steps.copy.outputs.gateway_name }}
-          subject-digest: ${{ steps.copy.outputs.gateway_digest }}
-          sbom-path: ${{ runner.temp }}/tested/dist/current/agent-gateway.spdx.json
+          subject-digest: ${{ steps.copy.outputs.gateway_amd64 }}
+          sbom-path: ${{ runner.temp }}/tested/dist/current/agent-gateway.linux-amd64.spdx.json
+          push-to-registry: true
+      - name: Attest the gateway image's SBOM, linux/arm64
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ steps.copy.outputs.gateway_name }}
+          subject-digest: ${{ steps.copy.outputs.gateway_arm64 }}
+          sbom-path: ${{ runner.temp }}/tested/dist/current/agent-gateway.linux-arm64.spdx.json
           push-to-registry: true
       - name: Attest the Codex worker image
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
@@ -141,18 +157,23 @@ jobs:
           subject-name: ${{ steps.copy.outputs.worker_codex_name }}
           subject-digest: ${{ steps.copy.outputs.worker_codex_digest }}
           push-to-registry: true
-      - name: Attest the Codex worker image's SBOM
+      - name: Attest the Codex worker image's SBOM, linux/amd64
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ steps.copy.outputs.worker_codex_name }}
-          subject-digest: ${{ steps.copy.outputs.worker_codex_digest }}
-          sbom-path: ${{ runner.temp }}/tested/dist/current/agent-gateway-worker-codex.spdx.json
+          subject-digest: ${{ steps.copy.outputs.worker_codex_amd64 }}
+          sbom-path: ${{ runner.temp }}/tested/dist/current/agent-gateway-worker-codex.linux-amd64.spdx.json
+          push-to-registry: true
+      - name: Attest the Codex worker image's SBOM, linux/arm64
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ steps.copy.outputs.worker_codex_name }}
+          subject-digest: ${{ steps.copy.outputs.worker_codex_arm64 }}
+          sbom-path: ${{ runner.temp }}/tested/dist/current/agent-gateway-worker-codex.linux-arm64.spdx.json
           push-to-registry: true
       - name: Assemble the bundle for the GHCR images
         run: |
-          gateway="$(grep '^gateway=' "$RUNNER_TEMP/ghcr.env" | cut -d= -f2)"
-          codex="$(grep '^worker-codex=' "$RUNNER_TEMP/ghcr.env" | cut -d= -f2)"
-          scripts/release/write-images-lock.sh "$VERSION" "$GITHUB_SHA" "$gateway" "$codex" \
+          scripts/release/write-images-lock.sh "$VERSION" "$GITHUB_SHA" "$RUNNER_TEMP/ghcr.json" \
             >"$RUNNER_TEMP/images.lock"
           mkdir -p "$RUNNER_TEMP/sbom"
           cp "$RUNNER_TEMP"/tested/dist/current/*.spdx.json "$RUNNER_TEMP/sbom/"
@@ -169,10 +190,12 @@ jobs:
       - name: The images are public
         run: |
           docker logout ghcr.io
-          while IFS== read -r name ref; do
-            docker pull --quiet "$ref" >/dev/null ||
-              { echo "::error::$ref cannot be pulled anonymously; make the GHCR package public"; exit 1; }
-          done <"$RUNNER_TEMP/ghcr.env"
+          for ref in $(jq -r '.[].ref' "$RUNNER_TEMP/ghcr.json"); do
+            for platform in linux/amd64 linux/arm64; do
+              docker pull --quiet --platform "$platform" "$ref" >/dev/null ||
+                { echo "::error::$ref ($platform) cannot be pulled anonymously; make the GHCR package public"; exit 1; }
+            done
+          done
       - name: Publish the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# Builds the release images reproducibly and pushes them to a registry:
+# Builds the release images for one platform reproducibly and pushes them to a registry:
 #
 #   build-images.sh <version> <registry prefix> <out file> [<context dir>]
 #
 # e.g. build-images.sh 0.1.0 localhost:5000/laruss images.env. Writes `gateway=<ref>` and
-# `worker-codex=<ref>` (by digest) to <out file>. Timestamps come from SOURCE_DATE_EPOCH (the
+# `worker-codex=<ref>` (by digest) to <out file>, tagged <version>-<arch>; make-index.sh joins
+# the platforms into one index per image. Timestamps come from SOURCE_DATE_EPOCH (the
 # commit time) and are rewritten in every layer; no provenance or SBOM is attached by BuildKit,
 # so the digest depends only on the inputs (the release workflow attests them separately).
 # Set BUILDER to use a given buildx builder, NO_CACHE=1 to build from scratch, and
-# PLATFORM (default linux/amd64).
+# PLATFORM (default linux/amd64; a release builds each platform natively, on its own runner).
 set -euo pipefail
 version="${1:?usage: build-images.sh <version> <registry prefix> <out file> [<context>]}"
 prefix="${2:?registry prefix}"
@@ -30,7 +31,7 @@ for target in gateway worker-codex; do
 		--build-arg "GATEWAY_VERSION=$version" --build-arg "GATEWAY_COMMIT=$commit" \
 		--build-arg SOURCE_DATE_EPOCH \
 		--provenance=false --sbom=false \
-		--output "type=image,name=$repository:$version,push=true,rewrite-timestamp=true,oci-mediatypes=true" \
+		--output "type=image,name=$repository:$version-${platform#linux/},push=true,rewrite-timestamp=true,oci-mediatypes=true" \
 		--metadata-file "$metadata" "$context"
 	digest="$(jq -r '."containerimage.digest"' "$metadata")"
 	rm -f "$metadata"

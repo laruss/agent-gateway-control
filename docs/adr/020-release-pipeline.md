@@ -41,9 +41,14 @@ have different licenses: Codex (Apache-2.0), OpenCode and Hermes (MIT), and Grok
 - **Grok, Kiro, OpenCode and Hermes are not released.** Their CLIs cannot confine their tools
   (ADR-015), and per-run containment, which ADR-019 made a release gate, does not exist yet.
   Web-only use does not lift the gate: web fetch reaches the host's private network.
-- **linux/amd64 only.** It is the one platform tested natively, and it matches Mattermost's
-  image. arm64 builds serve local development; an arm64 release needs its own native
-  qualification.
+- **linux/amd64 and linux/arm64, each qualified natively.** Each platform's images are built
+  and reproduced on a runner of that platform, and the install test runs on both; nothing of
+  the Gateway runs under emulation. Each image is published as an OCI index over the two
+  platform manifests, written from their digests alone, so the same builds give the same index
+  digest. `images.lock` (format 2) pins the index and the digest of each platform's manifest,
+  and `verify-release.sh` checks that the index lists exactly those. Mattermost publishes
+  amd64 images only: its test fixture runs under QEMU on the arm64 runner, and an arm64 host
+  runs Mattermost under emulation or elsewhere.
 - **Pinned inputs:**
   - the base image and the Dockerfile frontend by digest;
   - Debian packages by exact version from a fixed `snapshot.debian.org` date (signatures still
@@ -138,10 +143,11 @@ PostgreSQL keeps the five capabilities its entrypoint needs to prepare the data 
 
 - **`package.yml`** runs on every push to `main`, on every pull request, and from the release
   workflow:
-  1. builds the images into a local registry and checks that they reproduce;
-  2. scans SBOMs (SPDX, Syft) and assembles the bundle;
-  3. builds a synthetic next release with an expand migration;
-  4. on a second runner **without the checkout**, runs `install-test.sh` (install, bootstrap a
+  1. on a runner of each platform, builds the images into a local registry and checks that
+     they reproduce, and builds a synthetic next release with an expand migration;
+  2. joins the platforms into one index per image (`make-index.sh`), scans an SBOM of every
+     platform's image (SPDX, Syft) and assembles the bundles;
+  3. on a runner of each platform **without the checkout**, runs `install-test.sh` (install, bootstrap a
      throwaway Mattermost, smoke mention, versions, hardening, Codex sandbox) with a real
      upgrade to the next release and a rollback without a restore, asserting that no mention
      is answered twice.
@@ -149,7 +155,8 @@ PostgreSQL keeps the five capabilities its entrypoint needs to prepare the data 
   1. validates the tag, the changelog section and the manifest entry;
   2. runs CI, e2e, the security scans and `package.yml` on the tagged commit;
   3. copies the tested images to GHCR with their digests unchanged;
-  4. attests them (build provenance and SBOM, pushed to the registry);
+  4. attests them (the build provenance of each index, an SBOM of each platform's image,
+     pushed to the registry);
   5. assembles the bundle for the GHCR references and attests the archive, `SHA256SUMS`,
      `images.lock` and `compose.yaml`;
   6. checks anonymous pulls, then publishes the release from a draft whose assets were

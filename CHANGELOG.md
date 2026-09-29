@@ -8,7 +8,7 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 - The release pipeline (ADR-020):
   - release images `agent-gateway` (controller, CLI, Gmail connector, tool runner, mock
-    worker) and `agent-gateway-worker-codex`, linux/amd64, reproducible bit for bit from pinned
+    worker) and `agent-gateway-worker-codex`, reproducible bit for bit from pinned
     inputs (base image digest, Debian snapshot, `bun.lock`, checksummed CLI archives);
   - SPDX SBOMs, build provenance and SBOM attestations, and a checksummed, attested bundle:
     the Compose stack by digest (`images.lock`), `bin/agw`, `init-home.sh`,
@@ -28,6 +28,10 @@ All notable changes are documented here. The project follows Semantic Versioning
   that may run on the result, and every service and CLI session command refuses a database
   it is not certified for. A rollback by one release after expand-only migrations needs no
   restore. New commands `gateway db status`, `gateway db create-role` and `gateway version`.
+- linux/arm64 release images next to linux/amd64: each platform built, reproduced and
+  install-tested natively on its own runner, published as one index per image;
+  `images.lock` format 2 pins the index and each platform's manifest, and
+  `verify-release.sh` checks the index against it.
 - The deployment lock: services hold it shared, `gateway db migrate` exclusively, so a
   migration never runs under live services.
 

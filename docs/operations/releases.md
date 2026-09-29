@@ -12,19 +12,23 @@ are in the bundle's `UPGRADE.md` and `ROLLBACK.md`.
 | `agent-gateway-home-server-vX.Y.Z.tar.gz` | The bundle: Compose stack, helpers, runbooks, example configuration, SBOMs |
 | `compose.yaml`, `images.lock` | The stack and its images by digest, readable before download |
 | `RELEASE_NOTES.md`, `MIGRATIONS.md` | The changelog section; the migrations and which earlier releases stay certified |
-| `agent-gateway.spdx.json`, `agent-gateway-worker-codex.spdx.json` | SBOMs of the images (SPDX 2.3) |
+| `<image>.linux-amd64.spdx.json`, `<image>.linux-arm64.spdx.json` | SBOMs of each image per platform (SPDX 2.3) |
 | `SHA256SUMS` | Checksums of every asset |
 
 Images: `ghcr.io/laruss/agent-gateway` and `ghcr.io/laruss/agent-gateway-worker-codex`, tagged
-`X.Y.Z` and always used by digest. Each has a build provenance and an SBOM attestation.
+`X.Y.Z` and always used by digest. Each is an index over `linux/amd64` and `linux/arm64`; the
+index has a build provenance attestation, and each platform's image an SBOM attestation.
 
 ## The workflows
 
 - `package.yml` runs on every push to `main` and every pull request. It:
-  - builds the images twice, on independent builders without cache, and compares the digests;
-  - writes the SBOMs and assembles a candidate bundle (version `0.0.1`);
-  - builds a synthetic next release with one expand migration;
-  - runs the install test on a runner without the checkout.
+  - on an amd64 and an arm64 runner, builds that platform's images twice, on independent
+    builders without cache, and compares the digests; builds a synthetic next release with one
+    expand migration;
+  - joins the platforms into one index per image, writes the SBOMs and assembles a candidate
+    bundle (version `0.0.1`) and the next release's;
+  - runs the install test on a runner of each platform without the checkout (on arm64, the
+    Mattermost fixture runs under QEMU).
 - `release.yml` runs on a tag `vX.Y.Z`. It validates the tag, reruns `ci`, `e2e`, `security`
   and `package` on the tagged commit, then copies the tested images to GHCR, attests them,
   assembles and attests the bundle and publishes the release. It deploys nothing.
@@ -90,7 +94,10 @@ Build and test the images without GitHub (Docker with buildx, on any architectur
 docker run -d --name registry -p 127.0.0.1:5000:5000 registry:3
 docker buildx create --name local --driver docker-container --driver-opt network=host
 BUILDER=local PLATFORM=linux/arm64 scripts/release/build-images.sh 0.0.1 localhost:5000/laruss images.env
+scripts/release/make-index.sh 0.0.1 images.json linux/arm64=images.env
 ```
+
+A local index covers the platforms built; `write-images-lock.sh` needs both.
 
 `scripts/release/assemble-bundle.sh` needs GNU tar, and `scripts/release/install-test.sh` needs
 a Linux Docker host with root, for example a `docker:dind` container sharing the registry's
@@ -105,4 +112,5 @@ network. Set `CANDIDATE=1` to assemble a bundle for a version the changelog does
 - **Seccomp profile:** `bun scripts/generate-seccomp-profile.ts` rewrites
   `deploy/images/seccomp/worker-sandbox.json` from the pinned moby revision; change the
   revision and its checksum in the script to follow Docker's default profile.
-- **Actions and tools:** every action is pinned by commit SHA, and Syft by version and SHA-256.
+- **Actions and tools:** every action is pinned by commit SHA, Syft by version and SHA-256,
+  and BuildKit and QEMU's binfmt image (`package.yml`) by digest.

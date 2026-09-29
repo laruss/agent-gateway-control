@@ -1,11 +1,13 @@
 name: package
 
 # Builds the release images and bundle, and proves them the way an operator would use them:
-# - the images twice, on independent builders without cache: the digests must match;
-# - SBOMs of the images (SPDX, Syft);
+# - each platform's images natively on its own runner (linux/amd64, linux/arm64), twice, on
+#   independent builders without cache: the digests must match;
+# - one index per image over both platforms, and SBOMs of every platform's image (SPDX, Syft);
 # - the bundle, then a synthetic next release with an expand migration;
-# - the install test on a runner without the checkout: install, smoke mention, versions,
-#   hardening, the Codex sandbox, upgrade to the next release and rollback without a restore.
+# - the install test on a runner of each platform without the checkout: install, smoke
+#   mention, versions, hardening, the Codex sandbox, upgrade to the next release and rollback
+#   without a restore.
 # The release workflow calls it with the tag's version and publishes the tested images.
 on:
   push:
@@ -29,14 +31,26 @@ env:
   # A pull request or main build is a candidate: its bundle carries the unreleased changes.
   VERSION: ${{ inputs.version || '0.0.1' }}
   CANDIDATE: ${{ inputs.version == '' && '1' || '' }}
+  # Both builders run the same pinned BuildKit: a rebuild later reproduces the published digests.
+  BUILDKIT_IMAGE: moby/buildkit:v0.33.0@sha256:6c2fa84a6b61ccd72899dde4239f8d5717f05f9a8ca6f3cad185fb1a95a94de3
   REGISTRY_IMAGE: registry:3@sha256:852b3e4d378c426dda6b318fe9d9bfe8e92a0eccb9926671ec3d3ea17a196696
+  BINFMT_IMAGE: tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
   SYFT_VERSION: 1.52.0
   SYFT_SHA256: caeedb81fb0491615f1ebd1761e4145d41ee86dd2cc7bf80669f9f5ad9d6133d
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    env:
+      PLATFORM: linux/${{ matrix.arch }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -52,16 +66,88 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           name: release
-          driver-opts: network=host
+          driver-opts: |
+            network=host
+            image=${{ env.BUILDKIT_IMAGE }}
       - name: Build the images
-        run: scripts/release/build-images.sh "$VERSION" localhost:5000/laruss "$RUNNER_TEMP/images.env"
+        run: |
+          mkdir -p "$RUNNER_TEMP/images"
+          scripts/release/build-images.sh "$VERSION" localhost:5000/laruss "$RUNNER_TEMP/images/current.env"
       - name: Build them again from scratch and compare
         run: |
-          docker buildx create --name reproduce --driver docker-container --driver-opt network=host
+          docker buildx create --name reproduce --driver docker-container \
+            --driver-opt network=host --driver-opt "image=$BUILDKIT_IMAGE"
           BUILDER=reproduce NO_CACHE=1 scripts/release/build-images.sh "$VERSION" \
             localhost:5000/reproduce "$RUNNER_TEMP/reproduced.env"
-          diff <(cut -d@ -f2 "$RUNNER_TEMP/images.env") <(cut -d@ -f2 "$RUNNER_TEMP/reproduced.env")
+          diff <(cut -d@ -f2 "$RUNNER_TEMP/images/current.env") <(cut -d@ -f2 "$RUNNER_TEMP/reproduced.env")
           echo "the images are reproducible"
+      - name: Build a synthetic next release
+        run: |
+          tree="$RUNNER_TEMP/next-tree"
+          git worktree add --detach "$tree" HEAD
+          scripts/release/synthetic-next.sh "$tree" "$VERSION" "$(scripts/release/next-version.sh "$VERSION")"
+          (cd "$tree" && bun install --frozen-lockfile)
+          scripts/release/build-images.sh "$(scripts/release/next-version.sh "$VERSION")" \
+            localhost:5000/laruss "$RUNNER_TEMP/images/next.env" "$tree"
+      - name: Stop the registry
+        run: docker stop registry
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: registry-${{ matrix.arch }}
+          path: ${{ runner.temp }}/registry
+          retention-days: 7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: images-${{ matrix.arch }}
+          path: ${{ runner.temp }}/images
+          retention-days: 7
+
+  # Both platforms' images in one registry, one index per image, the SBOMs and the bundles.
+  bundle:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: package.json
+      - run: bun install --frozen-lockfile
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: registry-amd64
+          path: ${{ runner.temp }}/registry
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: registry-arm64
+          path: ${{ runner.temp }}/registry-arm64
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: images-amd64
+          path: ${{ runner.temp }}/images/amd64
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: images-arm64
+          path: ${{ runner.temp }}/images/arm64
+      - name: Serve both platforms' images
+        # The arm64 images are copied into the amd64 registry, which becomes the release's.
+        run: |
+          docker run -d --name registry -p 127.0.0.1:5000:5000 \
+            -v "$RUNNER_TEMP/registry:/var/lib/registry" "$REGISTRY_IMAGE"
+          docker run -d --name registry-arm64 -p 127.0.0.1:5001:5000 \
+            -v "$RUNNER_TEMP/registry-arm64:/var/lib/registry" "$REGISTRY_IMAGE"
+          images="$RUNNER_TEMP/images"
+          for release in current next; do
+            sed 's#^\([^=]*\)=localhost:5000/#\1=localhost:5001/#' "$images/arm64/$release.env" \
+              >"$images/arm64/$release.served.env"
+          done
+      - name: One index per image
+        run: |
+          images="$RUNNER_TEMP/images"
+          scripts/release/make-index.sh "$VERSION" "$RUNNER_TEMP/images.json" \
+            "linux/amd64=$images/amd64/current.env" "linux/arm64=$images/arm64/current.served.env"
+          scripts/release/make-index.sh "$(scripts/release/next-version.sh "$VERSION")" "$RUNNER_TEMP/next.json" \
+            "linux/amd64=$images/amd64/next.env" "linux/arm64=$images/arm64/next.served.env"
       - name: Install Syft
         run: |
           archive="syft_${SYFT_VERSION}_linux_amd64.tar.gz"
@@ -69,44 +155,42 @@ jobs:
             "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/$archive"
           echo "$SYFT_SHA256  $RUNNER_TEMP/$archive" | sha256sum --check --strict
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" syft
-      - name: SBOMs of the images
+      - name: SBOMs of every platform's images
         env:
           SYFT_REGISTRY_INSECURE_USE_HTTP: "true"
         run: |
+          set -o pipefail
           mkdir -p "$RUNNER_TEMP/sbom"
-          while IFS== read -r name ref; do
-            image=agent-gateway
-            [[ "$name" == gateway ]] || image="agent-gateway-$name"
-            "$RUNNER_TEMP/syft" scan "registry:$ref" --quiet \
-              --source-name "$image" --source-version "$VERSION" \
-              -o "spdx-json=$RUNNER_TEMP/sbom/$image.spdx.json"
-          done <"$RUNNER_TEMP/images.env"
+          jq -r 'to_entries[] | .key as $name | .value.ref as $ref
+            | .value.platforms | to_entries[] | [$name, ($ref | sub("@.*"; "")), .key, .value] | @tsv' \
+            "$RUNNER_TEMP/images.json" |
+            while IFS=$'\t' read -r name repository platform digest; do
+              image=agent-gateway
+              [[ "$name" == gateway ]] || image="agent-gateway-$name"
+              "$RUNNER_TEMP/syft" scan "registry:$repository@$digest" --quiet --platform "$platform" \
+                --source-name "$image" --source-version "$VERSION" \
+                -o "spdx-json=$RUNNER_TEMP/sbom/$image.${platform//\//-}.spdx.json" </dev/null
+            done
           ls -l "$RUNNER_TEMP/sbom"
       - name: Assemble the bundle
         run: |
-          gateway="$(grep '^gateway=' "$RUNNER_TEMP/images.env" | cut -d= -f2)"
-          codex="$(grep '^worker-codex=' "$RUNNER_TEMP/images.env" | cut -d= -f2)"
-          scripts/release/write-images-lock.sh "$VERSION" "$GITHUB_SHA" "$gateway" "$codex" \
+          scripts/release/write-images-lock.sh "$VERSION" "$GITHUB_SHA" "$RUNNER_TEMP/images.json" \
             >"$RUNNER_TEMP/images.lock"
           scripts/release/assemble-bundle.sh "$VERSION" "$RUNNER_TEMP/images.lock" \
             "$RUNNER_TEMP/sbom" "$RUNNER_TEMP/dist/current"
-      - name: Build a synthetic next release
+      - name: Assemble the synthetic next release
         run: |
-          IFS=. read -r major minor patch <<<"$VERSION"
-          next="$major.$minor.$((patch + 1))"
+          next="$(scripts/release/next-version.sh "$VERSION")"
           tree="$RUNNER_TEMP/next-tree"
           git worktree add --detach "$tree" HEAD
           scripts/release/synthetic-next.sh "$tree" "$VERSION" "$next"
           (cd "$tree" && bun install --frozen-lockfile)
-          scripts/release/build-images.sh "$next" localhost:5000/laruss "$RUNNER_TEMP/next.env" "$tree"
-          gateway="$(grep '^gateway=' "$RUNNER_TEMP/next.env" | cut -d= -f2)"
-          codex="$(grep '^worker-codex=' "$RUNNER_TEMP/next.env" | cut -d= -f2)"
-          scripts/release/write-images-lock.sh "$next" "$GITHUB_SHA" "$gateway" "$codex" \
+          scripts/release/write-images-lock.sh "$next" "$GITHUB_SHA" "$RUNNER_TEMP/next.json" \
             >"$RUNNER_TEMP/next.lock"
           (cd "$tree" && CANDIDATE= scripts/release/assemble-bundle.sh "$next" \
             "$RUNNER_TEMP/next.lock" "$RUNNER_TEMP/sbom" "$RUNNER_TEMP/dist/next")
-      - name: Stop the registry
-        run: docker stop registry
+      - name: Stop the registries
+        run: docker stop registry registry-arm64
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-registry
@@ -117,7 +201,7 @@ jobs:
           name: release-dist
           path: |
             ${{ runner.temp }}/dist
-            ${{ runner.temp }}/images.env
+            ${{ runner.temp }}/images.json
           retention-days: 7
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -127,11 +211,20 @@ jobs:
             scripts/release/mattermost-test.compose.yaml
           retention-days: 7
 
-  # A clean runner with no checkout: only the bundles, the images and the test harness.
+  # A clean runner of each platform with no checkout: only the bundles, the images and the
+  # test harness.
   install:
-    needs: build
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    needs: bundle
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -154,6 +247,10 @@ jobs:
           for dir in current next; do
             (cd "$RUNNER_TEMP/release/dist/$dir" && sha256sum --check --strict SHA256SUMS)
           done
+      - name: Emulate amd64 for the Mattermost fixture
+        # Mattermost publishes amd64 images only; the Gateway's own images run natively.
+        if: matrix.arch == 'arm64'
+        run: docker run --privileged --rm "$BINFMT_IMAGE" --install amd64
       - name: Restrict unprivileged user namespaces, as Ubuntu does by default
         # The worker's AppArmor profile must allow bubblewrap its namespace even so.
         run: |

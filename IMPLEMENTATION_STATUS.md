@@ -1686,7 +1686,7 @@ astra):
   apart.
 - Claude Code is built by the operator from a recipe (its license forbids redistribution);
   Grok, Kiro, OpenCode and Hermes ship no image until per-run containment exists.
-- linux/amd64 only.
+- linux/amd64 and linux/arm64 (arm64 added before the first release), each built, reproduced and install-tested natively on its own runner.
 - Certificates in the database instead of migration counts: an older release needs no
   knowledge of a newer one.
 - Planned downtime for every upgrade, enforced by the deployment lock.
