@@ -81,7 +81,11 @@ export const AgentConfigSchema = z.strictObject({
 		/** Bot username, equal to the agent id; the bot user id is resolved by bootstrap. */
 		username: MattermostNameSchema,
 		token_secret_file: SecretFileSchema,
-		allowed_channels: z.array(MattermostNameSchema).min(1).max(32),
+		/**
+		 * Channels given in the configuration. Optional: an owner or system admin can also give a
+		 * channel by adding the bot there in Mattermost (ADR-022).
+		 */
+		allowed_channels: z.array(MattermostNameSchema).max(32).default([]),
 	}),
 	runtime: AgentRuntimeConfigSchema,
 	prompts: z.strictObject({

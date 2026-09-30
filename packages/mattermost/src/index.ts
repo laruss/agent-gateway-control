@@ -4,6 +4,7 @@ export * from "./bootstrap.ts";
 export * from "./client.ts";
 export * from "./deliver.ts";
 export * from "./listener.ts";
+export * from "./membership.ts";
 export * from "./mentions.ts";
 export * from "./normalize.ts";
 export * from "./render.ts";

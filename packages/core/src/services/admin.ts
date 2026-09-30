@@ -19,6 +19,7 @@ import {
 	type DirectoryKind,
 	events,
 	gatewayControls,
+	mattermostChannelGrants,
 	mattermostDirectory,
 	mattermostIdentities,
 	type OutboxStatus,
@@ -161,16 +162,35 @@ export async function applyConfig(
 				"delete from source_cursors where source_id ~ '^mattermost:channel(-floor|-floor-posts)?:'",
 			);
 			await markChannelsLeft(uow, [TEAM_CHANGE_MARKER], generation);
+			// Grants were given in the old team's channels: another team starts without any.
+			await db
+				.update(mattermostChannelGrants)
+				.set({
+					state: "revoked",
+					revokedReason: "team_changed",
+					revokedAt: uow.now,
+					generation: sql`${mattermostChannelGrants.generation} + 1`,
+				})
+				.where(eq(mattermostChannelGrants.state, "active"));
 		} else if (previous !== null) {
 			// A channel leaving the configuration loses its catch-up at once: re-added later, it
 			// starts afresh instead of replaying what was posted while it was unmanaged.
+			// A channel an agent was granted stays followed: its catch-up is the grant's.
 			const kept = new Set(input.organization.mattermost.channels);
 			const resolved = await loadDirectory(db, "channel");
+			const granted = new Set(
+				(
+					await db
+						.select({ id: mattermostChannelGrants.channelId })
+						.from(mattermostChannelGrants)
+						.where(eq(mattermostChannelGrants.state, "active"))
+				).map((row) => row.id),
+			);
 			const ids = previous.organization.mattermost.channels
 				.filter((name) => !kept.has(name))
 				.flatMap((name) => {
 					const id = resolved.get(name);
-					return id === undefined ? [] : [id];
+					return id === undefined || granted.has(id) ? [] : [id];
 				});
 			if (ids.length > 0) {
 				await uow.tx.client.query(

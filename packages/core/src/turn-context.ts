@@ -3,7 +3,6 @@ import {
 	type AgentId,
 	type AgentTurnInput,
 	AgentTurnInputSchema,
-	type ChannelRef,
 	type GatewayEvent,
 	type MattermostId,
 	type MemoryItem,
@@ -16,6 +15,7 @@ import {
 	type WorkingSummary,
 } from "@agent-gateway/contracts";
 import type { AgentState } from "@agent-gateway/db";
+import { agentChannelRefs, type ChannelAccess } from "./channel-access.ts";
 
 export type AgentRecord = Readonly<{
 	id: AgentId;
@@ -33,8 +33,8 @@ export type TurnContextSources = Readonly<{
 	constitution: string;
 	/** Every registered agent, including `agent`. */
 	agents: Readonly<AgentRecord[]>;
-	/** Channel ids resolved by bootstrap, by channel name. */
-	channelIds: ReadonlyMap<string, MattermostId>;
+	/** The channels agents may work in: configured (resolved by bootstrap) and granted. */
+	access: ChannelAccess;
 	trigger: GatewayEvent;
 	pendingInbox: Readonly<GatewayEvent[]>;
 	previousRun: Readonly<{ id: Uuid; summary: WorkingSummary | null }> | null;
@@ -57,16 +57,6 @@ export type TurnContextResult =
 	| Readonly<{ ok: true; context: TurnContext }>
 	| Readonly<{ ok: false; reason: string }>;
 
-function resolveChannels(
-	names: Readonly<string[]>,
-	channelIds: ReadonlyMap<string, MattermostId>,
-): ChannelRef[] {
-	return names.flatMap((name) => {
-		const channelId = channelIds.get(name);
-		return channelId === undefined ? [] : [{ channelId, name }];
-	});
-}
-
 /**
  * Assembles the turn input and the authority its result is checked against. Both come from the
  * same sources at the same moment, so the runtime is told exactly what it is allowed to do.
@@ -74,7 +64,7 @@ function resolveChannels(
  */
 export function buildTurnContext(sources: TurnContextSources): TurnContextResult {
 	const { agent, organization, now } = sources;
-	const channels = resolveChannels(agent.config.mattermost.allowed_channels, sources.channelIds);
+	const channels = agentChannelRefs(agent, sources.access);
 	if (channels.length === 0) {
 		return { ok: false, reason: `no allowed channel of '${agent.id}' is resolved to an id` };
 	}
@@ -132,10 +122,7 @@ export function buildTurnContext(sources: TurnContextSources): TurnContextResult
 
 	const addressableAgents: Record<AgentId, MattermostId[]> = {};
 	for (const other of others) {
-		addressableAgents[other.id] = resolveChannels(
-			other.config.mattermost.allowed_channels,
-			sources.channelIds,
-		).map((c) => c.channelId);
+		addressableAgents[other.id] = agentChannelRefs(other, sources.access).map((c) => c.channelId);
 	}
 	return {
 		ok: true,

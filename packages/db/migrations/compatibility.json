@@ -16,7 +16,8 @@
     "0011_approval_guards": "pre-release",
     "0012_traces_retention_alerts": "pre-release",
     "0013_schema_certifications": "expand",
-    "0014_schema_state": "expand"
+    "0014_schema_state": "expand",
+    "0015_channel_grants": "expand"
   },
   "releases": [
     {

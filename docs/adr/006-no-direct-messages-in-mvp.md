@@ -1,6 +1,6 @@
 # ADR-006. No Direct Messages in the MVP
 
-- Status: Accepted
+- Status: Accepted; amended by [ADR-022](022-channel-grants.md) (channels given by adding a bot)
 - Date: 2026-09-24
 
 ## Context

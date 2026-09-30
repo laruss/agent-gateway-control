@@ -32,7 +32,7 @@ import {
 	audit,
 	loadActiveConfig,
 	loadAgents,
-	loadTeamChannels,
+	loadChannelAccess,
 	lockAgent,
 	lockCascade,
 	lockConfigShared,
@@ -181,9 +181,9 @@ export async function ingestInTransaction(
 		});
 		return { status: "accepted", eventId, routes: [] };
 	}
-	const channels = await loadTeamChannels(db);
+	const access = await loadChannelAccess(db);
 	const toRouting = (list: Awaited<ReturnType<typeof loadAgents>>): RoutingAgent[] =>
-		list.map((agent) => toRoutingAgent(agent, channels));
+		list.map((agent) => toRoutingAgent(agent, access));
 	// Every agent this event may wake is locked, in id order, before routing reads its state:
 	// the lock order of every use case (cascade, then agents by id, then runs and waits), and no
 	// concurrent disable or pause can slip between the decision and its effect.

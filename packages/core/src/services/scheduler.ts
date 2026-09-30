@@ -42,6 +42,7 @@ import {
 	type SQL,
 	sql,
 } from "drizzle-orm";
+import { agentChannelIds } from "../channel-access.ts";
 import { requireTransition } from "../state-machine.ts";
 import { type AgentRecord, buildTurnContext } from "../turn-context.ts";
 import { budgetHoldFor } from "./budgets.ts";
@@ -63,8 +64,8 @@ import {
 	isKillSwitchOn,
 	loadActiveConfig,
 	loadAgents,
+	loadChannelAccess,
 	loadOwnerUserIds,
-	loadTeamChannels,
 	lockAgent,
 	raiseAlert,
 	setAgentState,
@@ -250,13 +251,8 @@ export async function scheduleAgent(
 	if (await isKillSwitchOn(db)) {
 		return { skipped: "kill_switch" };
 	}
-	const channelIds = await loadTeamChannels(db);
-	const allowed = new Set(
-		agent.config.mattermost.allowed_channels.flatMap((name) => {
-			const id = channelIds.get(name);
-			return id === undefined ? [] : [id];
-		}),
-	);
+	const access = await loadChannelAccess(db);
+	const allowed = agentChannelIds(agent, access);
 	// Before any match or claim: stale entries neither resume nor wake. With no channel resolved
 	// (no configuration, or a team change before bootstrap) nothing is decided; the context check
 	// below defers the run instead.
@@ -364,7 +360,7 @@ export async function scheduleAgent(
 		organization: config.organization,
 		constitution: config.constitution,
 		agents: await loadAgents(db),
-		channelIds,
+		access,
 		trigger: triggerEvent,
 		pendingInbox: inboxEvents,
 		previousRun: previous,

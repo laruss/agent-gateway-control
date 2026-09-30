@@ -20,6 +20,11 @@ export type RoutingAgent = Readonly<{
 	wakeRules: Readonly<WakeRule[]>;
 	/** Resolved ids of the agent's allowed channels: a post elsewhere never reaches it. */
 	channelIds: ReadonlySet<string>;
+	/**
+	 * Per granted channel, when the agent's bot was added (ms): a post from before it never
+	 * reaches the agent, though the channel's catch-up may be older.
+	 */
+	channelFloors: ReadonlyMap<string, number>;
 }>;
 
 /** Counters the loop guards need, computed by the caller for the event's cascade. */
@@ -203,7 +208,12 @@ export function routeEvent(input: RoutingInput): Readonly<Route[]> {
 			continue;
 		}
 		const post = mattermostPost(event);
-		if (post !== null && !agent.channelIds.has(post.channel_id)) {
+		const floor = post === null ? undefined : agent.channelFloors.get(post.channel_id);
+		if (
+			post !== null &&
+			(!agent.channelIds.has(post.channel_id) ||
+				(floor !== undefined && Date.parse(event.time) <= floor))
+		) {
 			// Checked here, in the ingest transaction, against the configuration being applied:
 			// a permission revoked a moment ago no longer routes.
 			routes.push(route("ignore", "channel_not_allowed"));

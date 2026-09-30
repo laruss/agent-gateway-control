@@ -11,6 +11,11 @@ All notable changes are documented here. The project follows Semantic Versioning
   address, start at boot), the guest setup (fixed LAN address, mDNS name, egress firewall
   unit), the Mattermost 11.7 ESR stack with its own PostgreSQL and Caddy TLS, and daily
   encrypted backups of the whole server copied off the VM by a LaunchDaemon.
+- Channel grants (ADR-022): an owner or a system admin adds an agent's bot to a channel in
+  Mattermost, and within seconds the agent works there, without configuration or a command;
+  removing the bot takes the channel back. An add by anyone else, another agent's bot
+  included, is refused: the bot leaves and the alerts channel says who added it. The agent
+  sees nothing posted before its add. `allowed_channels` is optional.
 - `bin/egress-firewall.sh`: an nftables table that leaves the Gateway's egress bridge only the
   public internet and the host's DNS resolvers.
 

@@ -10,7 +10,7 @@ import { loopStats, type StoredEventPosition } from "./loop-stats.ts";
 import {
 	loadActiveConfig,
 	loadAgents,
-	loadTeamChannels,
+	loadChannelAccess,
 	raiseAlert,
 	toGatewayEvent,
 	toRoutingAgent,
@@ -133,7 +133,7 @@ async function lateMatchAllowed(
 	const guards = await loopStats(uow, event, position);
 	const [route] = routeEvent({
 		event,
-		agents: [toRoutingAgent(agent, await loadTeamChannels(db))],
+		agents: [toRoutingAgent(agent, await loadChannelAccess(db))],
 		waits: [wait],
 		limits,
 		stats: guards.stats,

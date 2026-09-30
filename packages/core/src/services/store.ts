@@ -17,12 +17,20 @@ import {
 	eventRoutes,
 	events,
 	gatewayControls,
+	mattermostChannelGrants,
 	mattermostDirectory,
+	mattermostIdentities,
 	type OutboxKind,
 	outbox,
 } from "@agent-gateway/db";
 import { childTraceparent } from "@agent-gateway/logging";
 import { and, asc, count, eq, inArray, isNull, max, or } from "drizzle-orm";
+import {
+	agentChannelFloors,
+	agentChannelIds,
+	type ChannelAccess,
+	type ChannelGrant,
+} from "../channel-access.ts";
 import type { RoutingAgent } from "../routing.ts";
 import type { AgentRecord } from "../turn-context.ts";
 import type { UnitOfWork } from "./deps.ts";
@@ -198,6 +206,54 @@ export async function loadTeamChannels(db: Db): Promise<Map<string, MattermostId
 	return teams.has(config.organization.mattermost.team) ? loadDirectory(db, "channel") : new Map();
 }
 
+/**
+ * The channels agents may work in (see {@link ChannelAccess}). A grant counts while it is active,
+ * belongs to the configured team as bootstrap resolved it, and names the bot the agent has now,
+ * for an agent of the active configuration.
+ */
+export async function loadChannelAccess(db: Db): Promise<ChannelAccess> {
+	const config = await loadActiveConfig(db);
+	const named = await loadTeamChannels(db);
+	if (config === null) {
+		return { named, granted: new Map() };
+	}
+	const teamId = (await loadDirectory(db, "team")).get(config.organization.mattermost.team);
+	if (teamId === undefined) {
+		return { named, granted: new Map() };
+	}
+	const rows = await db
+		.select({
+			agentId: mattermostChannelGrants.agentId,
+			channelId: mattermostChannelGrants.channelId,
+			name: mattermostChannelGrants.channelName,
+			sinceMs: mattermostChannelGrants.sinceMs,
+		})
+		.from(mattermostChannelGrants)
+		.innerJoin(agents, eq(agents.id, mattermostChannelGrants.agentId))
+		.innerJoin(
+			mattermostIdentities,
+			and(
+				eq(mattermostIdentities.agentId, mattermostChannelGrants.agentId),
+				eq(mattermostIdentities.mattermostUserId, mattermostChannelGrants.botUserId),
+			),
+		)
+		.where(
+			and(
+				eq(mattermostChannelGrants.state, "active"),
+				eq(mattermostChannelGrants.teamId, teamId),
+				eq(agents.configVersion, config.version),
+			),
+		)
+		.orderBy(asc(mattermostChannelGrants.agentId), asc(mattermostChannelGrants.channelId));
+	const granted = new Map<string, ChannelGrant[]>();
+	for (const row of rows) {
+		const list = granted.get(row.agentId) ?? [];
+		list.push({ channelId: row.channelId, name: row.name, sinceMs: row.sinceMs });
+		granted.set(row.agentId, list);
+	}
+	return { named, granted };
+}
+
 /** The organization's owners resolved to Mattermost user ids; they decide approvals. */
 export async function loadOwnerUserIds(db: Db): Promise<MattermostId[]> {
 	const config = await loadActiveConfig(db);
@@ -335,20 +391,13 @@ export async function postAlert(
 	});
 }
 
-/** An agent as routing sees it, with its allowed channels resolved to ids. */
-export function toRoutingAgent(
-	agent: AgentRecord,
-	channels: ReadonlyMap<string, MattermostId>,
-): RoutingAgent {
+/** An agent as routing sees it, with its channels (configured and granted) resolved to ids. */
+export function toRoutingAgent(agent: AgentRecord, access: ChannelAccess): RoutingAgent {
 	return {
 		id: agent.id,
 		state: agent.state,
 		wakeRules: agent.config.wake_rules,
-		channelIds: new Set(
-			agent.config.mattermost.allowed_channels.flatMap((name) => {
-				const id = channels.get(name);
-				return id === undefined ? [] : [id];
-			}),
-		),
+		channelIds: agentChannelIds(agent, access),
+		channelFloors: agentChannelFloors(agent, access),
 	};
 }

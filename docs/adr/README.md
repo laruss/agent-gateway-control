@@ -27,3 +27,4 @@ rewritten in substance: a changed decision gets a new ADR that references the ol
 | [019](019-observability-and-retention.md) | Metrics, trace-correlated logs, alert conditions, retention, backup checks | Accepted |
 | [020](020-release-pipeline.md) | Release pipeline: reproducible images, a verified bundle, certified schemas | Accepted |
 | [021](021-home-server.md) | The home server: a Lima VM on an Apple silicon Mac | Accepted |
+| [022](022-channel-grants.md) | Channel grants: an owner adds an agent's bot, and the agent works there | Accepted |

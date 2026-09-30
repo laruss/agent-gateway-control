@@ -161,6 +161,8 @@ export type BootstrapStore = Readonly<{
 	recordedBotUserId: (bot: BotSpec) => Promise<MattermostId | null>;
 	/** Drops a channel's catch-up, so managing it again starts afresh. */
 	forgetChannelStart: (channelId: MattermostId) => Promise<void>;
+	/** Channels owners granted this bot's agent (any agent, for the listener): it stays in them. */
+	grantedChannelIds: (bot: BotSpec) => Promise<ReadonlySet<MattermostId>>;
 }>;
 
 /** Token files; values never pass through logs or output. */
@@ -419,6 +421,10 @@ export async function bootstrapMattermost(options: BootstrapOptions): Promise<vo
 			allowed.add(channelId);
 			await admin.addChannelMember(channelId, userId);
 		}
+		// Channels an owner or admin granted by adding the bot stay (ADR-022).
+		for (const channelId of await store.grantedChannelIds(bot)) {
+			allowed.add(channelId);
+		}
 		// Every other channel of the team (managed or not) must not stay readable to its token;
 		// in the rest (its own and the default channel) it is a plain member.
 		let removed = 0;
@@ -477,6 +483,8 @@ export type ReconcileStore = Readonly<{
 	/** The user id bootstrap recorded for a bot. */
 	botUserId: (bot: BotSpec) => Promise<MattermostId | null>;
 	markVerified: (agentId: AgentId) => Promise<void>;
+	/** Channels owners granted this bot's agent (any agent, for the listener). */
+	grantedChannelIds: (bot: BotSpec) => Promise<ReadonlySet<MattermostId>>;
 }>;
 
 export type ReconcileOptions = Readonly<{
@@ -557,6 +565,9 @@ export async function reconcileMattermost(options: ReconcileOptions): Promise<Re
 			} else {
 				allowed.add(channel.id);
 			}
+		}
+		for (const channelId of await store.grantedChannelIds(bot)) {
+			allowed.add(channelId);
 		}
 		for (const channel of await client.userChannelsInTeam(expected, team.id)) {
 			if (isExtraChannel(channel, allowed)) {
