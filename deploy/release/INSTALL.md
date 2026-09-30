@@ -208,13 +208,15 @@ A read-only status page for one owner, off by default
 bin/agw run --rm gateway-cli gateway console password set   # hidden entry, confirmed twice
 ```
 
-Then set `CONSOLE_ENABLED=true` in `gateway.env` and restart the controller
-(`bin/agw restart gateway-controller`); it refuses to start if this is on with no password hash
-set. The listener publishes no host port and binds only the controller's own network alias, so
-nothing reaches it without a reverse proxy already wired to it — on the home server kit, Caddy
-at `https://gateway.local` (`docs/operations/home-server.md`). On another Docker host, put your
-own reverse proxy in front of it the same way, or reach it only from inside the Gateway's own
-network for now.
+Then set `CONSOLE_ENABLED=true` in `gateway.env` and apply it with `bin/agw up -d
+gateway-controller` (a `gateway.env` change needs the container recreated; `restart` alone does
+not re-read it — `restart` stays correct for rotating the password afterwards, since the
+controller re-reads the hash file at start either way). It refuses to start if this is on with
+no password hash set. The listener publishes no host port and binds only the controller's own
+network alias, so nothing reaches it without a reverse proxy already wired to it — on the home
+server kit, Caddy at `https://gateway.local` (`docs/operations/home-server.md`). On another
+Docker host, put your own reverse proxy in front of it the same way, or reach it only from
+inside the Gateway's own network for now.
 
 ## Backups
 

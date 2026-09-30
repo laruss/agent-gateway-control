@@ -44,6 +44,17 @@ describe("system status and console read models (ADR-023)", () => {
 		});
 	}
 
+	/** `loadSystemStatus` reports a schema failure rather than throwing (ADR-023); every scenario
+	 * below expects the good path, so it unwraps here instead of repeating the same check. The
+	 * failure path has its own test, further down, which calls `loadSystemStatus` directly. */
+	async function systemStatus(now: Date) {
+		const result = await readOnly((tx) => loadSystemStatus(tx, now));
+		if (!result.ok) {
+			throw new Error(result.reason);
+		}
+		return result.status;
+	}
+
 	beforeAll(async () => {
 		gateway = await startTestGateway();
 		// Every scenario below is seeded with raw SQL, on purpose bypassing the state machine and
@@ -62,7 +73,7 @@ describe("system status and console read models (ADR-023)", () => {
 
 	it("reports the configured agents and nothing else before anything has run", async () => {
 		const now = new Date();
-		const status = await readOnly((tx) => loadSystemStatus(tx, now));
+		const status = await systemStatus(now);
 		expect(status.agents.map((a) => a.agentId).sort()).toEqual([...REAL_AGENT_IDS].sort());
 		expect(status.omittedAgents).toBe(0);
 		for (const agent of status.agents) {
@@ -103,7 +114,7 @@ describe("system status and console read models (ADR-023)", () => {
 			[configVersion, extra],
 		);
 		try {
-			const status = await readOnly((tx) => loadSystemStatus(tx, new Date()));
+			const status = await systemStatus(new Date());
 			expect(status.agents).toHaveLength(SYSTEM_STATUS_LIMITS.agents);
 			expect(status.omittedAgents).toBe(
 				REAL_AGENT_IDS.length + extra - SYSTEM_STATUS_LIMITS.agents,
@@ -123,10 +134,45 @@ describe("system status and console read models (ADR-023)", () => {
 		}
 	});
 
+	it("reports a schema failure instead of throwing it, so a caller inside a shared transaction can alert and skip rather than crash (ADR-023)", async () => {
+		// Over `RuntimeVersionSchema`'s 128-character cap: a row that slipped past review, the one
+		// case `loadSystemStatus`'s own re-validation exists to catch.
+		const overLong = "v".repeat(200);
+		const [before] = await query<{ runtime_versions: Readonly<string[]> }>(
+			"select runtime_versions from runtime_availability where adapter = 'mock'",
+		);
+		await gateway.pool.query(
+			`insert into runtime_availability (adapter, available, runtime_versions, changed_at)
+			 values ('mock', true, $1::jsonb, now())
+			 on conflict (adapter) do update set runtime_versions = excluded.runtime_versions`,
+			[JSON.stringify([overLong])],
+		);
+		try {
+			const result = await readOnly((tx) => loadSystemStatus(tx, new Date()));
+			if (result.ok) {
+				throw new Error("expected the over-long runtime version to fail SystemStatusSchema");
+			}
+			expect(result).toMatchObject({ ok: false });
+			expect(result.reason).toContain("runtimes");
+		} finally {
+			if (before === undefined) {
+				await gateway.pool.query("delete from runtime_availability where adapter = 'mock'");
+			} else {
+				await gateway.pool.query(
+					"update runtime_availability set runtime_versions = $1::jsonb where adapter = 'mock'",
+					[JSON.stringify(before.runtime_versions)],
+				);
+			}
+		}
+	});
+
 	describe("with a scenario of runs, waits, usage, queues and alerts seeded", () => {
 		const NOW = new Date("2031-03-10T08:00:00.000Z");
 		const GRANTED_CHANNEL_ID = IDS.channel("granted-only");
 		const ROOT_POST_ID = IDS.channel("root-post");
+		/** The root of a thread a mention starts fresh: never recorded in `events`, only carried by
+		 * the trigger itself (see the `operator` scenario below). */
+		const NEW_THREAD_ROOT_ID = IDS.channel("new-thread-root");
 
 		const insertedEventIds: string[] = [];
 
@@ -194,8 +240,27 @@ describe("system status and console read models (ADR-023)", () => {
 			omittedPostCount?: number;
 			memories?: Readonly<string[]>;
 			pendingInbox?: number;
+			/**
+			 * The trigger's own Mattermost post, for a scenario where `foldThread` leaves
+			 * `threadContext.rootPost` null because the root is carried here instead (a mention that
+			 * starts a new thread, ADR-023). Omitted, the trigger carries no post at all (a wait
+			 * timeout, like `mail-follower` below).
+			 */
+			triggerPost?: Readonly<{ postId: string; message: string }>;
+			/** Pending inbox events that carry a post, for the same fallback as `triggerPost`. Its
+			 * length is the pending count; `pendingInbox` above is for a scenario that only needs the
+			 * count and no post to match against. */
+			pendingInboxPosts?: Readonly<Readonly<{ postId: string; message: string }>[]>;
 		}) {
+			const pendingInboxPosts = opts.pendingInboxPosts ?? [];
 			return {
+				trigger: {
+					type: "mattermost.agent.mentioned",
+					data:
+						opts.triggerPost === undefined
+							? { message: "trigger placeholder" }
+							: { post_id: opts.triggerPost.postId, message: opts.triggerPost.message },
+				},
 				threadContext: {
 					rootPost: (opts.rootMessage ?? null) === null ? null : { message: opts.rootMessage },
 					recentPosts: (opts.recentPosts ?? []).map((message) => ({ message })),
@@ -203,7 +268,12 @@ describe("system status and console read models (ADR-023)", () => {
 					omittedPostCount: opts.omittedPostCount ?? 0,
 				},
 				memories: (opts.memories ?? []).map((content) => ({ content })),
-				pendingInbox: new Array(opts.pendingInbox ?? 0).fill({}),
+				pendingInbox:
+					pendingInboxPosts.length > 0
+						? pendingInboxPosts.map((post) => ({
+								data: { post_id: post.postId, message: post.message },
+							}))
+						: new Array(opts.pendingInbox ?? 0).fill({}),
 			};
 		}
 
@@ -236,6 +306,7 @@ describe("system status and console read models (ADR-023)", () => {
 		let financeRunId: string;
 		let researchRunId: string;
 		let mailFollowerRunId: string;
+		let operatorRunId: string;
 
 		beforeAll(async () => {
 			await gateway.pool.query(
@@ -257,6 +328,10 @@ describe("system status and console read models (ADR-023)", () => {
 			await gateway.pool.query(
 				"update agents set state = $2, state_changed_at = $3 where id = $1",
 				["mail-follower", "running", NOW],
+			);
+			await gateway.pool.query(
+				"update agents set state = $2, state_changed_at = $3 where id = $1",
+				["operator", "running", NOW],
 			);
 
 			// director: a running turn whose stored input carries private content (message bodies, a
@@ -379,6 +454,32 @@ describe("system status and console read models (ADR-023)", () => {
 				],
 			);
 
+			// operator: a mention that starts a new thread. `foldThread` leaves `threadContext.rootPost`
+			// null because the root post is the trigger's own post, carried in `trigger`, not folded
+			// into the thread; the console must still measure it there (ADR-023).
+			const operatorEvent = await insertEvent("mattermost.agent.mentioned", {
+				message: `${PRIVATE_MARKER} new thread root`,
+			});
+			operatorRunId = await insertRun({
+				agentId: "operator",
+				eventId: operatorEvent,
+				status: "running",
+				startedAt: NOW,
+			});
+			await insertSnapshot({
+				agentId: "operator",
+				runId: operatorRunId,
+				threadRef: `channel/${IDS.channel("hq")}/thread/${NEW_THREAD_ROOT_ID}`,
+				input: snapshotInput({
+					rootMessage: null,
+					triggerPost: {
+						postId: NEW_THREAD_ROOT_ID,
+						message: `${PRIVATE_MARKER} new thread root`,
+					},
+				}),
+				sizeBytes: 1024,
+			});
+
 			// UTC-day usage: today's booking counts, yesterday's (on the very same run) does not.
 			await gateway.pool.query(
 				`insert into run_usage (run_id, attempt, agent_id, day, cost_usd, tokens, recorded_at)
@@ -430,16 +531,16 @@ describe("system status and console read models (ADR-023)", () => {
 			await gateway.pool.query("delete from wait_subscriptions where agent_id = 'finance'");
 			await gateway.pool.query("delete from agent_inbox where agent_id = 'developer'");
 			await gateway.pool.query("delete from context_snapshots where agent_id = any($1::text[])", [
-				["director", "developer", "mail-follower"],
+				["director", "developer", "mail-follower", "operator"],
 			]);
 			await gateway.pool.query("delete from agent_runs where agent_id = any($1::text[])", [
-				["director", "developer", "finance", "research", "mail-follower"],
+				["director", "developer", "finance", "research", "mail-follower", "operator"],
 			]);
 			await gateway.pool.query("delete from events where id = any($1::uuid[])", [insertedEventIds]);
 		});
 
 		it("never carries private content in the agent-facing system status", async () => {
-			const status = await readOnly((tx) => loadSystemStatus(tx, NOW));
+			const status = await systemStatus(NOW);
 			expect(JSON.stringify(status)).not.toContain(PRIVATE_MARKER);
 			expect(JSON.stringify(status)).not.toContain(ALERT_MARKER);
 		});
@@ -452,7 +553,7 @@ describe("system status and console read models (ADR-023)", () => {
 		});
 
 		it("shows queued, running, waiting and failed agents with their runs", async () => {
-			const status = await readOnly((tx) => loadSystemStatus(tx, NOW));
+			const status = await systemStatus(NOW);
 			const byId = new Map(status.agents.map((a) => [a.agentId, a]));
 
 			const director = byId.get("director");
@@ -532,8 +633,20 @@ describe("system status and console read models (ADR-023)", () => {
 			expect(director?.maxInputTokens7d).toBe(777);
 		});
 
+		it("measures the thread root from the trigger when a mention starts a new thread (foldThread leaves rootPost null, ADR-023)", async () => {
+			const console = await readOnly((tx) => loadConsoleStatus(tx, NOW, { perAgent: null }));
+			const operator = console.agents.find((a) => a.status.agentId === "operator");
+			expect(operator?.current).toMatchObject({
+				runId: operatorRunId,
+				threadRootId: NEW_THREAD_ROOT_ID,
+			});
+			// `threadContext.rootPost` is null (the root is carried in `trigger` instead), yet the
+			// root's own character count is still measured, from the trigger's post.
+			expect(operator?.context?.rootChars).toBe(`${PRIVATE_MARKER} new thread root`.length);
+		});
+
 		it("books usage on its own UTC day and leaves an agent without any at zero", async () => {
-			const status = await readOnly((tx) => loadSystemStatus(tx, NOW));
+			const status = await systemStatus(NOW);
 			const byId = new Map(status.agents.map((a) => [a.agentId, a]));
 			expect(byId.get("director")).toMatchObject({ tokensToday: 1000, costTodayUsd: 1.5 });
 			expect(byId.get("developer")).toMatchObject({ tokensToday: 250, costTodayUsd: 0.25 });
@@ -543,7 +656,7 @@ describe("system status and console read models (ADR-023)", () => {
 		});
 
 		it("shows only due jobs as waiting, and a dead letter queue by its own name", async () => {
-			const status = await readOnly((tx) => loadSystemStatus(tx, NOW));
+			const status = await systemStatus(NOW);
 			const byQueue = new Map(status.queues.map((q) => [q.queue, q]));
 			expect(byQueue.get("agent.run.mock")).toMatchObject({ waiting: 1, active: 0 });
 			expect(byQueue.get("agent.run.mock")?.oldestWaitingSeconds).toBeCloseTo(60, 0);
@@ -556,7 +669,7 @@ describe("system status and console read models (ADR-023)", () => {
 		});
 
 		it("lists a firing alert's key and time in the system status, its message on the console only", async () => {
-			const status = await readOnly((tx) => loadSystemStatus(tx, NOW));
+			const status = await systemStatus(NOW);
 			expect(status.alerts).toEqual([
 				expect.objectContaining({ key: "test:alert-marker", firedAt: NOW.toISOString() }),
 			]);
@@ -569,7 +682,7 @@ describe("system status and console read models (ADR-023)", () => {
 		it("lists recent runs across every agent, newest first", async () => {
 			const console = await readOnly((tx) => loadConsoleStatus(tx, NOW, { perAgent: null }));
 			const ids = console.recentRuns.map((r) => r.runId);
-			expect(ids).toHaveLength(5);
+			expect(ids).toHaveLength(6);
 			expect(ids).toEqual(
 				expect.arrayContaining([
 					directorRunId,
@@ -577,6 +690,7 @@ describe("system status and console read models (ADR-023)", () => {
 					financeRunId,
 					researchRunId,
 					mailFollowerRunId,
+					operatorRunId,
 				]),
 			);
 		});

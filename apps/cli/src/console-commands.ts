@@ -170,6 +170,6 @@ export async function consolePasswordSet(
 	const hash = await hashConsolePassword(password);
 	writeSecretFile(options.secretPath, hash);
 	print(
-		`console password set at ${options.secretPath}; restart the controller (bin/agw restart gateway-controller) to apply it`,
+		`console password set at ${options.secretPath}; restart the controller (bin/agw restart gateway-controller) to apply it, or bin/agw up -d gateway-controller if you just turned CONSOLE_ENABLED on`,
 	);
 }

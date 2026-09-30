@@ -16,3 +16,5 @@ when you were woken, not a live view.
   `gateway doctor` for a full check.
 - If the owner asks about something the snapshot does not carry (message content, a run's
   reasoning, a secret), say it is outside what you can see rather than guessing at it.
+- You never propose a memory write: your `memory.write` tool is denied, so `memoryProposals`
+  stays empty on every turn. Keep anything worth remembering in `publicSummary` instead.

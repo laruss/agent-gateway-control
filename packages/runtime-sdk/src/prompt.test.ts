@@ -93,6 +93,51 @@ describe("renderTurnPrompt", () => {
 	});
 });
 
+describe("renderTurnPrompt with a denied memory.write (ADR-023)", () => {
+	it("leaves an agent without the deny with the exact wording from before this distinction existed", () => {
+		const prompt = renderTurnPrompt(
+			contractTurnInput({ runId: RUN_ID, message: "hi", deadlineMs: 1000 }),
+		);
+		expect(prompt).toContain(
+			"- Private memory is yours alone; memory proposals to shared namespaces are reviewed by an\n  operator before other agents see them.",
+		);
+		expect(prompt).toContain(
+			"Memory: private namespace agents/developer; shared namespaces: (none)",
+		);
+	});
+
+	it("tells the agent memory is read-only and to make no memoryProposals when tools_deny covers memory.write exactly", () => {
+		const base = contractTurnInput({ runId: RUN_ID, message: "hi", deadlineMs: 1000 });
+		const input = {
+			...base,
+			memoryNamespaces: { ...base.memoryNamespaces, shared: ["organization/decisions"] },
+			toolPolicy: { ...base.toolPolicy, deny: [...base.toolPolicy.deny, "memory.write"] },
+		};
+		const prompt = renderTurnPrompt(input);
+		expect(prompt).not.toContain("Private memory is yours alone");
+		expect(prompt).toContain(
+			"Memory is read-only for you this turn (`memory.write` is denied): make no\n  memoryProposals at all",
+		);
+		expect(prompt).toContain(
+			"Memory: private namespace agents/developer is read-only this turn (`memory.write` is denied); make no memoryProposals. Shared namespaces, folded in for reading only: organization/decisions",
+		);
+	});
+
+	it("also recognizes a covering wildcard deny like 'memory.*'", () => {
+		const base = contractTurnInput({ runId: RUN_ID, message: "hi", deadlineMs: 1000 });
+		const input = {
+			...base,
+			toolPolicy: { ...base.toolPolicy, deny: [...base.toolPolicy.deny, "memory.*"] },
+		};
+		const prompt = renderTurnPrompt(input);
+		expect(prompt).not.toContain("Private memory is yours alone");
+		expect(prompt).toContain("Memory is read-only for you this turn");
+		expect(prompt).toContain(
+			"is read-only this turn (`memory.write` is denied); make no memoryProposals.",
+		);
+	});
+});
+
 describe("renderTurnPrompt with system status (ADR-023)", () => {
 	it("adds a System status section only for a version 2 input, between Policies and Durable state", () => {
 		const v1 = renderTurnPrompt(

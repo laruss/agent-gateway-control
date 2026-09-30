@@ -291,6 +291,62 @@ describe("scheduling, retry and redrive carry the system status (ADR-023)", () =
 		}
 	});
 
+	it("a system status that fails its own schema alerts and skips scheduling, rather than crashing the shared transaction", async () => {
+		// Over `RuntimeVersionSchema`'s 128-character cap: a row that slipped past review, inside
+		// the very transaction `scheduleAgent` shares with ingest of other agents, run completion
+		// and `sweepSchedules` (ADR-023). director observes the system from the earlier tests above.
+		const overLong = "v".repeat(200);
+		const [before] = await query<{ runtime_versions: string[] }>(
+			"select runtime_versions from runtime_availability where adapter = 'mock'",
+		);
+		await gateway.pool.query(
+			`insert into runtime_availability (adapter, available, runtime_versions, changed_at)
+			 values ('mock', true, $1::jsonb, now())
+			 on conflict (adapter) do update set runtime_versions = excluded.runtime_versions`,
+			[JSON.stringify([overLong])],
+		);
+		const event = humanPost("@director status despite a broken snapshot", ["director"]);
+		try {
+			const result = await ingestEvent(gateway.deps(), event);
+			expect(result.status).toBe("accepted");
+			// No run for the event, and its inbox entry is left pending, not claimed: scheduling was
+			// skipped, not crashed, and nothing else sharing the transaction was rolled back with it.
+			expect(await runsFor(event.id)).toEqual([]);
+			const [inbox] = await query<{ status: string }>(
+				`select i.status from agent_inbox i join events e on e.id = i.event_id
+				  where e.external_id = $1`,
+				[event.id],
+			);
+			expect(inbox?.status).toBe("pending");
+			const [alert] = await query<{ payload: { message: string } }>(
+				"select payload from outbox where idempotency_key = $1",
+				[`alert:context:director:${result.eventId}`],
+			);
+			expect(alert?.payload.message).toMatch(/system status/);
+		} finally {
+			if (before === undefined) {
+				await gateway.pool.query("delete from runtime_availability where adapter = 'mock'");
+			} else {
+				await gateway.pool.query(
+					"update runtime_availability set runtime_versions = $1::jsonb where adapter = 'mock'",
+					[JSON.stringify(before.runtime_versions)],
+				);
+			}
+			await gateway.pool.query(
+				`delete from agent_inbox where event_id in (select id from events where external_id = $1)`,
+				[event.id],
+			);
+			await gateway.pool.query(
+				`delete from event_routes where event_id in (select id from events where external_id = $1)`,
+				[event.id],
+			);
+			await gateway.pool.query("delete from events where external_id = $1", [event.id]);
+			await gateway.pool.query(
+				"delete from outbox where idempotency_key like 'alert:context:director:%'",
+			);
+		}
+	});
+
 	it("rejects scheduling over the input cap without partial scheduling", async () => {
 		const [{ v: configVersion } = { v: "" }] = await query<{ v: string }>(
 			"select active_config_version as v from gateway_controls where id = 1",

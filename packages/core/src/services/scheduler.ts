@@ -13,6 +13,7 @@ import {
 	RuntimeSessionHandleSchema,
 	runQueue,
 	type SessionPolicy,
+	type SystemStatus,
 	type WaitCondition,
 	type WorkingSummary,
 } from "@agent-gateway/contracts";
@@ -399,7 +400,23 @@ export async function scheduleAgent(
 	// resumption are ordinary calls of this function, so they always see the agent's permissions
 	// as they stand right now, not as they stood at an earlier attempt.
 	const observesSystem = agent.config.permissions.observe_system === true;
-	const systemStatus = observesSystem ? await loadSystemStatus(uow.tx, uow.now) : null;
+	let systemStatus: SystemStatus | null = null;
+	if (observesSystem) {
+		// This transaction is shared with ingest of other agents, run completion and
+		// `sweepSchedules`: a row that fails `SystemStatusSchema` here must never throw and take
+		// all of that down with it. Handled exactly like a `buildTurnContext` failure below, on
+		// the same alert key, so only this agent's scheduling is skipped.
+		const status = await loadSystemStatus(uow.tx, uow.now);
+		if (!status.ok) {
+			await raiseAlert(
+				uow,
+				`context:${agentId}:${trigger.event.id}`,
+				`Cannot start a run of @${agentId}: its system status is ${status.reason}`,
+			);
+			return { skipped: "context_unavailable" };
+		}
+		systemStatus = status.status;
+	}
 
 	const runId = randomUUID();
 	const built = buildTurnContext({

@@ -9,8 +9,10 @@ that answers the same question in Mattermost is in
 ## Enabling it
 
 The console is off by default. On the home server it needs three things: a password, the
-setting turned on, and Caddy already proxying `gateway.local` (set up once, in
-[home-server.md](home-server.md#mattermost)).
+setting turned on, and Caddy already proxying `gateway.local`. A first install gets that from
+[home-server.md](home-server.md#mattermost) already; turning the console on after an upgrade
+from an older home server kit needs an extra step first, in
+[UPGRADE.md](../../deploy/release/UPGRADE.md#upgrading-to-030).
 
 1. Set the password (hidden entry, confirmed twice; only its Argon2id hash is written, to
    `secrets/controller/console_password_hash`, mode `0600`):
@@ -25,10 +27,11 @@ setting turned on, and Caddy already proxying `gateway.local` (set up once, in
    CONSOLE_ENABLED=true
    ```
 
-3. Restart the controller to pick up both:
+3. Apply it: `CONSOLE_ENABLED` is a `gateway.env` change, and `docker compose restart` does not
+   re-read an updated `.env` file, only recreating the container does:
 
    ```bash
-   bin/agw restart gateway-controller
+   bin/agw up -d gateway-controller
    ```
 
 The controller reads the password hash once, at start; it refuses to start at all if
@@ -37,9 +40,11 @@ symlink, not group- or world-readable). This is deliberate: a half-configured co
 never end up serving unauthenticated, or silently skip only the console and start everything
 else.
 
-**Rotating the password** is the same two steps: run `gateway console password set` again,
-then `bin/agw restart gateway-controller`. There is one account, fixed to the username `owner`;
-it is never a Mattermost username or any other identity the rest of the Gateway uses.
+**Rotating the password** is different: only the hash file's content changes, and the
+controller still reads it just once at start, so a plain restart is enough to pick it up — run
+`gateway console password set` again, then `bin/agw restart gateway-controller`. There is one
+account, fixed to the username `owner`; it is never a Mattermost username or any other identity
+the rest of the Gateway uses.
 
 ## Opening it
 
@@ -116,7 +121,8 @@ for one.
 
 - **`401 unauthorized`:** no `Authorization` header, or a wrong username/password. The browser
   re-prompts on its own; check the password was actually set (`console_password_hash` exists)
-  and the controller was restarted after setting or rotating it.
+  and the controller picked it up: `bin/agw up -d gateway-controller` after first turning
+  `CONSOLE_ENABLED` on, `bin/agw restart gateway-controller` after only rotating the password.
 - **`429 too many attempts` (with `Retry-After`):** failed logins share one bounded, global
   counter — ten failures per minute, across every client, not partitioned by address. A
   password-guessing attempt from anywhere blocks the owner too, along with the attacker;

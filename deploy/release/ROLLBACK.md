@@ -81,9 +81,20 @@ re-validates them, so there is nothing to delete or rewrite here.
 
 **(f) If you are also reverting the home-server kit itself** (not only the Gateway release),
 set `CONSOLE_ENABLED=false` in `gateway.env` and remove the `gateway.local` site block from
-`home-server/mattermost/Caddyfile` (and its mDNS alias from `setup-guest.sh`, if you re-run
-guest setup from an older bundle). This is cleanup, not a requirement: a Caddy route to a
-console that is not there just returns `502`, harmless either way.
+`home-server/mattermost/Caddyfile`. An older bundle's `setup-guest.sh`
+(`deploy/home-server/guest/setup-guest.sh`) predates the console and does not know to remove its
+mDNS alias unit, so re-running guest setup from it leaves `agw-mdns-alias-gateway.service`
+behind, still announcing `gateway.local`; disable and remove it yourself:
+
+```bash
+systemctl disable --now agw-mdns-alias-gateway.service
+rm /etc/systemd/system/agw-mdns-alias-gateway.service
+systemctl daemon-reload
+```
+
+This is cleanup, not a requirement: a Caddy route to a console that is not there just returns
+`502`, and a stray mDNS alias with nothing behind it is likewise harmless either way — leaving
+either in place breaks nothing.
 
 Once (a)-(d) are done, continue with the database-only steps below.
 

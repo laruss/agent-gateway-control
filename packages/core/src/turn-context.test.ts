@@ -241,7 +241,7 @@ describe("buildTurnContext and an explicit memory.write deny", () => {
 		});
 	});
 
-	it("an exact 'memory.write' deny leaves no writable namespace, private or shared", () => {
+	it("an exact 'memory.write' deny leaves no writable namespace, private or shared, but the turn input still names the shared namespace read-only", () => {
 		const agent = withSharedNamespace(agentRecord("developer", { tools_deny: ["memory.write"] }));
 		const result = buildTurnContext(sources({ agent, agents: [agent] }));
 		expect(result.ok).toBe(true);
@@ -249,10 +249,12 @@ describe("buildTurnContext and an explicit memory.write deny", () => {
 			throw new Error(result.reason);
 		}
 		expect(result.context.authority.writableMemoryNamespaces).toEqual([]);
-		expect(result.context.input.memoryNamespaces.shared).toEqual([]);
+		// Not emptied: shared memory is still folded into the turn for reading, and the prompt
+		// derives writability from `toolPolicy.deny` rather than from this list being hidden.
+		expect(result.context.input.memoryNamespaces.shared).toEqual(["organization/decisions"]);
 	});
 
-	it("a covering wildcard deny ('memory.*') also leaves no writable namespace", () => {
+	it("a covering wildcard deny ('memory.*') also leaves no writable namespace, but the turn input still names the shared namespace read-only", () => {
 		const agent = withSharedNamespace(agentRecord("developer", { tools_deny: ["memory.*"] }));
 		const result = buildTurnContext(sources({ agent, agents: [agent] }));
 		expect(result.ok).toBe(true);
@@ -260,7 +262,7 @@ describe("buildTurnContext and an explicit memory.write deny", () => {
 			throw new Error(result.reason);
 		}
 		expect(result.context.authority.writableMemoryNamespaces).toEqual([]);
-		expect(result.context.input.memoryNamespaces.shared).toEqual([]);
+		expect(result.context.input.memoryNamespaces.shared).toEqual(["organization/decisions"]);
 	});
 
 	it("a denied memory.write causes memory proposals to be rejected by the turn's own authority", () => {

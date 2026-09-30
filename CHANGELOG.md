@@ -29,9 +29,10 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ### Changed
 
-- Usage is now saved for a retried attempt too, not only a run's first one: the console and an
-  observing agent's `SystemStatus` both show the last attempt's own reported tokens, whichever
-  attempt that was.
+- A run's displayed last-attempt usage (`agent_runs.usage`) now reflects a retried attempt too,
+  not only a run's first one: the console and an observing agent's `SystemStatus` both show the
+  last attempt's own reported tokens, whichever attempt that was. The budget ledger itself is
+  unaffected by this change: it already booked every attempt before and after.
 - An explicit `memory.write` deny now also removes every writable memory namespace, private and
   shared, not only the tool call itself: an agent denied `memory.write` is left with no
   namespace to propose a memory write into at all.

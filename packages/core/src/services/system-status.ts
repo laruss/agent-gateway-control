@@ -325,14 +325,31 @@ async function load(client: Client, now: Date): Promise<Loaded> {
 	};
 }
 
+/** `loadSystemStatus`'s result: a schema failure is reported, never thrown (ADR-023). The
+ * scheduler calls this inside a transaction shared with other agents' work, so a bad row must
+ * leave that work alone rather than aborting it. */
+export type SystemStatusResult =
+	| Readonly<{ ok: true; status: SystemStatus }>
+	| Readonly<{ ok: false; reason: string }>;
+
 /**
  * The Gateway's operational metadata as an observing agent sees it (ADR-023): states, ids,
  * counts, timestamps and codes, never message text. Reads only. Validated against
  * `SystemStatusSchema` before it returns, so the content boundary is enforced twice: by every
- * field's own type, and by this final parse.
+ * field's own type, and by this final parse — reported as `{ ok: false }`, not thrown, so a row
+ * that slipped past review fails loudly to the caller without crashing whatever transaction it
+ * runs in.
  */
-export async function loadSystemStatus(tx: Transaction, now: Date): Promise<SystemStatus> {
-	return SystemStatusSchema.parse((await load(tx.client, now)).status);
+export async function loadSystemStatus(tx: Transaction, now: Date): Promise<SystemStatusResult> {
+	const parsed = SystemStatusSchema.safeParse((await load(tx.client, now)).status);
+	if (!parsed.success) {
+		const first = parsed.error.issues[0];
+		return {
+			ok: false,
+			reason: `invalid at '${first?.path.join(".") ?? ""}': ${first?.message ?? ""}`,
+		};
+	}
+	return { ok: true, status: parsed.data };
 }
 
 // ---------------------------------------------------------------------------
@@ -453,6 +470,9 @@ type SnapshotThreadContext = Readonly<{
 	omittedPostCount: number;
 }>;
 type SnapshotMemoryItem = Readonly<{ content: string }>;
+/** A Mattermost post carried by the trigger or a pending inbox event, reduced to the two fields
+ * `measureContext` needs: which post it is, and its text. */
+type SnapshotPostRef = Readonly<{ post_id: string; message: string }>;
 
 type SnapshotRow = Readonly<{
 	run_id: string;
@@ -462,6 +482,16 @@ type SnapshotRow = Readonly<{
 	thread_context: SnapshotThreadContext | null;
 	memories: Readonly<SnapshotMemoryItem[]>;
 	pending_events: number;
+	/**
+	 * The trigger's own Mattermost post, when it carries one; null for a trigger with no post of
+	 * its own (a wait timeout, an internal event). `foldThread` (`packages/context`) deliberately
+	 * leaves `thread_context.rootPost` null when the root post is carried here instead, rather
+	 * than in the thread itself: a mention that starts a new thread is its own root, and one from
+	 * the pending inbox is handled the same way by `pending_inbox_posts` below.
+	 */
+	trigger_post: SnapshotPostRef | null;
+	/** Pending inbox events that carry a post, for the same fallback as `trigger_post`. */
+	pending_inbox_posts: Readonly<SnapshotPostRef[]>;
 }>;
 
 /** Fetches the budget-bounded parts of a run's stored turn input that `measureContext` counts. */
@@ -477,11 +507,48 @@ async function snapshots(
 		`select s.run_id, s.size_bytes, s.thread_ref,
 		        s.input->'threadContext' as thread_context,
 		        coalesce(s.input->'memories', '[]'::jsonb) as memories,
-		        jsonb_array_length(coalesce(s.input->'pendingInbox', '[]'::jsonb))::int as pending_events
+		        jsonb_array_length(coalesce(s.input->'pendingInbox', '[]'::jsonb))::int as pending_events,
+		        case when s.input->'trigger'->'data' ? 'post_id'
+		             then jsonb_build_object(
+		                    'post_id', s.input->'trigger'->'data'->>'post_id',
+		                    'message', s.input->'trigger'->'data'->>'message')
+		        end as trigger_post,
+		        coalesce((
+		          select jsonb_agg(jsonb_build_object(
+		                   'post_id', e->'data'->>'post_id',
+		                   'message', e->'data'->>'message'))
+		            from jsonb_array_elements(coalesce(s.input->'pendingInbox', '[]'::jsonb)) e
+		           where e->'data' ? 'post_id'
+		        ), '[]'::jsonb) as pending_inbox_posts
 		   from context_snapshots s where s.run_id = any($1::uuid[])`,
 		[idList(runIds)],
 	);
 	return new Map(found.map((row) => [row.run_id, row]));
+}
+
+/**
+ * The thread root's own character count: `thread.rootPost` when `foldThread` recorded one, else
+ * the trigger's or a pending inbox event's post whose id is the thread's root (the fallback ADR-
+ * 023 requires, since `foldThread` leaves `rootPost` null exactly when the root is carried one of
+ * those two ways instead). Zero when the root is genuinely unrecorded (posted before the channel
+ * became managed) or the turn carries no thread at all.
+ */
+function measureRootChars(
+	rootPostId: string | null,
+	thread: SnapshotThreadContext | null,
+	triggerPost: SnapshotPostRef | null,
+	pendingInboxPosts: Readonly<SnapshotPostRef[]>,
+): number {
+	if (thread?.rootPost) {
+		return thread.rootPost.message.length;
+	}
+	if (rootPostId === null) {
+		return 0;
+	}
+	if (triggerPost?.post_id === rootPostId) {
+		return triggerPost.message.length;
+	}
+	return pendingInboxPosts.find((post) => post.post_id === rootPostId)?.message.length ?? 0;
 }
 
 type RunUsageRow = Readonly<{
@@ -506,11 +573,17 @@ function measureContext(
 	}
 	const thread = snapshot.thread_context;
 	const recentPosts = thread?.recentPosts ?? [];
+	const rootPostId = parseThreadRef(snapshot.thread_ref)?.rootPostId ?? null;
 	return {
 		runId,
 		inputBytes: snapshot.size_bytes,
 		inputLimitBytes: MAX_TURN_INPUT_BYTES,
-		rootChars: thread?.rootPost?.message.length ?? 0,
+		rootChars: measureRootChars(
+			rootPostId,
+			thread,
+			snapshot.trigger_post,
+			snapshot.pending_inbox_posts,
+		),
 		rootLimitChars: DEFAULT_THREAD_BUDGET.maxPostChars,
 		threadPosts: recentPosts.length,
 		omittedPosts: thread?.omittedPostCount ?? 0,
@@ -684,6 +757,12 @@ export async function loadConsoleStatus(
 		};
 	});
 
+	// Per agent of the same bounded set the rest of this function uses, the newest `RECENT_RUNS`
+	// runs via `agent_runs_agent (agent_id, queued_at)` — the index an unqualified `order by
+	// queued_at desc limit` over the whole table could never use — then one global order and
+	// limit over that already-small, already-bounded union. No agent can contribute more than
+	// `RECENT_RUNS` rows, so the global top `RECENT_RUNS` is never missing one that a plain
+	// per-agent slice would have cut off first.
 	const recent = await rows<
 		Readonly<{
 			id: string;
@@ -704,8 +783,19 @@ export async function loadConsoleStatus(
 		        r.queued_at, r.started_at, r.finished_at,
 		        ${usageCount("inputTokens")} as input_tokens,
 		        ${usageCount("outputTokens")} as output_tokens
-		   from agent_runs r join events e on e.id = r.trigger_event_id
-		  order by r.queued_at desc, r.id desc limit ${RECENT_RUNS}`,
+		   from unnest($1::text[]) as sel(agent_id)
+		   cross join lateral (
+		         select id, agent_id, status, outcome, error_code, queued_at, started_at, finished_at,
+		                trigger_event_id, usage
+		           from agent_runs
+		          where agent_id = sel.agent_id
+		          order by queued_at desc, id desc
+		          limit $2
+		   ) r
+		   join events e on e.id = r.trigger_event_id
+		  order by r.queued_at desc, r.id desc
+		  limit $2`,
+		[ids, RECENT_RUNS],
 	);
 	const alerts = await rows<Readonly<{ key: string; message: string; fired_at: Date }>>(
 		client,

@@ -98,10 +98,13 @@ export function buildTurnContext(sources: TurnContextSources): TurnContextResult
 	// `memory.write` deny (a concrete pattern or a covering wildcard like `memory.*`) leaves it no
 	// writable namespace at all, private or shared, so the existing namespace check in
 	// `checkTurnResultAuthority` rejects every proposal rather than needing its own tool check.
+	// `memoryNamespaces.shared` below is never filtered by this: shared memory is still folded
+	// into `memories` for reading whether or not writes are denied, and the prompt (runtime-sdk)
+	// derives writability from `toolPolicy.deny` itself, so hiding the namespace here would only
+	// make the turn input inaccurate without gating anything the authority check does not already.
 	const memoryWriteDenied = permissions.tools_deny.some((pattern) =>
 		toolPatternCovers(pattern, "memory.write"),
 	);
-	const writableSharedNamespaces = memoryWriteDenied ? [] : memory.shared_namespaces;
 
 	// The status is placed, never collected: the caller only queries it for an agent whose
 	// permissions actually grant observation (ADR-023). A mismatch here is the caller's bug, not
@@ -147,7 +150,7 @@ export function buildTurnContext(sources: TurnContextSources): TurnContextResult
 		channels,
 		threadContext: sources.threadContext,
 		memories: sources.memories,
-		memoryNamespaces: { private: memory.private_namespace, shared: writableSharedNamespaces },
+		memoryNamespaces: { private: memory.private_namespace, shared: memory.shared_namespaces },
 		pendingInbox: sources.pendingInbox,
 		workspace: null,
 		toolPolicy,
