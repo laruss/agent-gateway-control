@@ -4,6 +4,18 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## [Unreleased]
 
+### Fixed
+
+- A worker stops a turn as soon as its run is cancelled (a pause, `runs cancel`, `kill-all`).
+  It only noticed the cancel at the turn's deadline: the runtime worked on, spending tokens,
+  and held the worker's slot, so the agent's next work waited up to the run timeout. Found by
+  the failure drills on the home server.
+
+### Added
+
+- `scripts/soak/drills.sh`: failure drills for a restored copy of the home server, and
+  `home-server/guest/restore.sh` to restore the whole server from a backup archive.
+
 ## [0.2.0] - 2026-09-30
 
 ### Added

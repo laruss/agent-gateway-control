@@ -40,6 +40,8 @@ export type WorkerOptions = Readonly<{
 	reprobeMs?: number;
 	/** Where the worker's metrics go; a registry of its own by default. */
 	metrics?: MetricsRegistry;
+	/** How often a turn in progress checks that its job is still active; lower in tests. */
+	jobCheckMs?: number;
 }>;
 
 export type RunningWorker = Readonly<{
@@ -65,6 +67,13 @@ const STALE_WORKSPACE_MS = 48 * 60 * 60 * 1000;
 const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 /** How long a worker giving up waits for its cancelled turns. */
 const GIVE_UP_WAIT_MS = 15_000;
+/**
+ * How often a turn in progress checks its job. pg-boss aborts a job's signal on a cancel only
+ * through job heartbeats, which the run queues do not use: an operator's cancel (a pause, a run
+ * cancel, kill-all) would otherwise leave the runtime working, and the worker's slot taken,
+ * until the turn's deadline.
+ */
+const JOB_CHECK_MS = 5_000;
 
 /** The probe with the version pin applied. */
 export function pinProbe(probe: RuntimeProbeResult, pinned: string | null): RuntimeProbeResult {
@@ -174,6 +183,31 @@ export async function startWorker(options: WorkerOptions): Promise<RunningWorker
 					const controller = new AbortController();
 					const abort = () => controller.abort();
 					job.signal.addEventListener("abort", abort, { once: true });
+					// Cancelled while it runs: the turn stops, its slot frees.
+					let checkFailed = false;
+					const check = setInterval(() => {
+						boss
+							.getJobById(runQueue(adapter.id), job.id)
+							.then((current) => {
+								// Cancelled (or deleted): an operator's stop. An expired or settled job is
+								// pg-boss's to signal, and its own abort path reports it rightly.
+								if (current === null || current.state === "cancelled") {
+									clearInterval(check);
+									log.info("run job cancelled; stopping its turn", {
+										job_id: job.id,
+										state: current?.state ?? "gone",
+									});
+									controller.abort();
+								}
+							})
+							.catch((error: Error) => {
+								if (!checkFailed) {
+									checkFailed = true;
+									log.warn("the run job's state could not be read", errorFields(error));
+								}
+							});
+					}, options.jobCheckMs ?? JOB_CHECK_MS);
+					check.unref();
 					const running = processRunJob(
 						{
 							adapter,
@@ -204,6 +238,7 @@ export async function startWorker(options: WorkerOptions): Promise<RunningWorker
 						throw error;
 					} finally {
 						runDurations.observe((Date.now() - started) / 1000, { adapter: adapter.id });
+						clearInterval(check);
 						inFlight.delete(entry);
 						job.signal.removeEventListener("abort", abort);
 					}

@@ -50,6 +50,7 @@ import {
 	type OutboxDeps,
 	reconcileOutbox,
 } from "@agent-gateway/outbox";
+import { createBoss } from "@agent-gateway/queue";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { pendingApprovalCards } from "./approval-cards.ts";
@@ -1622,7 +1623,13 @@ describe("durable core with the mock runtime", () => {
 		const event = humanPost("@developer take forever [mock:slow]", ["developer"]);
 		await ingestEvent(gateway.deps(), event);
 		await eventually(async () => (await agentState("developer")) === "running", 30_000, "running");
-		await pauseAgent(gateway.deps(), "developer", "test");
+		// As the CLI does: the cancelled runs' jobs are cancelled in pg-boss too.
+		const boss = createBoss(gateway.postgres.connectionString, "client");
+		await boss.start();
+		for (const job of await pauseAgent(gateway.deps(), "developer", "test")) {
+			await boss.cancel(job.queue, job.jobId);
+		}
+		await boss.stop({ graceful: false });
 		const [run] = await runsFor(event.id);
 		expect(run).toMatchObject({ status: "cancelled", error_code: "cancelled" });
 		const inbox = await query<{ status: string; run_id: string | null }>(
@@ -1631,6 +1638,8 @@ describe("durable core with the mock runtime", () => {
 		);
 		expect(inbox).toEqual([{ status: "pending", run_id: null }]);
 		expect(await agentState("developer")).toBe("paused");
+		// The worker stops the cancelled turn at once instead of running it to its deadline.
+		await eventually(async () => (await gateway.workerActiveJobs()) === 0, 10_000, "turn stopped");
 	});
 
 	it("keeps a config apply from revoking a post that is already authorized", async () => {

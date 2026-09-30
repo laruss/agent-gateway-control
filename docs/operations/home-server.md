@@ -147,6 +147,62 @@ certificate authority and the release in use. It is encrypted with
 The VM keeps its newest 7 archives, the Mac its newest 30 in `~/agw-backups` (with
 `backup.log`). Copy `~/agw-backups` to a disk that is not the Mac's, too.
 
+## Restore
+
+`guest/restore.sh` rebuilds both stacks from one archive into a VM with Docker and nothing else:
+the release, both home directories with their secrets, Mattermost's database, files and Caddy's
+authority, the Gateway's database with its worker roles (made again from their stored URLs
+before the dump, whose policies name them), and the Codex login. It checks the schema, runs the
+doctor and prints the row counts.
+
+Decrypt on the machine that holds the key and stream the archive straight into the script, so
+no plaintext copy of the secrets lands on any disk. The script comes from the release bundle
+(`home-server/guest/restore.sh`) or the repository; copy it into the VM first.
+
+```bash
+ssh <mac> 'cat ~/agw-backups/home-server-<time>.tar.age' | age -d -i agw-backup-identity.txt |
+  ssh <mac> 'limactl shell <vm> sudo bash /tmp/restore.sh [--rehearsal] -'
+```
+
+It refuses a VM that already has either stack. Roles of limited services are made again and
+given new passwords (their URLs are rewritten); a tool runner's grant is repeated by hand, as the
+script says.
+
+For a real restore, prepare the VM as in "The VM" first (the LAN address, mDNS and the egress
+firewall), then restore without `--rehearsal`. The copy has the same bot tokens, so stop the
+original first.
+
+**Rehearse it** regularly in a second VM without a LAN address (`limactl create
+--name=agw-restore --set '.networks = [] | .memory = "6GiB" | .disk = "60GiB"'`). `--rehearsal`
+starts no runtime worker, connector or tool runner: a copy must not use the real runtime logins
+(a refreshed token would log the original out) or act on the outside world; it also turns off
+Mattermost's push and email notifications (the copy has the real users) and marks the copy
+(`$GATEWAY_HOME/.rehearsal`), without which the failure drills refuse to run. Compare the row
+counts with the original. The first rehearsal (2026-09-30) restored in under a minute plus the
+image pulls.
+
+## Failure drills
+
+`scripts/soak/drills.sh` runs on a restored copy (never the original), on the mock runtime: each
+drill breaks one thing while an agent works and checks every mention is answered exactly once.
+
+| Drill | What breaks |
+|-------|-------------|
+| `controller_restart` | the controller restarts while a mention is routed |
+| `database_restart` | PostgreSQL stops cleanly for a while; the services lose the deployment lock and come back |
+| `mattermost_network` | the controller loses the Mattermost network; the backlog is caught up |
+| `duplicates` | a full resync reads every channel again; no post is stored twice |
+| `provider_flaky` | the runtime fails once, then answers |
+| `invalid_once` | the model's answer is malformed once, then repaired |
+| `cascade` | the agent hands work to another agent (needs a second enabled agent in the channel) |
+| `worker_kill` | the worker is killed during a long turn; the operator cancels it and resumes the agent |
+| `provider_permanent`, `invalid_always` | runs that cannot succeed; each leaves the agent FAILED, so each gets a pass of its own |
+
+Run each pass on a fresh restore of the newest backup (restore, then
+`sudo drills.sh [drill ...]`): that repeats the restore rehearsal too. The first drills
+(2026-09-30) found that a worker kept running a cancelled turn until its deadline (fixed in
+0.2.1).
+
 ## Checks after a restart
 
 ```bash
