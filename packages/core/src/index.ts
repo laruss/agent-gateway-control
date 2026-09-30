@@ -29,6 +29,7 @@ export * from "./services/runs.ts";
 export * from "./services/runtime-health.ts";
 export * from "./services/scheduler.ts";
 export { enqueueOutbox, type OutboxDraft, raiseAlert } from "./services/store.ts";
+export * from "./services/system-status.ts";
 export * from "./services/wait-timeouts.ts";
 export * from "./state-machine.ts";
 export * from "./turn-context.ts";

@@ -17,6 +17,14 @@ import {
 import type { AgentState } from "@agent-gateway/db";
 import { agentChannelRefs, type ChannelAccess } from "./channel-access.ts";
 
+/**
+ * The largest turn input a run starts with, serialized. A neutral constant (no IO, no service
+ * dependency): the scheduler enforces it when it builds a turn's input, and the system status
+ * read model (ADR-023) reports it as the console's byte budget, without either importing the
+ * other.
+ */
+export const MAX_TURN_INPUT_BYTES = 2 * 1024 * 1024;
+
 export type AgentRecord = Readonly<{
 	id: AgentId;
 	displayName: string;

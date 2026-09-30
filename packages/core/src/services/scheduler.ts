@@ -44,7 +44,7 @@ import {
 } from "drizzle-orm";
 import { agentChannelFloors, agentChannelIds, agentGrantsRecorded } from "../channel-access.ts";
 import { requireTransition } from "../state-machine.ts";
-import { type AgentRecord, buildTurnContext } from "../turn-context.ts";
+import { type AgentRecord, buildTurnContext, MAX_TURN_INPUT_BYTES } from "../turn-context.ts";
 import { budgetHoldFor } from "./budgets.ts";
 import {
 	assembleThread,
@@ -503,9 +503,6 @@ export async function scheduleAgent(
 	});
 	return { runId };
 }
-
-/** The largest turn input a run starts with, serialized. */
-export const MAX_TURN_INPUT_BYTES = 2 * 1024 * 1024;
 
 export type AttemptInit = Readonly<{
 	runId: string;
