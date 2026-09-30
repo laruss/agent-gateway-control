@@ -73,9 +73,8 @@ services:
       # The Gateway's bots, and the administrator's token for its bootstrap.
       MM_SERVICESETTINGS_ENABLEBOTACCOUNTCREATION: "true"
       MM_SERVICESETTINGS_ENABLEUSERACCESSTOKENS: "true"
-      # Accounts are created by the administrator: no open sign-up.
+      # No open sign-up: after the first account (the system admin), people join by invitation.
       MM_TEAMSETTINGS_ENABLEOPENSERVER: "false"
-      MM_EMAILSETTINGS_ENABLESIGNUPWITHEMAIL: "false"
       MM_BLEVESETTINGS_INDEXDIR: /mattermost/bleve-indexes
       # Plugins stay off: the Gateway needs none, and each would run emulated (Calls, AI and
       # Playbooks ship prepackaged).
