@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The home server's daily backup, as a LaunchDaemon: it runs without a login, as the user who
+  owns the Lima VM. Replace @USER@ and @HOME@, then install it (docs/operations/home-server.md):
+    sudo install -m 0644 io.agent-gateway.backup.plist /Library/LaunchDaemons/
+    sudo launchctl bootstrap system /Library/LaunchDaemons/io.agent-gateway.backup.plist
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>io.agent-gateway.backup</string>
+	<key>UserName</key>
+	<string>@USER@</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>@HOME@</string>
+	</dict>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@HOME@/agent-gateway/home-server/host/pull-backup.sh</string>
+	</array>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>3</integer>
+		<key>Minute</key>
+		<integer>30</integer>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>@HOME@/agw-backups/backup.log</string>
+	<key>StandardErrorPath</key>
+	<string>@HOME@/agw-backups/backup.log</string>
+	<key>ProcessType</key>
+	<string>Background</string>
+</dict>
+</plist>

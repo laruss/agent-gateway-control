@@ -47,6 +47,7 @@ See [local development](docs/operations/local-development.md) for the full walkt
 - [Security scans](docs/operations/security-scans.md)
 - [Releases](docs/operations/releases.md); installing on a server:
   [deploy/release/INSTALL.md](deploy/release/INSTALL.md)
+- [The home server on an Apple silicon Mac](docs/operations/home-server.md)
 - [Privacy notes](docs/security/privacy.md)
 - [Implementation status](IMPLEMENTATION_STATUS.md)
 

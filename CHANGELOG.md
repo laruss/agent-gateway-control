@@ -4,6 +4,22 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## [Unreleased]
 
+### Added
+
+- The home server kit (`home-server/` in the bundle, ADR-021): a Lima VM template for an
+  Apple silicon Mac (Ubuntu 24.04, Docker Engine by exact versions, Rosetta, bridged LAN
+  address, start at boot), the guest setup (fixed LAN address, mDNS name, egress firewall
+  unit), the Mattermost 11.7 ESR stack with its own PostgreSQL and Caddy TLS, and daily
+  encrypted backups of the whole server copied off the VM by a LaunchDaemon.
+- `bin/egress-firewall.sh`: an nftables table that leaves the Gateway's egress bridge only the
+  public internet and the host's DNS resolvers.
+
+### Changed
+
+- The `egress` network's bridge is named `agw-egress`, so host firewall rules can match it.
+  Upgrading from 0.1.x recreates the network: stop the stack with `bin/agw down` (volumes are
+  kept) before `bin/agw up -d`.
+
 ## [0.1.1] - 2026-09-30
 
 ### Fixed
