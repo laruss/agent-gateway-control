@@ -108,6 +108,27 @@ describe("channel grants", () => {
 		expect(await researchChannels()).toContain(LAB);
 	});
 
+	it("never grants a channel the agent has in its configuration", async () => {
+		const config = exampleConfig();
+		const configured = config.agents.find((agent) => agent.id === "research")?.mattermost
+			.allowed_channels[0];
+		if (configured === undefined) {
+			throw new Error("the example research agent has no channel");
+		}
+		expect(
+			await grantChannel(gateway.deps(), {
+				agentId: "research",
+				botUserId: RESEARCH_BOT,
+				teamId: IDS.channel("team"),
+				channelId: IDS.channel(configured),
+				channelName: configured,
+				grantorUserId: IDS.owner,
+				evidencePostId: EVIDENCE,
+				sinceMs: Date.now(),
+			}),
+		).toBe(false);
+	});
+
 	it("holds only for the agent's current bot", async () => {
 		expect(await unneededChannels(gateway.deps(), [LAB])).toEqual([]);
 		await setAgentBotUser(gateway.deps(), "research", "replacedb0t000000000000000", "test");

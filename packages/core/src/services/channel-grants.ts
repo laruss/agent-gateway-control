@@ -92,6 +92,7 @@ export async function loadMembershipState(deps: ControlPlaneDeps): Promise<Membe
 				state: mattermostChannelGrants.state,
 				botUserId: mattermostChannelGrants.botUserId,
 				sinceMs: mattermostChannelGrants.sinceMs,
+				revokedReason: mattermostChannelGrants.revokedReason,
 			})
 			.from(mattermostChannelGrants)
 			.where(eq(mattermostChannelGrants.teamId, teamId));
@@ -131,7 +132,7 @@ export async function grantChannel(
 		const { db } = uow.tx;
 		const config = await loadActiveConfig(db);
 		const [bot] = await db
-			.select({ userId: mattermostIdentities.mattermostUserId })
+			.select({ userId: mattermostIdentities.mattermostUserId, config: agents.config })
 			.from(mattermostIdentities)
 			.innerJoin(agents, eq(agents.id, mattermostIdentities.agentId))
 			.where(
@@ -140,7 +141,16 @@ export async function grantChannel(
 					eq(agents.configVersion, config?.version ?? ""),
 				),
 			);
-		if (bot?.userId !== input.botUserId) {
+		if (bot === undefined || bot.userId !== input.botUserId) {
+			return false;
+		}
+		// A configured channel needs no grant, and bootstrap's own add there (with the admin's
+		// token) must never become one: a pass that read the configuration before it changed
+		// could otherwise take that add for an admin's.
+		const named = await loadTeamChannels(db);
+		if (
+			bot.config.mattermost.allowed_channels.some((name) => named.get(name) === input.channelId)
+		) {
 			return false;
 		}
 		const [existing] = await db
@@ -279,11 +289,13 @@ export async function rejectChannelAdd(deps: ControlPlaneDeps, add: RejectedAdd)
 		};
 		await audit(uow, "system", "mattermost.channel.add_rejected", "agent", add.agentId, detail);
 		const message =
-			add.reason === "listener_not_added"
-				? `@${add.agentId} was added to ~${add.channelName}, but the Gateway could not add its listener there, so its bot left again. Check that channel members may add members, or add the listener by hand before the agent.`
-				: add.reason === "not_owner_or_admin"
-					? `@${add.agentId} was added to ~${add.channelName} by someone who is neither an owner nor a system admin; its bot left the channel.`
-					: `@${add.agentId} was in ~${add.channelName}, but no add by an owner or system admin was found; its bot left the channel.`;
+			add.reason === "configuration_removed"
+				? `@${add.agentId} was taken out of ~${add.channelName} by the configuration; its bot left the channel.`
+				: add.reason === "listener_not_added"
+					? `@${add.agentId} was added to ~${add.channelName}, but the Gateway could not add its listener there, so its bot left again. Check that channel members may add members, or add the listener by hand before the agent.`
+					: add.reason === "not_owner_or_admin"
+						? `@${add.agentId} was added to ~${add.channelName} by someone who is neither an owner nor a system admin; its bot left the channel.`
+						: `@${add.agentId} was in ~${add.channelName}, but no add by an owner or system admin was found; its bot left the channel.`;
 		const occurrence = add.evidencePostId ?? uow.now.toISOString().slice(0, 10);
 		await raiseAlert(
 			uow,

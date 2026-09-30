@@ -21,6 +21,8 @@ export type GrantRecord = Readonly<{
 	botUserId: MattermostId;
 	/** An add must be newer than this to grant (again). */
 	sinceMs: number;
+	/** Why a revoked record ended, e.g. `bot_left` or `config_removed`; null while active. */
+	revokedReason: string | null;
 }>;
 
 /** What the membership synchronizer works from; null before configuration and bootstrap. */
@@ -46,7 +48,12 @@ export type ChannelGrantInput = Readonly<{
 	sinceMs: number;
 }>;
 
-export type RejectedAddReason = "not_owner_or_admin" | "no_add_record" | "listener_not_added";
+export type RejectedAddReason =
+	| "not_owner_or_admin"
+	| "no_add_record"
+	| "listener_not_added"
+	/** The channel was taken out of the agent's `allowed_channels`: its bot leaves. */
+	| "configuration_removed";
 
 export type RejectedAdd = Readonly<{
 	agentId: AgentId;

@@ -38,7 +38,6 @@ export type MembershipClient = Pick<
 	MattermostClient,
 	| "userChannelsInTeam"
 	| "channelPostsBefore"
-	| "channelPostsSince"
 	| "user"
 	| "isChannelMember"
 	| "addChannelMember"
@@ -63,6 +62,20 @@ export type MembershipSyncOptions = Readonly<{
 const EVIDENCE_SCAN_PAGES = 3;
 const EVIDENCE_PAGE_SIZE = 200;
 const DEFAULT_GRACE_MS = 60_000;
+/** A post may be stored a little after its creation time: rescans overlap by this much. */
+const SCAN_OVERLAP_MS = 10_000;
+
+/** What the synchronizer remembers between passes. */
+export type MembershipMemory = Readonly<{
+	/** Memberships waiting for their add record, since when (ms), by `agent:channel`. */
+	pending: Map<string, number>;
+	/** Per granted `agent:channel`, up to when (ms) its posts were checked for a re-add. */
+	scanned: Map<string, number>;
+}>;
+
+export function membershipMemory(): MembershipMemory {
+	return { pending: new Map(), scanned: new Map() };
+}
 
 /** A channel type the Gateway works in: public or private, never direct or group messages. */
 function isTeamChannel(channel: ApiChannel, teamId: MattermostId): boolean {
@@ -99,21 +112,29 @@ function newestAdd(list: ApiPostList, userId: MattermostId): ApiPost | null {
 	return newest;
 }
 
-/** The newest add of `userId` among the channel's recent posts, or null. */
+/**
+ * The newest add of `userId` among the channel's posts newest first, reading back no further
+ * than posts created at `afterMs` (and at most a few pages), or null.
+ */
 async function findAdd(
 	client: MembershipClient,
 	channelId: MattermostId,
 	userId: MattermostId,
+	afterMs = 0,
 ): Promise<ApiPost | null> {
 	let before: MattermostId | null = null;
 	for (let page = 0; page < EVIDENCE_SCAN_PAGES; page += 1) {
 		const list = await client.channelPostsBefore(channelId, before, EVIDENCE_PAGE_SIZE);
 		const add = newestAdd(list, userId);
 		if (add !== null) {
-			return add;
+			return add.create_at > afterMs ? add : null;
 		}
 		const last = list.order.at(-1);
 		if (last === undefined || list.order.length < EVIDENCE_PAGE_SIZE) {
+			return null;
+		}
+		const oldest = list.posts[last];
+		if (oldest === undefined || oldest.create_at <= afterMs) {
 			return null;
 		}
 		before = last;
@@ -133,7 +154,7 @@ type BotPass = Readonly<{
 	state: MembershipState;
 	bot: MembershipBot;
 	client: MembershipClient;
-	pending: Map<string, number>;
+	memory: MembershipMemory;
 	seen: Set<string>;
 }>;
 
@@ -142,7 +163,8 @@ type BotPass = Readonly<{
  * listener could be brought in; otherwise any grant ends and the bot leaves.
  */
 async function judgeAdd(pass: BotPass, channel: ApiChannel, add: ApiPost): Promise<void> {
-	const { options, state, bot, client, pending } = pass;
+	const { options, state, bot, client } = pass;
+	const { pending } = pass.memory;
 	const key = `${bot.agentId}:${channel.id}`;
 	const base = { agentId: bot.agentId, channelId: channel.id, channelName: channel.name };
 	const leave = async (rejection: RejectedAdd) => {
@@ -202,9 +224,23 @@ async function judgeAdd(pass: BotPass, channel: ApiChannel, add: ApiPost): Promi
 	}
 }
 
+/** Runs one channel's step; a failure is logged and the bot's other channels go on. */
+async function step(pass: BotPass, channelId: MattermostId, work: () => Promise<void>) {
+	try {
+		await work();
+	} catch (error) {
+		pass.options.log.warn("membership sync of a channel failed", {
+			agent_id: pass.bot.agentId,
+			channel_id: channelId,
+			...errorFields(error),
+		});
+	}
+}
+
 /** One bot's channels: revocations, re-adds of granted channels, and new memberships. */
 async function syncBot(pass: BotPass): Promise<void> {
-	const { options, state, bot, client, pending, seen } = pass;
+	const { options, state, bot, client, seen } = pass;
+	const { pending, scanned } = pass.memory;
 	const channels = (await client.userChannelsInTeam(bot.userId, state.teamId)).filter((channel) =>
 		isTeamChannel(channel, state.teamId),
 	);
@@ -217,21 +253,32 @@ async function syncBot(pass: BotPass): Promise<void> {
 	);
 
 	for (const grant of active) {
-		const channel = member.get(grant.channelId);
-		if (channel === undefined) {
-			await options.store.revoke(bot.agentId, grant.channelId, "bot_left");
-			options.log.info("channel grant revoked", {
-				agent_id: bot.agentId,
-				channel_id: grant.channelId,
-			});
-			continue;
-		}
-		// Removed and added again between two polls: the newer add decides, not the old one.
-		const since = await client.channelPostsSince(grant.channelId, grant.sinceMs);
-		const readd = newestAdd(since, bot.userId);
-		if (readd !== null && readd.create_at > grant.sinceMs) {
-			await judgeAdd(pass, channel, readd);
-		}
+		const key = `${bot.agentId}:${grant.channelId}`;
+		await step(pass, grant.channelId, async () => {
+			const channel = member.get(grant.channelId);
+			if (channel === undefined) {
+				scanned.delete(key);
+				await options.store.revoke(bot.agentId, grant.channelId, "bot_left");
+				options.log.info("channel grant revoked", {
+					agent_id: bot.agentId,
+					channel_id: grant.channelId,
+				});
+				return;
+			}
+			// Configured as well: the configuration's rules hold there, whoever re-adds.
+			if (bot.configuredChannelIds.has(grant.channelId)) {
+				return;
+			}
+			// Removed and added again between two polls: the newer add decides, not the old one.
+			// Only posts since the last check are read (newest first, overlapping a little).
+			const checkedAt = options.clock().getTime() - SCAN_OVERLAP_MS;
+			const after = Math.max(grant.sinceMs, scanned.get(key) ?? grant.sinceMs);
+			const readd = await findAdd(client, grant.channelId, bot.userId, after);
+			scanned.set(key, checkedAt);
+			if (readd !== null && readd.create_at > grant.sinceMs) {
+				await judgeAdd(pass, channel, readd);
+			}
+		});
 	}
 
 	for (const channel of channels) {
@@ -243,18 +290,21 @@ async function syncBot(pass: BotPass): Promise<void> {
 		}
 		const key = `${bot.agentId}:${channel.id}`;
 		seen.add(key);
-		const latest = records.find((grant) => grant.channelId === channel.id);
-		const add = await findAdd(client, channel.id, bot.userId);
-		// An add no newer than the latest record is the one that record came from (or older):
-		// after a revocation, or a channel taken out of the configuration, only a new add counts.
-		if (add !== null && (latest === undefined || add.create_at > latest.sinceMs)) {
-			await judgeAdd(pass, channel, add);
-			continue;
-		}
-		const now = options.clock().getTime();
-		const first = pending.get(key) ?? now;
-		pending.set(key, first);
-		if (now - first >= (options.evidenceGraceMs ?? DEFAULT_GRACE_MS)) {
+		await step(pass, channel.id, async () => {
+			const latest = records.find((grant) => grant.channelId === channel.id);
+			const add = await findAdd(client, channel.id, bot.userId);
+			// An add no newer than the latest record is the one that record came from (or older):
+			// after a revocation, or a channel taken out of the configuration, only a new add counts.
+			if (add !== null && (latest === undefined || add.create_at > latest.sinceMs)) {
+				await judgeAdd(pass, channel, add);
+				return;
+			}
+			const now = options.clock().getTime();
+			const first = pending.get(key) ?? now;
+			pending.set(key, first);
+			if (now - first < (options.evidenceGraceMs ?? DEFAULT_GRACE_MS)) {
+				return;
+			}
 			pending.delete(key);
 			await options.store.reject({
 				agentId: bot.agentId,
@@ -262,14 +312,15 @@ async function syncBot(pass: BotPass): Promise<void> {
 				channelName: channel.name,
 				actorUserId: null,
 				evidencePostId: null,
-				reason: "no_add_record",
+				reason:
+					latest?.revokedReason === "config_removed" ? "configuration_removed" : "no_add_record",
 			});
 			await client.removeChannelMember(channel.id, bot.userId);
-			options.log.warn("an agent bot left a channel without an add record", {
+			options.log.warn("an agent bot left a channel it holds no grant for", {
 				agent_id: bot.agentId,
 				channel_id: channel.id,
 			});
-		}
+		});
 	}
 }
 
@@ -300,7 +351,7 @@ async function sweepListener(options: MembershipSyncOptions, state: MembershipSt
  */
 export async function syncMembership(
 	options: MembershipSyncOptions,
-	pending: Map<string, number>,
+	memory: MembershipMemory,
 ): Promise<void> {
 	const state = await options.store.state();
 	if (state === null) {
@@ -314,7 +365,7 @@ export async function syncMembership(
 			continue;
 		}
 		try {
-			await syncBot({ options, state, bot, client: connect(token), pending, seen });
+			await syncBot({ options, state, bot, client: connect(token), memory, seen });
 		} catch (error) {
 			options.log.warn("membership sync of an agent bot failed", {
 				agent_id: bot.agentId,
@@ -323,9 +374,9 @@ export async function syncMembership(
 		}
 	}
 	// Memberships that went away while waiting for their add record wait no more.
-	for (const key of [...pending.keys()]) {
+	for (const key of [...memory.pending.keys()]) {
 		if (!seen.has(key)) {
-			pending.delete(key);
+			memory.pending.delete(key);
 		}
 	}
 	try {
@@ -341,14 +392,14 @@ export type RunningMembershipSync = Readonly<{ stop: () => Promise<void> }>;
 export function startMembershipSync(
 	options: MembershipSyncOptions & Readonly<{ intervalMs?: number }>,
 ): RunningMembershipSync {
-	const pending = new Map<string, number>();
+	const memory = membershipMemory();
 	let running: Promise<void> | null = null;
 	let stopped = false;
 	const pass = () => {
 		if (stopped || running !== null) {
 			return;
 		}
-		running = syncMembership(options, pending)
+		running = syncMembership(options, memory)
 			.catch((error: Error) => options.log.warn("membership sync failed", errorFields(error)))
 			.finally(() => {
 				running = null;

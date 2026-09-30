@@ -379,6 +379,11 @@ export async function bootstrapMattermost(options: BootstrapOptions): Promise<vo
 		resolved.set(bot, await ensureBot(admin, bot));
 	}
 	const gatewayBots = [...resolved.values()];
+	/** Per bot, the channels it was given by an owner or admin (any agent's, for the listener). */
+	const granted = new Map<MattermostId, ReadonlySet<MattermostId>>();
+	for (const [bot, userId] of resolved) {
+		granted.set(userId, await store.grantedChannelIds(bot));
+	}
 	for (const [bot, userId] of resolved) {
 		const recorded = await store.recordedBotUserId(bot);
 		if (recorded !== null && recorded !== userId && !gatewayBots.includes(recorded)) {
@@ -422,7 +427,7 @@ export async function bootstrapMattermost(options: BootstrapOptions): Promise<vo
 			await admin.addChannelMember(channelId, userId);
 		}
 		// Channels an owner or admin granted by adding the bot stay (ADR-022).
-		for (const channelId of await store.grantedChannelIds(bot)) {
+		for (const channelId of granted.get(userId) ?? []) {
 			allowed.add(channelId);
 		}
 		// Every other channel of the team (managed or not) must not stay readable to its token;
@@ -469,10 +474,19 @@ export async function bootstrapMattermost(options: BootstrapOptions): Promise<vo
 		await store.forget("user", name, id);
 	}
 	for (const [name, id] of staleChannels) {
+		// A channel an owner or admin gave an agent stays followed for it (ADR-022): that bot and
+		// the listener stay, and so does the channel's catch-up.
+		const keptFor = (userId: MattermostId) => granted.get(userId)?.has(id) === true;
 		for (const userId of new Set([...gatewayBots, ...plan.retiredBots.map((bot) => bot.userId)])) {
-			await leave(userId, [id]);
+			if (!keptFor(userId)) {
+				await leave(userId, [id]);
+			}
 		}
 		await store.forget("channel", name, id);
+		if (gatewayBots.some(keptFor)) {
+			report(`channel '${name}': no longer configured, kept for the agents granted it`);
+			continue;
+		}
 		await store.forgetChannelStart(id);
 		report(`channel '${name}': no longer managed, Gateway bots removed`);
 	}

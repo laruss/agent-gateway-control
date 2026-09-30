@@ -7,7 +7,7 @@ import type {
 import { createLogger } from "@agent-gateway/logging";
 import { describe, expect, it } from "vitest";
 import type { ApiChannel, ApiPost, ApiPostList, ApiUser } from "./api-schemas.ts";
-import { type MembershipClient, syncMembership } from "./membership.ts";
+import { type MembershipClient, membershipMemory, syncMembership } from "./membership.ts";
 
 /** A Mattermost id: 26 lowercase letters and digits. */
 function id(label: string): MattermostId {
@@ -107,8 +107,6 @@ class World {
 			posts: Object.fromEntries(posts.map((post) => [post.id, post])),
 		});
 		return {
-			channelPostsSince: async (channelId, sinceMs) =>
-				list(this.at(channelId).posts.filter((post) => post.update_at > sinceMs)),
 			userChannelsInTeam: async (userId, teamId) => {
 				check();
 				return [...this.channels.values()]
@@ -149,7 +147,7 @@ class Records {
 function harness(bots = [DEVELOPER_BOT]) {
 	const world = new World();
 	const records = new Records();
-	const pending = new Map<string, number>();
+	const memory = membershipMemory();
 	const store = {
 		state: async () => ({
 			teamId: TEAM,
@@ -178,13 +176,16 @@ function harness(bots = [DEVELOPER_BOT]) {
 					state: "active",
 					botUserId: grant.botUserId,
 					sinceMs: grant.sinceMs,
+					revokedReason: null,
 				},
 			];
 			return true;
 		},
-		revoke: async (agentId: string, channelId: MattermostId) => {
+		revoke: async (agentId: string, channelId: MattermostId, reason: string) => {
 			records.grants = records.grants.map((g) =>
-				g.agentId === agentId && g.channelId === channelId ? { ...g, state: "revoked" } : g,
+				g.agentId === agentId && g.channelId === channelId && g.state === "active"
+					? { ...g, state: "revoked", revokedReason: reason }
+					: g,
 			);
 			return records.grants.some((g) => g.channelId === channelId && g.state === "active");
 		},
@@ -214,7 +215,7 @@ function harness(bots = [DEVELOPER_BOT]) {
 				evidenceGraceMs: 60_000,
 				client: (token) => world.client(token),
 			},
-			pending,
+			memory,
 		);
 	return { world, records, sync };
 }
@@ -344,6 +345,44 @@ describe("the membership synchronizer", () => {
 		]);
 		expect(world.at(LAB).members.has(DEVELOPER_BOT)).toBe(false);
 		expect(world.at(LAB).members.has(LISTENER)).toBe(false);
+	});
+
+	it("finds a re-add behind many newer posts in a busy channel", async () => {
+		const { world, records, sync } = harness();
+		world.add(LAB, OWNER, DEVELOPER_BOT);
+		await sync();
+		world.at(LAB).members.delete(DEVELOPER_BOT);
+		world.add(LAB, MEMBER, DEVELOPER_BOT);
+		for (let i = 0; i < 150; i += 1) {
+			world.add(LAB, OWNER, id(`h${i}`));
+		}
+		await sync();
+		expect(records.rejections).toEqual([
+			expect.objectContaining({ actorUserId: MEMBER, reason: "not_owner_or_admin" }),
+		]);
+	});
+
+	it("says so when a channel was taken out of the configuration", async () => {
+		const { world, records, sync } = harness();
+		world.add(LAB, ADMIN, DEVELOPER_BOT);
+		records.grants = [
+			{
+				agentId: "developer",
+				channelId: LAB,
+				state: "revoked",
+				botUserId: DEVELOPER_BOT,
+				sinceMs: world.now + 1,
+				revokedReason: "config_removed",
+			},
+		];
+		await sync();
+		world.now += 60_000;
+		await sync();
+		expect(records.granted).toEqual([]);
+		expect(records.rejections).toEqual([
+			expect.objectContaining({ reason: "configuration_removed" }),
+		]);
+		expect(world.at(LAB).members.has(DEVELOPER_BOT)).toBe(false);
 	});
 
 	it("moves a grant's floor to an owner's newer re-add", async () => {

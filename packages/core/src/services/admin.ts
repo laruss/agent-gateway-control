@@ -179,7 +179,11 @@ async function tombstoneUnconfiguredChannels(
 				.onConflictDoUpdate({
 					target: [mattermostChannelGrants.agentId, mattermostChannelGrants.channelId],
 					set: { ...values, generation: sql`${mattermostChannelGrants.generation} + 1` },
-					setWhere: eq(mattermostChannelGrants.state, "revoked"),
+					// A revoked record, or an active one of a replaced bot (it grants nothing).
+					setWhere: or(
+						eq(mattermostChannelGrants.state, "revoked"),
+						ne(mattermostChannelGrants.botUserId, sql`excluded.bot_user_id`),
+					),
 				});
 		}
 	}
