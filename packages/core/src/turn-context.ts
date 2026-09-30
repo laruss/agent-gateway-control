@@ -12,6 +12,7 @@ import {
 	type SystemStatus,
 	type ThreadContext,
 	type TurnAuthorityContext,
+	toolPatternCovers,
 	type Uuid,
 	type WorkingSummary,
 } from "@agent-gateway/contracts";
@@ -93,6 +94,15 @@ export function buildTurnContext(sources: TurnContextSources): TurnContextResult
 		deny: permissions.tools_deny,
 	};
 
+	// Namespace authorization alone would still let an agent propose memory writes; an explicit
+	// `memory.write` deny (a concrete pattern or a covering wildcard like `memory.*`) leaves it no
+	// writable namespace at all, private or shared, so the existing namespace check in
+	// `checkTurnResultAuthority` rejects every proposal rather than needing its own tool check.
+	const memoryWriteDenied = permissions.tools_deny.some((pattern) =>
+		toolPatternCovers(pattern, "memory.write"),
+	);
+	const writableSharedNamespaces = memoryWriteDenied ? [] : memory.shared_namespaces;
+
 	// The status is placed, never collected: the caller only queries it for an agent whose
 	// permissions actually grant observation (ADR-023). A mismatch here is the caller's bug, not
 	// silently reconciled into whichever version fits what it happened to pass.
@@ -137,7 +147,7 @@ export function buildTurnContext(sources: TurnContextSources): TurnContextResult
 		channels,
 		threadContext: sources.threadContext,
 		memories: sources.memories,
-		memoryNamespaces: { private: memory.private_namespace, shared: memory.shared_namespaces },
+		memoryNamespaces: { private: memory.private_namespace, shared: writableSharedNamespaces },
 		pendingInbox: sources.pendingInbox,
 		workspace: null,
 		toolPolicy,
@@ -168,7 +178,9 @@ export function buildTurnContext(sources: TurnContextSources): TurnContextResult
 				allowedChannelIds: channels.map((c) => c.channelId),
 				registeredAgentIds: sources.agents.map((a) => a.id),
 				addressableAgents,
-				writableMemoryNamespaces: [memory.private_namespace, ...memory.shared_namespaces],
+				writableMemoryNamespaces: memoryWriteDenied
+					? []
+					: [memory.private_namespace, ...memory.shared_namespaces],
 				attachableArtifactIds: [],
 				waitableUserIds: [...new Set(sources.waitableUserIds)].sort(),
 				toolPolicy,

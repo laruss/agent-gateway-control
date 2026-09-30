@@ -2,6 +2,7 @@ import {
 	type AgentTurnInput,
 	AgentTurnInputSchema,
 	modelOutputJsonSchema,
+	type SystemStatus,
 } from "@agent-gateway/contracts";
 
 /** Fixed ids of the contract fixture; any 26-character Mattermost ids would do. */
@@ -18,16 +19,37 @@ export type ContractInputInit = Readonly<{
 	/** Milliseconds from now until the deadline. */
 	deadlineMs: number;
 	now?: Date;
+	/** Given only for a version 2 input: the Gateway's status snapshot (ADR-023). */
+	systemStatus?: SystemStatus;
 }>;
+
+/** An empty but schema-valid `SystemStatus` (ADR-023), for tests that only need version 2's shape. */
+export function contractSystemStatus(overrides: Partial<SystemStatus> = {}): SystemStatus {
+	return {
+		asOf: new Date().toISOString(),
+		killSwitch: false,
+		agents: [],
+		omittedAgents: 0,
+		runtimes: [],
+		queues: [],
+		outbox: { pending: 0, dead: 0 },
+		approvalsPending: 0,
+		toolActionsUnknown: 0,
+		alerts: [],
+		maintenance: [],
+		...overrides,
+	};
+}
 
 /**
  * A complete, valid turn input for adapter tests: agent `developer` in one channel, woken by a
- * human post that mentions it; `finance` is addressable in the same channel.
+ * human post that mentions it; `finance` is addressable in the same channel. Version 2, carrying
+ * `init.systemStatus`, only when it is given.
  */
 export function contractTurnInput(init: ContractInputInit): AgentTurnInput {
 	const now = init.now ?? new Date();
 	return AgentTurnInputSchema.parse({
-		schemaVersion: 1,
+		schemaVersion: init.systemStatus === undefined ? 1 : 2,
 		runId: init.runId,
 		agent: {
 			agentId: "developer",
@@ -85,5 +107,6 @@ export function contractTurnInput(init: ContractInputInit): AgentTurnInput {
 		},
 		outputSchema: modelOutputJsonSchema(),
 		deadline: new Date(now.getTime() + init.deadlineMs).toISOString(),
+		systemStatus: init.systemStatus,
 	});
 }

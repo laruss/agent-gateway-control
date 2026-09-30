@@ -47,7 +47,10 @@ const CTRL_C = "\u0003";
 const CTRL_U = "\u0015";
 const BACKSPACE = "\u007f";
 /** C0 controls, DEL and C1 controls: never part of a password a login dialog can reproduce. */
-const CONTROL = /[\u0000-\u001f\u007f-\u009f]/u;
+function isControl(ch: string): boolean {
+	const code = ch.codePointAt(0) ?? 0;
+	return code < 0x20 || (code >= 0x7f && code <= 0x9f);
+}
 
 /**
  * Reads one line with the terminal's echo off. Raw mode is restored whichever way the line
@@ -84,7 +87,7 @@ function readHiddenLine(stdin: TtyInput, stdout: TtyOutput, prompt: string): Pro
 					value = [];
 					continue;
 				}
-				if (CONTROL.test(ch)) {
+				if (isControl(ch)) {
 					finish(() => {
 						stdout.write("\n");
 						reject(

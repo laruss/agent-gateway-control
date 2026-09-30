@@ -285,7 +285,9 @@ describe("Mattermost bridge against a real server", () => {
 		);
 
 	it("bootstraps bots, memberships and tokens, and reconcile finds nothing to fix", async () => {
-		expect(bootstrapReport.filter((line) => line.includes("token issued"))).toHaveLength(6);
+		// Every example agent's bot, plus the Gateway's own listener bot.
+		const bots = exampleConfig().agents.length + 1;
+		expect(bootstrapReport.filter((line) => line.includes("token issued"))).toHaveLength(bots);
 		const deps = gateway.deps();
 		expect(await reconcile()).toEqual([]);
 		// Bots are plain members, never admins.
@@ -296,7 +298,7 @@ describe("Mattermost bridge against a real server", () => {
 		bootstrapReport.length = 0;
 		await bootstrap(deps);
 		expect(readFileSync(join(secretsDir, "mm_developer_token"), "utf8")).toBe(before);
-		expect(bootstrapReport).toHaveLength(6);
+		expect(bootstrapReport).toHaveLength(bots);
 		expect(bootstrapReport.every((line) => line.includes("token kept"))).toBe(true);
 
 		// A membership outside the bot's channels is found, and bootstrap removes it.
@@ -382,6 +384,31 @@ describe("Mattermost bridge against a real server", () => {
 		}
 		const echoed = await eventOf(replyId);
 		expect(echoed).toMatchObject({ type: "mattermost.thread.reply", sender_agent_id: "developer" });
+		await settle();
+		expect(await runsOf(echoed.id)).toEqual([]);
+	});
+
+	it("wakes the operator (ADR-023) on a mention and the owner gets exactly one reply", async () => {
+		const postId = await say("hq", "@operator what is running right now?");
+		const event = await eventOf(postId);
+		expect(event.type).toBe("mattermost.agent.mentioned");
+		const run = await finishedRun(event.id, "operator run");
+		expect(run).toMatchObject({ agent_id: "operator", status: "succeeded" });
+		expect(await runsOf(event.id)).toHaveLength(1);
+
+		const reply = await publishedPost(run.id);
+		expect(reply.user_id).toBe(await botUserId("operator"));
+		expect(reply.root_id).toBe(postId);
+		expect(reply.channel_id).toBe(channel("hq"));
+
+		// The reply comes back through the listener as the operator's own, unaddressed post: it
+		// does not wake the operator, or anyone, a second time.
+		const replyId = reply.id;
+		if (typeof replyId !== "string") {
+			throw new Error("reply has no id");
+		}
+		const echoed = await eventOf(replyId);
+		expect(echoed).toMatchObject({ type: "mattermost.thread.reply", sender_agent_id: "operator" });
 		await settle();
 		expect(await runsOf(echoed.id)).toEqual([]);
 	});

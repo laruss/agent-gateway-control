@@ -1,8 +1,9 @@
-import type {
-	AgentConfig,
-	AgentPermissions,
-	OrganizationConfig,
-	SystemStatus,
+import {
+	type AgentConfig,
+	type AgentPermissions,
+	checkTurnResultAuthority,
+	type OrganizationConfig,
+	type SystemStatus,
 } from "@agent-gateway/contracts";
 import { describe, expect, it } from "vitest";
 import type { ChannelAccess } from "./channel-access.ts";
@@ -205,5 +206,107 @@ describe("buildTurnContext and the system status (ADR-023)", () => {
 		const v1Bytes = Buffer.byteLength(JSON.stringify(v1.context.input), "utf8");
 		const v2Bytes = Buffer.byteLength(JSON.stringify(v2.context.input), "utf8");
 		expect(v2Bytes).toBeGreaterThan(v1Bytes);
+	});
+});
+
+describe("buildTurnContext and an explicit memory.write deny", () => {
+	/** `developer` with `shared_namespaces` set, so emptying it is visible in the assertions. */
+	function withSharedNamespace(agent: AgentRecord): AgentRecord {
+		return {
+			...agent,
+			config: {
+				...agent.config,
+				memory: {
+					private_namespace: agent.config.memory.private_namespace,
+					shared_namespaces: ["organization/decisions"],
+				},
+			},
+		};
+	}
+
+	it("namespace authorization alone would still accept a proposal (today's baseline)", () => {
+		const agent = withSharedNamespace(agentRecord("developer"));
+		const result = buildTurnContext(sources({ agent, agents: [agent] }));
+		expect(result.ok).toBe(true);
+		if (!result.ok) {
+			throw new Error(result.reason);
+		}
+		expect(result.context.authority.writableMemoryNamespaces).toEqual([
+			"agents/developer",
+			"organization/decisions",
+		]);
+		expect(result.context.input.memoryNamespaces).toEqual({
+			private: "agents/developer",
+			shared: ["organization/decisions"],
+		});
+	});
+
+	it("an exact 'memory.write' deny leaves no writable namespace, private or shared", () => {
+		const agent = withSharedNamespace(agentRecord("developer", { tools_deny: ["memory.write"] }));
+		const result = buildTurnContext(sources({ agent, agents: [agent] }));
+		expect(result.ok).toBe(true);
+		if (!result.ok) {
+			throw new Error(result.reason);
+		}
+		expect(result.context.authority.writableMemoryNamespaces).toEqual([]);
+		expect(result.context.input.memoryNamespaces.shared).toEqual([]);
+	});
+
+	it("a covering wildcard deny ('memory.*') also leaves no writable namespace", () => {
+		const agent = withSharedNamespace(agentRecord("developer", { tools_deny: ["memory.*"] }));
+		const result = buildTurnContext(sources({ agent, agents: [agent] }));
+		expect(result.ok).toBe(true);
+		if (!result.ok) {
+			throw new Error(result.reason);
+		}
+		expect(result.context.authority.writableMemoryNamespaces).toEqual([]);
+		expect(result.context.input.memoryNamespaces.shared).toEqual([]);
+	});
+
+	it("a denied memory.write causes memory proposals to be rejected by the turn's own authority", () => {
+		const agent = withSharedNamespace(agentRecord("developer", { tools_deny: ["memory.write"] }));
+		const result = buildTurnContext(sources({ agent, agents: [agent] }));
+		expect(result.ok).toBe(true);
+		if (!result.ok) {
+			throw new Error(result.reason);
+		}
+		const issues = checkTurnResultAuthority(
+			{
+				schemaVersion: 1,
+				runId: RUN_ID,
+				publicMessages: [],
+				nextState: { kind: "idle" },
+				publicSummary: {
+					assigned: "",
+					facts: [],
+					decisions: [],
+					done: [],
+					remaining: [],
+					waitingFor: [],
+					risks: [],
+				},
+				memoryProposals: [
+					{ namespace: "agents/developer", key: "k", content: "c", visibility: "private" },
+				],
+				artifacts: [],
+				usage: null,
+				session: null,
+			},
+			result.context.authority,
+		);
+		expect(issues).toEqual([{ path: "memoryProposals.0.namespace", message: expect.any(String) }]);
+	});
+
+	it("does not deny memory writes for an unrelated tools_deny pattern", () => {
+		const agent = withSharedNamespace(agentRecord("developer", { tools_deny: ["deploy.*"] }));
+		const result = buildTurnContext(sources({ agent, agents: [agent] }));
+		expect(result.ok).toBe(true);
+		if (!result.ok) {
+			throw new Error(result.reason);
+		}
+		expect(result.context.authority.writableMemoryNamespaces).toEqual([
+			"agents/developer",
+			"organization/decisions",
+		]);
 	});
 });

@@ -19,7 +19,14 @@ const ALERT_MARKER = "ALERT-7e1bd4-PUBLIC-OK";
  */
 const EMOJI_SNIPPET = " \u{1f600} hello";
 
-const REAL_AGENT_IDS = ["developer", "director", "finance", "mail-follower", "research"] as const;
+const REAL_AGENT_IDS = [
+	"developer",
+	"director",
+	"finance",
+	"mail-follower",
+	"operator",
+	"research",
+] as const;
 
 describe("system status and console read models (ADR-023)", () => {
 	let gateway: TestGateway;
@@ -109,7 +116,7 @@ describe("system status and console read models (ADR-023)", () => {
 					(_, i) => `zzagent${String(i + 1).padStart(3, "0")}`,
 				),
 			);
-			// The one left out is the lexicographically largest synthetic id, never one of the 5 real ones.
+			// The one left out is the lexicographically largest synthetic id, never one of the real ones.
 			expect(ids).not.toContain(`zzagent${String(extra).padStart(3, "0")}`);
 		} finally {
 			await gateway.pool.query("delete from agents where id like 'zzagent%'");
