@@ -175,6 +175,9 @@
             "type": "string",
             "pattern": "^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)*\\.([a-z][a-z0-9-]*|\\*)$"
           }
+        },
+        "observe_system": {
+          "type": "boolean"
         }
       },
       "required": ["tools_allow", "tools_require_human_approval", "tools_deny"],

@@ -28,3 +28,4 @@ rewritten in substance: a changed decision gets a new ADR that references the ol
 | [020](020-release-pipeline.md) | Release pipeline: reproducible images, a verified bundle, certified schemas | Accepted |
 | [021](021-home-server.md) | The home server: a Lima VM on an Apple silicon Mac | Accepted |
 | [022](022-channel-grants.md) | Channel grants: an owner adds an agent's bot, and the agent works there | Accepted |
+| [023](023-console-and-operator.md) | The owner's console and the operator agent's system status | Accepted |

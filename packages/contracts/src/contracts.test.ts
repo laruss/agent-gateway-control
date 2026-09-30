@@ -11,6 +11,7 @@ import { type GatewayEvent, GatewayEventSchema } from "./event.ts";
 import { OrganizationMattermostSchema } from "./organization.ts";
 import {
 	agent,
+	agentTurnInput,
 	CHANNEL_ID,
 	financeReplyWait,
 	gmailMessageData,
@@ -20,6 +21,7 @@ import {
 	organization,
 	ROOT_ID,
 	RUN_ID,
+	systemStatus,
 	USER_ID,
 } from "./test-fixtures.ts";
 import {
@@ -229,49 +231,7 @@ describe("AgentTurnResult", () => {
 });
 
 describe("AgentTurnInput", () => {
-	const gmailTrigger = {
-		specversion: "1.0",
-		id: "gmail-message:primary:18c2a1b2c3d4e5f6",
-		source: "gmail://primary",
-		type: "google.gmail.message.received",
-		time: "2026-09-24T14:00:00Z",
-		datacontenttype: "application/json",
-		correlationid: "gmail-thread:primary:18c2a1b2c3d4e5f6",
-		causationid: null,
-		trustlevel: "external-untrusted",
-		hop: 0,
-		data: gmailMessageData(),
-	};
-	const input = {
-		schemaVersion: 1,
-		runId: RUN_ID,
-		agent: {
-			agentId: "mail-follower",
-			displayName: "Mail Follower",
-			mattermostUsername: "mail-follower",
-			rolePrompt: "Sort incoming mail.",
-			configVersion: "1",
-		},
-		organization: {
-			organizationId: "lab",
-			globalGoal: "goal",
-			constitution: "rules",
-			rules: [],
-			limits: organization().organization.default_limits,
-			directory: [],
-		},
-		trigger: gmailTrigger,
-		durableState: { previousRunId: null, previousSummary: null, resolvedWaits: [] },
-		channels: [{ channelId: CHANNEL_ID, name: "mail" }],
-		threadContext: null,
-		memories: [],
-		memoryNamespaces: { private: "agents/mail-follower", shared: ["organization/customers"] },
-		pendingInbox: [],
-		workspace: null,
-		toolPolicy: { policyVersion: "1", allow: ["mail.read"], requireHumanApproval: [], deny: [] },
-		outputSchema: { type: "object" },
-		deadline: "2026-09-24T14:15:00Z",
-	};
+	const input = agentTurnInput();
 
 	it("gives a turn without a Mattermost thread the channels it may post to", () => {
 		expect(issuePaths(AgentTurnInputSchema, input)).toEqual([]);
@@ -279,6 +239,18 @@ describe("AgentTurnInput", () => {
 
 	it("requires at least one postable channel", () => {
 		expect(issuePaths(AgentTurnInputSchema, { ...input, channels: [] })).toEqual(["channels"]);
+	});
+
+	it("rejects version 1 carrying a system status", () => {
+		expect(issuePaths(AgentTurnInputSchema, { ...input, systemStatus: systemStatus() })).toEqual([
+			"schemaVersion",
+		]);
+	});
+
+	it("requires version 2 to carry a system status", () => {
+		const v2 = agentTurnInput({ schemaVersion: 2 });
+		expect(issuePaths(AgentTurnInputSchema, v2)).toEqual(["schemaVersion"]);
+		expect(issuePaths(AgentTurnInputSchema, { ...v2, systemStatus: systemStatus() })).toEqual([]);
 	});
 });
 
