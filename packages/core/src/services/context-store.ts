@@ -229,6 +229,8 @@ export async function withCurrentPosts(
 	db: Db,
 	carried: Readonly<GatewayEvent[]>,
 	allowed: ReadonlySet<MattermostId>,
+	/** Grant floors by channel (ms): a post from before the agent's add carries no text either. */
+	floors: ReadonlyMap<MattermostId, number> = new Map(),
 ): Promise<GatewayEvent[]> {
 	const postIds = new Set<MattermostId>();
 	for (const event of carried) {
@@ -244,9 +246,13 @@ export async function withCurrentPosts(
 	const overlays = postOverlays(changes, postIds);
 	return carried.map((event) => {
 		const post = mattermostPost(event);
-		if (post !== null && !allowed.has(post.channel_id)) {
-			// A wait resolved by a post of a channel the agent has lost since: the outcome stays,
-			// the text does not reach the turn.
+		const floor = post === null ? undefined : floors.get(post.channel_id);
+		if (
+			post !== null &&
+			(!allowed.has(post.channel_id) || (floor !== undefined && Date.parse(event.time) <= floor))
+		) {
+			// A wait resolved by a post of a channel the agent has lost since, or from before it was
+			// given the channel again: the outcome stays, the text does not reach the turn.
 			return { ...event, data: { ...post, message: "" } };
 		}
 		const overlay = post === null ? undefined : overlays.get(post.post_id);

@@ -53,7 +53,9 @@ export type RejectedAddReason =
 	| "no_add_record"
 	| "listener_not_added"
 	/** The channel was taken out of the agent's `allowed_channels`: its bot leaves. */
-	| "configuration_removed";
+	| "configuration_removed"
+	/** Too many posts since the last check to tell who added a granted bot again: it leaves. */
+	| "add_unverified";
 
 export type RejectedAdd = Readonly<{
 	agentId: AgentId;

@@ -113,7 +113,11 @@ class World {
 					.filter((c) => c.members.has(userId) && c.channel.team_id === teamId)
 					.map((c) => c.channel);
 			},
-			channelPostsBefore: async (channelId) => list([...this.at(channelId).posts].reverse()),
+			channelPostsBefore: async (channelId, before, perPage) => {
+				const newestFirst = [...this.at(channelId).posts].reverse();
+				const start = before === null ? 0 : newestFirst.findIndex((post) => post.id === before) + 1;
+				return list(newestFirst.slice(start, start + perPage));
+			},
 			user: async (userId) => {
 				const user = this.users.get(userId);
 				if (user === undefined) {
@@ -360,6 +364,28 @@ describe("the membership synchronizer", () => {
 		expect(records.rejections).toEqual([
 			expect.objectContaining({ actorUserId: MEMBER, reason: "not_owner_or_admin" }),
 		]);
+	});
+
+	it("fails closed when too many posts hide who added a granted bot again", async () => {
+		const { world, records, sync } = harness();
+		world.add(LAB, OWNER, DEVELOPER_BOT);
+		await sync();
+		world.at(LAB).members.delete(DEVELOPER_BOT);
+		world.add(LAB, OWNER, DEVELOPER_BOT);
+		world.now += 20_000;
+		for (let i = 0; i < 2100; i += 1) {
+			world.add(LAB, OWNER, id(`h${i}`));
+		}
+		await sync();
+		expect(records.grants).toEqual([
+			expect.objectContaining({
+				channelId: LAB,
+				state: "revoked",
+				revokedReason: "add_unverified",
+			}),
+		]);
+		expect(records.rejections).toEqual([expect.objectContaining({ reason: "add_unverified" })]);
+		expect(world.at(LAB).members.has(DEVELOPER_BOT)).toBe(false);
 	});
 
 	it("says so when a channel was taken out of the configuration", async () => {

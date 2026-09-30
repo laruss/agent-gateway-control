@@ -10,6 +10,7 @@ import {
 	gatewayControls,
 	mattermostChannelGrants,
 	mattermostIdentities,
+	runtimeSessions,
 	sourceCursors,
 	withTransaction,
 } from "@agent-gateway/db";
@@ -199,6 +200,7 @@ export async function grantChannel(
 				.values({ ...start, updatedAt: uow.now })
 				.onConflictDoNothing({ target: sourceCursors.sourceId });
 		}
+		await endSessions(uow, input.agentId);
 		await audit(uow, "system", "mattermost.channel.granted", "agent", input.agentId, {
 			channel_id: input.channelId,
 			channel_name: input.channelName,
@@ -241,6 +243,7 @@ export async function revokeChannelGrant(
 			)
 			.returning({ name: mattermostChannelGrants.channelName });
 		if (revoked.length > 0) {
+			await endSessions(uow, agentId);
 			await audit(uow, "system", "mattermost.channel.revoked", "agent", agentId, {
 				channel_id: channelId,
 				channel_name: revoked[0]?.name ?? null,
@@ -249,6 +252,17 @@ export async function revokeChannelGrant(
 		}
 		return channelStillFollowed(uow, channelId);
 	});
+}
+
+/**
+ * Ends the agent's stored provider sessions: their transcripts hold what earlier turns saw, and
+ * a changed grant (a channel taken away, or given again with a newer floor) must not resume it.
+ */
+async function endSessions({ tx }: UnitOfWork, agentId: AgentId): Promise<void> {
+	await tx.db
+		.update(runtimeSessions)
+		.set({ status: "revoked" })
+		.where(and(eq(runtimeSessions.agentId, agentId), eq(runtimeSessions.status, "active")));
 }
 
 /**
@@ -289,13 +303,15 @@ export async function rejectChannelAdd(deps: ControlPlaneDeps, add: RejectedAdd)
 		};
 		await audit(uow, "system", "mattermost.channel.add_rejected", "agent", add.agentId, detail);
 		const message =
-			add.reason === "configuration_removed"
-				? `@${add.agentId} was taken out of ~${add.channelName} by the configuration; its bot left the channel.`
-				: add.reason === "listener_not_added"
-					? `@${add.agentId} was added to ~${add.channelName}, but the Gateway could not add its listener there, so its bot left again. Check that channel members may add members, or add the listener by hand before the agent.`
-					: add.reason === "not_owner_or_admin"
-						? `@${add.agentId} was added to ~${add.channelName} by someone who is neither an owner nor a system admin; its bot left the channel.`
-						: `@${add.agentId} was in ~${add.channelName}, but no add by an owner or system admin was found; its bot left the channel.`;
+			add.reason === "add_unverified"
+				? `@${add.agentId} may have been removed from ~${add.channelName} and added again, but too many posts followed to tell by whom; its bot left the channel. Add it again.`
+				: add.reason === "configuration_removed"
+					? `@${add.agentId} was taken out of ~${add.channelName} by the configuration; its bot left the channel.`
+					: add.reason === "listener_not_added"
+						? `@${add.agentId} was added to ~${add.channelName}, but the Gateway could not add its listener there, so its bot left again. Check that channel members may add members, or add the listener by hand before the agent.`
+						: add.reason === "not_owner_or_admin"
+							? `@${add.agentId} was added to ~${add.channelName} by someone who is neither an owner nor a system admin; its bot left the channel.`
+							: `@${add.agentId} was in ~${add.channelName}, but no add by an owner or system admin was found; its bot left the channel.`;
 		const occurrence = add.evidencePostId ?? uow.now.toISOString().slice(0, 10);
 		await raiseAlert(
 			uow,

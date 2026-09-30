@@ -58,8 +58,10 @@ export type MembershipSyncOptions = Readonly<{
 	client?: (token: string) => MembershipClient;
 }>;
 
-/** Posts scanned per channel for a new membership's add record. */
+/** Pages scanned for a new membership's add record. */
 const EVIDENCE_SCAN_PAGES = 3;
+/** Pages scanned for a re-add of a granted bot, back to the last check. */
+const READD_SCAN_PAGES = 10;
 const EVIDENCE_PAGE_SIZE = 200;
 const DEFAULT_GRACE_MS = 60_000;
 /** A post may be stored a little after its creation time: rescans overlap by this much. */
@@ -112,34 +114,38 @@ function newestAdd(list: ApiPostList, userId: MattermostId): ApiPost | null {
 	return newest;
 }
 
+/** What a scan for an add found; `complete` is false when it stopped before `afterMs`. */
+type AddScan = Readonly<{ add: ApiPost | null; complete: boolean }>;
+
 /**
- * The newest add of `userId` among the channel's posts newest first, reading back no further
- * than posts created at `afterMs` (and at most a few pages), or null.
+ * The newest add of `userId` among the channel's posts, newest first, reading back no further
+ * than posts created at `afterMs`, and at most `pages` pages.
  */
 async function findAdd(
 	client: MembershipClient,
 	channelId: MattermostId,
 	userId: MattermostId,
-	afterMs = 0,
-): Promise<ApiPost | null> {
+	afterMs: number,
+	pages: number,
+): Promise<AddScan> {
 	let before: MattermostId | null = null;
-	for (let page = 0; page < EVIDENCE_SCAN_PAGES; page += 1) {
+	for (let page = 0; page < pages; page += 1) {
 		const list = await client.channelPostsBefore(channelId, before, EVIDENCE_PAGE_SIZE);
 		const add = newestAdd(list, userId);
 		if (add !== null) {
-			return add.create_at > afterMs ? add : null;
+			return { add: add.create_at > afterMs ? add : null, complete: true };
 		}
 		const last = list.order.at(-1);
 		if (last === undefined || list.order.length < EVIDENCE_PAGE_SIZE) {
-			return null;
+			return { add: null, complete: true };
 		}
 		const oldest = list.posts[last];
 		if (oldest === undefined || oldest.create_at <= afterMs) {
-			return null;
+			return { add: null, complete: true };
 		}
 		before = last;
 	}
-	return null;
+	return { add: null, complete: false };
 }
 
 function mayGrant(user: ApiUser, owners: ReadonlySet<MattermostId>): boolean {
@@ -270,14 +276,30 @@ async function syncBot(pass: BotPass): Promise<void> {
 				return;
 			}
 			// Removed and added again between two polls: the newer add decides, not the old one.
-			// Only posts since the last check are read (newest first, overlapping a little).
+			// Only posts since the last check are read (newest first, overlapping a little); the
+			// check counts as done only once whatever it found was judged.
 			const checkedAt = options.clock().getTime() - SCAN_OVERLAP_MS;
 			const after = Math.max(grant.sinceMs, scanned.get(key) ?? grant.sinceMs);
-			const readd = await findAdd(client, grant.channelId, bot.userId, after);
-			scanned.set(key, checkedAt);
-			if (readd !== null && readd.create_at > grant.sinceMs) {
-				await judgeAdd(pass, channel, readd);
+			const scan = await findAdd(client, grant.channelId, bot.userId, after, READD_SCAN_PAGES);
+			if (!scan.complete) {
+				// Who added the bot this time cannot be told: fail closed.
+				scanned.delete(key);
+				await options.store.revoke(bot.agentId, grant.channelId, "add_unverified");
+				await options.store.reject({
+					agentId: bot.agentId,
+					channelId: grant.channelId,
+					channelName: channel.name,
+					actorUserId: null,
+					evidencePostId: null,
+					reason: "add_unverified",
+				});
+				await client.removeChannelMember(grant.channelId, bot.userId);
+				return;
 			}
+			if (scan.add !== null && scan.add.create_at > grant.sinceMs) {
+				await judgeAdd(pass, channel, scan.add);
+			}
+			scanned.set(key, checkedAt);
 		});
 	}
 
@@ -292,7 +314,7 @@ async function syncBot(pass: BotPass): Promise<void> {
 		seen.add(key);
 		await step(pass, channel.id, async () => {
 			const latest = records.find((grant) => grant.channelId === channel.id);
-			const add = await findAdd(client, channel.id, bot.userId);
+			const { add } = await findAdd(client, channel.id, bot.userId, 0, EVIDENCE_SCAN_PAGES);
 			// An add no newer than the latest record is the one that record came from (or older):
 			// after a revocation, or a channel taken out of the configuration, only a new add counts.
 			if (add !== null && (latest === undefined || add.create_at > latest.sinceMs)) {

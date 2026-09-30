@@ -107,6 +107,8 @@ async function previousRun(
 	waitCreatorRunId: string | null,
 	correlationId: string,
 	allowed: ReadonlySet<MattermostId>,
+	/** Grant floors by channel: a run there from before the agent's add is not its previous one. */
+	floors: ReadonlyMap<MattermostId, number>,
 ): Promise<PreviousRun | null> {
 	const latest = async (which: SQL) => {
 		const [row] = await uow.tx.db
@@ -121,7 +123,13 @@ async function previousRun(
 					// `channel/<id>/thread/<root>`: only threads of channels the agent may still read.
 					or(
 						isNull(contextSnapshots.threadRef),
-						inArray(sql<string>`split_part(${contextSnapshots.threadRef}, '/', 2)`, [...allowed]),
+						and(
+							inArray(sql<string>`split_part(${contextSnapshots.threadRef}, '/', 2)`, [...allowed]),
+							sql`not exists (
+								select 1 from jsonb_each_text(${JSON.stringify(Object.fromEntries(floors))}::jsonb) f
+								 where f.key = split_part(${contextSnapshots.threadRef}, '/', 2)
+								   and ${agentRuns.queuedAt} <= to_timestamp(f.value::bigint / 1000.0))`,
+						),
 					),
 				),
 			)
@@ -332,6 +340,7 @@ export async function scheduleAgent(
 		db,
 		claimed.map((row) => toGatewayEvent(row.event)),
 		allowed,
+		floors,
 	);
 	const [triggerEvent, ...inboxEvents] = turnEvents;
 	if (triggerEvent === undefined) {
@@ -345,6 +354,7 @@ export async function scheduleAgent(
 		waitCreatorRunId,
 		triggerEvent.correlationid,
 		allowed,
+		floors,
 	);
 	const context = await assembleTurnContext(uow, {
 		agent,
@@ -493,20 +503,26 @@ export type AttemptInit = Readonly<{
 }>;
 
 /**
- * What a provider session may be resumed for: the same configuration version (role, policy,
- * channels) and the same conversations, those of the trigger and of every carried inbox event.
- * A session's transcript holds everything its earlier turns saw, so resuming it elsewhere would
- * show a run more than its own context allows.
+ * What a provider session may be resumed for: the same configuration version (role, policy),
+ * the same channels (configured and granted) and the same conversations, those of the trigger
+ * and of every carried inbox event. A session's transcript holds everything its earlier turns
+ * saw, so resuming it elsewhere would show a run more than its own context allows. (A grant
+ * given or revoked also ends the agent's stored sessions: a channel given again keeps its id.)
  */
 export function sessionScope(
 	configVersion: string,
-	input: Readonly<{ trigger: GatewayEvent; pendingInbox: Readonly<GatewayEvent[]> }>,
+	input: Readonly<{
+		trigger: GatewayEvent;
+		pendingInbox: Readonly<GatewayEvent[]>;
+		channels: Readonly<Readonly<{ channelId: string }>[]>;
+	}>,
 ): string {
 	const correlations = [
 		...new Set([input.trigger, ...input.pendingInbox].map((event) => event.correlationid)),
 	].sort();
+	const channels = [...new Set(input.channels.map((channel) => channel.channelId))].sort();
 	// JSON keeps ids containing separators apart.
-	return JSON.stringify([configVersion, correlations]);
+	return JSON.stringify([configVersion, correlations, channels]);
 }
 
 /**

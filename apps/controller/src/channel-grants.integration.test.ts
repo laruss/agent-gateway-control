@@ -129,6 +129,27 @@ describe("channel grants", () => {
 		).toBe(false);
 	});
 
+	it("ends the agent's stored provider sessions when its grants change", async () => {
+		const session = () =>
+			gateway.pool.query(
+				`insert into runtime_sessions (agent_id, adapter, provider_session_ref, runtime_version, status)
+				 values ('research', 'mock', 'transcript-1', 'mock/1', 'active')
+				 on conflict (agent_id, adapter) do update set status = 'active'`,
+			);
+		const status = async () =>
+			(
+				await gateway.pool.query<{ status: string }>(
+					"select status from runtime_sessions where agent_id = 'research'",
+				)
+			).rows[0]?.status;
+		await session();
+		await revokeChannelGrant(gateway.deps(), "research", LAB, "bot_left");
+		expect(await status()).toBe("revoked");
+		await session();
+		expect(await grant(since + 7000)).toBe(true);
+		expect(await status()).toBe("revoked");
+	});
+
 	it("holds only for the agent's current bot", async () => {
 		expect(await unneededChannels(gateway.deps(), [LAB])).toEqual([]);
 		await setAgentBotUser(gateway.deps(), "research", "replacedb0t000000000000000", "test");

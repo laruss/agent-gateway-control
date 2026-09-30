@@ -27,8 +27,10 @@ bot could add another agent.
   author as the actor. An active human who is a configured owner or has `system_admin` grants
   the channel; anyone else, bots included, grants nothing, the bot leaves and an alert says who
   added it. A membership without such a post leaves after a minute. For a granted channel each
-  poll also reads the posts since the grant: a newer add (a remove and re-add between polls)
-  is judged again, and a refused one ends the grant.
+  poll also reads the posts since its last check: a newer add (a remove and re-add between
+  polls) is judged again, and a refused one ends the grant. When too many posts followed to
+  tell (after a long downtime in a busy channel), the grant ends and the bot leaves: fail
+  closed, the owner adds it again.
 - **Grants are rows** (`mattermost_channel_grants`: agent, channel, team, the bot's user id,
   grantor, the add's post and time, state, generation). A grant counts while it is active, in
   the configured team, for the agent's current bot, in the active configuration; a revoked row
@@ -42,8 +44,11 @@ bot could add another agent.
   finishes first and none is authorized from stale rows.
 - **No history.** A channel first followed through a grant starts its catch-up at the add
   itself; a channel already followed keeps its catch-up, and the grant's time is the agent's
-  floor there: routing, its inbox, the answers that may end its waits and the thread context of
-  its turns (roots, replies, summaries) hold nothing created at or before its add.
+  floor there: routing, its inbox, the answers that may end its waits, the posts its turns
+  carry, the thread context (roots, replies, summaries) and its previous run's summary hold
+  nothing from before its add. A grant given or revoked ends the agent's stored provider
+  sessions, and a session is resumed only for the same channels: a transcript never carries
+  what a later turn may not see.
 - **The listener comes with the first grant.** The agent's own bot adds it (a plain member may
   add members under Mattermost's default permissions): no admin credential is stored. When it
   cannot, nothing is granted, the bot leaves and the alerts channel says so. Every poll ends
