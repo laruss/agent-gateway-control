@@ -31,6 +31,11 @@
       "version": "0.1.1",
       "head": "0014_schema_state",
       "pgboss_schema": 42
+    },
+    {
+      "version": "0.2.0",
+      "head": "0017_channel_grant_checks",
+      "pgboss_schema": 42
     }
   ]
 }
