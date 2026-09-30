@@ -1792,5 +1792,11 @@ Channel grants review log (5 rounds, Codex and Opus):
 - Round 5: no P1/P2. Kept P3: a deactivated agent bot keeps its grants (it cannot post); a
   mention in a post edited before the grant was recorded is not routed.
 
-Still to do: install 0.2.0 by upgrade, backups with an age key, restore rehearsal, failure
-drills and the soak.
+Since then:
+- 0.2.0 released and installed on the home server by upgrade from 0.1.1 (UPGRADE.md: backup,
+  migrations 0015-0017, 0.1.1 still certified), the runtime doctor fully passing.
+- Daily encrypted backups: the age identity kept off the server; the LaunchDaemon on the Mac.
+- Restore rehearsal in a second VM: every row count matched; it found that worker roles must
+  exist before the dump restore (its pg-boss policies name them).
+
+Still to do: failure drills and the soak.

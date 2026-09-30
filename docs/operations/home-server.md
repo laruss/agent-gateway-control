@@ -147,6 +147,34 @@ certificate authority and the release in use. It is encrypted with
 The VM keeps its newest 7 archives, the Mac its newest 30 in `~/agw-backups` (with
 `backup.log`). Copy `~/agw-backups` to a disk that is not the Mac's, too.
 
+## Restore
+
+`guest/restore.sh` rebuilds both stacks from one archive into a VM with Docker and nothing else:
+the release, both home directories with their secrets, Mattermost's database, files and Caddy's
+authority, the Gateway's database with its worker roles (made again from their stored URLs
+before the dump, whose policies name them), and the Codex login. It checks the schema, runs the
+doctor and prints the row counts.
+
+Decrypt on the machine that holds the key and stream the archive in, so no plaintext copy lands
+on the Mac's disk:
+
+```bash
+ssh <mac> 'cat ~/agw-backups/home-server-<time>.tar.age' | age -d -i agw-backup-identity.txt |
+  ssh <mac> 'limactl shell <vm> sudo tee /var/tmp/backup.tar >/dev/null'
+limactl shell <vm> sudo /srv/.../restore.sh [--rehearsal] /var/tmp/backup.tar
+```
+
+For a real restore, prepare the VM as in "The VM" first (the LAN address, mDNS and the egress
+firewall), then restore without `--rehearsal`. The copy has the same bot tokens, so stop the
+original first.
+
+**Rehearse it** regularly in a second VM without a LAN address (`limactl create
+--name=agw-restore --set '.networks = [] | .memory = "6GiB" | .disk = "60GiB"'`). `--rehearsal`
+starts no runtime worker, connector or tool runner: a copy must not use the real runtime logins
+(a refreshed token would log the original out) or act on the outside world. Compare the row
+counts with the original. The first rehearsal (2026-09-30) restored in under a minute plus the
+image pulls.
+
 ## Checks after a restart
 
 ```bash
