@@ -9,22 +9,27 @@ Packages are created in the phase where they get code. Progress is tracked in
 ```text
 agent-gateway-control/
 ├── apps/
-│   ├── controller/          # report/timeout/outbox consumers, health endpoints     (done)
+│   ├── controller/          # report/timeout/outbox consumers, health endpoints,    (done)
+│   │                        #   the owner's console (console-server/-status/-render.ts)
 │   ├── worker/              # generic worker host for one runtime adapter           (done)
 │   ├── connector-gmail/     # Gmail connector process for one mailbox               (done)
 │   ├── tool-runner/         # executes approved tool actions of its namespaces      (done)
-│   └── cli/                 # `gateway` admin CLI                                    (done)
+│   └── cli/                 # `gateway` admin CLI, console-commands.ts              (done)
+│                            #   (console password set)
 ├── packages/
-│   ├── contracts/           # Zod schemas: config, events, turn, queue payloads      (done)
+│   ├── contracts/           # Zod schemas: config, events, turn, queue payloads,     (done)
+│   │                        #   system-status.ts (ADR-023)
 │   ├── testkit/             # Testcontainers PostgreSQL, test helpers                (done)
-│   ├── core/                # state machine, routing, wait matching, use cases       (done)
+│   ├── core/                # state machine, routing, wait matching, use cases,      (done)
+│   │                        #   system-status.ts and console read models (ADR-023)
 │   ├── db/                  # Drizzle schema, migrations, schema certificates,       (done)
 │   │                        #   deployment lock
 │   ├── queue/               # pg-boss queues, retry/DLQ policies, transactional send (done)
 │   ├── events/              # canonical JSON, hashes, CloudEvents helpers            (done)
 │   ├── outbox/              # leased, idempotent side-effect delivery                (done)
 │   ├── logging/             # JSON logs with mandatory redaction, trace context      (done)
-│   ├── service/             # settings, health server, metrics registry, shutdown     (done)
+│   ├── service/             # settings, health server, metrics registry, shutdown,    (done)
+│   │                        #   console-auth.ts (Argon2id)
 │   ├── runtime-sdk/         # adapter contract, turn execution, process control,     (done)
 │   │                        #   workspaces, tool grants, doctor, contract/live suites
 │   ├── runtime-mock/        # scenario-driven mock runtime                           (done)

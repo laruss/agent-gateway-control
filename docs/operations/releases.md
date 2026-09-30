@@ -87,6 +87,28 @@ anonymous pulls before it publishes anything.
 A failed release is fixed with a new patch version; a published version is never rebuilt or
 retagged.
 
+## The v2 compatibility rule
+
+[ADR-020](../adr/020-release-pipeline.md)'s schema certification (`packages/db/migrations/compatibility.json`,
+`gateway db status`) is about the **database** schema: which earlier releases may still run on
+a migrated one. [ADR-023](../adr/023-console-and-operator.md) adds a second, distinct
+compatibility rule, about **configuration and queued work**, that a database migration cannot
+express: `AgentTurnInput.schemaVersion` is `1` or `2`, and only a release that knows version 2
+(this one and later) accepts a configuration with `permissions.observe_system` set, or a queued
+run job whose input is version 2. An older release's schemas are strict and reject both
+outright — not a crash, but a release that cannot read a configuration or a job the owner asks
+it to.
+
+This is not a migration: no column or certified database history changes for the input's own
+sake, so `packages/db/migrations/compatibility.json` says nothing about it. It is a
+release-runbook concern instead, in the bundle's `ROLLBACK.md`: rolling back past a release that
+introduced a permission or a schema version like this needs that permission removed from
+configuration (not merely turned off — an older, strict schema rejects the key at all,
+whatever its value) and no work built under the newer schema version left outstanding, before
+the older release ever starts. Note the same in `MIGRATIONS.md`
+whenever a future release adds another schema-versioned permission or turn input field, the way
+`observe_system` and turn input v2 are noted for 0.3.0.
+
 ## Local rehearsal
 
 Build and test the images without GitHub (Docker with buildx, on any architecture):

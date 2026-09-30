@@ -11,7 +11,12 @@
 # controller's console environment, and no worker or connector on the controller's network or
 # holding its secrets. With a second bundle (the next release, whose migrations are
 # expand-only): upgrade to it, smoke-test, roll back to the first bundle without a restore, and
-# smoke-test again; no mention is answered twice.
+# smoke-test again; no mention is answered twice. The rollback also rehearses ROLLBACK.md's
+# observe_system/turn-input-v2 compatibility steps: settle the operator, remove its permission
+# and re-apply, check nothing of its own is queued, running or dead-lettered, then confirm the
+# restored configuration validates and applies under the first bundle. Passing `first` as a
+# genuine pre-ADR-023 release (not the same-commit pair package.yml builds) also rehearses that
+# bundle picking up the operator the way an existing install would (UPGRADE.md).
 #
 # Needs root (or sudo) for the ownership of $GATEWAY_HOME, and the images of the bundles'
 # images.lock reachable (a registry). Leaves the stacks running on failure for inspection;
@@ -307,6 +312,78 @@ check_no_duplicates() {
 	done
 }
 
+# ADR-023's release-compatibility rule (ROLLBACK.md, "config and queued-input compatibility"):
+# an older release rejects `permissions.observe_system` in configuration and refuses a version 2
+# run job outright, so rolling back past this release needs the permission removed and no
+# version 2 work outstanding first. This rehearses that recipe's steps (a)-(c) against the
+# bundle under test as `next`: one real run of the observer agent (config.example ships the
+# operator with `observe_system: true`), removing the permission and re-applying, then checking
+# nothing of its own is left queued, running or dead-lettered.
+#
+# It does not by itself prove that a release predating ADR-023 rejects `observe_system`: the
+# pair package.yml builds for this test (`first`/`next`) are both built from the same commit,
+# so `first` already accepts it. That half of the rule is covered by the contracts' own schema
+# tests (packages/contracts/src/turn.ts, agent-config.ts); rehearsing the actual rejection needs
+# a genuine pre-ADR-023 bundle (a real previous release, e.g. one `gh release download`'d) as
+# `first`, which this harness is not given in package.yml.
+settle_observe_system_and_restore_config() {
+	log "rollback rehearsal: settle the operator and remove observe_system (ROLLBACK.md, a-c)"
+	# UPGRADE.md, "adding the operator on an existing install": a bundle predating ADR-023 (a
+	# real previous release used as $first) never had config.example/agents/operator.yaml to
+	# copy in at install time. Add it now, the same way an existing install would, so there is
+	# an observing agent to rehearse the rollback rule against.
+	if [[ ! -f "$GATEWAY_HOME/config/agents/operator.yaml" ]]; then
+		"${sudo_cmd[@]}" mkdir -p "$GATEWAY_HOME/config/prompts/examples/agents"
+		"${sudo_cmd[@]}" cp "$next_release/config.example/agents/operator.yaml" \
+			"$GATEWAY_HOME/config/agents/operator.yaml"
+		"${sudo_cmd[@]}" cp "$next_release/config.example/prompts/examples/agents/operator.md" \
+			"$GATEWAY_HOME/config/prompts/examples/agents/operator.md"
+		cli gateway config validate /config --root /config
+		cli gateway config apply /config --root /config --mock-runtimes
+		"$agw" run --rm -e MATTERMOST_ADMIN_TOKEN="$admin_token" gateway-cli gateway mattermost bootstrap
+		cli gateway mattermost reconcile
+	fi
+	local root reply
+	root="$(mm_api POST posts "$human_token" \
+		"$(jq -nc --arg c "${channel_ids[hq]}" '{channel_id: $c, message: "@operator install check observe_system"}')" | jq -r .id)"
+	smoke_roots+=("$root")
+	for _ in $(seq 1 90); do
+		reply="$(mm_api GET "posts/$root/thread" "$human_token" |
+			jq -r --arg root "$root" '[.posts[] | select(.id != $root and .props.from_bot == "true")] | length')"
+		[[ "$reply" -ge 1 ]] && break
+		sleep 2
+	done
+	[[ "$reply" -ge 1 ]] || fail "no reply to the operator mention"
+
+	# (a) the permission removed and re-applied: no new version 2 turn is scheduled from here
+	# on. The line is deleted outright, not set to 'false' — an older release's schema does not
+	# know the key at all (strict object), so any presence of it, any value, is what it rejects.
+	"${sudo_cmd[@]}" sed -i '/^\s*observe_system:/d' "$GATEWAY_HOME/config/agents/operator.yaml"
+	cli gateway config validate /config --root /config
+	cli gateway config apply /config --root /config --mock-runtimes
+
+	# (b) nothing of the observing agent left queued or running (the mock runtime settles the
+	# run just triggered immediately; a real deployment cancels what remains with
+	# 'gateway runs cancel <run-id>' first).
+	cli gateway runs list --agent operator |
+		jq -e '[.[] | select(.status == "queued" or .status == "running")] | length == 0' >/dev/null ||
+		fail "an operator run is still outstanding; ROLLBACK.md says to settle or cancel it first"
+
+	# (c) nothing of its own work sits in a dead letter queue.
+	cli gateway dlq list | jq -e 'length == 0' >/dev/null ||
+		fail "unexpected dead-lettered jobs before the observe_system rollback rehearsal"
+}
+
+# ROLLBACK.md, (d): the restored configuration (observe_system already off, from
+# settle_observe_system_and_restore_config) validates and applies under the release being
+# rolled back to. $agw and `cli` must already point at $first_release when this runs.
+restore_config_under_first() {
+	log "rollback rehearsal: restored config applies under $first_version"
+	cli gateway config validate /config --root /config
+	cli gateway config apply /config --root /config --mock-runtimes ||
+		fail "the restored configuration did not apply under $first_version"
+}
+
 smoke_roots=()
 mkdir -p "$work"
 setup_mattermost
@@ -351,6 +428,7 @@ if [[ -n "$next" ]]; then
 	check_versions "$next_version"
 	check_console_compose
 	smoke "$next_version"
+	settle_observe_system_and_restore_config
 
 	log "rollback $next_version -> $first_version (ROLLBACK.md)"
 	stop_services
@@ -358,6 +436,7 @@ if [[ -n "$next" ]]; then
 	cli gateway db status | tee /dev/stderr | jq -e '.compatible' >/dev/null ||
 		fail "the previous release is not certified for the upgraded database"
 	regrant
+	restore_config_under_first
 	start_services
 	check_versions "$first_version"
 	smoke "$first_version-after-rollback"

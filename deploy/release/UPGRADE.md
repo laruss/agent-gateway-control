@@ -50,6 +50,39 @@ bin/agw run --rm gateway-cli gateway doctor
 
 Then post a mention in Mattermost and check the reply. If anything fails, go to ROLLBACK.md.
 
+## Upgrading to 0.3.0
+
+0.3.0 ships no new migration: its head is still `0017_channel_grant_checks`, the same as
+0.2.0 and 0.2.1. Still run `gateway db migrate` at step 4 above — it certifies 0.3.0 against the
+schema (and is a no-op otherwise), the same as every upgrade.
+
+0.3.0 adds the owner's console and the `operator` example agent
+([ADR-023](../../docs/adr/023-console-and-operator.md)), both optional and off unless you turn
+them on:
+
+- **The console** ([docs/operations/console.md](../../docs/operations/console.md)): set a
+  password (`gateway console password set`), set `CONSOLE_ENABLED=true` in `gateway.env`, and
+  restart the controller. Skip this and nothing changes.
+- **The operator agent**, on an existing install that does not already have it: copy
+  `config.example/agents/operator.yaml` and `config.example/prompts/examples/agents/operator.md`
+  into your live `config/` (the same layout, `config/agents/operator.yaml` and
+  `config/prompts/examples/agents/operator.md`), then:
+
+  ```bash
+  bin/agw run --rm gateway-cli gateway config validate /config --root /config
+  bin/agw run --rm gateway-cli gateway config apply /config --root /config
+  bin/agw run --rm -e MATTERMOST_ADMIN_TOKEN gateway-cli gateway mattermost bootstrap
+  bin/agw run --rm gateway-cli gateway mattermost reconcile
+  ```
+
+  Bootstrap needs a temporary system admin token, the same way the first install's does
+  (INSTALL.md, step 4); revoke it afterwards. This creates the operator's bot, adds it to `hq`
+  (or whichever channel `operator.yaml` names) and writes its token into
+  `secrets/controller/`.
+
+Rolling back from 0.3.0 to 0.2.1 needs an extra check beyond the database: see ROLLBACK.md and
+[docs/operations/releases.md](../../docs/operations/releases.md#the-v2-compatibility-rule).
+
 ## Rules the releases follow
 
 - `gateway db migrate` is the only thing that changes the schema. Services never migrate; they

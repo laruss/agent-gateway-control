@@ -64,7 +64,10 @@ sudo "$EDITOR" "$GATEWAY_HOME/gateway.env" "$GATEWAY_HOME/config/organization.ya
 - `gateway.env`: `MATTERMOST_URL` (as the controller reaches it on the shared network),
   `MATTERMOST_NETWORK`, and `COMPOSE_PROFILES` (the workers and connectors to run).
 - `config/`: `organization.yaml`, `agents/*.yaml` and their prompts. Give each agent a runtime
-  you run a worker for; change or disable the example agents on other runtimes.
+  you run a worker for; change or disable the example agents on other runtimes. `operator.yaml`
+  is one of them: a read-only agent that answers "what's going on" in Mattermost from the
+  Gateway's own state (`permissions.observe_system`, [ADR-023](../../docs/adr/023-console-and-operator.md)).
+  Leave it enabled to keep it, or disable it like any other example agent.
 - `secrets/`: one directory per service ([secrets.example/README.md](secrets.example/README.md)).
   Each service mounts only its own, read-only.
 
@@ -194,6 +197,24 @@ Compose uses the readiness endpoint as the health check. To scrape from the host
 ports on loopback in an override file. Watch from outside the Gateway as well: the exit codes of
 `bin/agw run --rm gateway-cli gateway health` and `gateway backup check` (see the backup
 section of the operations docs).
+
+## The owner's console (optional)
+
+A read-only status page for one owner, off by default
+([ADR-023](../../docs/adr/023-console-and-operator.md), full guide in
+[docs/operations/console.md](../../docs/operations/console.md)):
+
+```bash
+bin/agw run --rm gateway-cli gateway console password set   # hidden entry, confirmed twice
+```
+
+Then set `CONSOLE_ENABLED=true` in `gateway.env` and restart the controller
+(`bin/agw restart gateway-controller`); it refuses to start if this is on with no password hash
+set. The listener publishes no host port and binds only the controller's own network alias, so
+nothing reaches it without a reverse proxy already wired to it — on the home server kit, Caddy
+at `https://gateway.local` (`docs/operations/home-server.md`). On another Docker host, put your
+own reverse proxy in front of it the same way, or reach it only from inside the Gateway's own
+network for now.
 
 ## Backups
 
