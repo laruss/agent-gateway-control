@@ -149,8 +149,12 @@ check_console_compose() {
 		fail "gateway-controller publishes a host port"
 	jq -e '.services["gateway-controller"].environment.CONSOLE_ENABLED == "false"' <<<"$rendered" >/dev/null ||
 		fail "gateway-controller is missing CONSOLE_ENABLED"
-	jq -e '.services["gateway-controller"].environment.CONSOLE_HOST == "0.0.0.0"' <<<"$rendered" >/dev/null ||
-		fail "gateway-controller's CONSOLE_HOST is not 0.0.0.0"
+	jq -e '.services["gateway-controller"].environment.CONSOLE_HOST == "gateway-console"' <<<"$rendered" >/dev/null ||
+		fail "gateway-controller's CONSOLE_HOST is not its agent-mm alias"
+	jq -e '.services["gateway-controller"].networks["agent-mm"].aliases | index("gateway-console")' <<<"$rendered" >/dev/null ||
+		fail "gateway-controller has no gateway-console alias on agent-mm"
+	jq -e '(.services["gateway-controller"].networks["agent-control"].aliases // []) | index("gateway-console") | not' <<<"$rendered" >/dev/null ||
+		fail "gateway-console is an alias on agent-control too"
 	jq -e '.services["gateway-controller"].environment.CONSOLE_PORT == "8084"' <<<"$rendered" >/dev/null ||
 		fail "gateway-controller's CONSOLE_PORT is not 8084"
 	local service
@@ -312,7 +316,10 @@ check_caddyfile "$first_release"
 install_release "$first_release"
 check_versions "$first_version"
 check_hardening
-check_console_compose
+# A starting release from before the console (0.2.x) has no console settings to check.
+if grep -q CONSOLE_ENABLED "$first_release/compose.yaml"; then
+	check_console_compose
+fi
 log "migrate refused while services run"
 if refusal="$(cli gateway db migrate 2>&1)"; then
 	fail "db migrate ran under live services"

@@ -16,5 +16,5 @@
 # (gateway console password set); until then this returns a proxy error.
 {$GATEWAY_HOST} {
 	encode zstd gzip
-	reverse_proxy gateway-controller:8084
+	reverse_proxy gateway-console:8084
 }

@@ -1,3 +1,4 @@
+import { lookup } from "node:dns/promises";
 import { createLogger, serviceVersion } from "@agent-gateway/logging";
 import { assertRoutingKey } from "@agent-gateway/mattermost";
 import { dryRunDeliverers } from "@agent-gateway/outbox";
@@ -98,18 +99,23 @@ const health = startHealthServer({
 });
 log.info("health endpoints listening", { port: health.port });
 
+// A name (the container's alias on the proxy-facing network) is resolved once here and the
+// listener binds that one address, never every interface of the container.
+const consoleAddress = consoleEnabled
+	? (await lookup(readSetting("CONSOLE_HOST") ?? "127.0.0.1", { family: 4 })).address
+	: null;
 const ownerConsole =
-	consoleEnabled && consolePasswordHash !== null
+	consoleAddress !== null && consolePasswordHash !== null
 		? startConsoleServer({
 				port: intSetting("CONSOLE_PORT", 8084),
-				hostname: readSetting("CONSOLE_HOST") ?? "127.0.0.1",
+				hostname: consoleAddress,
 				passwordHash: consolePasswordHash,
 				cache: createConsoleStatusCache((now) => collectConsoleStatus(controller.deps.pool, now)),
 				log,
 			})
 		: null;
 if (ownerConsole !== null) {
-	log.info("console listening", { port: ownerConsole.port });
+	log.info("console listening", { address: consoleAddress, port: ownerConsole.port });
 }
 
 onShutdown(log, async () => {
