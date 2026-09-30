@@ -530,21 +530,30 @@ function measureContext(
 }
 
 /**
- * Every channel name the console may need to show: channels bootstrap resolved from
+ * The names of the channels the displayed tasks run in: channels bootstrap resolved from
  * configuration, and channels an owner or system admin granted directly
  * (`mattermost_channel_grants`), which never appear in the resolved directory. The directory's
  * own name wins when a channel is somehow in both (it is refreshed at resolution; a grant's name
  * is only as fresh as its last check).
  */
-async function channelNames(client: Client): Promise<Map<string, string>> {
+async function channelNames(
+	client: Client,
+	channelIds: Readonly<string[]>,
+): Promise<Map<string, string>> {
+	if (channelIds.length === 0) {
+		return new Map();
+	}
 	const found = await rows<Readonly<{ id: string; name: string }>>(
 		client,
 		`select distinct on (id) id, name from (
-		   select mattermost_id as id, name, 0 as pri from mattermost_directory where kind = 'channel'
+		   select mattermost_id as id, name, 0 as pri from mattermost_directory
+		    where kind = 'channel' and mattermost_id = any($1::text[])
 		   union all
 		   select channel_id as id, channel_name as name, 1 as pri from mattermost_channel_grants
+		    where channel_id = any($1::text[])
 		 ) c
 		 order by id, pri, name`,
+		[idList(channelIds)],
 	);
 	return new Map(found.map((row) => [row.id, row.name]));
 }
@@ -561,7 +570,6 @@ export async function loadConsoleStatus(
 	const { client } = tx;
 	const loaded = await load(client, now);
 	const ids = idList(loaded.agentIds);
-	const channels = await channelNames(client);
 	const focus = new Map<string, string>();
 	for (const agent of loaded.agents) {
 		const run = loaded.active.get(agent.id)?.[0] ?? loaded.last.get(agent.id)?.[0];
@@ -571,6 +579,14 @@ export async function loadConsoleStatus(
 	}
 	const focusRunIds = [...focus.values()];
 	const measured = await snapshots(client, focusRunIds);
+	const focusChannelIds = new Set<string>();
+	for (const snapshot of measured.values()) {
+		const ref = parseThreadRef(snapshot.thread_ref);
+		if (ref !== null) {
+			focusChannelIds.add(ref.channelId);
+		}
+	}
+	const channels = await channelNames(client, [...focusChannelIds]);
 	const runDetails = new Map(
 		(
 			await rows<RunUsageRow>(
