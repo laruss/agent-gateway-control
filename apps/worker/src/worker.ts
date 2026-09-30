@@ -183,20 +183,29 @@ export async function startWorker(options: WorkerOptions): Promise<RunningWorker
 					const controller = new AbortController();
 					const abort = () => controller.abort();
 					job.signal.addEventListener("abort", abort, { once: true });
-					// Cancelled, settled or deleted while it runs: the turn stops, its slot frees.
+					// Cancelled while it runs: the turn stops, its slot frees.
+					let checkFailed = false;
 					const check = setInterval(() => {
 						boss
 							.getJobById(runQueue(adapter.id), job.id)
 							.then((current) => {
-								if (current === null || current.state !== "active") {
-									log.info("run job no longer active; stopping its turn", {
+								// Cancelled (or deleted): an operator's stop. An expired or settled job is
+								// pg-boss's to signal, and its own abort path reports it rightly.
+								if (current === null || current.state === "cancelled") {
+									clearInterval(check);
+									log.info("run job cancelled; stopping its turn", {
 										job_id: job.id,
 										state: current?.state ?? "gone",
 									});
 									controller.abort();
 								}
 							})
-							.catch(() => undefined);
+							.catch((error: Error) => {
+								if (!checkFailed) {
+									checkFailed = true;
+									log.warn("the run job's state could not be read", errorFields(error));
+								}
+							});
 					}, options.jobCheckMs ?? JOB_CHECK_MS);
 					check.unref();
 					const running = processRunJob(

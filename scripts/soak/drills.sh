@@ -12,6 +12,12 @@ set -uo pipefail
 [[ "$(id -u)" == 0 ]] || { echo "run it with sudo" >&2; exit 1; }
 operator="${SUDO_USER:?run it with sudo, as the user who runs docker compose}"
 export GATEWAY_HOME="${GATEWAY_HOME:-/srv/agent-gateway}"
+# Only on a copy restored with --rehearsal: the drills stop workers, change the configuration
+# and break services on purpose.
+[[ -e "$GATEWAY_HOME/.rehearsal" ]] || {
+	echo "not a rehearsal copy ($GATEWAY_HOME/.rehearsal missing): drills never run on the original" >&2
+	exit 1
+}
 agw() { sudo -u "$operator" GATEWAY_HOME="$GATEWAY_HOME" "$GATEWAY_HOME/current/bin/agw" "$@"; }
 quiet() { grep -v " Container \| Network \| Volume " || true; }
 mm() { docker exec agent-gateway-mattermost-mattermost-1 /mattermost/bin/mmctl --local "$@"; }
@@ -118,16 +124,19 @@ setup() {
 drill_controller_restart() {
 	local post
 	post="$(say "@$agent [mock:reply] during a controller restart")"
-	docker restart agent-gateway-gateway-controller-1 >/dev/null
+	docker restart agent-gateway-gateway-controller-1 >/dev/null ||
+		{ report controller-restart fail "could not restart the controller"; return; }
 	if answered_once "$post" 120; then report controller-restart ok "one reply after the restart"; else report controller-restart fail "replies=$(replies "$post") runs=$(runs "$post")"; fi
 }
 
 drill_database_restart() {
-	docker stop -t 60 agent-gateway-gateway-postgres-1 >/dev/null
+	docker stop -t 60 agent-gateway-gateway-postgres-1 >/dev/null ||
+		{ report database-restart fail "could not stop the database"; return; }
 	local post
 	post="$(say "@$agent [mock:reply] while the database is down")"
 	sleep 10
-	docker start agent-gateway-gateway-postgres-1 >/dev/null
+	docker start agent-gateway-gateway-postgres-1 >/dev/null ||
+		{ report database-restart fail "could not start the database"; return; }
 	# The services lose the deployment lock and exit; their restart policy brings them back.
 	if answered_once "$post" 180; then report database-restart ok "caught up once the database was back"; else report database-restart fail "replies=$(replies "$post") runs=$(runs "$post")"; fi
 }
@@ -136,7 +145,8 @@ drill_worker_kill() {
 	local post
 	post="$(say "@$agent [mock:slow] a long task")"
 	until_equals running 60 run_status "$post" >/dev/null
-	docker kill agent-gateway-gateway-worker-mock-1 >/dev/null
+	docker kill agent-gateway-gateway-worker-mock-1 >/dev/null ||
+		{ report worker-kill fail "could not kill the worker"; return; }
 	agw up -d --wait gateway-worker-mock 2>&1 | quiet >/dev/null
 	# The killed attempt's lease expires and the run is retried or ends; never twice at once.
 	sleep 20
@@ -160,11 +170,13 @@ drill_worker_kill() {
 }
 
 drill_mattermost_network() {
-	docker network disconnect agent-mm agent-gateway-gateway-controller-1
+	docker network disconnect agent-mm agent-gateway-gateway-controller-1 ||
+		{ report mattermost-network fail "could not disconnect the controller"; return; }
 	local post
 	post="$(say "@$agent [mock:reply] while Mattermost is unreachable")"
 	sleep 15
-	docker network connect agent-mm agent-gateway-gateway-controller-1
+	docker network connect agent-mm agent-gateway-gateway-controller-1 ||
+		{ report mattermost-network fail "could not reconnect the controller"; return; }
 	if answered_once "$post" 180; then report mattermost-network ok "backlog caught up, one reply"; else report mattermost-network fail "replies=$(replies "$post") runs=$(runs "$post")"; fi
 }
 
@@ -191,7 +203,9 @@ drill_provider_permanent() {
 	local permanent
 	permanent="$(say "@$agent [mock:permanent] the provider refuses")"
 	until_equals failed 120 run_status "$permanent" >/dev/null
-	if [[ "$(run_status "$permanent")" == failed && "$(replies "$permanent")" -le 1 ]]; then report provider-permanent ok "failed once, at most one notice"; else report provider-permanent fail "status=$(run_status "$permanent") replies=$(replies "$permanent")"; fi
+	local noticed
+	noticed="$(replies "$permanent")"
+	if [[ "$(run_status "$permanent")" == failed && -n "$noticed" && "$noticed" -le 1 ]]; then report provider-permanent ok "failed once, at most one notice"; else report provider-permanent fail "status=$(run_status "$permanent") replies=$(replies "$permanent")"; fi
 }
 
 drill_invalid_once() {
@@ -224,7 +238,8 @@ drill_cascade() {
 	local agents
 	agents="$(sql "select string_agg(r.agent_id || ':' || r.status, ',' order by r.queued_at) from agent_runs r
 	               where r.correlation_id = (select correlation_id from events where subject like 'channel/%/post/$post' limit 1)")"
-	if [[ "$agents" == *"$agent:succeeded"* ]]; then report cascade ok "$agents"; else report cascade fail "$agents"; fi
+	# Exactly one run of each, both succeeded.
+	if [[ "$agents" == "$agent:succeeded,$other:succeeded" ]]; then report cascade ok "$agents"; else report cascade fail "$agents"; fi
 }
 
 setup

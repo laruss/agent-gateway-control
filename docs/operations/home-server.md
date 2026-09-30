@@ -155,14 +155,18 @@ authority, the Gateway's database with its worker roles (made again from their s
 before the dump, whose policies name them), and the Codex login. It checks the schema, runs the
 doctor and prints the row counts.
 
-Decrypt on the machine that holds the key and stream the archive in, so no plaintext copy lands
-on the Mac's disk:
+Decrypt on the machine that holds the key and stream the archive straight into the script, so
+no plaintext copy of the secrets lands on any disk. The script comes from the release bundle
+(`home-server/guest/restore.sh`) or the repository; copy it into the VM first.
 
 ```bash
 ssh <mac> 'cat ~/agw-backups/home-server-<time>.tar.age' | age -d -i agw-backup-identity.txt |
-  ssh <mac> 'limactl shell <vm> sudo tee /var/tmp/backup.tar >/dev/null'
-limactl shell <vm> sudo /srv/.../restore.sh [--rehearsal] /var/tmp/backup.tar
+  ssh <mac> 'limactl shell <vm> sudo bash /tmp/restore.sh [--rehearsal] -'
 ```
+
+It refuses a VM that already has either stack. Roles of limited services are made again and
+given new passwords (their URLs are rewritten); a tool runner's grant is repeated by hand, as the
+script says.
 
 For a real restore, prepare the VM as in "The VM" first (the LAN address, mDNS and the egress
 firewall), then restore without `--rehearsal`. The copy has the same bot tokens, so stop the
@@ -171,7 +175,9 @@ original first.
 **Rehearse it** regularly in a second VM without a LAN address (`limactl create
 --name=agw-restore --set '.networks = [] | .memory = "6GiB" | .disk = "60GiB"'`). `--rehearsal`
 starts no runtime worker, connector or tool runner: a copy must not use the real runtime logins
-(a refreshed token would log the original out) or act on the outside world. Compare the row
+(a refreshed token would log the original out) or act on the outside world; it also turns off
+Mattermost's push and email notifications (the copy has the real users) and marks the copy
+(`$GATEWAY_HOME/.rehearsal`), without which the failure drills refuse to run. Compare the row
 counts with the original. The first rehearsal (2026-09-30) restored in under a minute plus the
 image pulls.
 
