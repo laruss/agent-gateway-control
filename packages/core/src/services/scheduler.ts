@@ -112,7 +112,12 @@ async function previousRun(
 ): Promise<PreviousRun | null> {
 	const latest = async (which: SQL) => {
 		const [row] = await uow.tx.db
-			.select({ id: agentRuns.id, summary: agentRuns.publicSummary })
+			.select({
+				id: agentRuns.id,
+				summary: agentRuns.publicSummary,
+				queuedAt: agentRuns.queuedAt,
+				input: contextSnapshots.input,
+			})
 			.from(agentRuns)
 			.innerJoin(contextSnapshots, eq(contextSnapshots.runId, agentRuns.id))
 			.where(
@@ -135,7 +140,20 @@ async function previousRun(
 			)
 			.orderBy(desc(agentRuns.finishedAt))
 			.limit(1);
-		return row ?? null;
+		if (row === undefined) {
+			return null;
+		}
+		// Every post the run carried, not only its thread's: a summary of a channel the agent lost,
+		// or from before it was given the channel again, does not carry over.
+		const carried = [row.input.trigger, ...row.input.pendingInbox].flatMap((event) => {
+			const post = mattermostPost(event);
+			return post === null ? [] : [post.channel_id];
+		});
+		const stale = carried.some((channelId) => {
+			const floor = floors.get(channelId);
+			return !allowed.has(channelId) || (floor !== undefined && row.queuedAt.getTime() <= floor);
+		});
+		return stale ? null : { id: row.id, summary: row.summary };
 	};
 	return (
 		(waitCreatorRunId === null ? null : await latest(eq(agentRuns.id, waitCreatorRunId))) ??

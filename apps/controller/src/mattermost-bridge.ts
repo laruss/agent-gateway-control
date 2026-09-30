@@ -22,6 +22,7 @@ import {
 	recordImpersonation,
 	rejectChannelAdd,
 	revokeChannelGrant,
+	routeGrantedMention,
 	startManagedChannel,
 	threadCorrelation,
 	unneededChannels,
@@ -234,6 +235,8 @@ export function membershipStore(deps: ControlPlaneDeps, secretsDir?: string): Me
 		reject: (rejection) => rejectChannelAdd(deps, rejection),
 		unneeded: (channelIds) => unneededChannels(deps, channelIds),
 		checked: (agentId, channelId, atMs) => markGrantChecked(deps, agentId, channelId, atMs),
+		routeMention: (agentId, channelId, postId) =>
+			routeGrantedMention(deps, agentId, channelId, postId),
 		token: (secretRef) => {
 			const path = resolveSecretPath(secretRef, secretsDir);
 			return secretFileState(path) === "private" ? readSecretFile(path) : null;

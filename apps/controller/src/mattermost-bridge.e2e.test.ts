@@ -825,6 +825,37 @@ describe("Mattermost bridge against a real server", () => {
 		}
 	});
 
+	it("answers a mention made right after the add, in a channel already followed", async () => {
+		const ownerToken = mm.users.get("owner")?.token;
+		if (ownerToken === undefined) {
+			throw new Error("no owner user");
+		}
+		// #engineering is the developer's: the listener already follows it.
+		const engineering = channel("engineering");
+		const research = await botUserId("research");
+		await mmApi("POST", `channels/${engineering}/members`, ownerToken, { user_id: research });
+		const mention = await say("engineering", "@research can you check the build log?", {
+			token: ownerToken,
+		});
+		const event = await eventOf(mention);
+		const run = await finishedRun(event.id, "research run after the add");
+		expect(run).toMatchObject({ agent_id: "research", status: "succeeded" });
+		expect((await publishedPost(run.id)).channel_id).toBe(engineering);
+		expect(await runsOf(event.id)).toHaveLength(1);
+		await mmApi("DELETE", `channels/${engineering}/members/${research}`, ownerToken);
+		await eventually(
+			async () =>
+				(
+					await query<{ state: string }>(
+						"select state from mattermost_channel_grants where agent_id = 'research' and channel_id = $1",
+						[engineering],
+					)
+				)[0]?.state === "revoked",
+			30_000,
+			"research's engineering grant revoked",
+		);
+	});
+
 	it("developer waits for finance and resumes once on its reply in the thread", async () => {
 		const root = await say("hq", "@developer ask finance about the budget [mock:wait finance]");
 		const asked = await finishedRun((await eventOf(root)).id, "developer asks finance");

@@ -10,6 +10,7 @@ import type {
 import { errorFields, type Logger } from "@agent-gateway/logging";
 import type { ApiChannel, ApiPost, ApiPostList, ApiUser } from "./api-schemas.ts";
 import { MattermostClient } from "./client.ts";
+import { mentionedAgents } from "./mentions.ts";
 
 /**
  * The membership synchronizer (ADR-022): an agent works in a channel from the moment an owner or
@@ -27,6 +28,15 @@ export type MembershipStore = Readonly<{
 	grant: (grant: ChannelGrantInput) => Promise<boolean>;
 	revoke: (agentId: AgentId, channelId: MattermostId, reason: string) => Promise<boolean>;
 	reject: (rejection: RejectedAdd) => Promise<void>;
+	/**
+	 * Routes a stored post to the agent it mentions, when it was stored before the grant made the
+	 * agent addressable there (an already-followed channel).
+	 */
+	routeMention: (
+		agentId: AgentId,
+		channelId: MattermostId,
+		postId: MattermostId,
+	) => Promise<boolean>;
 	/** Records that a granted channel was checked for a re-add up to `atMs`. */
 	checked: (agentId: AgentId, channelId: MattermostId, atMs: number) => Promise<void>;
 	/** Those of the given channels nothing needs any more (not configured, not granted). */
@@ -40,6 +50,7 @@ export type MembershipClient = Pick<
 	MattermostClient,
 	| "userChannelsInTeam"
 	| "channelPostsBefore"
+	| "channelPostsSince"
 	| "user"
 	| "isChannelMember"
 	| "addChannelMember"
@@ -228,8 +239,23 @@ async function judgeAdd(pass: BotPass, channel: ApiChannel, add: ApiPost): Promi
 		evidencePostId: add.id,
 		sinceMs: add.create_at,
 	});
-	if (granted) {
-		options.log.info("channel granted", { agent_id: bot.agentId, channel_id: channel.id });
+	if (!granted) {
+		return;
+	}
+	options.log.info("channel granted", { agent_id: bot.agentId, channel_id: channel.id });
+	// A mention right after the add, in a channel the listener already followed, was stored
+	// before the agent could be addressed there: it is routed to the agent now.
+	const since = await client.channelPostsSince(channel.id, add.create_at);
+	const mentions = new Set([bot.agentId]);
+	for (const post of Object.values(since.posts)) {
+		if (
+			post.type === "" &&
+			post.create_at > add.create_at &&
+			post.delete_at === 0 &&
+			mentionedAgents(post.message, mentions).length > 0
+		) {
+			await options.store.routeMention(bot.agentId, channel.id, post.id);
+		}
 	}
 }
 

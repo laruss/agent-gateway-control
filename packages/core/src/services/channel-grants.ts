@@ -25,6 +25,7 @@ import {
 	loadDirectory,
 	loadOwnerUserIds,
 	loadTeamChannels,
+	lockAgent,
 	raiseAlert,
 } from "./store.ts";
 
@@ -131,6 +132,8 @@ export async function grantChannel(
 ): Promise<boolean> {
 	return inTransaction(deps, async (uow) => {
 		await lockConfigExclusive(uow);
+		// The agent too, as scheduling holds it: no turn is built from the access this changes.
+		await lockAgent(uow.tx.db, input.agentId);
 		const { db } = uow.tx;
 		const config = await loadActiveConfig(db);
 		const [bot] = await db
@@ -227,6 +230,7 @@ export async function revokeChannelGrant(
 ): Promise<boolean> {
 	return inTransaction(deps, async (uow) => {
 		await lockConfigExclusive(uow);
+		await lockAgent(uow.tx.db, agentId);
 		const { db } = uow.tx;
 		const revoked = await db
 			.update(mattermostChannelGrants)

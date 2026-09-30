@@ -113,6 +113,8 @@ class World {
 					.filter((c) => c.members.has(userId) && c.channel.team_id === teamId)
 					.map((c) => c.channel);
 			},
+			channelPostsSince: async (channelId, sinceMs) =>
+				list(this.at(channelId).posts.filter((post) => post.update_at > sinceMs)),
 			channelPostsBefore: async (channelId, before, perPage) => {
 				const newestFirst = [...this.at(channelId).posts].reverse();
 				const start = before === null ? 0 : newestFirst.findIndex((post) => post.id === before) + 1;
@@ -144,6 +146,7 @@ class Records {
 	grants: GrantRecord[] = [];
 	granted: ChannelGrantInput[] = [];
 	rejections: RejectedAdd[] = [];
+	routed: Readonly<{ agentId: string; channelId: MattermostId; postId: MattermostId }>[] = [];
 	/** What `grant` answers: false stands for a stale grant (the bot was replaced meanwhile). */
 	accept = true;
 }
@@ -204,6 +207,10 @@ function harness(bots = [DEVELOPER_BOT]) {
 					!records.grants.some((g) => g.channelId === channelId && g.state === "active"),
 			),
 		token: (secretRef: string) => secretRef,
+		routeMention: async (agentId: string, channelId: MattermostId, postId: MattermostId) => {
+			records.routed.push({ agentId, channelId, postId });
+			return true;
+		},
 		checked: async (agentId: string, channelId: MattermostId, atMs: number) => {
 			records.grants = records.grants.map((g) =>
 				g.agentId === agentId && g.channelId === channelId && g.state === "active"
@@ -252,6 +259,29 @@ describe("the membership synchronizer", () => {
 		await sync();
 		expect(records.granted).toHaveLength(1);
 		expect(records.rejections).toEqual([]);
+	});
+
+	it("routes a mention made right after the add, before the grant was seen", async () => {
+		const { world, records, sync } = harness();
+		world.add(LAB, OWNER, DEVELOPER_BOT);
+		world.now += 5;
+		world.at(LAB).posts.push({
+			id: id("mention"),
+			create_at: world.now,
+			update_at: world.now,
+			edit_at: 0,
+			delete_at: 0,
+			user_id: OWNER,
+			channel_id: LAB,
+			root_id: "",
+			message: "@developer please look at this",
+			type: "",
+			props: {},
+		});
+		await sync();
+		expect(records.routed).toEqual([
+			{ agentId: "developer", channelId: LAB, postId: id("mention") },
+		]);
 	});
 
 	it("grants a system admin's add as well", async () => {

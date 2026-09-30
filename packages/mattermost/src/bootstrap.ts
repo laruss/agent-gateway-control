@@ -426,9 +426,14 @@ export async function bootstrapMattermost(options: BootstrapOptions): Promise<vo
 			allowed.add(channelId);
 			await admin.addChannelMember(channelId, userId);
 		}
-		// Channels an owner or admin granted by adding the bot stay (ADR-022).
+		// Channels an owner or admin granted by adding the bot stay (ADR-022). The listener is
+		// brought back into them (a replaced listener, say); an agent's bot is not: its removal
+		// from a channel is how a grant is taken back.
 		for (const channelId of granted.get(userId) ?? []) {
 			allowed.add(channelId);
+			if (bot.agentId === null) {
+				await admin.addChannelMember(channelId, userId);
+			}
 		}
 		// Every other channel of the team (managed or not) must not stay readable to its token;
 		// in the rest (its own and the default channel) it is a plain member.

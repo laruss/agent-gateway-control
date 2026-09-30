@@ -49,10 +49,16 @@ bot could add another agent.
   nothing from before its add. A grant given or revoked ends the agent's stored provider
   sessions, and a session is resumed only for the same channels: a transcript never carries
   what a later turn may not see.
+- **A mention right after the add is not lost.** In a channel the listener already follows, a
+  post made before the grant was recorded was stored without the agent as an addressee; the
+  synchronizer reads the posts after the add and routes those mentioning the agent to it, once,
+  with the ordinary guards. A grant or revocation takes the agent's row as scheduling does, so
+  no turn is built from access it changes.
 - **The listener comes with the first grant.** The agent's own bot adds it (a plain member may
   add members under Mattermost's default permissions): no admin credential is stored. When it
   cannot, nothing is granted, the bot leaves and the alerts channel says so. Every poll ends
-  with the listener leaving the channels that no grant and no configured channel needs.
+  with the listener leaving the channels that no grant and no configured channel needs, and
+  bootstrap brings it back into granted channels (never an agent's bot).
 - **Removal revokes.** A bot no longer in a granted channel loses the grant at the next poll;
   pending work from there is dropped where it is checked (an agent left with no channel too),
   and nothing more is delivered there. One bot's failure (a rejected token) does not stop the
