@@ -72,6 +72,7 @@ import {
 	toAgentRecord,
 	toGatewayEvent,
 } from "./store.ts";
+import { loadSystemStatus } from "./system-status.ts";
 import { matchMissedAnswers } from "./wait-store.ts";
 
 async function hourlyQuotaReached(uow: UnitOfWork, agentId: string): Promise<boolean> {
@@ -392,6 +393,14 @@ export async function scheduleAgent(
 					},
 	});
 
+	// Collected only for an agent whose current permissions grant it (ADR-023), in this same
+	// scheduling transaction and before the input is serialized or stored: no console collection,
+	// no network IO, and every other agent's turn issues no status query at all. Redrive and wait
+	// resumption are ordinary calls of this function, so they always see the agent's permissions
+	// as they stand right now, not as they stood at an earlier attempt.
+	const observesSystem = agent.config.permissions.observe_system === true;
+	const systemStatus = observesSystem ? await loadSystemStatus(uow.tx, uow.now) : null;
+
 	const runId = randomUUID();
 	const built = buildTurnContext({
 		runId,
@@ -407,6 +416,7 @@ export async function scheduleAgent(
 		threadContext: context.thread?.context ?? null,
 		memories: context.memories,
 		waitableUserIds: context.waitableUserIds,
+		systemStatus,
 		now: uow.now,
 	});
 	if (!built.ok) {

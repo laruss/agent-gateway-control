@@ -9,6 +9,7 @@ import {
 	modelOutputJsonSchema,
 	type OrganizationConfig,
 	type ResolvedWait,
+	type SystemStatus,
 	type ThreadContext,
 	type TurnAuthorityContext,
 	type Uuid,
@@ -53,6 +54,13 @@ export type TurnContextSources = Readonly<{
 	memories: Readonly<MemoryItem[]>;
 	/** Humans who posted in the run's threads, and the owners. */
 	waitableUserIds: Readonly<MattermostId[]>;
+	/**
+	 * The Gateway's own operational snapshot (ADR-023), collected by the caller only for an agent
+	 * whose permissions grant `observe_system`; null for every other agent. This function does no
+	 * IO itself, so it only places what it is given: a status handed to a non-observing agent, or
+	 * an observing agent handed none, is refused rather than silently reconciled.
+	 */
+	systemStatus: SystemStatus | null;
 	now: Date;
 }>;
 
@@ -85,8 +93,25 @@ export function buildTurnContext(sources: TurnContextSources): TurnContextResult
 		deny: permissions.tools_deny,
 	};
 
+	// The status is placed, never collected: the caller only queries it for an agent whose
+	// permissions actually grant observation (ADR-023). A mismatch here is the caller's bug, not
+	// silently reconciled into whichever version fits what it happened to pass.
+	const observesSystem = permissions.observe_system === true;
+	let systemStatus: SystemStatus | undefined;
+	if (observesSystem) {
+		if (sources.systemStatus === null) {
+			return { ok: false, reason: `'${agent.id}' observes the system but no status was supplied` };
+		}
+		systemStatus = sources.systemStatus;
+	} else if (sources.systemStatus !== null) {
+		return {
+			ok: false,
+			reason: `'${agent.id}' does not observe the system but a status was supplied`,
+		};
+	}
+
 	const candidate = {
-		schemaVersion: 1,
+		schemaVersion: observesSystem ? 2 : 1,
 		runId: sources.runId,
 		agent: {
 			agentId: agent.id,
@@ -118,6 +143,7 @@ export function buildTurnContext(sources: TurnContextSources): TurnContextResult
 		toolPolicy,
 		outputSchema: modelOutputJsonSchema(),
 		deadline: new Date(now.getTime() + runtime.timeout_seconds * 1000).toISOString(),
+		systemStatus,
 	};
 	const parsed = AgentTurnInputSchema.safeParse(candidate);
 	if (!parsed.success) {
