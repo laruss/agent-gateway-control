@@ -210,6 +210,24 @@ describe("nodeHiddenReader", () => {
 		expect(tty.written.join("")).not.toContain("partial-entry");
 	});
 
+	it("backspaces a whole character and clears the entry on Ctrl-U", async () => {
+		const tty = fakeTty(true);
+		const reader = nodeHiddenReader(tty.stdin, tty.stdout);
+		const pending = reader.readLine("Console password: ");
+		tty.type("discarded\u0015");
+		tty.type(`${STRONG_PASSWORD}\u{1F511}\u007f\n`);
+		expect(await pending).toBe(STRONG_PASSWORD);
+	});
+
+	it("rejects an arrow key's escape sequence and restores the terminal", async () => {
+		const tty = fakeTty(true);
+		const reader = nodeHiddenReader(tty.stdin, tty.stdout);
+		const pending = reader.readLine("Console password: ");
+		tty.type(`${STRONG_PASSWORD}\u001b[D\n`);
+		await expect(pending).rejects.toThrow(ConsoleCommandError);
+		expect(tty.rawModeHistory).toEqual([true, false]);
+	});
+
 	it("reports a non-TTY stream without touching raw mode", () => {
 		const tty = fakeTty(false);
 		const reader = nodeHiddenReader(tty.stdin, tty.stdout);

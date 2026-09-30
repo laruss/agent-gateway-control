@@ -44,15 +44,21 @@ export type TtyOutput = Readonly<{
 }>;
 
 const CTRL_C = "\u0003";
+const CTRL_U = "\u0015";
 const BACKSPACE = "\u007f";
+/** C0 controls, DEL and C1 controls: never part of a password a login dialog can reproduce. */
+const CONTROL = /[\u0000-\u001f\u007f-\u009f]/u;
 
 /**
  * Reads one line with the terminal's echo off. Raw mode is restored whichever way the line
- * ends: Enter, Ctrl-C, or an error partway through.
+ * ends: Enter, Ctrl-C, or an error partway through. Backspace removes a whole character and
+ * Ctrl-U the whole entry; any other control key (arrows and other escape sequences included)
+ * ends the entry with an error rather than storing bytes an HTTP Basic dialog cannot type.
  */
 function readHiddenLine(stdin: TtyInput, stdout: TtyOutput, prompt: string): Promise<string> {
 	return new Promise((resolve, reject) => {
-		let value = "";
+		// Code points, not UTF-16 units, so a backspace never leaves half a surrogate pair.
+		let value: string[] = [];
 		let settled = false;
 		const onData = (chunk: string) => {
 			for (const ch of chunk) {
@@ -66,7 +72,7 @@ function readHiddenLine(stdin: TtyInput, stdout: TtyOutput, prompt: string): Pro
 				if (ch === "\r" || ch === "\n") {
 					finish(() => {
 						stdout.write("\n");
-						resolve(value);
+						resolve(value.join(""));
 					});
 					return;
 				}
@@ -74,7 +80,22 @@ function readHiddenLine(stdin: TtyInput, stdout: TtyOutput, prompt: string): Pro
 					value = value.slice(0, -1);
 					continue;
 				}
-				value += ch;
+				if (ch === CTRL_U) {
+					value = [];
+					continue;
+				}
+				if (CONTROL.test(ch)) {
+					finish(() => {
+						stdout.write("\n");
+						reject(
+							new ConsoleCommandError(
+								"unsupported key in the password (only Backspace and Ctrl-U edit it); nothing was changed",
+							),
+						);
+					});
+					return;
+				}
+				value.push(ch);
 			}
 		};
 		const finish = (run: () => void) => {
