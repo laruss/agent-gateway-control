@@ -14,6 +14,18 @@ All notable changes are documented here. The project follows Semantic Versioning
 - `bin/egress-firewall.sh`: an nftables table that leaves the Gateway's egress bridge only the
   public internet and the host's DNS resolvers.
 
+### Fixed
+
+- The Codex worker image carries Codex's code-mode host (`codex-code-mode-host`, pinned by
+  SHA-256 like the CLI). Codex 0.156 runs the model's shell commands through it; without it
+  no command ran, so an agent granted `tests.run` could not run tests or builds.
+- The turn prompt says that shell commands may create and change files in the working
+  directory; "create and edit files: not available" made models refuse builds and tests
+  that write files when only `tests.run` was granted.
+- `gateway runtime doctor` shows the model's reply when its sandboxed-command check fails.
+- The binaries of the Codex worker image belong to root, not to the uid of the upstream
+  archive.
+
 ### Changed
 
 - The `egress` network's bridge is named `agw-egress`, so host firewall rules can match it.

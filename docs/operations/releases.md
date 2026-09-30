@@ -65,7 +65,8 @@ anonymous pulls before it publishes anything.
 4. Check each new migration's kind. `expand` only if the previous release keeps working on the
    migrated schema, reading and writing. A `contract` means no rollback without a restore:
    ship it one release after the code stopped using the old shape.
-5. If a runtime CLI changes, update its pins in `deploy/images/Dockerfile` (version, SHA-256,
+5. If a runtime CLI changes, update its pins in `deploy/images/Dockerfile` (version, the
+   SHA-256 of each archive, including Codex's bwrap and code-mode host, and
    `WORKER_RUNTIME_VERSION`), in `scripts/release/write-images-lock.sh` and, for Claude Code,
    in `deploy/release/runtimes/claude-code/Dockerfile`. Then run the live suite and the doctor
    against the new version.

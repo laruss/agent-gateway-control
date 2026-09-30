@@ -34,7 +34,7 @@ export type DoctorOptions = Readonly<{
 const REPLY_TASK =
 	"@developer Reply in this thread with one short greeting, then finish with nextState idle.";
 const SANDBOX_TASK =
-	'@developer Run the shell commands `cat word.txt > echo.txt` and `echo "$TMPDIR" > tmpdir.txt` in your working directory (word.txt holds a harmless test word), then reply that it is done and finish with nextState idle.';
+	'@developer This is a sandbox self-test. Your tests.run grant lets you run shell commands, and a command may create files in your working directory (only the file-edit tools need workspace.write). Run the shell commands `cat word.txt > echo.txt` and `echo "$TMPDIR" > tmpdir.txt` there (word.txt holds a harmless test word), then reply that it is done and finish with nextState idle.';
 /** Written by the sandbox check's command; only a shell can create it (no file-write grant). */
 const SANDBOX_ECHO = "echo.txt";
 const LONG_TASK =
@@ -43,6 +43,15 @@ const LONG_TASK =
 /** A harmless-looking random word: a model refuses to post anything that looks like a token. */
 export function testWord(): string {
 	return `lighthouse${randomInt(100_000, 999_999)}`;
+}
+
+/** The first message a completed turn would post, shortened: why a check's turn did nothing. */
+function replyText(execution: TurnExecution): string {
+	if (execution.kind !== "completed") {
+		return "none";
+	}
+	const markdown = execution.result.publicMessages[0]?.markdown ?? "none";
+	return markdown.length > 300 ? `${markdown.slice(0, 300)}…` : markdown;
 }
 
 function describeFailure(execution: TurnExecution): string {
@@ -167,7 +176,11 @@ export async function runtimeDoctor(
 		check(
 			"sandboxed command (tests.run)",
 			sandboxOutput ? "pass" : "fail",
-			sandboxOutput ? "a granted command ran in the sandbox" : describeFailure(sandboxed),
+			sandboxOutput
+				? "a granted command ran in the sandbox"
+				: sandboxed.kind === "completed"
+					? `the turn completed, but no command wrote ${SANDBOX_ECHO}; the reply: ${replyText(sandboxed)}`
+					: describeFailure(sandboxed),
 		);
 
 		if (sandboxOutput) {

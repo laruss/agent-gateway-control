@@ -54,7 +54,7 @@ have different licenses: Codex (Apache-2.0), OpenCode and Hermes (MIT), and Grok
   - Debian packages by exact version from a fixed `snapshot.debian.org` date (signatures still
     verified);
   - JavaScript dependencies by `bun.lock`, without install scripts;
-  - the Codex archive, its bubblewrap and its license files by SHA-256.
+  - the Codex archive, its bubblewrap, its code-mode host and its license files by SHA-256.
 
   `WORKER_RUNTIME_VERSION` is baked into each worker image: any other CLI version makes the
   runtime unavailable.

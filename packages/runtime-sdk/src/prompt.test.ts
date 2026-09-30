@@ -67,11 +67,14 @@ describe("renderTurnPrompt", () => {
 			...base,
 			toolPolicy: { ...base.toolPolicy, allow: ["mattermost.post", "tests.run", "web.search"] },
 		};
-		expect(renderTurnPrompt(input)).toContain(
-			"run shell commands (tests, builds, any command): allowed",
-		);
+		const shell =
+			"run shell commands (tests, builds, any command; a command may create and change files in your working directory)";
+		const prompt = renderTurnPrompt(input);
+		expect(prompt).toContain(`${shell}: allowed`);
+		// Commands may write even without the file tools: the model must not read one as the other.
+		expect(prompt).toContain("create and edit files with your file tools: not available");
 		const confined = renderTurnPrompt(input, ["webSearch", "webFetch"]);
-		expect(confined).toContain("run shell commands (tests, builds, any command): not available");
+		expect(confined).toContain(`${shell}: not available`);
 		expect(confined).toContain("read files: not available");
 		expect(confined).toContain("web search: allowed");
 	});

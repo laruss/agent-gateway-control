@@ -35,8 +35,8 @@ function builtInTools(
 	const yes = (granted: boolean) => (granted ? "allowed" : "not available");
 	return [
 		`read files: ${yes(grants.read)}`,
-		`create and edit files: ${yes(grants.write)}`,
-		`run shell commands (tests, builds, any command): ${yes(grants.exec)}`,
+		`create and edit files with your file tools: ${yes(grants.write)}`,
+		`run shell commands (tests, builds, any command; a command may create and change files in your working directory): ${yes(grants.exec)}`,
 		`web search: ${yes(grants.webSearch)}`,
 		`fetch web pages: ${yes(grants.webFetch)}`,
 	];
