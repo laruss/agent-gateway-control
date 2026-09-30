@@ -478,7 +478,16 @@ export async function deleteUnmanagedChannelCursors(deps: ControlPlaneDeps): Pro
 		       where d.kind = 'channel'
 		         and (c.organization -> 'mattermost' -> 'channels') ? d.name
 		      union
-		      select gr.channel_id from mattermost_channel_grants gr where gr.state = 'active')`,
+		      -- Grants as the channel access counts them: the agent's current bot, the active
+		      -- configuration, the configured team.
+		      select gr.channel_id
+		        from mattermost_channel_grants gr
+		        join mattermost_identities i
+		          on i.agent_id = gr.agent_id and i.mattermost_user_id = gr.bot_user_id
+		        join agents a on a.id = gr.agent_id
+		        join gateway_controls g2 on g2.id = 1 and a.config_version = g2.active_config_version
+		        join mattermost_directory t on t.kind = 'team' and t.mattermost_id = gr.team_id
+		       where gr.state = 'active')`,
 	);
 }
 

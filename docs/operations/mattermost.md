@@ -79,8 +79,11 @@ answers mentions there. Nothing needs to change in the configuration, and no com
   (ADR-006), and `town-square`, which every team member is in, works only through the
   configuration.
 - Mattermost's default permissions let a channel member add members; the agent's bot uses that
-  to add the listener. With a stricter permission scheme, add the listener by hand as well (the
-  alerts channel says when it is missing).
+  to add the listener. With a stricter permission scheme, add `gateway-listener` to the channel
+  first, then the agent (otherwise the bot leaves again and the alerts channel says why).
+- Taking a channel out of an agent's `allowed_channels` takes it away for good: to give it back,
+  add the bot again (or configure it again).
+- An archived channel loses its agents; after restoring it, add the bots again.
 
 `allowed_channels` in an agent's configuration stays available for channels an agent should
 always have; bootstrap adds the bot there. Bootstrap keeps bots in the channels they were

@@ -23,6 +23,7 @@ import {
 	revokeChannelGrant,
 	startManagedChannel,
 	threadCorrelation,
+	unneededChannels,
 	whileAgentMayPost,
 	whileListenerMayPost,
 } from "@agent-gateway/core";
@@ -226,10 +227,11 @@ export function startBridgeListener(
 /** The records behind the membership synchronizer, and the bots' tokens from their secret files. */
 export function membershipStore(deps: ControlPlaneDeps, secretsDir?: string): MembershipStore {
 	return {
-		view: () => loadMembershipState(deps),
+		state: () => loadMembershipState(deps),
 		grant: (grant) => grantChannel(deps, grant),
 		revoke: (agentId, channelId, reason) => revokeChannelGrant(deps, agentId, channelId, reason),
 		reject: (rejection) => rejectChannelAdd(deps, rejection),
+		unneeded: (channelIds) => unneededChannels(deps, channelIds),
 		token: (secretRef) => {
 			const path = resolveSecretPath(secretRef, secretsDir);
 			return secretFileState(path) === "private" ? readSecretFile(path) : null;

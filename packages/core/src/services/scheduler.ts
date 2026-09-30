@@ -42,7 +42,7 @@ import {
 	type SQL,
 	sql,
 } from "drizzle-orm";
-import { agentChannelIds } from "../channel-access.ts";
+import { agentChannelFloors, agentChannelIds } from "../channel-access.ts";
 import { requireTransition } from "../state-machine.ts";
 import { type AgentRecord, buildTurnContext } from "../turn-context.ts";
 import { budgetHoldFor } from "./budgets.ts";
@@ -139,6 +139,8 @@ type TurnContextInit = Readonly<{
 	agent: AgentRecord;
 	/** The agent's allowed channels, resolved to ids. */
 	allowed: ReadonlySet<MattermostId>;
+	/** Grant floors by channel: the thread context holds nothing from before the agent's add. */
+	floors: ReadonlyMap<MattermostId, number>;
 	/** The trigger first, then the claimed inbox events. */
 	turnEvents: Readonly<GatewayEvent[]>;
 	/** The wait the trigger resolved, if it resolved one. */
@@ -181,7 +183,10 @@ async function assembleTurnContext(
 			return post === null ? [] : [post.post_id];
 		}),
 	);
-	const thread = threadRef === null ? null : await assembleThread(db, threadRef, carried);
+	const thread =
+		threadRef === null
+			? null
+			: await assembleThread(db, threadRef, carried, init.floors.get(threadRef.channelId) ?? null);
 	// The humans the run may wait on: authors in the turn's own thread (already folded), in the
 	// threads of its other posts, and the humans whose posts it carries.
 	const own = threadRef === null ? null : formatThreadRef(threadRef);
@@ -192,7 +197,7 @@ async function assembleTurnContext(
 	});
 	const waitableUserIds = [
 		...(thread?.humanUserIds ?? []),
-		...(await threadHumans(db, otherThreads)),
+		...(await threadHumans(db, otherThreads, init.floors)),
 		...carriedHumans,
 		...(await loadOwnerUserIds(db)),
 	];
@@ -253,11 +258,13 @@ export async function scheduleAgent(
 	}
 	const access = await loadChannelAccess(db);
 	const allowed = agentChannelIds(agent, access);
+	const floors = agentChannelFloors(agent, access);
 	// Before any match or claim: stale entries neither resume nor wake. With no channel resolved
 	// (no configuration, or a team change before bootstrap) nothing is decided; the context check
-	// below defers the run instead.
-	if (allowed.size > 0) {
-		const dropped = await retireInbox(uow, agentId, [...allowed]);
+	// below defers the run instead. An agent whose last grant was revoked has no channel, but the
+	// team is resolved: its work from there is dropped.
+	if (access.named.size > 0) {
+		const dropped = await retireInbox(uow, agentId, [...allowed], floors);
 		if (dropped.length > 0) {
 			await audit(uow, "system", "inbox.dropped", "agent", agentId, {
 				reason: "deleted post or channel no longer allowed",
@@ -265,7 +272,7 @@ export async function scheduleAgent(
 			});
 		}
 		if (agent.state === "waiting") {
-			await matchMissedAnswers(uow, agentId, allowed);
+			await matchMissedAnswers(uow, agentId, allowed, floors);
 		}
 	}
 	// The hourly quota holds for runs started from the inbox too, not only for the wake-up that
@@ -342,6 +349,7 @@ export async function scheduleAgent(
 	const context = await assembleTurnContext(uow, {
 		agent,
 		allowed,
+		floors,
 		turnEvents,
 		resolvedWait:
 			triggerWait === undefined

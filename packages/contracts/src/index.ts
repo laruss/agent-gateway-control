@@ -1,5 +1,6 @@
 export * from "./agent-config.ts";
 export * from "./approval.ts";
+export * from "./channel-grants.ts";
 export * from "./common.ts";
 export * from "./config-bundle.ts";
 export * from "./event.ts";

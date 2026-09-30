@@ -745,6 +745,25 @@ describe("Mattermost bridge against a real server", () => {
 		// Nothing from before the add reached the agent.
 		expect(await creationOf(before)).toEqual([]);
 
+		// An agent never grants: research's bot adding finance's is refused.
+		const researchToken = readSecretFile(
+			resolveSecretPath("/run/secrets/mm_research_token", secretsDir),
+		);
+		await mmApi("POST", `channels/${garden}/members`, researchToken, { user_id: finance });
+		await eventually(async () => !(await member(finance)), 30_000, "finance bot left (bot add)");
+		const refusedByBot = await eventually(
+			async () =>
+				(
+					await query<{ detail: JsonObject }>(
+						"select detail from audit_log where action = 'mattermost.channel.add_rejected' and detail->>'actor_user_id' = $1",
+						[research ?? ""],
+					)
+				)[0],
+			30_000,
+			"the bot's add refused",
+		);
+		expect(refusedByBot.detail.reason).toBe("not_owner_or_admin");
+
 		// A human who is neither an owner nor an admin grants nothing: the bot leaves.
 		await mmApi("POST", `channels/${garden}/members`, humanToken(), { user_id: finance });
 		await eventually(async () => !(await member(finance)), 30_000, "finance bot left");
@@ -768,7 +787,21 @@ describe("Mattermost bridge against a real server", () => {
 			"alert about the refused add",
 		);
 
-		// The owner takes the channel back: the grant ends and the listener leaves.
+		// A system admin grants as well.
+		await mmApi("POST", `channels/${garden}/members`, mm.adminToken, { user_id: finance });
+		await eventually(
+			async () =>
+				(
+					await query<{ state: string }>(
+						"select state from mattermost_channel_grants where agent_id = 'finance' and channel_id = $1",
+						[garden],
+					)
+				)[0]?.state === "active",
+			30_000,
+			"finance granted by the admin",
+		);
+
+		// The owner takes the channel back: the grants end and the listener leaves with the last.
 		await mmApi("DELETE", `channels/${garden}/members/${research}`, ownerToken);
 		await eventually(
 			async () =>
@@ -781,6 +814,8 @@ describe("Mattermost bridge against a real server", () => {
 			30_000,
 			"research's grant revoked",
 		);
+		expect(await member(listener)).toBe(true);
+		await mmApi("DELETE", `channels/${garden}/members/${finance}`, ownerToken);
 		await eventually(async () => !(await member(listener)), 30_000, "listener left the channel");
 		const late = await say("garden", "@research are you still here?", { channelId: garden });
 		await settle();

@@ -1,4 +1,10 @@
-import type { AgentId, MattermostId } from "@agent-gateway/contracts";
+import type {
+	AgentId,
+	ChannelGrantInput,
+	MattermostId,
+	MembershipState,
+	RejectedAdd,
+} from "@agent-gateway/contracts";
 import {
 	agents,
 	gatewayControls,
@@ -8,11 +14,13 @@ import {
 	withTransaction,
 } from "@agent-gateway/db";
 import { and, eq, inArray, sql } from "drizzle-orm";
+import { grantedChannels } from "../channel-access.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
 import { channelCursorIds } from "./mattermost-bridge.ts";
 import {
 	audit,
 	loadActiveConfig,
+	loadChannelAccess,
 	loadDirectory,
 	loadOwnerUserIds,
 	loadTeamChannels,
@@ -47,36 +55,6 @@ async function lockConfigExclusive({ tx }: UnitOfWork): Promise<void> {
 		.for("update");
 }
 
-export type MembershipBot = Readonly<{
-	agentId: AgentId;
-	userId: MattermostId;
-	tokenSecretRef: string;
-	/** The agent's configured channels, resolved: they need no grant. */
-	configuredChannelIds: ReadonlySet<MattermostId>;
-}>;
-
-export type GrantRecord = Readonly<{
-	agentId: AgentId;
-	channelId: MattermostId;
-	state: "active" | "revoked";
-	botUserId: MattermostId;
-	sinceMs: number;
-}>;
-
-/** What the membership synchronizer works from; null before configuration and bootstrap. */
-export type MembershipState = Readonly<{
-	teamId: MattermostId;
-	/** Owners by user id: their adds grant a channel (as do system admins'). */
-	ownerUserIds: ReadonlySet<MattermostId>;
-	listener: Readonly<{ userId: MattermostId; tokenSecretRef: string }>;
-	/** Bots of the active configuration's agents that bootstrap resolved. */
-	bots: Readonly<MembershipBot[]>;
-	/** The latest grant record of each agent and channel, active or revoked. */
-	grants: Readonly<GrantRecord[]>;
-	/** The configured channels, resolved: the listener stays in them whatever the grants. */
-	configuredChannelIds: ReadonlySet<MattermostId>;
-}>;
-
 export async function loadMembershipState(deps: ControlPlaneDeps): Promise<MembershipState | null> {
 	return inTransaction(deps, async ({ tx }) => {
 		const config = await loadActiveConfig(tx.db);
@@ -107,7 +85,7 @@ export async function loadMembershipState(deps: ControlPlaneDeps): Promise<Membe
 			.from(agents)
 			.innerJoin(mattermostIdentities, eq(mattermostIdentities.agentId, agents.id))
 			.where(eq(agents.configVersion, config.version));
-		const grantRows = await tx.db
+		const grants = await tx.db
 			.select({
 				agentId: mattermostChannelGrants.agentId,
 				channelId: mattermostChannelGrants.channelId,
@@ -133,29 +111,16 @@ export async function loadMembershipState(deps: ControlPlaneDeps): Promise<Membe
 							},
 						],
 			),
-			grants: grantRows,
-			configuredChannelIds: resolve(mattermost.channels),
+			grants,
 		};
 	});
 }
-
-export type ChannelGrantInput = Readonly<{
-	agentId: AgentId;
-	botUserId: MattermostId;
-	teamId: MattermostId;
-	channelId: MattermostId;
-	channelName: string;
-	grantorUserId: MattermostId;
-	evidencePostId: MattermostId;
-	/** When the bot was added (the add's system post): the agent's floor in this channel. */
-	sinceMs: number;
-}>;
 
 /**
  * Records an owner's or system admin's add as a grant. A channel not followed yet starts its
  * catch-up at the add itself, so a mention right after it is not lost; a followed channel keeps
  * its catch-up, and the grant's floor keeps older posts from the agent. False when the grant is
- * stale: the agent or its bot changed, or a newer record exists.
+ * stale: the agent or its bot changed, or a record at least as new exists.
  */
 export async function grantChannel(
 	deps: ControlPlaneDeps,
@@ -276,24 +241,19 @@ export async function revokeChannelGrant(
 	});
 }
 
+/**
+ * Whether a channel is still followed: configured, or granted to an agent as the channel access
+ * counts grants (a stale row of a replaced bot or a removed agent does not keep it). When it is
+ * not, its catch-up is deleted.
+ */
 async function channelStillFollowed(uow: UnitOfWork, channelId: MattermostId): Promise<boolean> {
 	const { db } = uow.tx;
-	const others = await db
-		.select({ agentId: mattermostChannelGrants.agentId })
-		.from(mattermostChannelGrants)
-		.where(
-			and(
-				eq(mattermostChannelGrants.channelId, channelId),
-				eq(mattermostChannelGrants.state, "active"),
-			),
-		)
-		.limit(1);
 	const config = await loadActiveConfig(db);
-	const named = await loadTeamChannels(db);
+	const access = await loadChannelAccess(db);
 	const configured = (config?.organization.mattermost.channels ?? []).some(
-		(name) => named.get(name) === channelId,
+		(name) => access.named.get(name) === channelId,
 	);
-	if (others.length > 0 || configured) {
+	if (configured || grantedChannels(access).has(channelId)) {
 		return true;
 	}
 	const ids = channelCursorIds(channelId);
@@ -303,17 +263,10 @@ async function channelStillFollowed(uow: UnitOfWork, channelId: MattermostId): P
 	return false;
 }
 
-export type RejectedAdd = Readonly<{
-	agentId: AgentId;
-	channelId: MattermostId;
-	channelName: string;
-	/** Who added the bot, when the add's system post says; null when no such post was found. */
-	actorUserId: MattermostId | null;
-	evidencePostId: MattermostId | null;
-	reason: "not_owner_or_admin" | "no_add_record" | "listener_not_added";
-}>;
-
-/** Audits an add that grants nothing and alerts the operators, once per add. */
+/**
+ * Audits an add that grants nothing and alerts the operators: once per add record, and for a
+ * membership without one, once a day.
+ */
 export async function rejectChannelAdd(deps: ControlPlaneDeps, add: RejectedAdd): Promise<void> {
 	await inTransaction(deps, async (uow) => {
 		const detail = {
@@ -327,13 +280,14 @@ export async function rejectChannelAdd(deps: ControlPlaneDeps, add: RejectedAdd)
 		await audit(uow, "system", "mattermost.channel.add_rejected", "agent", add.agentId, detail);
 		const message =
 			add.reason === "listener_not_added"
-				? `@${add.agentId} was added to ~${add.channelName}, but the Gateway could not add its listener there; the agent does not work in that channel yet. Check that channel members may add members.`
+				? `@${add.agentId} was added to ~${add.channelName}, but the Gateway could not add its listener there, so its bot left again. Check that channel members may add members, or add the listener by hand before the agent.`
 				: add.reason === "not_owner_or_admin"
 					? `@${add.agentId} was added to ~${add.channelName} by someone who is neither an owner nor a system admin; its bot left the channel.`
-					: `@${add.agentId} is in ~${add.channelName}, but no add by an owner or system admin was found; its bot left the channel.`;
+					: `@${add.agentId} was in ~${add.channelName}, but no add by an owner or system admin was found; its bot left the channel.`;
+		const occurrence = add.evidencePostId ?? uow.now.toISOString().slice(0, 10);
 		await raiseAlert(
 			uow,
-			`channel-add:${add.agentId}:${add.channelId}:${add.evidencePostId ?? add.reason}`,
+			`channel-add:${add.agentId}:${add.channelId}:${add.reason}:${occurrence}`,
 			message,
 			detail,
 		);
@@ -341,8 +295,8 @@ export async function rejectChannelAdd(deps: ControlPlaneDeps, add: RejectedAdd)
 }
 
 /**
- * Channels no active grant and no configuration needs, among those given; their catch-up is
- * deleted, so the listener may leave them.
+ * Channels among those given that nothing needs any more (not configured, not granted); their
+ * catch-up is deleted, so the listener may leave them.
  */
 export async function unneededChannels(
 	deps: ControlPlaneDeps,

@@ -1,14 +1,13 @@
-import type { MattermostId } from "@agent-gateway/contracts";
+import type {
+	ChannelGrantInput,
+	GrantRecord,
+	MattermostId,
+	RejectedAdd,
+} from "@agent-gateway/contracts";
 import { createLogger } from "@agent-gateway/logging";
 import { describe, expect, it } from "vitest";
 import type { ApiChannel, ApiPost, ApiPostList, ApiUser } from "./api-schemas.ts";
-import {
-	type MembershipClient,
-	type MembershipGrant,
-	type MembershipGrantView,
-	type MembershipRejection,
-	syncMembership,
-} from "./membership.ts";
+import { type MembershipClient, syncMembership } from "./membership.ts";
 
 /** A Mattermost id: 26 lowercase letters and digits. */
 function id(label: string): MattermostId {
@@ -33,6 +32,8 @@ class World {
 	channels = new Map<MattermostId, Channel>();
 	now = 1_000_000;
 	failListenerAdd = false;
+	/** Tokens whose every call fails, like a revoked one. */
+	broken = new Set<string>();
 
 	constructor() {
 		this.user(OWNER, { roles: "system_user" });
@@ -96,18 +97,25 @@ class World {
 
 	/** Each token is its user's id: the client acts as that user. */
 	client(token: string): MembershipClient {
+		const check = () => {
+			if (this.broken.has(token)) {
+				throw new Error("401 invalid token");
+			}
+		};
+		const list = (posts: ApiPost[]): ApiPostList => ({
+			order: posts.map((post) => post.id),
+			posts: Object.fromEntries(posts.map((post) => [post.id, post])),
+		});
 		return {
-			userChannelsInTeam: async (userId, teamId) =>
-				[...this.channels.values()]
+			channelPostsSince: async (channelId, sinceMs) =>
+				list(this.at(channelId).posts.filter((post) => post.update_at > sinceMs)),
+			userChannelsInTeam: async (userId, teamId) => {
+				check();
+				return [...this.channels.values()]
 					.filter((c) => c.members.has(userId) && c.channel.team_id === teamId)
-					.map((c) => c.channel),
-			channelPostsBefore: async (channelId): Promise<ApiPostList> => {
-				const posts = [...this.at(channelId).posts].reverse();
-				return {
-					order: posts.map((post) => post.id),
-					posts: Object.fromEntries(posts.map((post) => [post.id, post])),
-				};
+					.map((c) => c.channel);
 			},
+			channelPostsBefore: async (channelId) => list([...this.at(channelId).posts].reverse()),
 			user: async (userId) => {
 				const user = this.users.get(userId);
 				if (user === undefined) {
@@ -131,10 +139,11 @@ class World {
 
 /** The control-plane side: grants and rejections, as the store records them. */
 class Records {
-	grants: MembershipGrantView[] = [];
-	granted: MembershipGrant[] = [];
-	rejections: MembershipRejection[] = [];
-	configured = new Set<MattermostId>();
+	grants: GrantRecord[] = [];
+	granted: ChannelGrantInput[] = [];
+	rejections: RejectedAdd[] = [];
+	/** What `grant` answers: false stands for a stale grant (the bot was replaced meanwhile). */
+	accept = true;
 }
 
 function harness(bots = [DEVELOPER_BOT]) {
@@ -142,7 +151,7 @@ function harness(bots = [DEVELOPER_BOT]) {
 	const records = new Records();
 	const pending = new Map<string, number>();
 	const store = {
-		view: async () => ({
+		state: async () => ({
 			teamId: TEAM,
 			ownerUserIds: new Set([OWNER]),
 			listener: { userId: LISTENER, tokenSecretRef: LISTENER },
@@ -154,7 +163,10 @@ function harness(bots = [DEVELOPER_BOT]) {
 			})),
 			grants: records.grants,
 		}),
-		grant: async (grant: MembershipGrant) => {
+		grant: async (grant: ChannelGrantInput) => {
+			if (!records.accept) {
+				return false;
+			}
 			records.granted.push(grant);
 			records.grants = [
 				...records.grants.filter(
@@ -176,9 +188,15 @@ function harness(bots = [DEVELOPER_BOT]) {
 			);
 			return records.grants.some((g) => g.channelId === channelId && g.state === "active");
 		},
-		reject: async (rejection: MembershipRejection) => {
+		reject: async (rejection: RejectedAdd) => {
 			records.rejections.push(rejection);
 		},
+		unneeded: async (channelIds: Readonly<MattermostId[]>) =>
+			channelIds.filter(
+				(channelId) =>
+					channelId !== CONFIGURED &&
+					!records.grants.some((g) => g.channelId === channelId && g.state === "active"),
+			),
 		token: (secretRef: string) => secretRef,
 	};
 	const sync = () =>
@@ -299,20 +317,77 @@ describe("the membership synchronizer", () => {
 		expect(records.grants).toEqual([expect.objectContaining({ channelId: LAB, state: "active" })]);
 	});
 
-	it("grants nothing while the listener cannot be brought in, and says so", async () => {
+	it("grants nothing while the listener cannot be brought in: the bot leaves, once", async () => {
 		const { world, records, sync } = harness();
 		world.failListenerAdd = true;
 		world.add(LAB, OWNER, DEVELOPER_BOT);
+		await sync();
 		await sync();
 		expect(records.granted).toEqual([]);
 		expect(records.rejections).toEqual([
 			expect.objectContaining({ reason: "listener_not_added", actorUserId: OWNER }),
 		]);
-		// The bot stays: the owner's add is valid, and the next pass tries again.
-		expect(world.at(LAB).members.has(DEVELOPER_BOT)).toBe(true);
-		world.failListenerAdd = false;
+		expect(world.at(LAB).members.has(DEVELOPER_BOT)).toBe(false);
+	});
+
+	it("judges a re-add between two polls by the newer add", async () => {
+		const { world, records, sync } = harness();
+		world.add(LAB, OWNER, DEVELOPER_BOT);
 		await sync();
-		expect(records.granted).toHaveLength(1);
+		// Removed and added again by someone who may not grant, before the next poll.
+		world.at(LAB).members.delete(DEVELOPER_BOT);
+		world.add(LAB, MEMBER, DEVELOPER_BOT);
+		await sync();
+		expect(records.grants).toEqual([expect.objectContaining({ channelId: LAB, state: "revoked" })]);
+		expect(records.rejections).toEqual([
+			expect.objectContaining({ actorUserId: MEMBER, reason: "not_owner_or_admin" }),
+		]);
+		expect(world.at(LAB).members.has(DEVELOPER_BOT)).toBe(false);
+		expect(world.at(LAB).members.has(LISTENER)).toBe(false);
+	});
+
+	it("moves a grant's floor to an owner's newer re-add", async () => {
+		const { world, records, sync } = harness();
+		world.add(LAB, OWNER, DEVELOPER_BOT);
+		await sync();
+		world.at(LAB).members.delete(DEVELOPER_BOT);
+		world.add(LAB, ADMIN, DEVELOPER_BOT);
+		const readdedAt = world.now;
+		await sync();
+		expect(records.grants).toEqual([
+			expect.objectContaining({ channelId: LAB, state: "active", sinceMs: readdedAt }),
+		]);
+	});
+
+	it("keeps the listener while another agent still has the channel", async () => {
+		const { world, records, sync } = harness([DEVELOPER_BOT, FINANCE_BOT]);
+		world.add(LAB, OWNER, DEVELOPER_BOT);
+		world.add(LAB, OWNER, FINANCE_BOT);
+		await sync();
+		expect(records.granted).toHaveLength(2);
+		world.at(LAB).members.delete(DEVELOPER_BOT);
+		await sync();
+		expect(world.at(LAB).members.has(LISTENER)).toBe(true);
+		world.at(LAB).members.delete(FINANCE_BOT);
+		await sync();
+		expect(world.at(LAB).members.has(LISTENER)).toBe(false);
+	});
+
+	it("takes the listener out again when the grant turns out stale", async () => {
+		const { world, records, sync } = harness();
+		records.accept = false;
+		world.add(LAB, OWNER, DEVELOPER_BOT);
+		await sync();
+		expect(records.granted).toEqual([]);
+		expect(world.at(LAB).members.has(LISTENER)).toBe(false);
+	});
+
+	it("goes on with the other bots when one fails", async () => {
+		const { world, records, sync } = harness([DEVELOPER_BOT, FINANCE_BOT]);
+		world.broken.add(DEVELOPER_BOT);
+		world.add(LAB, OWNER, FINANCE_BOT);
+		await sync();
+		expect(records.granted.map((grant) => grant.agentId)).toEqual(["finance"]);
 	});
 
 	it("leaves configured channels, town-square and direct messages alone", async () => {

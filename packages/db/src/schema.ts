@@ -192,9 +192,12 @@ export const mattermostChannelGrants = pgTable(
 		channelName: text("channel_name").notNull(),
 		botUserId: text("bot_user_id").$type<MattermostId>().notNull(),
 		state: text("state").$type<ChannelGrantState>().notNull(),
-		/** Who added the bot, from the channel's system post of the add. */
-		grantorUserId: text("grantor_user_id").$type<MattermostId>().notNull(),
-		evidencePostId: text("evidence_post_id").$type<MattermostId>().notNull(),
+		/**
+		 * Who added the bot, from the channel's system post of the add. Null for a tombstone the
+		 * configuration wrote (a channel taken out of `allowed_channels`).
+		 */
+		grantorUserId: text("grantor_user_id").$type<MattermostId>(),
+		evidencePostId: text("evidence_post_id").$type<MattermostId>(),
 		/** When the bot was added: the agent sees nothing created at or before it. */
 		sinceMs: bigint("since_ms", { mode: "number" }).notNull(),
 		/** Incremented by every grant and revocation of this agent in this channel. */
