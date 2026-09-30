@@ -6,6 +6,11 @@ export type ChannelGrant = Readonly<{
 	name: string;
 	/** When the bot was added: nothing created at or before it reaches the agent. */
 	sinceMs: number;
+	/**
+	 * When the Gateway recorded the grant (ms): a turn built before it used the access from
+	 * before, so a run queued earlier is not a source for this grant's turns.
+	 */
+	recordedMs: number;
 }>;
 
 /**
@@ -60,6 +65,22 @@ export function agentChannelFloors(
 		(access.granted.get(agent.id) ?? [])
 			.filter((grant) => !configured.has(grant.channelId))
 			.map((grant) => [grant.channelId, grant.sinceMs]),
+	);
+}
+
+/**
+ * Per granted channel, when its grant was recorded: a run queued at or before it saw the channel
+ * under earlier access (or none).
+ */
+export function agentGrantsRecorded(
+	agent: AgentChannels,
+	access: ChannelAccess,
+): ReadonlyMap<MattermostId, number> {
+	const floors = agentChannelFloors(agent, access);
+	return new Map(
+		(access.granted.get(agent.id) ?? [])
+			.filter((grant) => floors.has(grant.channelId))
+			.map((grant) => [grant.channelId, grant.recordedMs]),
 	);
 }
 

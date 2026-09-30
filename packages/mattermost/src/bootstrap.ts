@@ -432,7 +432,10 @@ export async function bootstrapMattermost(options: BootstrapOptions): Promise<vo
 		for (const channelId of granted.get(userId) ?? []) {
 			allowed.add(channelId);
 			if (bot.agentId === null) {
-				await admin.addChannelMember(channelId, userId);
+				// An archived channel whose grant the synchronizer has not ended yet: it will.
+				await admin.addChannelMember(channelId, userId).catch((error: Error) => {
+					report(`listener: not added to granted channel ${channelId} (${error.message})`);
+				});
 			}
 		}
 		// Every other channel of the team (managed or not) must not stay readable to its token;

@@ -69,8 +69,22 @@ class World {
 
 	/** `actor` adds `userId`, as the server does: the member, then its system post. */
 	add(channelId: MattermostId, actor: MattermostId, userId: MattermostId) {
+		this.at(channelId).members.add(userId);
+		this.system(channelId, actor, "system_add_to_channel", { addedUserId: userId, userId: actor });
+	}
+
+	/** `actor` removes `userId` (or `userId` leaves), with the server's system post. */
+	remove(channelId: MattermostId, actor: MattermostId, userId: MattermostId) {
+		this.at(channelId).members.delete(userId);
+		if (actor === userId) {
+			this.system(channelId, userId, "system_leave_channel", {});
+		} else {
+			this.system(channelId, actor, "system_remove_from_channel", { removedUserId: userId });
+		}
+	}
+
+	system(channelId: MattermostId, actor: MattermostId, type: string, props: ApiPost["props"]) {
 		const entry = this.at(channelId);
-		entry.members.add(userId);
 		this.now += 10;
 		entry.posts.push({
 			id: id(`p${entry.posts.length}${channelId.slice(0, 4)}`),
@@ -81,10 +95,18 @@ class World {
 			user_id: actor,
 			channel_id: channelId,
 			root_id: "",
-			message: "added to the channel",
-			type: "system_add_to_channel",
-			props: { addedUserId: userId, userId: actor },
+			message: type,
+			type,
+			props,
 		});
+	}
+
+	/** The author deletes a post, as a plain member may delete their own. */
+	deleteNewest(channelId: MattermostId) {
+		const post = this.at(channelId).posts.at(-1);
+		if (post !== undefined) {
+			post.delete_at = this.now;
+		}
 	}
 
 	at(channelId: MattermostId): Channel {
@@ -135,7 +157,7 @@ class World {
 				this.add(channelId, token, userId);
 			},
 			removeChannelMember: async (channelId, userId) => {
-				this.at(channelId).members.delete(userId);
+				this.remove(channelId, token, userId);
 			},
 		};
 	}
@@ -151,7 +173,8 @@ class Records {
 	accept = true;
 }
 
-function harness(bots = [DEVELOPER_BOT]) {
+/** `clockAheadMs`: how far the controller's clock runs ahead of Mattermost's. */
+function harness(bots = [DEVELOPER_BOT], clockAheadMs = 0) {
 	const world = new World();
 	const records = new Records();
 	const memory = membershipMemory();
@@ -230,7 +253,7 @@ function harness(bots = [DEVELOPER_BOT]) {
 					environment: "test",
 					level: "error",
 				}),
-				clock: () => new Date(world.now),
+				clock: () => new Date(world.now + clockAheadMs),
 				evidenceGraceMs: 60_000,
 				client: (token) => world.client(token),
 			},
@@ -282,6 +305,49 @@ describe("the membership synchronizer", () => {
 		expect(records.routed).toEqual([
 			{ agentId: "developer", channelId: LAB, postId: id("mention") },
 		]);
+	});
+
+	it("grants nothing from an old owner's add when someone else brought the bot back", async () => {
+		const { world, records, sync } = harness();
+		// An owner's add from long ago, then a removal (by the Gateway's bootstrap, say).
+		world.add(LAB, OWNER, DEVELOPER_BOT);
+		world.remove(LAB, ADMIN, DEVELOPER_BOT);
+		// A member adds the bot again and deletes the add's system post.
+		world.add(LAB, MEMBER, DEVELOPER_BOT);
+		world.deleteNewest(LAB);
+		await sync();
+		world.now += 60_000;
+		await sync();
+		expect(records.granted).toEqual([]);
+		expect(world.at(LAB).members.has(DEVELOPER_BOT)).toBe(false);
+	});
+
+	it("sees a re-add between polls even when the controller's clock runs ahead", async () => {
+		const { world, records, sync } = harness([DEVELOPER_BOT], 3_600_000);
+		world.add(LAB, OWNER, DEVELOPER_BOT);
+		await sync();
+		await sync();
+		world.remove(LAB, MEMBER, DEVELOPER_BOT);
+		world.add(LAB, MEMBER, DEVELOPER_BOT);
+		await sync();
+		expect(records.rejections).toEqual([
+			expect.objectContaining({ actorUserId: MEMBER, reason: "not_owner_or_admin" }),
+		]);
+		expect(world.at(LAB).members.has(DEVELOPER_BOT)).toBe(false);
+	});
+
+	it("fails closed when a granted bot's return has no add record", async () => {
+		const { world, records, sync } = harness();
+		world.add(LAB, OWNER, DEVELOPER_BOT);
+		await sync();
+		world.remove(LAB, MEMBER, DEVELOPER_BOT);
+		world.add(LAB, MEMBER, DEVELOPER_BOT);
+		world.deleteNewest(LAB);
+		await sync();
+		expect(records.grants).toEqual([
+			expect.objectContaining({ state: "revoked", revokedReason: "add_unverified" }),
+		]);
+		expect(world.at(LAB).members.has(DEVELOPER_BOT)).toBe(false);
 	});
 
 	it("grants a system admin's add as well", async () => {

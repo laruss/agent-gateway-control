@@ -134,6 +134,8 @@ export async function grantChannel(
 		await lockConfigExclusive(uow);
 		// The agent too, as scheduling holds it: no turn is built from the access this changes.
 		await lockAgent(uow.tx.db, input.agentId);
+		// Dated after the locks: a run queued while this waited for them is older than the grant.
+		const now = uow.deps.clock();
 		const { db } = uow.tx;
 		const config = await loadActiveConfig(db);
 		const [bot] = await db
@@ -182,7 +184,7 @@ export async function grantChannel(
 			sinceMs: input.sinceMs,
 			checkedAtMs: input.sinceMs,
 			revokedReason: null,
-			grantedAt: uow.now,
+			grantedAt: now,
 			revokedAt: null,
 		};
 		await db
@@ -237,7 +239,8 @@ export async function revokeChannelGrant(
 			.set({
 				state: "revoked",
 				revokedReason: reason,
-				revokedAt: uow.now,
+				// Dated after the locks, like a grant.
+				revokedAt: uow.deps.clock(),
 				generation: sql`${mattermostChannelGrants.generation} + 1`,
 			})
 			.where(

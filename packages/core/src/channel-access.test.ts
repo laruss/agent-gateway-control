@@ -4,6 +4,7 @@ import {
 	agentChannelFloors,
 	agentChannelIds,
 	agentChannelRefs,
+	agentGrantsRecorded,
 	type ChannelAccess,
 	grantedChannels,
 } from "./channel-access.ts";
@@ -30,9 +31,9 @@ const ACCESS: ChannelAccess = {
 		[
 			"developer",
 			[
-				{ channelId: LAB, name: "lab", sinceMs: 1000 },
+				{ channelId: LAB, name: "lab", sinceMs: 1000, recordedMs: 1500 },
 				// Granted and configured: the configuration's own rules hold, no floor.
-				{ channelId: HQ, name: "hq", sinceMs: 2000 },
+				{ channelId: HQ, name: "hq", sinceMs: 2000, recordedMs: 2500 },
 			],
 		],
 	]),
@@ -52,6 +53,10 @@ describe("channel access", () => {
 	it("keeps an agent from posts before its add, in granted channels only", () => {
 		expect(agentChannelFloors(agent("developer", ["hq"]), ACCESS)).toEqual(new Map([[LAB, 1000]]));
 		expect(agentChannelFloors(agent("finance", ["ops"]), ACCESS)).toEqual(new Map());
+	});
+
+	it("dates each granted channel's access by when its grant was recorded", () => {
+		expect(agentGrantsRecorded(agent("developer", ["hq"]), ACCESS)).toEqual(new Map([[LAB, 1500]]));
 	});
 
 	it("lists every granted channel", () => {

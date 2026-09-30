@@ -256,6 +256,8 @@ export async function ingestInTransaction(
  */
 export async function routeGrantedMention(
 	deps: ControlPlaneDeps,
+	/** The Mattermost event source the post was stored under. */
+	source: string,
 	agentId: AgentId,
 	channelId: string,
 	postId: string,
@@ -268,6 +270,7 @@ export async function routeGrantedMention(
 			.from(events)
 			.where(
 				and(
+					eq(events.source, source),
 					eq(events.subject, `channel/${channelId}/post/${postId}`),
 					inArray(events.type, [...NEW_POST_EVENT_TYPES]),
 				),
@@ -339,6 +342,14 @@ export async function routeGrantedMention(
 			},
 			createdAt: uow.now,
 		});
+		if (final.decision === "blocked") {
+			await raiseAlert(
+				uow,
+				`loop:${row.id}:${agentId}`,
+				`Loop guard '${final.reason}' blocked a wake-up of @${agentId} in '${event.correlationid}'; the cascade is stopped.`,
+				{ event_id: row.id, agent_id: agentId, reason: final.reason, hop: event.hop },
+			);
+		}
 		if (final.decision !== "wake") {
 			return false;
 		}

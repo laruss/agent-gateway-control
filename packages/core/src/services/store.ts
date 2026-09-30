@@ -227,6 +227,7 @@ export async function loadChannelAccess(db: Db): Promise<ChannelAccess> {
 			channelId: mattermostChannelGrants.channelId,
 			name: mattermostChannelGrants.channelName,
 			sinceMs: mattermostChannelGrants.sinceMs,
+			grantedAt: mattermostChannelGrants.grantedAt,
 		})
 		.from(mattermostChannelGrants)
 		.innerJoin(agents, eq(agents.id, mattermostChannelGrants.agentId))
@@ -248,7 +249,12 @@ export async function loadChannelAccess(db: Db): Promise<ChannelAccess> {
 	const granted = new Map<string, ChannelGrant[]>();
 	for (const row of rows) {
 		const list = granted.get(row.agentId) ?? [];
-		list.push({ channelId: row.channelId, name: row.name, sinceMs: row.sinceMs });
+		list.push({
+			channelId: row.channelId,
+			name: row.name,
+			sinceMs: row.sinceMs,
+			recordedMs: row.grantedAt.getTime(),
+		});
 		granted.set(row.agentId, list);
 	}
 	return { named, granted };

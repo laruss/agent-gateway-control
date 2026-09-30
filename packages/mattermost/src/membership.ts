@@ -105,61 +105,89 @@ function isTeamChannel(channel: ApiChannel, teamId: MattermostId): boolean {
 }
 
 /**
- * The server's record of `userId` being added. Only the server writes system posts (clients
- * cannot create or edit them), and only its add record names the added user in `addedUserId`.
+ * How a post changes `userId`'s membership: `add` (someone added them), `gone` (removed, or they
+ * left), or null. Only the server writes system posts (clients cannot create or edit them), and
+ * only its add and remove records name the member in `addedUserId` and `removedUserId`.
  */
-function isAddOf(post: ApiPost | undefined, userId: MattermostId): post is ApiPost {
-	return (
-		post !== undefined &&
-		post.type === "system_add_to_channel" &&
-		post.props.addedUserId === userId &&
-		post.delete_at === 0
-	);
+function membershipChange(post: ApiPost | undefined, userId: MattermostId): "add" | "gone" | null {
+	if (post === undefined || post.delete_at !== 0) {
+		return null;
+	}
+	switch (post.type) {
+		case "system_add_to_channel":
+			return post.props.addedUserId === userId ? "add" : null;
+		case "system_join_channel":
+			return post.user_id === userId ? "add" : null;
+		case "system_remove_from_channel":
+			return post.props.removedUserId === userId ? "gone" : null;
+		case "system_leave_channel":
+			return post.user_id === userId ? "gone" : null;
+		default:
+			return null;
+	}
 }
 
-/** The newest add of `userId` in the list, or null. */
-function newestAdd(list: ApiPostList, userId: MattermostId): ApiPost | null {
-	let newest: ApiPost | null = null;
+type MembershipChange = Readonly<{ post: ApiPost; kind: "add" | "gone" }>;
+
+/** The newest change of `userId`'s membership in the list, or null. */
+function newestChange(list: ApiPostList, userId: MattermostId): MembershipChange | null {
+	let newest: MembershipChange | null = null;
 	for (const post of Object.values(list.posts)) {
-		if (isAddOf(post, userId) && (newest === null || post.create_at > newest.create_at)) {
-			newest = post;
+		const kind = membershipChange(post, userId);
+		if (kind !== null && (newest === null || post.create_at > newest.post.create_at)) {
+			newest = { post, kind };
 		}
 	}
 	return newest;
 }
 
-/** What a scan for an add found; `complete` is false when it stopped before `afterMs`. */
-type AddScan = Readonly<{ add: ApiPost | null; complete: boolean }>;
+/**
+ * What a scan found: the newest change of the membership after `afterMs`, if any; `complete` is
+ * false when it stopped before reaching `afterMs`.
+ */
+type ChangeScan = Readonly<{
+	change: MembershipChange | null;
+	complete: boolean;
+	/** The newest post's creation time, by Mattermost's clock; null for an empty channel. */
+	newestMs: number | null;
+}>;
 
 /**
- * The newest add of `userId` among the channel's posts, newest first, reading back no further
- * than posts created at `afterMs`, and at most `pages` pages.
+ * The newest change of `userId`'s membership among the channel's posts, newest first, reading
+ * back no further than posts created at `afterMs`, and at most `pages` pages. The newest change
+ * decides, not the newest add: an old owner's add followed by a removal grants nothing, whoever
+ * brought the bot back.
  */
-async function findAdd(
+async function findChange(
 	client: MembershipClient,
 	channelId: MattermostId,
 	userId: MattermostId,
 	afterMs: number,
 	pages: number,
-): Promise<AddScan> {
+): Promise<ChangeScan> {
 	let before: MattermostId | null = null;
+	let newestMs: number | null = null;
 	for (let page = 0; page < pages; page += 1) {
 		const list = await client.channelPostsBefore(channelId, before, EVIDENCE_PAGE_SIZE);
-		const add = newestAdd(list, userId);
-		if (add !== null) {
-			return { add: add.create_at > afterMs ? add : null, complete: true };
+		const first = list.order[0];
+		if (page === 0 && first !== undefined) {
+			newestMs = list.posts[first]?.create_at ?? null;
+		}
+		const change = newestChange(list, userId);
+		if (change !== null) {
+			return { change: change.post.create_at > afterMs ? change : null, complete: true, newestMs };
 		}
 		const last = list.order.at(-1);
 		if (last === undefined || list.order.length < EVIDENCE_PAGE_SIZE) {
-			return { add: null, complete: true };
+			return { change: null, complete: true, newestMs };
 		}
 		const oldest = list.posts[last];
 		if (oldest === undefined || oldest.create_at <= afterMs) {
-			return { add: null, complete: true };
+			return { change: null, complete: true, newestMs };
 		}
 		before = last;
 	}
-	return { add: null, complete: false };
+	return { change: null, complete: false, newestMs };
 }
 
 function mayGrant(user: ApiUser, owners: ReadonlySet<MattermostId>): boolean {
@@ -243,18 +271,28 @@ async function judgeAdd(pass: BotPass, channel: ApiChannel, add: ApiPost): Promi
 		return;
 	}
 	options.log.info("channel granted", { agent_id: bot.agentId, channel_id: channel.id });
-	// A mention right after the add, in a channel the listener already followed, was stored
-	// before the agent could be addressed there: it is routed to the agent now.
-	const since = await client.channelPostsSince(channel.id, add.create_at);
-	const mentions = new Set([bot.agentId]);
-	for (const post of Object.values(since.posts)) {
+	await routeMentions(pass, channel.id, add.create_at);
+}
+
+/**
+ * Routes the posts after `afterMs` that mention the agent to it: in a channel the listener
+ * already followed, a mention right after the add was stored before the agent could be
+ * addressed there. Routing is idempotent (a post routed to the agent once is left alone), so
+ * every check repeats it over its window. Edited posts are left out: the stored text is the
+ * original, and edits never wake anyone.
+ */
+async function routeMentions(pass: BotPass, channelId: MattermostId, afterMs: number) {
+	const posts = await pass.client.channelPostsSince(channelId, afterMs);
+	const mentions = new Set([pass.bot.agentId]);
+	for (const post of Object.values(posts.posts)) {
 		if (
 			post.type === "" &&
-			post.create_at > add.create_at &&
+			post.create_at > afterMs &&
+			post.edit_at === 0 &&
 			post.delete_at === 0 &&
 			mentionedAgents(post.message, mentions).length > 0
 		) {
-			await options.store.routeMention(bot.agentId, channel.id, post.id);
+			await pass.options.store.routeMention(pass.bot.agentId, channelId, post.id);
 		}
 	}
 }
@@ -305,11 +343,11 @@ async function syncBot(pass: BotPass): Promise<void> {
 			// Removed and added again between two polls: the newer add decides, not the old one.
 			// Only posts since the last check are read (newest first, overlapping a little); the
 			// check counts as done only once whatever it found was judged.
-			const checkedAt = options.clock().getTime() - SCAN_OVERLAP_MS;
 			const after = Math.max(grant.sinceMs, grant.checkedAtMs ?? grant.sinceMs);
-			const scan = await findAdd(client, grant.channelId, bot.userId, after, READD_SCAN_PAGES);
-			if (!scan.complete) {
-				// Who added the bot this time cannot be told: fail closed.
+			const scan = await findChange(client, grant.channelId, bot.userId, after, READD_SCAN_PAGES);
+			// Who brought the bot back cannot be told (too many posts, or its add record is gone:
+			// the newest change is its removal although it is a member): fail closed.
+			if (!scan.complete || scan.change?.kind === "gone") {
 				await options.store.revoke(bot.agentId, grant.channelId, "add_unverified");
 				await options.store.reject({
 					agentId: bot.agentId,
@@ -322,10 +360,22 @@ async function syncBot(pass: BotPass): Promise<void> {
 				await client.removeChannelMember(grant.channelId, bot.userId);
 				return;
 			}
-			if (scan.add !== null && scan.add.create_at > grant.sinceMs) {
-				await judgeAdd(pass, channel, scan.add);
+			if (scan.change !== null && scan.change.post.create_at > grant.sinceMs) {
+				await judgeAdd(pass, channel, scan.change.post);
+				if (!(await client.isChannelMember(grant.channelId, bot.userId))) {
+					return;
+				}
 			}
-			await options.store.checked(bot.agentId, grant.channelId, checkedAt);
+			await routeMentions(pass, grant.channelId, Math.max(grant.sinceMs, after - SCAN_OVERLAP_MS));
+			// By Mattermost's own clock: the newest post read, a little back. The controller's clock
+			// may run ahead of the server's, and posts are dated by the server.
+			if (scan.newestMs !== null) {
+				await options.store.checked(
+					bot.agentId,
+					grant.channelId,
+					Math.max(grant.sinceMs, scan.newestMs - SCAN_OVERLAP_MS),
+				);
+			}
 		});
 	}
 
@@ -340,11 +390,14 @@ async function syncBot(pass: BotPass): Promise<void> {
 		seen.add(key);
 		await step(pass, channel.id, async () => {
 			const latest = records.find((grant) => grant.channelId === channel.id);
-			const { add } = await findAdd(client, channel.id, bot.userId, 0, EVIDENCE_SCAN_PAGES);
-			// An add no newer than the latest record is the one that record came from (or older):
-			// after a revocation, or a channel taken out of the configuration, only a new add counts.
-			if (add !== null && (latest === undefined || add.create_at > latest.sinceMs)) {
-				await judgeAdd(pass, channel, add);
+			const { change } = await findChange(client, channel.id, bot.userId, 0, EVIDENCE_SCAN_PAGES);
+			// Only the newest change counts, and only an add newer than the latest record (the add
+			// a record came from, or older, grants nothing again).
+			if (
+				change?.kind === "add" &&
+				(latest === undefined || change.post.create_at > latest.sinceMs)
+			) {
+				await judgeAdd(pass, channel, change.post);
 				return;
 			}
 			const now = options.clock().getTime();

@@ -235,8 +235,18 @@ export function membershipStore(deps: ControlPlaneDeps, secretsDir?: string): Me
 		reject: (rejection) => rejectChannelAdd(deps, rejection),
 		unneeded: (channelIds) => unneededChannels(deps, channelIds),
 		checked: (agentId, channelId, atMs) => markGrantChecked(deps, agentId, channelId, atMs),
-		routeMention: (agentId, channelId, postId) =>
-			routeGrantedMention(deps, agentId, channelId, postId),
+		routeMention: async (agentId, channelId, postId) => {
+			const snapshot = await loadMattermostSnapshot(deps);
+			return snapshot === null
+				? false
+				: routeGrantedMention(
+						deps,
+						mattermostSource(snapshot.organization.mattermost.team),
+						agentId,
+						channelId,
+						postId,
+					);
+		},
 		token: (secretRef) => {
 			const path = resolveSecretPath(secretRef, secretsDir);
 			return secretFileState(path) === "private" ? readSecretFile(path) : null;

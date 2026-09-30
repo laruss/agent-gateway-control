@@ -42,7 +42,7 @@ import {
 	type SQL,
 	sql,
 } from "drizzle-orm";
-import { agentChannelFloors, agentChannelIds } from "../channel-access.ts";
+import { agentChannelFloors, agentChannelIds, agentGrantsRecorded } from "../channel-access.ts";
 import { requireTransition } from "../state-machine.ts";
 import { type AgentRecord, buildTurnContext } from "../turn-context.ts";
 import { budgetHoldFor } from "./budgets.ts";
@@ -107,8 +107,11 @@ async function previousRun(
 	waitCreatorRunId: string | null,
 	correlationId: string,
 	allowed: ReadonlySet<MattermostId>,
-	/** Grant floors by channel: a run there from before the agent's add is not its previous one. */
-	floors: ReadonlyMap<MattermostId, number>,
+	/**
+	 * When each granted channel's grant was recorded: a run queued before it was built under
+	 * earlier access and is not the previous run of a turn under this one.
+	 */
+	recorded: ReadonlyMap<MattermostId, number>,
 ): Promise<PreviousRun | null> {
 	const latest = async (which: SQL) => {
 		const [row] = await uow.tx.db
@@ -131,7 +134,7 @@ async function previousRun(
 						and(
 							inArray(sql<string>`split_part(${contextSnapshots.threadRef}, '/', 2)`, [...allowed]),
 							sql`not exists (
-								select 1 from jsonb_each_text(${JSON.stringify(Object.fromEntries(floors))}::jsonb) f
+								select 1 from jsonb_each_text(${JSON.stringify(Object.fromEntries(recorded))}::jsonb) f
 								 where f.key = split_part(${contextSnapshots.threadRef}, '/', 2)
 								   and ${agentRuns.queuedAt} <= to_timestamp(f.value::bigint / 1000.0))`,
 						),
@@ -150,8 +153,8 @@ async function previousRun(
 			return post === null ? [] : [post.channel_id];
 		});
 		const stale = carried.some((channelId) => {
-			const floor = floors.get(channelId);
-			return !allowed.has(channelId) || (floor !== undefined && row.queuedAt.getTime() <= floor);
+			const since = recorded.get(channelId);
+			return !allowed.has(channelId) || (since !== undefined && row.queuedAt.getTime() <= since);
 		});
 		return stale ? null : { id: row.id, summary: row.summary };
 	};
@@ -372,7 +375,7 @@ export async function scheduleAgent(
 		waitCreatorRunId,
 		triggerEvent.correlationid,
 		allowed,
-		floors,
+		agentGrantsRecorded(agent, access),
 	);
 	const context = await assembleTurnContext(uow, {
 		agent,
