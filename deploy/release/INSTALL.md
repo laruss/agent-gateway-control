@@ -169,10 +169,23 @@ metrics are reachable by the other containers on `agent-control`; they hold coun
 ids, no content.
 
 **Egress.** Workers, the Gmail connector and the tool runner reach the internet through the
-`egress` network. The Mattermost network is closed to them, but its public URL, the host's
-own services and your LAN are not: block those from the `egress` bridge with the host
-firewall (for example `DOCKER-USER` rules for its subnet), and require authentication on
-every service the host exposes.
+`egress` network, whose bridge is named `agw-egress`. The Mattermost network is closed to
+them, but its public URL, the host's own services and your LAN are not until the host's
+firewall closes them. `bin/egress-firewall.sh` (as root, needs `nft`) loads an nftables table
+that rejects everything from `agw-egress` except the public internet and the DNS resolvers
+Docker uses; load it at every boot, before the stack starts (a systemd unit that runs it
+`Before=docker.service`). Check it from a worker, with your router's address in place of
+`192.168.1.1`: the first line must say `open`, the second `closed`.
+
+```bash
+bin/agw run --rm --entrypoint bun gateway-worker-codex -e '
+  for (const url of ["https://example.com", "http://192.168.1.1"]) {
+    try { await fetch(url, { signal: AbortSignal.timeout(5000) }); console.log(url, "open"); }
+    catch { console.log(url, "closed"); }
+  }'
+```
+
+Still require authentication on every service the host exposes.
 
 ## Monitoring
 

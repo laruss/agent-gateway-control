@@ -1,0 +1,10 @@
+# TLS for Mattermost on the LAN, from Caddy's own certificate authority: clients trust its
+# root certificate once (docs/operations/home-server.md). HTTP redirects to HTTPS.
+{
+	local_certs
+}
+
+{$MATTERMOST_HOST} {
+	encode zstd gzip
+	reverse_proxy mattermost:8065
+}

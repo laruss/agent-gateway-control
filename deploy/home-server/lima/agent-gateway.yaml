@@ -1,0 +1,107 @@
+# The home server's VM on an Apple silicon Mac: Ubuntu 24.04 arm64 under Apple's
+# Virtualization framework, Docker Engine, and Rosetta for Mattermost's amd64 image. It has a
+# LAN address of its own (bridged through socket_vmnet), so Mattermost is served from the VM
+# directly; nothing is forwarded through Lima. See docs/operations/home-server.md.
+#
+#   limactl create --name=agw deploy/home-server/lima/agent-gateway.yaml
+minimumLimaVersion: 2.2.0
+vmType: vz
+arch: aarch64
+cpus: 8
+memory: 16GiB
+disk: 200GiB
+
+# A dated release by digest; Ubuntu removes old dated directories after some months, which
+# matters only for a new VM.
+images:
+  - location: https://cloud-images.ubuntu.com/releases/noble/release-20260926/ubuntu-24.04-server-cloudimg-arm64.img
+    arch: aarch64
+    digest: sha256:1d6bffe64b848468ac97f821d369a4846d983de1800ccf6b5ec8853e85cefc55
+
+# No host directory is shared: state and backups live on the VM's disk, and backups leave it
+# over SSH.
+mounts: []
+
+vmOpts:
+  vz:
+    rosetta:
+      enabled: true
+      binfmt: true
+
+networks:
+  # A LAN address by DHCP on the Mac's interface named in ~/.lima/_config/networks.yaml
+  # (`bridged`, en0 by default). Reserve it on the router by the VM's MAC address.
+  - lima: bridged
+
+# Docker Engine from Docker's repository, below; not Lima's containerd.
+containerd:
+  system: false
+  user: false
+
+ssh:
+  loadDotSSHPubKeys: false
+
+# Nothing is forwarded to the Mac: the services are reached at the VM's LAN address.
+portForwards:
+  - guestPortRange: [1, 65535]
+    proto: any
+    ignore: true
+
+provision:
+  # Runs at every boot as root; installs once, then only checks.
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      docker_version=5:29.8.1-1~ubuntu.24.04~noble
+      if [ "$(dpkg-query -W -f='${Version}' docker-ce 2>/dev/null || true)" != "$docker_version" ]; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y ca-certificates curl nftables
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc.new
+        # Docker's release key, by fingerprint.
+        gpg --show-keys --with-colons /etc/apt/keyrings/docker.asc.new |
+          grep -qx 'fpr:::::::::9DC858229FC7DD38854AE2D88D81803C0EBFCD88:'
+        mv /etc/apt/keyrings/docker.asc.new /etc/apt/keyrings/docker.asc
+        chmod a+r /etc/apt/keyrings/docker.asc
+        cat >/etc/apt/sources.list.d/docker.sources <<SOURCES
+      Types: deb
+      URIs: https://download.docker.com/linux/ubuntu
+      Suites: noble
+      Components: stable
+      Architectures: arm64
+      Signed-By: /etc/apt/keyrings/docker.asc
+      SOURCES
+        apt-get update
+        apt-get install -y --allow-downgrades \
+          docker-ce="$docker_version" docker-ce-cli="$docker_version" \
+          containerd.io=2.3.6-1~ubuntu.24.04~noble \
+          docker-buildx-plugin=0.37.1-1~ubuntu.24.04~noble \
+          docker-compose-plugin=5.5.1-1~ubuntu.24.04~noble
+        apt-mark hold docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+      fi
+      install -d -m 0755 /etc/docker
+      cat >/etc/docker/daemon.json.new <<'JSON'
+      {
+        "log-driver": "local",
+        "log-opts": { "max-size": "20m", "max-file": "5" },
+        "live-restore": true
+      }
+      JSON
+      if ! cmp -s /etc/docker/daemon.json.new /etc/docker/daemon.json; then
+        mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+        systemctl restart docker
+      else
+        rm /etc/docker/daemon.json.new
+      fi
+      systemctl enable --now docker
+      usermod -aG docker "{{.User}}"
+
+probes:
+  - description: Docker Engine is running
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      timeout 300 bash -c 'until systemctl is-active --quiet docker; do sleep 3; done'
+    hint: see /var/log/cloud-init-output.log in the guest

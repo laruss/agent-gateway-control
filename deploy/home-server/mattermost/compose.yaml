@@ -1,0 +1,129 @@
+# The home server's Mattermost: the pinned ESR, its own PostgreSQL, and Caddy terminating TLS
+# with its own certificate authority. A separate stack with its own lifecycle; the Gateway's
+# controller joins the `agent-mm` network and reaches Mattermost at http://mattermost:8065.
+#
+#   docker compose --env-file "$MATTERMOST_HOME/mattermost.env" -f compose.yaml up -d
+#
+# See docs/operations/home-server.md. Every image is pinned by digest.
+name: agent-gateway-mattermost
+
+networks:
+  default: {}
+  # Created here, joined by the Gateway (MATTERMOST_NETWORK in gateway.env).
+  agent-mm:
+    name: agent-mm
+
+volumes:
+  postgres-data: {}
+  mattermost-config: {}
+  mattermost-data: {}
+  mattermost-logs: {}
+  mattermost-plugins: {}
+  mattermost-client-plugins: {}
+  mattermost-bleve: {}
+  # Caddy's certificate authority and certificates: back it up, or every client must trust a
+  # new root.
+  caddy-data: {}
+  caddy-config: {}
+
+x-hardening: &hardening
+  restart: unless-stopped
+  security_opt: ["no-new-privileges:true"]
+  logging:
+    driver: local
+    options: { max-size: 20m, max-file: "5" }
+
+services:
+  postgres:
+    <<: *hardening
+    image: docker.io/library/postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+    # The entrypoint prepares the data directory as root, then runs PostgreSQL as its own user.
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+    environment:
+      POSTGRES_DB: mattermost
+      POSTGRES_USER: mattermost
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres/postgres_password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ${MATTERMOST_HOME:?set MATTERMOST_HOME}/secrets/postgres:/run/secrets/postgres:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mattermost -d mattermost"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    shm_size: 256m
+    mem_limit: 2g
+    pids_limit: 512
+
+  mattermost:
+    <<: *hardening
+    # Mattermost publishes amd64 images only; the VM runs it through Rosetta.
+    image: docker.io/mattermost/mattermost-team-edition:11.7.11@sha256:7ddc241942476577379614106e16292e23c4d36cde9b30b66899220b706e4b90
+    platform: linux/amd64
+    cap_drop: [ALL]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # MM_SQLSETTINGS_DATASOURCE carries the database password; it comes from secrets/database.env.
+      MM_SQLSETTINGS_DRIVERNAME: postgres
+      MM_SERVICESETTINGS_SITEURL: https://${MATTERMOST_HOST:?set MATTERMOST_HOST}
+      MM_SERVICESETTINGS_LISTENADDRESS: ":8065"
+      # The Gateway's bots, and the administrator's token for its bootstrap.
+      MM_SERVICESETTINGS_ENABLEBOTACCOUNTCREATION: "true"
+      MM_SERVICESETTINGS_ENABLEUSERACCESSTOKENS: "true"
+      # Accounts are created by the administrator: no open sign-up.
+      MM_TEAMSETTINGS_ENABLEOPENSERVER: "false"
+      MM_EMAILSETTINGS_ENABLESIGNUPWITHEMAIL: "false"
+      MM_BLEVESETTINGS_INDEXDIR: /mattermost/bleve-indexes
+      # Plugins stay off: the Gateway needs none, and each would run emulated (Calls, AI and
+      # Playbooks ship prepackaged).
+      MM_PLUGINSETTINGS_ENABLE: "false"
+      # mmctl --local inside the container only (the image has no shell or curl): the health
+      # check, and administration without a token (docs/operations/home-server.md).
+      MM_SERVICESETTINGS_ENABLELOCALMODE: "true"
+      MM_LOGSETTINGS_CONSOLELEVEL: INFO
+      MM_LOGSETTINGS_ENABLEFILE: "false"
+      TZ: ${TZ:-UTC}
+    env_file:
+      - ${MATTERMOST_HOME}/secrets/database.env
+    volumes:
+      - mattermost-config:/mattermost/config
+      - mattermost-data:/mattermost/data
+      - mattermost-logs:/mattermost/logs
+      - mattermost-plugins:/mattermost/plugins
+      - mattermost-client-plugins:/mattermost/client/plugins
+      - mattermost-bleve:/mattermost/bleve-indexes
+    healthcheck:
+      test: ["CMD", "/mattermost/bin/mmctl", "--local", "system", "status"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
+    mem_limit: 4g
+    pids_limit: 1024
+    networks:
+      default: {}
+      agent-mm:
+        aliases: [mattermost]
+
+  caddy:
+    <<: *hardening
+    image: docker.io/library/caddy:2.11.4-alpine@sha256:6aeddd44c3078b0f9a35206472a11420648a79c184603ef95957d0a20044cb2b
+    depends_on: [mattermost]
+    environment:
+      MATTERMOST_HOST: ${MATTERMOST_HOST}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    read_only: true
+    tmpfs: [/tmp]
+    mem_limit: 512m
+    pids_limit: 256
