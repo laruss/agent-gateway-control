@@ -19,6 +19,7 @@ import {
 	type DirectoryKind,
 	events,
 	gatewayControls,
+	mattermostChannelGrants,
 	mattermostDirectory,
 	mattermostIdentities,
 	type OutboxStatus,
@@ -30,6 +31,7 @@ import {
 } from "@agent-gateway/db";
 import { canonicalHash } from "@agent-gateway/events";
 import { and, asc, desc, eq, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
+import { grantedChannels } from "../channel-access.ts";
 import { nextAgentState, requireTransition } from "../state-machine.ts";
 import { revokeQueuedActions, sweepApprovals, withdrawOpenApprovals } from "./approvals.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
@@ -38,6 +40,7 @@ import { type ScheduleResult, scheduleAgent } from "./scheduler.ts";
 import {
 	audit,
 	loadActiveConfig,
+	loadChannelAccess,
 	loadDirectory,
 	lockAgent,
 	setAgentState,
@@ -118,6 +121,75 @@ export function configBundleProblems(input: ConfigApplyInput): Readonly<string[]
 }
 
 /**
+ * A channel taken out of an agent's `allowed_channels` must not come back as a grant: bootstrap
+ * added the bot there with the admin's token, and that add record would otherwise count. A
+ * revoked row dated now is written for it (an owner's grant still active is left alone), so
+ * only a later add grants the channel again.
+ */
+async function tombstoneUnconfiguredChannels(
+	uow: UnitOfWork,
+	before: Readonly<Readonly<{ id: string; config: AgentConfig }>[]>,
+	after: Readonly<AgentConfig[]>,
+): Promise<void> {
+	const { db } = uow.tx;
+	const config = await loadActiveConfig(db);
+	const teamId =
+		config === null
+			? undefined
+			: (await loadDirectory(db, "team")).get(config.organization.mattermost.team);
+	if (teamId === undefined) {
+		return;
+	}
+	const channels = await loadDirectory(db, "channel");
+	const identities = new Map(
+		(
+			await db
+				.select({
+					agentId: mattermostIdentities.agentId,
+					userId: mattermostIdentities.mattermostUserId,
+				})
+				.from(mattermostIdentities)
+		).map((row) => [row.agentId, row.userId]),
+	);
+	for (const old of before) {
+		const kept = new Set(
+			after.find((agent) => agent.id === old.id)?.mattermost.allowed_channels ?? [],
+		);
+		const botUserId = identities.get(old.id) ?? null;
+		for (const name of old.config.mattermost.allowed_channels) {
+			const channelId = channels.get(name);
+			if (kept.has(name) || channelId === undefined || botUserId === null) {
+				continue;
+			}
+			const values = {
+				teamId,
+				channelName: name,
+				botUserId,
+				state: "revoked" as const,
+				grantorUserId: null,
+				evidencePostId: null,
+				sinceMs: uow.now.getTime(),
+				revokedReason: "config_removed",
+				grantedAt: uow.now,
+				revokedAt: uow.now,
+			};
+			await db
+				.insert(mattermostChannelGrants)
+				.values({ agentId: old.id, channelId, ...values })
+				.onConflictDoUpdate({
+					target: [mattermostChannelGrants.agentId, mattermostChannelGrants.channelId],
+					set: { ...values, generation: sql`${mattermostChannelGrants.generation} + 1` },
+					// A revoked record, or an active one of a replaced bot (it grants nothing).
+					setWhere: or(
+						eq(mattermostChannelGrants.state, "revoked"),
+						ne(mattermostChannelGrants.botUserId, sql`excluded.bot_user_id`),
+					),
+				});
+		}
+	}
+}
+
+/**
  * Stores a validated configuration as the active version and upserts its agents. Agents that
  * left the configuration are disabled, never deleted: their history stays referenced. An agent
  * with a run in progress cannot be disabled by config; pause it first.
@@ -161,16 +233,28 @@ export async function applyConfig(
 				"delete from source_cursors where source_id ~ '^mattermost:channel(-floor|-floor-posts)?:'",
 			);
 			await markChannelsLeft(uow, [TEAM_CHANGE_MARKER], generation);
+			// Grants were given in the old team's channels: another team starts without any.
+			await db
+				.update(mattermostChannelGrants)
+				.set({
+					state: "revoked",
+					revokedReason: "team_changed",
+					revokedAt: uow.now,
+					generation: sql`${mattermostChannelGrants.generation} + 1`,
+				})
+				.where(eq(mattermostChannelGrants.state, "active"));
 		} else if (previous !== null) {
 			// A channel leaving the configuration loses its catch-up at once: re-added later, it
 			// starts afresh instead of replaying what was posted while it was unmanaged.
+			// A channel an agent was granted stays followed: its catch-up is the grant's.
 			const kept = new Set(input.organization.mattermost.channels);
 			const resolved = await loadDirectory(db, "channel");
+			const granted = grantedChannels(await loadChannelAccess(db));
 			const ids = previous.organization.mattermost.channels
 				.filter((name) => !kept.has(name))
 				.flatMap((name) => {
 					const id = resolved.get(name);
-					return id === undefined ? [] : [id];
+					return id === undefined || granted.has(id) ? [] : [id];
 				});
 			if (ids.length > 0) {
 				await uow.tx.client.query(
@@ -209,7 +293,21 @@ export async function applyConfig(
 			});
 
 		// Every existing agent row, locked in id order up front: the apply touches most of them.
-		await db.select({ id: agents.id }).from(agents).orderBy(asc(agents.id)).for("no key update");
+		const before = await db
+			.select({ id: agents.id, config: agents.config, version: agents.configVersion })
+			.from(agents)
+			.orderBy(asc(agents.id))
+			.for("no key update");
+		if (
+			previous !== null &&
+			previous.organization.mattermost.team === input.organization.mattermost.team
+		) {
+			await tombstoneUnconfiguredChannels(
+				uow,
+				before.filter((row) => row.version === previous.version),
+				input.agents,
+			);
+		}
 		const created: string[] = [];
 		const updated: string[] = [];
 		const disabled: string[] = [];

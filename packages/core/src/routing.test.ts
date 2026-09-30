@@ -28,7 +28,7 @@ const NO_STATS: LoopStats = {
 };
 
 function agent(id: string, state: AgentState = "idle", wakeRules: WakeRule[] = []): RoutingAgent {
-	return { id, state, wakeRules, channelIds: new Set([CHANNEL]) };
+	return { id, state, wakeRules, channelIds: new Set([CHANNEL]), channelFloors: new Map() };
 }
 
 const AGENTS = [agent("developer"), agent("finance"), agent("research")];
@@ -234,6 +234,23 @@ describe("routing", () => {
 				waits: [wait()],
 			}),
 		).toEqual([expect.objectContaining({ decision: "ignore", reason: "channel_not_allowed" })]);
+	});
+
+	it("never routes a post from before the agent was added to a granted channel", () => {
+		const added = Date.parse("2026-09-25T10:00:00.000Z");
+		const granted = (floor: number) => [
+			{ ...agent("developer"), channelFloors: new Map([[CHANNEL, floor]]) },
+		];
+		const human = postEvent({ rootId: null, targets: ["developer"] });
+		// The post is from the add's own millisecond: the agent was not there for it yet.
+		expect(route(human, { agents: granted(added) })[0]).toMatchObject({
+			decision: "ignore",
+			reason: "channel_not_allowed",
+		});
+		expect(route(human, { agents: granted(added - 1) })[0]).toMatchObject({
+			decision: "wake",
+			reason: "target",
+		});
 	});
 
 	it("lets a human repeat themselves", () => {

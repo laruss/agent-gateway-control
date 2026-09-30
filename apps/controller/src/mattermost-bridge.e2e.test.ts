@@ -99,6 +99,8 @@ describe("Mattermost bridge against a real server", () => {
 					secretsDir,
 					syncIntervalMs: 60_000,
 					reconnectMinMs: 2000,
+					membershipIntervalMs: 1000,
+					membershipGraceMs: 3000,
 				},
 				bootstrap: (deps) => bootstrap(deps),
 			},
@@ -687,6 +689,171 @@ describe("Mattermost bridge against a real server", () => {
 				await query("select 1 from events where subject like $1", [`channel/%/post/${postId}`]),
 			).toEqual([]);
 		}
+	});
+
+	it("lets an owner give an agent a channel by adding its bot, and take it back", async () => {
+		const ownerToken = mm.users.get("owner")?.token;
+		const human = mm.users.get("human");
+		const owner = mm.users.get("owner");
+		if (ownerToken === undefined || human === undefined || owner === undefined) {
+			throw new Error("no owner or human user");
+		}
+		const garden = String(
+			(
+				await mmApi("POST", "channels", mm.adminToken, {
+					team_id: mm.teamId,
+					name: "garden",
+					display_name: "garden",
+					type: "O",
+				})
+			).id,
+		);
+		for (const user of [human, owner]) {
+			await mmApi("POST", `channels/${garden}/members`, mm.adminToken, { user_id: user.id });
+		}
+		const research = await botUserId("research");
+		const finance = await botUserId("finance");
+		const listener = await loadDirectoryEntry(gateway.deps(), "user", "gateway-listener");
+		const before = await say("garden", "@research anything growing here?", { channelId: garden });
+
+		// The owner adds the bot: no configuration, no command.
+		await mmApi("POST", `channels/${garden}/members`, ownerToken, { user_id: research });
+		await eventually(
+			async () =>
+				(
+					await query<{ state: string }>(
+						"select state from mattermost_channel_grants where agent_id = 'research' and channel_id = $1",
+						[garden],
+					)
+				)[0]?.state === "active",
+			30_000,
+			"research granted the channel",
+		);
+		const member = (userId: string | null) =>
+			mmApi("GET", `channels/${garden}/members/${userId}`, mm.adminToken).then(
+				() => true,
+				() => false,
+			);
+		expect(await member(listener)).toBe(true);
+		const after = await say("garden", "@research please say hello", { channelId: garden });
+		const event = await eventOf(after);
+		const run = await finishedRun(event.id, "research run in the granted channel");
+		expect(run).toMatchObject({ agent_id: "research", status: "succeeded" });
+		const reply = await publishedPost(run.id);
+		expect(reply.channel_id).toBe(garden);
+		expect(reply.user_id).toBe(research);
+		// Nothing from before the add reached the agent.
+		expect(await creationOf(before)).toEqual([]);
+
+		// An agent never grants: research's bot adding finance's is refused.
+		const researchToken = readSecretFile(
+			resolveSecretPath("/run/secrets/mm_research_token", secretsDir),
+		);
+		await mmApi("POST", `channels/${garden}/members`, researchToken, { user_id: finance });
+		await eventually(async () => !(await member(finance)), 30_000, "finance bot left (bot add)");
+		const refusedByBot = await eventually(
+			async () =>
+				(
+					await query<{ detail: JsonObject }>(
+						"select detail from audit_log where action = 'mattermost.channel.add_rejected' and detail->>'actor_user_id' = $1",
+						[research ?? ""],
+					)
+				)[0],
+			30_000,
+			"the bot's add refused",
+		);
+		expect(refusedByBot.detail.reason).toBe("not_owner_or_admin");
+
+		// A human who is neither an owner nor an admin grants nothing: the bot leaves.
+		await mmApi("POST", `channels/${garden}/members`, humanToken(), { user_id: finance });
+		await eventually(async () => !(await member(finance)), 30_000, "finance bot left");
+		expect(
+			await query(
+				"select 1 from mattermost_channel_grants where agent_id = 'finance' and channel_id = $1",
+				[garden],
+			),
+		).toEqual([]);
+		await eventually(
+			async () =>
+				(
+					await query(
+						"select 1 from outbox where kind = 'mattermost.alert' and payload->>'message' like $1",
+						[
+							"%@finance was added to ~garden by someone who is neither an owner nor a system admin%",
+						],
+					)
+				).length > 0,
+			30_000,
+			"alert about the refused add",
+		);
+
+		// A system admin grants as well.
+		await mmApi("POST", `channels/${garden}/members`, mm.adminToken, { user_id: finance });
+		await eventually(
+			async () =>
+				(
+					await query<{ state: string }>(
+						"select state from mattermost_channel_grants where agent_id = 'finance' and channel_id = $1",
+						[garden],
+					)
+				)[0]?.state === "active",
+			30_000,
+			"finance granted by the admin",
+		);
+
+		// The owner takes the channel back: the grants end and the listener leaves with the last.
+		await mmApi("DELETE", `channels/${garden}/members/${research}`, ownerToken);
+		await eventually(
+			async () =>
+				(
+					await query<{ state: string }>(
+						"select state from mattermost_channel_grants where agent_id = 'research' and channel_id = $1",
+						[garden],
+					)
+				)[0]?.state === "revoked",
+			30_000,
+			"research's grant revoked",
+		);
+		expect(await member(listener)).toBe(true);
+		await mmApi("DELETE", `channels/${garden}/members/${finance}`, ownerToken);
+		await eventually(async () => !(await member(listener)), 30_000, "listener left the channel");
+		const late = await say("garden", "@research are you still here?", { channelId: garden });
+		await settle();
+		const lateEvents = await creationOf(late);
+		for (const lateEvent of lateEvents) {
+			expect(await runsOf(lateEvent.id)).toEqual([]);
+		}
+	});
+
+	it("answers a mention made right after the add, in a channel already followed", async () => {
+		const ownerToken = mm.users.get("owner")?.token;
+		if (ownerToken === undefined) {
+			throw new Error("no owner user");
+		}
+		// #engineering is the developer's: the listener already follows it.
+		const engineering = channel("engineering");
+		const research = await botUserId("research");
+		await mmApi("POST", `channels/${engineering}/members`, ownerToken, { user_id: research });
+		const mention = await say("engineering", "@research can you check the build log?", {
+			token: ownerToken,
+		});
+		const event = await eventOf(mention);
+		const run = await finishedRun(event.id, "research run after the add");
+		expect(run).toMatchObject({ agent_id: "research", status: "succeeded" });
+		expect((await publishedPost(run.id)).channel_id).toBe(engineering);
+		expect(await runsOf(event.id)).toHaveLength(1);
+		await mmApi("DELETE", `channels/${engineering}/members/${research}`, ownerToken);
+		await eventually(
+			async () =>
+				(
+					await query<{ state: string }>(
+						"select state from mattermost_channel_grants where agent_id = 'research' and channel_id = $1",
+						[engineering],
+					)
+				)[0]?.state === "revoked",
+			30_000,
+			"research's engineering grant revoked",
+		);
 	});
 
 	it("developer waits for finance and resumes once on its reply in the thread", async () => {

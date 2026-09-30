@@ -60,6 +60,8 @@ cp "$lock" "$bundle/images.lock"
 cp -R "$root/deploy/release/bin" "$bundle/bin"
 cp "$root/scripts/backup-gateway-db.sh" "$bundle/bin/"
 cp -R "$root/deploy/release/runtimes" "$bundle/runtimes"
+# The Apple silicon home server: the Lima VM, its guest setup and backups, and Mattermost.
+cp -R "$root/deploy/home-server" "$bundle/home-server"
 cp -R "$root/deploy/release/secrets.example" "$bundle/secrets.example"
 cp "$root/deploy/release/gateway.env.example" "$root/deploy/release/compose.override.example.yaml" \
 	"$root/deploy/release/INSTALL.md" "$root/deploy/release/UPGRADE.md" \
@@ -105,7 +107,7 @@ cp "$sbom_dir"/*.spdx.json "$bundle/sbom/"
 # Directories 0755, executables 0755, other files 0644; owned by root.
 find "$bundle" -type d -exec chmod 0755 {} +
 find "$bundle" -type f -exec chmod 0644 {} +
-chmod 0755 "$bundle"/bin/*
+chmod 0755 "$bundle"/bin/* "$bundle"/home-server/*/*.sh
 tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner \
 	--pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
 	-C "$work" -cf - "$name" | gzip -9n >"$out/$name.tar.gz"

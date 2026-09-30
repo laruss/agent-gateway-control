@@ -19,10 +19,11 @@ import {
 	contentHash,
 	eventSenderAgentId,
 	GATEWAY_SOURCE,
+	mattermostPost,
 	payloadHash,
 } from "@agent-gateway/events";
 import { childTraceparent, parseTraceparent } from "@agent-gateway/logging";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { type Route, type RoutingAgent, routeEvent, wakePriority } from "../routing.ts";
 import type { ActiveWait } from "../waits.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
@@ -32,11 +33,13 @@ import {
 	audit,
 	loadActiveConfig,
 	loadAgents,
-	loadTeamChannels,
+	loadChannelAccess,
 	lockAgent,
 	lockCascade,
 	lockConfigShared,
+	NEW_POST_EVENT_TYPES,
 	raiseAlert,
+	toGatewayEvent,
 	toRoutingAgent,
 } from "./store.ts";
 import { resolveWait, toActiveWaits } from "./wait-store.ts";
@@ -181,9 +184,9 @@ export async function ingestInTransaction(
 		});
 		return { status: "accepted", eventId, routes: [] };
 	}
-	const channels = await loadTeamChannels(db);
+	const access = await loadChannelAccess(db);
 	const toRouting = (list: Awaited<ReturnType<typeof loadAgents>>): RoutingAgent[] =>
-		list.map((agent) => toRoutingAgent(agent, channels));
+		list.map((agent) => toRoutingAgent(agent, access));
 	// Every agent this event may wake is locked, in id order, before routing reads its state:
 	// the lock order of every use case (cascade, then agents by id, then runs and waits), and no
 	// concurrent disable or pause can slip between the decision and its effect.
@@ -243,6 +246,116 @@ export async function ingestInTransaction(
 		await scheduleAgent(uow, agentId);
 	}
 	return { status: "accepted", eventId, routes: recorded };
+}
+
+/**
+ * Routes a stored post to an agent it could not address when it was stored: a mention made
+ * right after an owner gave the agent an already-followed channel, before the grant was
+ * recorded (ADR-022). The post is routed as if it had named the agent, with the ordinary guards;
+ * once only (a post already routed to the agent is left alone). True when it woke the agent.
+ */
+export async function routeGrantedMention(
+	deps: ControlPlaneDeps,
+	/** The Mattermost event source the post was stored under. */
+	source: string,
+	agentId: AgentId,
+	channelId: string,
+	postId: string,
+): Promise<boolean> {
+	return withTransaction(deps.pool, async (tx) => {
+		const uow: UnitOfWork = { deps, tx, jobs: deps.jobs(tx), now: deps.clock() };
+		const { db } = tx;
+		const [row] = await db
+			.select()
+			.from(events)
+			.where(
+				and(
+					eq(events.source, source),
+					eq(events.subject, `channel/${channelId}/post/${postId}`),
+					inArray(events.type, [...NEW_POST_EVENT_TYPES]),
+				),
+			)
+			.limit(1);
+		if (row === undefined || row.trustLevel !== "human-trusted") {
+			return false;
+		}
+		const stored = toGatewayEvent(row);
+		const post = mattermostPost(stored);
+		if (
+			post === null ||
+			post.target_agent_ids.includes(agentId) ||
+			post.target_agent_ids.length >= 8
+		) {
+			return false;
+		}
+		await lockCascade(uow, stored.correlationid);
+		await lockConfigShared(uow);
+		const config = await loadActiveConfig(db);
+		const [routed] = await db
+			.select({ agentId: eventRoutes.agentId })
+			.from(eventRoutes)
+			.where(and(eq(eventRoutes.eventId, row.id), eq(eventRoutes.agentId, agentId)))
+			.limit(1);
+		if (config === null || routed !== undefined) {
+			return false;
+		}
+		await lockAgent(db, agentId);
+		const access = await loadChannelAccess(db);
+		const agent = (await loadAgents(db)).find((candidate) => candidate.id === agentId);
+		if (agent === undefined) {
+			return false;
+		}
+		const routingAgents = [toRoutingAgent(agent, access)];
+		const event: GatewayEvent = {
+			...stored,
+			data: { ...post, target_agent_ids: [...post.target_agent_ids, agentId] },
+		};
+		const guards = await loopStats(uow, event, {
+			id: row.id,
+			seq: row.seq,
+			receivedAt: row.receivedAt,
+		});
+		const [route] = routeEvent({
+			event,
+			agents: routingAgents,
+			waits: [],
+			limits: config.organization.organization.default_limits,
+			stats: guards.stats,
+			now: uow.now,
+		});
+		if (route === undefined) {
+			return false;
+		}
+		const final = await applyRoute(uow, route, row.id, event, routingAgents);
+		await db.insert(eventRoutes).values({
+			eventId: row.id,
+			agentId,
+			decision: final.decision,
+			reasonCode: final.reason,
+			waitId: final.waitId,
+			cascadeAnchor: guards.cascadeAnchor,
+			policySnapshot: {
+				config_version: config.version,
+				hop: event.hop,
+				limits: config.organization.organization.default_limits,
+				granted_mention: true,
+			},
+			createdAt: uow.now,
+		});
+		if (final.decision === "blocked") {
+			await raiseAlert(
+				uow,
+				`loop:${row.id}:${agentId}`,
+				`Loop guard '${final.reason}' blocked a wake-up of @${agentId} in '${event.correlationid}'; the cascade is stopped.`,
+				{ event_id: row.id, agent_id: agentId, reason: final.reason, hop: event.hop },
+			);
+		}
+		if (final.decision !== "wake") {
+			return false;
+		}
+		await scheduleAgent(uow, agentId);
+		return true;
+	});
 }
 
 /**

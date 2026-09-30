@@ -10,7 +10,7 @@ import { loopStats, type StoredEventPosition } from "./loop-stats.ts";
 import {
 	loadActiveConfig,
 	loadAgents,
-	loadTeamChannels,
+	loadChannelAccess,
 	raiseAlert,
 	toGatewayEvent,
 	toRoutingAgent,
@@ -133,7 +133,7 @@ async function lateMatchAllowed(
 	const guards = await loopStats(uow, event, position);
 	const [route] = routeEvent({
 		event,
-		agents: [toRoutingAgent(agent, await loadTeamChannels(db))],
+		agents: [toRoutingAgent(agent, await loadChannelAccess(db))],
 		waits: [wait],
 		limits,
 		stats: guards.stats,
@@ -186,6 +186,8 @@ export async function matchMissedAnswers(
 	uow: UnitOfWork,
 	agentId: string,
 	allowed: ReadonlySet<string>,
+	/** Grant floors (ms) by channel: a post from before the agent's add answers nothing. */
+	floors: ReadonlyMap<string, number> = new Map(),
 ): Promise<boolean> {
 	const { db } = uow.tx;
 	const waitRows = await db
@@ -267,7 +269,13 @@ export async function matchMissedAnswers(
 		}
 		const event = toGatewayEvent(row);
 		const post = mattermostPost(event);
-		if (post !== null && (deleted.has(post.post_id) || !allowed.has(post.channel_id))) {
+		const floor = post === null ? undefined : floors.get(post.channel_id);
+		if (
+			post !== null &&
+			(deleted.has(post.post_id) ||
+				!allowed.has(post.channel_id) ||
+				(floor !== undefined && Date.parse(event.time) <= floor))
+		) {
 			continue;
 		}
 		const wait = waits.find((w) => waitMatches(w, event, uow.now));

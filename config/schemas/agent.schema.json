@@ -33,7 +33,7 @@
           "pattern": "^\\/run\\/secrets\\/[a-z0-9_]+$"
         },
         "allowed_channels": {
-          "minItems": 1,
+          "default": [],
           "maxItems": 32,
           "type": "array",
           "items": {
@@ -42,7 +42,7 @@
           }
         }
       },
-      "required": ["username", "token_secret_file", "allowed_channels"],
+      "required": ["username", "token_secret_file"],
       "additionalProperties": false
     },
     "runtime": {

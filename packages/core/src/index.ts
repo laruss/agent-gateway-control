@@ -1,3 +1,4 @@
+export * from "./channel-access.ts";
 export * from "./outcome.ts";
 export * from "./routing.ts";
 export * from "./services/admin.ts";
@@ -16,6 +17,7 @@ export {
 	type ToolReportOutcome,
 } from "./services/approvals.ts";
 export { type BudgetReport, budgetHoldFor, budgetReport } from "./services/budgets.ts";
+export * from "./services/channel-grants.ts";
 export * from "./services/deps.ts";
 export * from "./services/gmail.ts";
 export * from "./services/ingest.ts";

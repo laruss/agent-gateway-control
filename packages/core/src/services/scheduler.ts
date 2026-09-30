@@ -42,6 +42,7 @@ import {
 	type SQL,
 	sql,
 } from "drizzle-orm";
+import { agentChannelFloors, agentChannelIds, agentGrantsRecorded } from "../channel-access.ts";
 import { requireTransition } from "../state-machine.ts";
 import { type AgentRecord, buildTurnContext } from "../turn-context.ts";
 import { budgetHoldFor } from "./budgets.ts";
@@ -63,8 +64,8 @@ import {
 	isKillSwitchOn,
 	loadActiveConfig,
 	loadAgents,
+	loadChannelAccess,
 	loadOwnerUserIds,
-	loadTeamChannels,
 	lockAgent,
 	raiseAlert,
 	setAgentState,
@@ -106,10 +107,20 @@ async function previousRun(
 	waitCreatorRunId: string | null,
 	correlationId: string,
 	allowed: ReadonlySet<MattermostId>,
+	/**
+	 * When each granted channel's grant was recorded: a run queued before it was built under
+	 * earlier access and is not the previous run of a turn under this one.
+	 */
+	recorded: ReadonlyMap<MattermostId, number>,
 ): Promise<PreviousRun | null> {
 	const latest = async (which: SQL) => {
 		const [row] = await uow.tx.db
-			.select({ id: agentRuns.id, summary: agentRuns.publicSummary })
+			.select({
+				id: agentRuns.id,
+				summary: agentRuns.publicSummary,
+				queuedAt: agentRuns.queuedAt,
+				input: contextSnapshots.input,
+			})
 			.from(agentRuns)
 			.innerJoin(contextSnapshots, eq(contextSnapshots.runId, agentRuns.id))
 			.where(
@@ -120,13 +131,32 @@ async function previousRun(
 					// `channel/<id>/thread/<root>`: only threads of channels the agent may still read.
 					or(
 						isNull(contextSnapshots.threadRef),
-						inArray(sql<string>`split_part(${contextSnapshots.threadRef}, '/', 2)`, [...allowed]),
+						and(
+							inArray(sql<string>`split_part(${contextSnapshots.threadRef}, '/', 2)`, [...allowed]),
+							sql`not exists (
+								select 1 from jsonb_each_text(${JSON.stringify(Object.fromEntries(recorded))}::jsonb) f
+								 where f.key = split_part(${contextSnapshots.threadRef}, '/', 2)
+								   and ${agentRuns.queuedAt} <= to_timestamp(f.value::bigint / 1000.0))`,
+						),
 					),
 				),
 			)
 			.orderBy(desc(agentRuns.finishedAt))
 			.limit(1);
-		return row ?? null;
+		if (row === undefined) {
+			return null;
+		}
+		// Every post the run carried, not only its thread's: a summary of a channel the agent lost,
+		// or from before it was given the channel again, does not carry over.
+		const carried = [row.input.trigger, ...row.input.pendingInbox].flatMap((event) => {
+			const post = mattermostPost(event);
+			return post === null ? [] : [post.channel_id];
+		});
+		const stale = carried.some((channelId) => {
+			const since = recorded.get(channelId);
+			return !allowed.has(channelId) || (since !== undefined && row.queuedAt.getTime() <= since);
+		});
+		return stale ? null : { id: row.id, summary: row.summary };
 	};
 	return (
 		(waitCreatorRunId === null ? null : await latest(eq(agentRuns.id, waitCreatorRunId))) ??
@@ -138,6 +168,8 @@ type TurnContextInit = Readonly<{
 	agent: AgentRecord;
 	/** The agent's allowed channels, resolved to ids. */
 	allowed: ReadonlySet<MattermostId>;
+	/** Grant floors by channel: the thread context holds nothing from before the agent's add. */
+	floors: ReadonlyMap<MattermostId, number>;
 	/** The trigger first, then the claimed inbox events. */
 	turnEvents: Readonly<GatewayEvent[]>;
 	/** The wait the trigger resolved, if it resolved one. */
@@ -180,7 +212,10 @@ async function assembleTurnContext(
 			return post === null ? [] : [post.post_id];
 		}),
 	);
-	const thread = threadRef === null ? null : await assembleThread(db, threadRef, carried);
+	const thread =
+		threadRef === null
+			? null
+			: await assembleThread(db, threadRef, carried, init.floors.get(threadRef.channelId) ?? null);
 	// The humans the run may wait on: authors in the turn's own thread (already folded), in the
 	// threads of its other posts, and the humans whose posts it carries.
 	const own = threadRef === null ? null : formatThreadRef(threadRef);
@@ -191,7 +226,7 @@ async function assembleTurnContext(
 	});
 	const waitableUserIds = [
 		...(thread?.humanUserIds ?? []),
-		...(await threadHumans(db, otherThreads)),
+		...(await threadHumans(db, otherThreads, init.floors)),
 		...carriedHumans,
 		...(await loadOwnerUserIds(db)),
 	];
@@ -250,18 +285,15 @@ export async function scheduleAgent(
 	if (await isKillSwitchOn(db)) {
 		return { skipped: "kill_switch" };
 	}
-	const channelIds = await loadTeamChannels(db);
-	const allowed = new Set(
-		agent.config.mattermost.allowed_channels.flatMap((name) => {
-			const id = channelIds.get(name);
-			return id === undefined ? [] : [id];
-		}),
-	);
+	const access = await loadChannelAccess(db);
+	const allowed = agentChannelIds(agent, access);
+	const floors = agentChannelFloors(agent, access);
 	// Before any match or claim: stale entries neither resume nor wake. With no channel resolved
 	// (no configuration, or a team change before bootstrap) nothing is decided; the context check
-	// below defers the run instead.
-	if (allowed.size > 0) {
-		const dropped = await retireInbox(uow, agentId, [...allowed]);
+	// below defers the run instead. An agent whose last grant was revoked has no channel, but the
+	// team is resolved: its work from there is dropped.
+	if (access.named.size > 0) {
+		const dropped = await retireInbox(uow, agentId, [...allowed], floors);
 		if (dropped.length > 0) {
 			await audit(uow, "system", "inbox.dropped", "agent", agentId, {
 				reason: "deleted post or channel no longer allowed",
@@ -269,7 +301,7 @@ export async function scheduleAgent(
 			});
 		}
 		if (agent.state === "waiting") {
-			await matchMissedAnswers(uow, agentId, allowed);
+			await matchMissedAnswers(uow, agentId, allowed, floors);
 		}
 	}
 	// The hourly quota holds for runs started from the inbox too, not only for the wake-up that
@@ -329,6 +361,7 @@ export async function scheduleAgent(
 		db,
 		claimed.map((row) => toGatewayEvent(row.event)),
 		allowed,
+		floors,
 	);
 	const [triggerEvent, ...inboxEvents] = turnEvents;
 	if (triggerEvent === undefined) {
@@ -342,10 +375,12 @@ export async function scheduleAgent(
 		waitCreatorRunId,
 		triggerEvent.correlationid,
 		allowed,
+		agentGrantsRecorded(agent, access),
 	);
 	const context = await assembleTurnContext(uow, {
 		agent,
 		allowed,
+		floors,
 		turnEvents,
 		resolvedWait:
 			triggerWait === undefined
@@ -364,7 +399,7 @@ export async function scheduleAgent(
 		organization: config.organization,
 		constitution: config.constitution,
 		agents: await loadAgents(db),
-		channelIds,
+		access,
 		trigger: triggerEvent,
 		pendingInbox: inboxEvents,
 		previousRun: previous,
@@ -489,20 +524,26 @@ export type AttemptInit = Readonly<{
 }>;
 
 /**
- * What a provider session may be resumed for: the same configuration version (role, policy,
- * channels) and the same conversations, those of the trigger and of every carried inbox event.
- * A session's transcript holds everything its earlier turns saw, so resuming it elsewhere would
- * show a run more than its own context allows.
+ * What a provider session may be resumed for: the same configuration version (role, policy),
+ * the same channels (configured and granted) and the same conversations, those of the trigger
+ * and of every carried inbox event. A session's transcript holds everything its earlier turns
+ * saw, so resuming it elsewhere would show a run more than its own context allows. (A grant
+ * given or revoked also ends the agent's stored sessions: a channel given again keeps its id.)
  */
 export function sessionScope(
 	configVersion: string,
-	input: Readonly<{ trigger: GatewayEvent; pendingInbox: Readonly<GatewayEvent[]> }>,
+	input: Readonly<{
+		trigger: GatewayEvent;
+		pendingInbox: Readonly<GatewayEvent[]>;
+		channels: Readonly<Readonly<{ channelId: string }>[]>;
+	}>,
 ): string {
 	const correlations = [
 		...new Set([input.trigger, ...input.pendingInbox].map((event) => event.correlationid)),
 	].sort();
+	const channels = [...new Set(input.channels.map((channel) => channel.channelId))].sort();
 	// JSON keeps ids containing separators apart.
-	return JSON.stringify([configVersion, correlations]);
+	return JSON.stringify([configVersion, correlations, channels]);
 }
 
 /**

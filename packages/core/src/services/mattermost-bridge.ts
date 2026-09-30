@@ -18,14 +18,15 @@ import {
 	withTransaction,
 } from "@agent-gateway/db";
 import { and, asc, eq, inArray, ne, sql } from "drizzle-orm";
+import { agentChannelIds, grantedChannels } from "../channel-access.ts";
 import { setDirectoryEntry, setDirectoryEntryIn, TEAM_CHANGE_MARKER } from "./admin.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
 import type { IngestAdmission } from "./ingest.ts";
 import {
 	audit,
 	loadActiveConfig,
+	loadChannelAccess,
 	loadDirectory,
-	loadTeamChannels,
 	lockConfigShared,
 	NEW_POST_EVENT_TYPES,
 	raiseAlert,
@@ -87,12 +88,18 @@ async function snapshotIn({ tx }: UnitOfWork): Promise<MattermostSnapshot | null
 			return null;
 		}
 		// Channel names resolve within the team bootstrap resolved; until the configured team is
-		// resolved (after a team change, before bootstrap) nothing is managed.
-		const resolved = await loadTeamChannels(tx.db);
+		// resolved (after a team change, before bootstrap) nothing is managed. Granted channels
+		// are managed as long as a grant holds.
+		const access = await loadChannelAccess(tx.db);
 		const managed = new Map<MattermostId, string>();
 		for (const name of config.organization.mattermost.channels) {
-			const id = resolved.get(name);
+			const id = access.named.get(name);
 			if (id !== undefined) {
+				managed.set(id, name);
+			}
+		}
+		for (const [id, name] of grantedChannels(access)) {
+			if (!managed.has(id)) {
 				managed.set(id, name);
 			}
 		}
@@ -113,12 +120,7 @@ async function snapshotIn({ tx }: UnitOfWork): Promise<MattermostSnapshot | null
 			agents: rows.map((row) => ({
 				id: row.id,
 				userId: row.userId ?? null,
-				channelIds: new Set(
-					row.config.mattermost.allowed_channels.flatMap((name) => {
-						const id = resolved.get(name);
-						return id === undefined ? [] : [id];
-					}),
-				),
+				channelIds: agentChannelIds({ id: row.id, config: row.config }, access),
 			})),
 		};
 	}
@@ -474,7 +476,18 @@ export async function deleteUnmanagedChannelCursors(deps: ControlPlaneDeps): Pro
 		        join gateway_controls g on g.id = 1
 		        join config_versions c on c.version = g.active_config_version
 		       where d.kind = 'channel'
-		         and (c.organization -> 'mattermost' -> 'channels') ? d.name)`,
+		         and (c.organization -> 'mattermost' -> 'channels') ? d.name
+		      union
+		      -- Grants as the channel access counts them: the agent's current bot, the active
+		      -- configuration, the configured team.
+		      select gr.channel_id
+		        from mattermost_channel_grants gr
+		        join mattermost_identities i
+		          on i.agent_id = gr.agent_id and i.mattermost_user_id = gr.bot_user_id
+		        join agents a on a.id = gr.agent_id
+		        join gateway_controls g2 on g2.id = 1 and a.config_version = g2.active_config_version
+		        join mattermost_directory t on t.kind = 'team' and t.mattermost_id = gr.team_id
+		       where gr.state = 'active')`,
 	);
 }
 
@@ -595,6 +608,8 @@ export function mattermostBootstrapStore(deps: ControlPlaneDeps, actor: string) 
 				.delete(sourceCursors)
 				.where(inArray(sourceCursors.sourceId, [ids.cursor, ids.floor, ids.floorPosts]));
 		},
+		grantedChannelIds: (bot: Readonly<{ agentId: AgentId | null }>) =>
+			loadGrantedChannelIds(deps, bot.agentId),
 		hasChannelStart: async (channelId: MattermostId) =>
 			(await readNumericCursor(deps, channelCursorIds(channelId).cursor)) !== null,
 		/**
@@ -664,6 +679,8 @@ export function mattermostReconcileStore(deps: ControlPlaneDeps) {
 				? loadDirectoryEntry(deps, "user", bot.username)
 				: ((await loadMattermostIdentity(deps, bot.agentId))?.userId ?? null),
 		markVerified: (agentId: AgentId) => markIdentityVerified(deps, agentId),
+		grantedChannelIds: (bot: Readonly<{ agentId: AgentId | null }>) =>
+			loadGrantedChannelIds(deps, bot.agentId),
 	};
 }
 
@@ -699,16 +716,15 @@ export function afterChannelStart(
 	createAt: number,
 ): IngestAdmission {
 	return async ({ tx }) => {
-		// Managed right now: a channel of the configured team, named in the configuration (a
-		// replaced or removed channel's surviving floor admits nothing).
+		// Managed right now: a channel of the configured team, named in the configuration or
+		// granted to an agent (a replaced, removed or revoked channel's surviving floor admits
+		// nothing).
 		const config = await loadActiveConfig(tx.db);
-		const channels = await loadTeamChannels(tx.db);
-		const name = [...channels].find(([, id]) => id === channelId)?.[0];
-		if (
-			config === null ||
-			name === undefined ||
-			!config.organization.mattermost.channels.includes(name)
-		) {
+		const access = await loadChannelAccess(tx.db);
+		const name = [...access.named].find(([, id]) => id === channelId)?.[0];
+		const configured =
+			name !== undefined && config?.organization.mattermost.channels.includes(name) === true;
+		if (config === null || (!configured && !grantedChannels(access).has(channelId))) {
 			return false;
 		}
 		const ids = channelCursorIds(channelId);
@@ -809,4 +825,20 @@ async function generationIn({ tx }: UnitOfWork): Promise<number> {
 		.from(gatewayControls)
 		.where(eq(gatewayControls.id, 1));
 	return row?.generation ?? 0;
+}
+
+/**
+ * Channels granted to an agent's current bot, or (for the listener, `agentId` null) to any
+ * agent: bootstrap keeps its bots in them, and reconcile counts them as allowed.
+ */
+export async function loadGrantedChannelIds(
+	deps: ControlPlaneDeps,
+	agentId: AgentId | null,
+): Promise<ReadonlySet<MattermostId>> {
+	return inTransaction(deps, async ({ tx }) => {
+		const access = await loadChannelAccess(tx.db);
+		return agentId === null
+			? new Set(grantedChannels(access).keys())
+			: new Set((access.granted.get(agentId) ?? []).map((grant) => grant.channelId));
+	});
 }

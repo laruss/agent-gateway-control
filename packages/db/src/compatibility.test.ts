@@ -158,7 +158,10 @@ describe("the shipped migrations", () => {
 	it("all have a kind, and every published release a known head in order", async () => {
 		const schema = await loadLocalSchema();
 		expect(schema.migrations.length).toBeGreaterThan(0);
-		expect(schema.migrations.at(-1)?.tag).toBe("0014_schema_state");
+		const tags = schema.migrations.map((m) => m.tag);
+		const heads = schema.releases.map((release) => tags.indexOf(release.head));
+		expect(heads.every((index) => index >= 0)).toBe(true);
+		expect(heads).toEqual([...heads].sort((a, b) => a - b));
 		// Migrations after the first release are never pre-release.
 		const firstRelease = schema.releases[0];
 		if (firstRelease !== undefined) {

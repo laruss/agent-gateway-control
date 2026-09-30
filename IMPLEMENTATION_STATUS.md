@@ -1758,3 +1758,39 @@ Known gaps, deferred:
     releases;
   - the Gmail connector, which needs a real Google account, is not started in the install
     test.
+
+## Phase 10 - Home server deployment and soak (in progress)
+
+Done so far ([ADR-021](docs/adr/021-home-server.md), [ADR-022](docs/adr/022-channel-grants.md)):
+
+- Release images for linux/arm64 next to linux/amd64, each built, reproduced and
+  install-tested natively; the first releases (0.1.0 never published, 0.1.1 published).
+- The home server kit in the bundle: a Lima VM for an Apple silicon Mac, the guest setup (fixed
+  LAN address, mDNS name, the egress firewall unit), the Mattermost ESR stack with Caddy TLS,
+  and encrypted backups copied off the VM by a LaunchDaemon.
+- On the home server: the VM starts at boot; Mattermost runs behind Caddy; the Gateway 0.1.1
+  runs with one agent on Codex; the egress firewall is checked from a worker.
+- Found there and fixed: the Codex worker image lacked Codex's code-mode host (no granted
+  command ran); the turn prompt made models refuse commands that write files.
+- Channel grants: an owner or system admin adds an agent's bot to a channel in Mattermost and
+  the agent works there; any other add is refused.
+
+Channel grants review log (5 rounds, Codex and Opus):
+- Round 1: a channel taken out of the configuration became a grant through bootstrap's admin
+  add; pre-add history reached turns through thread context; one failing bot stopped the poll;
+  a re-add between polls was not judged.
+- Round 2: the re-add check read the whole channel since the grant; bootstrap removed granted
+  bots from channels leaving `mattermost.channels`; a race could turn bootstrap's add into a
+  grant.
+- Round 3: incomplete re-add scans kept grants (now fail closed); provider sessions could
+  carry revoked channels (now ended on grant changes); the check mark lived in memory, so a
+  restart revoked grants in busy channels (now stored, migration 0017).
+- Round 4: an old owner's add could vouch for someone else's return (now the newest membership
+  change decides); a mention right after the add in an already-followed channel was lost (now
+  routed); grant changes were not serialized with scheduling; the check mark followed the
+  controller's clock.
+- Round 5: no P1/P2. Kept P3: a deactivated agent bot keeps its grants (it cannot post); a
+  mention in a post edited before the grant was recorded is not routed.
+
+Still to do: install 0.2.0 by upgrade, backups with an age key, restore rehearsal, failure
+drills and the soak.

@@ -1,6 +1,6 @@
 # ADR-012. Mattermost bridge: identity, signed routing, durable catch-up
 
-- Status: Accepted
+- Status: Accepted; amended by [ADR-022](022-channel-grants.md) (channels given by adding a bot)
 - Date: 2026-09-25
 
 ## Context

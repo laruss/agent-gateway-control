@@ -172,6 +172,56 @@ export const mattermostIdentities = pgTable("mattermost_identities", {
 	lastVerifiedAt: timestamp("last_verified_at", { withTimezone: true }),
 });
 
+export const CHANNEL_GRANT_STATES = ["active", "revoked"] as const;
+export type ChannelGrantState = (typeof CHANNEL_GRANT_STATES)[number];
+
+/**
+ * Channels an owner or system admin gave an agent by adding its bot in Mattermost. A grant holds
+ * for the bot it names only (a replaced bot starts without), and a revoked one stays as a
+ * tombstone: a later add must be newer than `since_ms` to count.
+ */
+export const mattermostChannelGrants = pgTable(
+	"mattermost_channel_grants",
+	{
+		agentId: text("agent_id")
+			.notNull()
+			.references(() => agents.id),
+		channelId: text("channel_id").$type<MattermostId>().notNull(),
+		teamId: text("team_id").$type<MattermostId>().notNull(),
+		/** The channel's name when the grant was last checked; ids decide, names are for people. */
+		channelName: text("channel_name").notNull(),
+		botUserId: text("bot_user_id").$type<MattermostId>().notNull(),
+		state: text("state").$type<ChannelGrantState>().notNull(),
+		/**
+		 * Who added the bot, from the channel's system post of the add. Null for a tombstone the
+		 * configuration wrote (a channel taken out of `allowed_channels`).
+		 */
+		grantorUserId: text("grantor_user_id").$type<MattermostId>(),
+		evidencePostId: text("evidence_post_id").$type<MattermostId>(),
+		/** When the bot was added: the agent sees nothing created at or before it. */
+		sinceMs: bigint("since_ms", { mode: "number" }).notNull(),
+		/**
+		 * Up to when (ms) the channel's posts were checked for a re-add of the bot: the next check
+		 * reads only what came after, across restarts too.
+		 */
+		checkedAtMs: bigint("checked_at_ms", { mode: "number" }),
+		/** Incremented by every grant and revocation of this agent in this channel. */
+		generation: integer("generation").notNull().default(1),
+		revokedReason: text("revoked_reason"),
+		grantedAt: timestamp("granted_at", { withTimezone: true }).notNull(),
+		revokedAt: timestamp("revoked_at", { withTimezone: true }),
+	},
+	(t) => [
+		primaryKey({ columns: [t.agentId, t.channelId] }),
+		index("mattermost_channel_grants_channel").on(t.channelId),
+		check("mattermost_channel_grants_state", oneOf("state", CHANNEL_GRANT_STATES)),
+		check(
+			"mattermost_channel_grants_revoked",
+			sql`(${t.state} = 'revoked') = (${t.revokedAt} is not null)`,
+		),
+	],
+);
+
 export const events = pgTable(
 	"events",
 	{

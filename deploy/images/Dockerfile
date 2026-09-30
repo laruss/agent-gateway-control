@@ -7,7 +7,8 @@
 #
 # Targets:
 #   gateway        controller, CLI, Gmail connector, tool runner and the mock worker
-#   worker-codex   the worker with the Codex CLI (Apache-2.0) and its bubblewrap (LGPL-2.0+)
+#   worker-codex   the worker with the Codex CLI and its code-mode host (Apache-2.0) and its
+#                  bubblewrap (LGPL-2.0+)
 #
 # Every input is pinned: the base image by digest, Debian packages by version from a fixed
 # snapshot, JavaScript dependencies by bun.lock, downloaded CLIs by checksum. Built with
@@ -96,6 +97,9 @@ ADD --checksum=sha256:aff46539a83aff86e3c62c592bce2c50d95391f9df289afaf03a50c01d
 ADD --checksum=sha256:74bb868f29e845da36ab287b88459a5fbb1fa4e16ff59837660312eaf0b33f3a \
 	https://github.com/openai/codex/releases/download/rust-v0.156.1/bwrap-x86_64-unknown-linux-musl.tar.gz \
 	/tmp/bwrap.tar.gz
+ADD --checksum=sha256:a929daa9f6a0bddc00c0c9e6402df117b125acd96f9d554f6c99c32c7e66c608 \
+	https://github.com/openai/codex/releases/download/rust-v0.156.1/codex-code-mode-host-x86_64-unknown-linux-musl.tar.gz \
+	/tmp/code-mode-host.tar.gz
 
 FROM scratch AS codex-arm64
 ADD --checksum=sha256:558e12aaa6dacb335ec47240bf9721db8a54746806d64f01185a403f44f79b72 \
@@ -104,11 +108,14 @@ ADD --checksum=sha256:558e12aaa6dacb335ec47240bf9721db8a54746806d64f01185a403f44
 ADD --checksum=sha256:42803e6a0f5557bb32fbef636aa9efa805eb5a108c28a670e83fd1a0e1c672aa \
 	https://github.com/openai/codex/releases/download/rust-v0.156.1/bwrap-aarch64-unknown-linux-musl.tar.gz \
 	/tmp/bwrap.tar.gz
+ADD --checksum=sha256:40198138b03798ffa8c0da4c827a8ca5896774ea104b7110c2a2c0c7560cbe94 \
+	https://github.com/openai/codex/releases/download/rust-v0.156.1/codex-code-mode-host-aarch64-unknown-linux-musl.tar.gz \
+	/tmp/code-mode-host.tar.gz
 
 FROM codex-${TARGETARCH} AS codex-archive
 
 FROM base AS codex-files
-COPY --from=codex-archive /tmp/codex.tar.gz /tmp/bwrap.tar.gz /tmp/
+COPY --from=codex-archive /tmp/codex.tar.gz /tmp/bwrap.tar.gz /tmp/code-mode-host.tar.gz /tmp/
 ADD --checksum=sha256:d17f227e4df5da1600391338865ce0f3055211760a36688f816941d58232d8dc \
 	https://raw.githubusercontent.com/openai/codex/rust-v0.156.1/LICENSE /licenses/LICENSE
 ADD --checksum=sha256:9d71575ecfd9a843fc1677b0efb08053c6ba9fd686a0de1a6f5382fd3c220915 \
@@ -119,8 +126,11 @@ ADD --checksum=sha256:9d71575ecfd9a843fc1677b0efb08053c6ba9fd686a0de1a6f5382fd3c
 ADD --checksum=sha256:b7993225104d90ddd8024fd838faf300bea5e83d91203eab98e29512acebd69c \
 	https://raw.githubusercontent.com/openai/codex/rust-v0.156.1/codex-rs/vendor/bubblewrap/COPYING \
 	/licenses/bubblewrap/COPYING
-RUN mkdir /out && tar -xzf /tmp/codex.tar.gz -C /out && tar -xzf /tmp/bwrap.tar.gz -C /out \
-	&& mv /out/codex-* /out/codex && mv /out/bwrap-* /out/bwrap && chmod 0755 /out/codex /out/bwrap \
+RUN mkdir /out && tar --no-same-owner -xzf /tmp/codex.tar.gz -C /out && tar --no-same-owner -xzf /tmp/bwrap.tar.gz -C /out \
+	&& tar --no-same-owner -xzf /tmp/code-mode-host.tar.gz -C /out \
+	&& mv /out/codex-code-mode-host-* /out/codex-code-mode-host \
+	&& mv /out/codex-*-unknown-linux-musl /out/codex && mv /out/bwrap-* /out/bwrap \
+	&& chmod 0755 /out/codex /out/bwrap /out/codex-code-mode-host \
 	&& printf '%s\n' \
 		"bubblewrap, built by OpenAI from https://github.com/openai/codex/tree/rust-v0.156.1/codex-rs/vendor/bubblewrap" \
 		"(upstream https://github.com/containers/bubblewrap), licensed under the LGPL-2.0-or-later (COPYING)." \
@@ -130,7 +140,8 @@ RUN mkdir /out && tar -xzf /tmp/codex.tar.gz -C /out && tar -xzf /tmp/bwrap.tar.
 FROM gateway AS worker-codex
 # bubblewrap confines the commands Codex runs (ADR-014); the worker's seccomp profile lets it
 # create its namespaces (deploy/images/seccomp/worker-sandbox.json).
-COPY --from=codex-files /out/codex /out/bwrap /usr/local/bin/
+# Codex runs the model's commands through its code-mode host, which it looks for next to itself.
+COPY --from=codex-files /out/codex /out/bwrap /out/codex-code-mode-host /usr/local/bin/
 COPY --from=codex-files /licenses/ /usr/share/doc/codex/
 # New volumes take the ownership of these directories: the worker's, mode 0700.
 COPY --from=codex-files --chown=10001:10001 /state/ /var/lib/agent-gateway/

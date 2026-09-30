@@ -24,6 +24,7 @@ import {
 	approvalRequests,
 	artifacts,
 	contextSnapshots,
+	mattermostChannelGrants,
 	memoryItems,
 	policyDecisions,
 	type RunOutcome,
@@ -40,7 +41,7 @@ import {
 	approvedActionIssues,
 	riskLevelFor,
 } from "@agent-gateway/policy";
-import { and, eq } from "drizzle-orm";
+import { and, eq, gt, or } from "drizzle-orm";
 import {
 	checkRunScope,
 	type OutcomeIssue,
@@ -541,7 +542,13 @@ async function applyCompletion(
 	const artifactIds = await persistArtifacts(uow, run, result);
 	await persistMessages(uow, run, agent, result, artifactIds, scope);
 	await persistMemory(uow, run, agent, result);
-	await persistSession(uow, agent.id, result, sessionScope(snapshot.configVersion, snapshot.input));
+	await persistSession(
+		uow,
+		agent.id,
+		result,
+		sessionScope(snapshot.configVersion, snapshot.input),
+		run.queuedAt,
+	);
 	// A thread's summary is read by every agent working in that thread's channel: a run that also
 	// saw posts of another channel keeps its summary to itself.
 	const threadRef = parseThreadRef(snapshot.threadRef);
@@ -746,9 +753,27 @@ async function persistSession(
 	agentId: string,
 	result: AgentTurnResult,
 	scope: string,
+	/** When the run was queued: a grant given or revoked since then ends its session instead. */
+	queuedAt: Date,
 ): Promise<void> {
 	const session = result.session;
 	if (session === null) {
+		return;
+	}
+	const [changed] = await uow.tx.db
+		.select({ agentId: mattermostChannelGrants.agentId })
+		.from(mattermostChannelGrants)
+		.where(
+			and(
+				eq(mattermostChannelGrants.agentId, agentId),
+				or(
+					gt(mattermostChannelGrants.grantedAt, queuedAt),
+					gt(mattermostChannelGrants.revokedAt, queuedAt),
+				),
+			),
+		)
+		.limit(1);
+	if (changed !== undefined) {
 		return;
 	}
 	const values = {

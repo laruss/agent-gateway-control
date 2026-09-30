@@ -48,6 +48,8 @@ agent-gateway-control/
 ├── prompts/examples/        # constitution and agent roles
 ├── deploy/
 │   ├── dev/                 # development Compose (PostgreSQL, Mattermost)
+│   ├── home-server/         # the Apple silicon home server: Lima VM, guest setup and
+│   │                        #   backups, the Mattermost stack, the Mac's backup job
 │   ├── images/              # release Dockerfile, entrypoints, the worker seccomp profile
 │   └── release/             # the home server bundle: Compose stack, runbooks, helper
 │                            #   scripts, the Claude Code worker recipe

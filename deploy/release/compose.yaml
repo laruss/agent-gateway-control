@@ -30,8 +30,11 @@ networks:
     external: true
     name: ${MATTERMOST_NETWORK:-agent-mm}
   # Outbound internet for the runtimes, Google and tool providers. Workers are not on agent-mm;
-  # block the host's and Mattermost's addresses from this network (INSTALL.md, "Egress").
-  egress: {}
+  # block the host's and Mattermost's addresses from this network (INSTALL.md, "Egress"). The
+  # bridge has a fixed name, so host firewall rules can match it.
+  egress:
+    driver_opts:
+      com.docker.network.bridge.name: agw-egress
 
 volumes:
   postgres-data:

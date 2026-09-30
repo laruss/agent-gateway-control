@@ -24,7 +24,7 @@ import {
 } from "@agent-gateway/contracts";
 import { contextSnapshots, events, memoryItems, threadSummaries } from "@agent-gateway/db";
 import { mattermostPost } from "@agent-gateway/events";
-import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, sql } from "drizzle-orm";
 import type { UnitOfWork } from "./deps.ts";
 import { NEW_POST_EVENT_TYPES } from "./store.ts";
 
@@ -126,7 +126,12 @@ const inThread = (ref: ThreadRef) =>
  * The stored events of a thread's posts, in acceptance order: the root's, the newest replies'
  * creations (edits cannot push replies out of the window), and the changes of those posts.
  */
-async function loadThreadEvents(db: Db, ref: ThreadRef): Promise<StoredPostEvent[]> {
+async function loadThreadEvents(
+	db: Db,
+	ref: ThreadRef,
+	/** The agent's grant floor in the channel (ms): posts created at or before it are left out. */
+	floorMs: number | null,
+): Promise<StoredPostEvent[]> {
 	const columns = {
 		seq: events.seq,
 		type: events.type,
@@ -134,10 +139,16 @@ async function loadThreadEvents(db: Db, ref: ThreadRef): Promise<StoredPostEvent
 		trustLevel: events.trustLevel,
 		payload: events.payload,
 	};
-	const root = await db
+	const rootRows = await db
 		.select(columns)
 		.from(events)
 		.where(and(inThread(ref), sql`(${events.payload}->>'root_id') is null`));
+	// A root from before the floor goes with its edits: an edit made later is still its text.
+	const rootCreated = rootRows.find((row) => POST_CREATION_TYPES.some((type) => type === row.type));
+	const root =
+		floorMs === null || (rootCreated !== undefined && rootCreated.time.getTime() > floorMs)
+			? rootRows
+			: [];
 	const replies = await db
 		.select(columns)
 		.from(events)
@@ -146,6 +157,7 @@ async function loadThreadEvents(db: Db, ref: ThreadRef): Promise<StoredPostEvent
 				inThread(ref),
 				sql`(${events.payload}->>'root_id') is not null`,
 				inArray(events.type, [...POST_CREATION_TYPES]),
+				floorMs === null ? undefined : gt(events.time, new Date(floorMs)),
 			),
 		)
 		// Newest by post time: a catch-up importing older replies late cannot push newer ones out.
@@ -217,6 +229,8 @@ export async function withCurrentPosts(
 	db: Db,
 	carried: Readonly<GatewayEvent[]>,
 	allowed: ReadonlySet<MattermostId>,
+	/** Grant floors by channel (ms): a post from before the agent's add carries no text either. */
+	floors: ReadonlyMap<MattermostId, number> = new Map(),
 ): Promise<GatewayEvent[]> {
 	const postIds = new Set<MattermostId>();
 	for (const event of carried) {
@@ -232,9 +246,13 @@ export async function withCurrentPosts(
 	const overlays = postOverlays(changes, postIds);
 	return carried.map((event) => {
 		const post = mattermostPost(event);
-		if (post !== null && !allowed.has(post.channel_id)) {
-			// A wait resolved by a post of a channel the agent has lost since: the outcome stays,
-			// the text does not reach the turn.
+		const floor = post === null ? undefined : floors.get(post.channel_id);
+		if (
+			post !== null &&
+			(!allowed.has(post.channel_id) || (floor !== undefined && Date.parse(event.time) <= floor))
+		) {
+			// A wait resolved by a post of a channel the agent has lost since, or from before it was
+			// given the channel again: the outcome stays, the text does not reach the turn.
 			return { ...event, data: { ...post, message: "" } };
 		}
 		const overlay = post === null ? undefined : overlays.get(post.post_id);
@@ -275,6 +293,8 @@ export async function retireInbox(
 	uow: UnitOfWork,
 	agentId: string,
 	allowedChannelIds: Readonly<MattermostId[]>,
+	/** Grant floors (ms) by channel: posts created at or before them are dropped too. */
+	floors: ReadonlyMap<MattermostId, number> = new Map(),
 ): Promise<string[]> {
 	const result = await uow.tx.client.query<{ event_id: string }>(
 		`update agent_inbox i set status = 'dead'
@@ -284,6 +304,10 @@ export async function retireInbox(
 		    and e.type = any($3::text[]) and e.payload ? 'post_id'
 		    and (not ((e.payload->>'channel_id') = any($2::text[]))
 		         or exists (
+		           select 1 from jsonb_each_text($4::jsonb) f
+		            where f.key = (e.payload->>'channel_id')
+		              and e.time <= to_timestamp(f.value::bigint / 1000.0))
+		         or exists (
 		           select 1 from events d
 		            where d.type = 'mattermost.post.deleted'
 		              and d.payload ? 'post_id'
@@ -292,7 +316,12 @@ export async function retireInbox(
 		                  = coalesce(e.payload->>'root_id', e.payload->>'post_id')
 		              and (d.payload->>'post_id') = (e.payload->>'post_id')))
 		  returning i.event_id`,
-		[agentId, [...allowedChannelIds], [...MATTERMOST_POST_EVENT_TYPES]],
+		[
+			agentId,
+			[...allowedChannelIds],
+			[...MATTERMOST_POST_EVENT_TYPES],
+			JSON.stringify(Object.fromEntries(floors)),
+		],
 	);
 	return result.rows.map((row) => row.event_id);
 }
@@ -319,11 +348,14 @@ export async function assembleThread(
 	db: Db,
 	ref: ThreadRef,
 	exclude: ReadonlySet<MattermostId>,
+	/** The agent's grant floor in the channel: nothing from before it, summaries included. */
+	floorMs: number | null = null,
 ): Promise<FoldedThread | null> {
-	return foldThread(await loadThreadEvents(db, ref), {
+	return foldThread(await loadThreadEvents(db, ref, floorMs), {
 		...ref,
 		exclude,
-		summary: renderThreadSummary(await loadThreadSummary(db, ref)),
+		// A summary covers the thread's whole history, from before the floor too.
+		summary: floorMs === null ? renderThreadSummary(await loadThreadSummary(db, ref)) : null,
 		budget: DEFAULT_THREAD_BUDGET,
 	});
 }
@@ -332,10 +364,11 @@ export async function assembleThread(
 export async function threadHumans(
 	db: Db,
 	refs: Readonly<ThreadRef[]>,
+	floors: ReadonlyMap<MattermostId, number> = new Map(),
 ): Promise<Readonly<MattermostId[]>> {
 	const humans = new Set<MattermostId>();
 	for (const ref of refs) {
-		const folded = foldThread(await loadThreadEvents(db, ref), {
+		const folded = foldThread(await loadThreadEvents(db, ref, floors.get(ref.channelId) ?? null), {
 			...ref,
 			exclude: new Set(),
 			summary: null,

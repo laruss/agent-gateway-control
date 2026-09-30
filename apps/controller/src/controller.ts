@@ -34,7 +34,11 @@ import { createBoss, transactionalJobSink } from "@agent-gateway/queue";
 import { gauge, type HealthCheck, MetricsRegistry } from "@agent-gateway/service";
 import type pg from "pg";
 import type { PgBoss } from "pg-boss";
-import { type MattermostBridgeOptions, startBridgeListener } from "./mattermost-bridge.ts";
+import {
+	type MattermostBridgeOptions,
+	startBridgeListener,
+	startBridgeMembershipSync,
+} from "./mattermost-bridge.ts";
 import { registerControllerMetrics } from "./metrics.ts";
 
 export type ControllerOptions = Readonly<{
@@ -358,6 +362,10 @@ export async function startController(options: ControllerOptions): Promise<Runni
 	const retentionTimer = setInterval(() => void retain(), options.reconcileIntervalMs ?? 60_000);
 	listener =
 		options.mattermost === undefined ? null : startBridgeListener(deps, options.mattermost, log);
+	const membership =
+		options.mattermost === undefined
+			? null
+			: startBridgeMembershipSync(deps, options.mattermost, log);
 
 	metrics.collect(() =>
 		listener === null
@@ -408,6 +416,7 @@ export async function startController(options: ControllerOptions): Promise<Runni
 			clearInterval(timer);
 			clearInterval(retentionTimer);
 			await Promise.allSettled([reconciling, retaining]);
+			await membership?.stop();
 			await listener?.stop();
 			await boss.stop({ graceful: true, timeout: 30_000 });
 			await pool.end();

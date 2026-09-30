@@ -6,19 +6,26 @@ import {
 	channelAdmits,
 	channelCursorIds,
 	deleteUnmanagedChannelCursors,
+	grantChannel,
 	handleApprovalReply,
 	ingestEvent,
 	ingestEventIf,
 	loadConfigGeneration,
 	loadDirectoryEntry,
 	loadMattermostSnapshot,
+	loadMembershipState,
+	markGrantChecked,
 	outboxReceiptPostId,
 	postCreationExists,
 	readChannelFloor,
 	readNumericCursor,
 	recordImpersonation,
+	rejectChannelAdd,
+	revokeChannelGrant,
+	routeGrantedMention,
 	startManagedChannel,
 	threadCorrelation,
+	unneededChannels,
 	whileAgentMayPost,
 	whileListenerMayPost,
 } from "@agent-gateway/core";
@@ -29,9 +36,12 @@ import {
 	type BridgeDirectory,
 	type ListenerStore,
 	type MattermostDeliverers,
+	type MembershipStore,
 	mattermostDeliverers,
 	type RunningListener,
+	type RunningMembershipSync,
 	startListener,
+	startMembershipSync,
 } from "@agent-gateway/mattermost";
 import { readSecretFile, resolveSecretPath, secretFileState } from "@agent-gateway/service";
 
@@ -45,6 +55,9 @@ export type MattermostBridgeOptions = Readonly<{
 	syncIntervalMs?: number;
 	pingIntervalMs?: number;
 	reconnectMinMs?: number;
+	/** How often agent bots' channel memberships are checked, for tests. */
+	membershipIntervalMs?: number;
+	membershipGraceMs?: number;
 }>;
 
 /** The event source of a Mattermost team: stable across URL changes, unique per team. */
@@ -210,5 +223,52 @@ export function startBridgeListener(
 		...(options.syncIntervalMs === undefined ? {} : { syncIntervalMs: options.syncIntervalMs }),
 		...(options.pingIntervalMs === undefined ? {} : { pingIntervalMs: options.pingIntervalMs }),
 		...(options.reconnectMinMs === undefined ? {} : { reconnectMinMs: options.reconnectMinMs }),
+	});
+}
+
+/** The records behind the membership synchronizer, and the bots' tokens from their secret files. */
+export function membershipStore(deps: ControlPlaneDeps, secretsDir?: string): MembershipStore {
+	return {
+		state: () => loadMembershipState(deps),
+		grant: (grant) => grantChannel(deps, grant),
+		revoke: (agentId, channelId, reason) => revokeChannelGrant(deps, agentId, channelId, reason),
+		reject: (rejection) => rejectChannelAdd(deps, rejection),
+		unneeded: (channelIds) => unneededChannels(deps, channelIds),
+		checked: (agentId, channelId, atMs) => markGrantChecked(deps, agentId, channelId, atMs),
+		routeMention: async (agentId, channelId, postId) => {
+			const snapshot = await loadMattermostSnapshot(deps);
+			return snapshot === null
+				? false
+				: routeGrantedMention(
+						deps,
+						mattermostSource(snapshot.organization.mattermost.team),
+						agentId,
+						channelId,
+						postId,
+					);
+		},
+		token: (secretRef) => {
+			const path = resolveSecretPath(secretRef, secretsDir);
+			return secretFileState(path) === "private" ? readSecretFile(path) : null;
+		},
+	};
+}
+
+export function startBridgeMembershipSync(
+	deps: ControlPlaneDeps,
+	options: MattermostBridgeOptions,
+	log: Logger,
+): RunningMembershipSync {
+	return startMembershipSync({
+		baseUrl: options.baseUrl,
+		store: membershipStore(deps, options.secretsDir),
+		log: log.child({ component: "mattermost-membership" }),
+		clock: deps.clock,
+		...(options.membershipIntervalMs === undefined
+			? {}
+			: { intervalMs: options.membershipIntervalMs }),
+		...(options.membershipGraceMs === undefined
+			? {}
+			: { evidenceGraceMs: options.membershipGraceMs }),
 	});
 }

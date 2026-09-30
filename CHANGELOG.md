@@ -4,6 +4,39 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## [Unreleased]
 
+### Added
+
+- The home server kit (`home-server/` in the bundle, ADR-021): a Lima VM template for an
+  Apple silicon Mac (Ubuntu 24.04, Docker Engine by exact versions, Rosetta, bridged LAN
+  address, start at boot), the guest setup (fixed LAN address, mDNS name, egress firewall
+  unit), the Mattermost 11.7 ESR stack with its own PostgreSQL and Caddy TLS, and daily
+  encrypted backups of the whole server copied off the VM by a LaunchDaemon.
+- Channel grants (ADR-022): an owner or a system admin adds an agent's bot to a channel in
+  Mattermost, and within seconds the agent works there, without configuration or a command;
+  removing the bot takes the channel back. An add by anyone else, another agent's bot
+  included, is refused: the bot leaves and the alerts channel says who added it. The agent
+  sees nothing posted before its add. `allowed_channels` is optional.
+- `bin/egress-firewall.sh`: an nftables table that leaves the Gateway's egress bridge only the
+  public internet and the host's DNS resolvers.
+
+### Fixed
+
+- The Codex worker image carries Codex's code-mode host (`codex-code-mode-host`, pinned by
+  SHA-256 like the CLI). Codex 0.156 runs the model's shell commands through it; without it
+  no command ran, so an agent granted `tests.run` could not run tests or builds.
+- The turn prompt says that shell commands may create and change files in the working
+  directory; "create and edit files: not available" made models refuse builds and tests
+  that write files when only `tests.run` was granted.
+- `gateway runtime doctor` shows the model's reply when its sandboxed-command check fails.
+- The binaries of the Codex worker image belong to root, not to the uid of the upstream
+  archive.
+
+### Changed
+
+- The `egress` network's bridge is named `agw-egress`, so host firewall rules can match it.
+  Upgrading from 0.1.x recreates the network: stop the stack with `bin/agw down` (volumes are
+  kept) before `bin/agw up -d`.
+
 ## [0.1.1] - 2026-09-30
 
 ### Fixed

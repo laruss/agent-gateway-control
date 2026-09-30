@@ -22,11 +22,23 @@ describe("sessionScope", () => {
 	const a = event("a", "thread:a");
 	const b = event("b", "thread:b");
 
+	const channels = [{ channelId: "hq" }];
+
 	it("covers the config version and every carried conversation", () => {
-		const single = { trigger: a, pendingInbox: [] };
+		const single = { trigger: a, pendingInbox: [], channels };
 		expect(sessionScope("v1", single)).not.toBe(sessionScope("v2", single));
-		const mixed = sessionScope("v1", { trigger: a, pendingInbox: [b] });
+		const mixed = sessionScope("v1", { trigger: a, pendingInbox: [b], channels });
 		expect(mixed).not.toBe(sessionScope("v1", single));
-		expect(mixed).toBe(sessionScope("v1", { trigger: b, pendingInbox: [a, a] }));
+		expect(mixed).toBe(sessionScope("v1", { trigger: b, pendingInbox: [a, a], channels }));
+	});
+
+	it("covers the agent's channels: a channel given or taken away is another scope", () => {
+		const hq = sessionScope("v1", { trigger: a, pendingInbox: [], channels });
+		const more = sessionScope("v1", {
+			trigger: a,
+			pendingInbox: [],
+			channels: [{ channelId: "lab" }, ...channels],
+		});
+		expect(more).not.toBe(hq);
 	});
 });

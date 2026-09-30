@@ -161,6 +161,8 @@ export type BootstrapStore = Readonly<{
 	recordedBotUserId: (bot: BotSpec) => Promise<MattermostId | null>;
 	/** Drops a channel's catch-up, so managing it again starts afresh. */
 	forgetChannelStart: (channelId: MattermostId) => Promise<void>;
+	/** Channels owners granted this bot's agent (any agent, for the listener): it stays in them. */
+	grantedChannelIds: (bot: BotSpec) => Promise<ReadonlySet<MattermostId>>;
 }>;
 
 /** Token files; values never pass through logs or output. */
@@ -377,6 +379,11 @@ export async function bootstrapMattermost(options: BootstrapOptions): Promise<vo
 		resolved.set(bot, await ensureBot(admin, bot));
 	}
 	const gatewayBots = [...resolved.values()];
+	/** Per bot, the channels it was given by an owner or admin (any agent's, for the listener). */
+	const granted = new Map<MattermostId, ReadonlySet<MattermostId>>();
+	for (const [bot, userId] of resolved) {
+		granted.set(userId, await store.grantedChannelIds(bot));
+	}
 	for (const [bot, userId] of resolved) {
 		const recorded = await store.recordedBotUserId(bot);
 		if (recorded !== null && recorded !== userId && !gatewayBots.includes(recorded)) {
@@ -418,6 +425,18 @@ export async function bootstrapMattermost(options: BootstrapOptions): Promise<vo
 			}
 			allowed.add(channelId);
 			await admin.addChannelMember(channelId, userId);
+		}
+		// Channels an owner or admin granted by adding the bot stay (ADR-022). The listener is
+		// brought back into them (a replaced listener, say); an agent's bot is not: its removal
+		// from a channel is how a grant is taken back.
+		for (const channelId of granted.get(userId) ?? []) {
+			allowed.add(channelId);
+			if (bot.agentId === null) {
+				// An archived channel whose grant the synchronizer has not ended yet: it will.
+				await admin.addChannelMember(channelId, userId).catch((error: Error) => {
+					report(`listener: not added to granted channel ${channelId} (${error.message})`);
+				});
+			}
 		}
 		// Every other channel of the team (managed or not) must not stay readable to its token;
 		// in the rest (its own and the default channel) it is a plain member.
@@ -463,10 +482,19 @@ export async function bootstrapMattermost(options: BootstrapOptions): Promise<vo
 		await store.forget("user", name, id);
 	}
 	for (const [name, id] of staleChannels) {
+		// A channel an owner or admin gave an agent stays followed for it (ADR-022): that bot and
+		// the listener stay, and so does the channel's catch-up.
+		const keptFor = (userId: MattermostId) => granted.get(userId)?.has(id) === true;
 		for (const userId of new Set([...gatewayBots, ...plan.retiredBots.map((bot) => bot.userId)])) {
-			await leave(userId, [id]);
+			if (!keptFor(userId)) {
+				await leave(userId, [id]);
+			}
 		}
 		await store.forget("channel", name, id);
+		if (gatewayBots.some(keptFor)) {
+			report(`channel '${name}': no longer configured, kept for the agents granted it`);
+			continue;
+		}
 		await store.forgetChannelStart(id);
 		report(`channel '${name}': no longer managed, Gateway bots removed`);
 	}
@@ -477,6 +505,8 @@ export type ReconcileStore = Readonly<{
 	/** The user id bootstrap recorded for a bot. */
 	botUserId: (bot: BotSpec) => Promise<MattermostId | null>;
 	markVerified: (agentId: AgentId) => Promise<void>;
+	/** Channels owners granted this bot's agent (any agent, for the listener). */
+	grantedChannelIds: (bot: BotSpec) => Promise<ReadonlySet<MattermostId>>;
 }>;
 
 export type ReconcileOptions = Readonly<{
@@ -557,6 +587,9 @@ export async function reconcileMattermost(options: ReconcileOptions): Promise<Re
 			} else {
 				allowed.add(channel.id);
 			}
+		}
+		for (const channelId of await store.grantedChannelIds(bot)) {
+			allowed.add(channelId);
 		}
 		for (const channel of await client.userChannelsInTeam(expected, team.id)) {
 			if (isExtraChannel(channel, allowed)) {

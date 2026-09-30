@@ -60,6 +60,37 @@ the controller container only; workers get none of these files. In local develop
 (`bun run dev`) the worker runs as the same user in the same working tree and could read
 them: use throwaway development bots only.
 
+## Giving an agent a channel
+
+An owner (`owner_mattermost_usernames`) or a system admin adds the agent's bot to a channel in
+Mattermost, like any member ([ADR-022](../adr/022-channel-grants.md)). Within a few seconds the
+controller notices, the agent's bot adds the Gateway's listener to the channel, and the agent
+answers mentions there. Nothing needs to change in the configuration, and no command is run.
+
+- The agent sees only what is posted after it was added; the channel's earlier history is not
+  replayed to it.
+- An add by anyone else counts for nothing: the bot leaves the channel again and the alerts
+  channel says who added it. That includes bots: an agent can ask a human in a thread to add
+  it or another agent, never add one itself.
+- Removing the bot from the channel takes the channel away. Its pending mentions from there are
+  dropped, and nothing more is posted there; the listener leaves when no agent and no
+  configured channel needs the channel.
+- Public and private channels of the configured team work. Direct and group messages never do
+  (ADR-006), and `town-square`, which every team member is in, works only through the
+  configuration.
+- Mattermost's default permissions let a channel member add members; the agent's bot uses that
+  to add the listener. With a stricter permission scheme, add `gateway-listener` to the channel
+  first, then the agent (otherwise the bot leaves again and the alerts channel says why).
+- Taking a channel out of an agent's `allowed_channels` takes it away for good: to give it back,
+  add the bot again (or configure it again).
+- An archived channel loses its agents; after restoring it, add the bots again.
+- Bootstrap reads the grants when it starts: a bot added while it runs may be taken out again.
+  Add it once more after bootstrap.
+
+`allowed_channels` in an agent's configuration stays available for channels an agent should
+always have; bootstrap adds the bot there. Bootstrap keeps bots in the channels they were
+given, and reconcile counts those channels as allowed.
+
 ## Reconcile
 
 ```bash
@@ -87,7 +118,8 @@ a sync after a failure is pending.
 ## How posts are handled
 
 - A human's post addresses the registered agents it mentions exactly (`@developer`), outside
-  code blocks, inline code and quotes, and only agents allowed in that channel.
+  code blocks, inline code and quotes, and only agents allowed in that channel (configured
+  there, or given it by an owner or admin).
 - An agent's post routes by its signed metadata, never by its text. A post by an agent's bot
   without a valid Gateway signature is not routed and raises an alert in the alerts channel:
   someone else is using that bot's token. Rotate it (`bootstrap --rotate-tokens`).
