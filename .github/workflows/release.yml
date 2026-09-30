@@ -190,12 +190,16 @@ jobs:
       - name: The images are public
         run: |
           docker logout ghcr.io
-          for ref in $(jq -r '.[].ref' "$RUNNER_TEMP/ghcr.json"); do
-            for platform in linux/amd64 linux/arm64; do
-              docker pull --quiet --platform "$platform" "$ref" >/dev/null ||
+          # Each platform's image by its own digest: Docker keeps one image per reference, so a
+          # second platform pulled through the same index digest would collide with the first.
+          set -o pipefail
+          jq -r '.[] | (.ref | sub("@.*"; "")) as $repository
+            | .platforms | to_entries[] | [.key, "\($repository)@\(.value)"] | @tsv' \
+            "$RUNNER_TEMP/ghcr.json" |
+            while IFS=$'\t' read -r platform ref; do
+              docker pull --quiet --platform "$platform" "$ref" >/dev/null </dev/null ||
                 { echo "::error::$ref ($platform) cannot be pulled anonymously; make the GHCR package public"; exit 1; }
             done
-          done
       - name: Publish the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

@@ -4,6 +4,15 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-30
+
+### Fixed
+
+- The release workflow checks anonymous pulls of each platform's image by its own digest.
+  Pulling the second platform through the index collided with the first in Docker's image
+  store, so 0.1.0 stopped before its GitHub Release; its images are in GHCR but the release
+  was never published. Install 0.1.1.
+
 ## [0.1.0] - 2026-09-30
 
 ### Added
