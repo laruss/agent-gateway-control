@@ -13,6 +13,8 @@ $GATEWAY_HOME/secrets/
     gateway_routing_key       written by `gateway mattermost bootstrap`
     mm_gateway_listener_token written by bootstrap
     mm_<agent>_token          one per agent, written by bootstrap
+    console_password_hash     optional; written by `gateway console password set`, required
+                              only once CONSOLE_ENABLED=true (ADR-023)
   worker-codex/
     database_url              written by `gateway db create-role` (a role limited to Codex jobs)
     codex_api_key             optional, with CODEX_API_KEY_FILE

@@ -6,9 +6,12 @@
 #
 # With one bundle: install, bootstrap a throwaway Mattermost, smoke-test a mention on the mock
 # runtime, and check every service's version, the containers' hardening and the Codex sandbox.
-# With a second bundle (the next release, whose migrations are expand-only): upgrade to it,
-# smoke-test, roll back to the first bundle without a restore, and smoke-test again; no mention
-# is answered twice.
+# Also validates the home server's Caddyfile (both site blocks, under the pinned Caddy image)
+# and the owner's console wiring (ADR-023) in the rendered Compose config: no host port, the
+# controller's console environment, and no worker or connector on the controller's network or
+# holding its secrets. With a second bundle (the next release, whose migrations are
+# expand-only): upgrade to it, smoke-test, roll back to the first bundle without a restore, and
+# smoke-test again; no mention is answered twice.
 #
 # Needs root (or sudo) for the ownership of $GATEWAY_HOME, and the images of the bundles'
 # images.lock reachable (a registry). Leaves the stacks running on failure for inspection;
@@ -133,6 +136,49 @@ install_release() {
 }
 
 cli() { "$agw" run --rm gateway-cli "$@"; }
+
+# The owner's console (ADR-023), from the rendered Compose config (every profile, so the
+# workers behind COMPOSE_PROFILES this install doesn't run are checked too): no host port for
+# it, the controller has its console environment, and no worker or connector service can reach
+# or read it.
+check_console_compose() {
+	log "console compose config"
+	local rendered
+	rendered="$("$agw" --profile '*' config --format json)"
+	jq -e '(.services["gateway-controller"].ports // []) | length == 0' <<<"$rendered" >/dev/null ||
+		fail "gateway-controller publishes a host port"
+	jq -e '.services["gateway-controller"].environment.CONSOLE_ENABLED == "false"' <<<"$rendered" >/dev/null ||
+		fail "gateway-controller is missing CONSOLE_ENABLED"
+	jq -e '.services["gateway-controller"].environment.CONSOLE_HOST == "0.0.0.0"' <<<"$rendered" >/dev/null ||
+		fail "gateway-controller's CONSOLE_HOST is not 0.0.0.0"
+	jq -e '.services["gateway-controller"].environment.CONSOLE_PORT == "8084"' <<<"$rendered" >/dev/null ||
+		fail "gateway-controller's CONSOLE_PORT is not 8084"
+	local service
+	for service in gateway-worker-mock gateway-worker-codex gateway-worker-claude-code \
+		gateway-tool-runner gateway-connector-gmail; do
+		jq -e --arg s "$service" \
+			'(.services[$s].networks // {}) | has("agent-mm") | not' <<<"$rendered" >/dev/null ||
+			fail "$service is on agent-mm, the controller's console network"
+		jq -e --arg s "$service" \
+			'[(.services[$s].volumes // [])[].source] | map(endswith("/secrets/controller")) | any | not' \
+			<<<"$rendered" >/dev/null ||
+			fail "$service mounts the controller's secrets (holds the console password hash)"
+	done
+}
+
+# The home server's Caddy: both site blocks (Mattermost and the Gateway's console, ADR-023)
+# parse under the pinned image.
+check_caddyfile() {
+	local release="$1" image
+	log "Caddyfile ($(basename "$release"))"
+	image="$(grep -m1 -oE 'docker\.io/library/caddy:[^ ]+' \
+		"$release/home-server/mattermost/compose.yaml")"
+	[[ -n "$image" ]] || fail "no pinned Caddy image in home-server/mattermost/compose.yaml"
+	docker run --rm -v "$release/home-server/mattermost/Caddyfile:/etc/caddy/Caddyfile:ro" \
+		-e MATTERMOST_HOST=mattermost.local -e GATEWAY_HOST=gateway.local \
+		"$image" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile ||
+		fail "Caddyfile did not validate"
+}
 
 # UPGRADE.md, step 2: every Gateway service stops, the database keeps running.
 stop_services() {
@@ -262,9 +308,11 @@ mkdir -p "$work"
 setup_mattermost
 first_release="$(unpack "$first")"
 first_version="$(jq -r .release "$first_release/images.lock")"
+check_caddyfile "$first_release"
 install_release "$first_release"
 check_versions "$first_version"
 check_hardening
+check_console_compose
 log "migrate refused while services run"
 if refusal="$(cli gateway db migrate 2>&1)"; then
 	fail "db migrate ran under live services"
@@ -276,6 +324,7 @@ smoke "$first_version"
 if [[ -n "$next" ]]; then
 	next_release="$(unpack "$next")"
 	next_version="$(jq -r .release "$next_release/images.lock")"
+	check_caddyfile "$next_release"
 
 	log "upgrade $first_version -> $next_version (UPGRADE.md)"
 	stop_services
@@ -293,6 +342,7 @@ if [[ -n "$next" ]]; then
 	cli gateway db status | jq -e '.compatible' >/dev/null || fail "status after upgrade"
 	start_services
 	check_versions "$next_version"
+	check_console_compose
 	smoke "$next_version"
 
 	log "rollback $next_version -> $first_version (ROLLBACK.md)"

@@ -25,7 +25,8 @@ networks:
   # The Gateway database and the services; nothing here reaches beyond the stack.
   agent-control:
     internal: true
-  # Shared with the Mattermost stack: the controller and the CLI (bootstrap) reach Mattermost.
+  # Shared with the Mattermost stack: the controller and the CLI (bootstrap) reach Mattermost,
+  # and the Mattermost stack's Caddy reaches the controller's console (ADR-023) here too.
   agent-mm:
     external: true
     name: ${MATTERMOST_NETWORK:-agent-mm}
@@ -113,6 +114,13 @@ services:
       OUTBOX_DELIVERY: mattermost
       MATTERMOST_URL: ${MATTERMOST_URL:?set MATTERMOST_URL}
       GATEWAY_ROUTING_KEY_FILE: /run/secrets/gateway_routing_key
+      # The owner's console (ADR-023): off unless gateway.env turns it on, and then only once
+      # `gateway console password set` has written a password hash (a missing or invalid hash
+      # refuses to start). CONSOLE_HOST binds every interface inside the container, not the
+      # host: no port is published, so only Caddy, over agent-mm, ever reaches it.
+      CONSOLE_ENABLED: ${CONSOLE_ENABLED:-false}
+      CONSOLE_HOST: "0.0.0.0"
+      CONSOLE_PORT: "8084"
     volumes:
       - ${GATEWAY_HOME}/secrets/controller:/run/secrets:ro
     tmpfs:
