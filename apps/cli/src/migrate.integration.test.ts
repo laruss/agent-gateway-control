@@ -68,7 +68,9 @@ describe("gateway db migrate and the schema rules", () => {
 	const folders: string[] = [];
 
 	beforeAll(async () => {
-		current = await loadLocalSchema();
+		// The shipped migrations without the published releases: each case names the releases
+		// it needs, so a new release in the manifest changes no expectation here.
+		current = { ...(await loadLocalSchema()), releases: [] };
 	});
 
 	beforeEach(async () => {
