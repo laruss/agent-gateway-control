@@ -1,0 +1,1 @@
+ALTER TABLE "mattermost_channel_grants" ADD COLUMN "checked_at_ms" bigint;

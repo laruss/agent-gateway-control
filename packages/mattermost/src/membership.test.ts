@@ -181,6 +181,7 @@ function harness(bots = [DEVELOPER_BOT]) {
 					botUserId: grant.botUserId,
 					sinceMs: grant.sinceMs,
 					revokedReason: null,
+					checkedAtMs: grant.sinceMs,
 				},
 			];
 			return true;
@@ -203,6 +204,13 @@ function harness(bots = [DEVELOPER_BOT]) {
 					!records.grants.some((g) => g.channelId === channelId && g.state === "active"),
 			),
 		token: (secretRef: string) => secretRef,
+		checked: async (agentId: string, channelId: MattermostId, atMs: number) => {
+			records.grants = records.grants.map((g) =>
+				g.agentId === agentId && g.channelId === channelId && g.state === "active"
+					? { ...g, checkedAtMs: Math.max(g.checkedAtMs ?? 0, atMs) }
+					: g,
+			);
+		},
 	};
 	const sync = () =>
 		syncMembership(
@@ -388,6 +396,30 @@ describe("the membership synchronizer", () => {
 		expect(world.at(LAB).members.has(DEVELOPER_BOT)).toBe(false);
 	});
 
+	it("remembers how far a granted channel was checked across a restart", async () => {
+		const { world, records, sync } = harness();
+		world.add(LAB, OWNER, DEVELOPER_BOT);
+		await sync();
+		// Posts pile up between polls, far more than one check reads back.
+		for (let round = 0; round < 6; round += 1) {
+			for (let i = 0; i < 400; i += 1) {
+				world.add(LAB, OWNER, id(`h${round}x${i}`));
+			}
+			world.now += 20_000;
+			await sync();
+		}
+		// A fresh synchronizer (a restarted controller) reads on from the stored check.
+		const restarted = harness();
+		restarted.world.channels = world.channels;
+		restarted.world.now = world.now;
+		restarted.records.grants = records.grants;
+		await restarted.sync();
+		expect(restarted.records.grants).toEqual([
+			expect.objectContaining({ channelId: LAB, state: "active" }),
+		]);
+		expect(restarted.records.rejections).toEqual([]);
+	});
+
 	it("says so when a channel was taken out of the configuration", async () => {
 		const { world, records, sync } = harness();
 		world.add(LAB, ADMIN, DEVELOPER_BOT);
@@ -399,6 +431,7 @@ describe("the membership synchronizer", () => {
 				botUserId: DEVELOPER_BOT,
 				sinceMs: world.now + 1,
 				revokedReason: "config_removed",
+				checkedAtMs: null,
 			},
 		];
 		await sync();

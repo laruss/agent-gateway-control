@@ -84,6 +84,8 @@ answers mentions there. Nothing needs to change in the configuration, and no com
 - Taking a channel out of an agent's `allowed_channels` takes it away for good: to give it back,
   add the bot again (or configure it again).
 - An archived channel loses its agents; after restoring it, add the bots again.
+- Bootstrap reads the grants when it starts: a bot added while it runs may be taken out again.
+  Add it once more after bootstrap.
 
 `allowed_channels` in an agent's configuration stays available for channels an agent should
 always have; bootstrap adds the bot there. Bootstrap keeps bots in the channels they were

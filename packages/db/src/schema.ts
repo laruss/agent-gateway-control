@@ -200,6 +200,11 @@ export const mattermostChannelGrants = pgTable(
 		evidencePostId: text("evidence_post_id").$type<MattermostId>(),
 		/** When the bot was added: the agent sees nothing created at or before it. */
 		sinceMs: bigint("since_ms", { mode: "number" }).notNull(),
+		/**
+		 * Up to when (ms) the channel's posts were checked for a re-add of the bot: the next check
+		 * reads only what came after, across restarts too.
+		 */
+		checkedAtMs: bigint("checked_at_ms", { mode: "number" }),
 		/** Incremented by every grant and revocation of this agent in this channel. */
 		generation: integer("generation").notNull().default(1),
 		revokedReason: text("revoked_reason"),

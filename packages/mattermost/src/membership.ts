@@ -27,6 +27,8 @@ export type MembershipStore = Readonly<{
 	grant: (grant: ChannelGrantInput) => Promise<boolean>;
 	revoke: (agentId: AgentId, channelId: MattermostId, reason: string) => Promise<boolean>;
 	reject: (rejection: RejectedAdd) => Promise<void>;
+	/** Records that a granted channel was checked for a re-add up to `atMs`. */
+	checked: (agentId: AgentId, channelId: MattermostId, atMs: number) => Promise<void>;
 	/** Those of the given channels nothing needs any more (not configured, not granted). */
 	unneeded: (channelIds: Readonly<MattermostId[]>) => Promise<Readonly<MattermostId[]>>;
 	/** A bot's token, read at use; null when its secret file is missing or not private. */
@@ -67,16 +69,17 @@ const DEFAULT_GRACE_MS = 60_000;
 /** A post may be stored a little after its creation time: rescans overlap by this much. */
 const SCAN_OVERLAP_MS = 10_000;
 
-/** What the synchronizer remembers between passes. */
+/**
+ * What the synchronizer remembers between passes (how far granted channels were checked is
+ * stored with the grants: it must survive a restart).
+ */
 export type MembershipMemory = Readonly<{
 	/** Memberships waiting for their add record, since when (ms), by `agent:channel`. */
 	pending: Map<string, number>;
-	/** Per granted `agent:channel`, up to when (ms) its posts were checked for a re-add. */
-	scanned: Map<string, number>;
 }>;
 
 export function membershipMemory(): MembershipMemory {
-	return { pending: new Map(), scanned: new Map() };
+	return { pending: new Map() };
 }
 
 /** A channel type the Gateway works in: public or private, never direct or group messages. */
@@ -246,7 +249,7 @@ async function step(pass: BotPass, channelId: MattermostId, work: () => Promise<
 /** One bot's channels: revocations, re-adds of granted channels, and new memberships. */
 async function syncBot(pass: BotPass): Promise<void> {
 	const { options, state, bot, client, seen } = pass;
-	const { pending, scanned } = pass.memory;
+	const { pending } = pass.memory;
 	const channels = (await client.userChannelsInTeam(bot.userId, state.teamId)).filter((channel) =>
 		isTeamChannel(channel, state.teamId),
 	);
@@ -259,11 +262,9 @@ async function syncBot(pass: BotPass): Promise<void> {
 	);
 
 	for (const grant of active) {
-		const key = `${bot.agentId}:${grant.channelId}`;
 		await step(pass, grant.channelId, async () => {
 			const channel = member.get(grant.channelId);
 			if (channel === undefined) {
-				scanned.delete(key);
 				await options.store.revoke(bot.agentId, grant.channelId, "bot_left");
 				options.log.info("channel grant revoked", {
 					agent_id: bot.agentId,
@@ -279,11 +280,10 @@ async function syncBot(pass: BotPass): Promise<void> {
 			// Only posts since the last check are read (newest first, overlapping a little); the
 			// check counts as done only once whatever it found was judged.
 			const checkedAt = options.clock().getTime() - SCAN_OVERLAP_MS;
-			const after = Math.max(grant.sinceMs, scanned.get(key) ?? grant.sinceMs);
+			const after = Math.max(grant.sinceMs, grant.checkedAtMs ?? grant.sinceMs);
 			const scan = await findAdd(client, grant.channelId, bot.userId, after, READD_SCAN_PAGES);
 			if (!scan.complete) {
 				// Who added the bot this time cannot be told: fail closed.
-				scanned.delete(key);
 				await options.store.revoke(bot.agentId, grant.channelId, "add_unverified");
 				await options.store.reject({
 					agentId: bot.agentId,
@@ -299,7 +299,7 @@ async function syncBot(pass: BotPass): Promise<void> {
 			if (scan.add !== null && scan.add.create_at > grant.sinceMs) {
 				await judgeAdd(pass, channel, scan.add);
 			}
-			scanned.set(key, checkedAt);
+			await options.store.checked(bot.agentId, grant.channelId, checkedAt);
 		});
 	}
 

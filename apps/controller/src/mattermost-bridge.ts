@@ -14,6 +14,7 @@ import {
 	loadDirectoryEntry,
 	loadMattermostSnapshot,
 	loadMembershipState,
+	markGrantChecked,
 	outboxReceiptPostId,
 	postCreationExists,
 	readChannelFloor,
@@ -232,6 +233,7 @@ export function membershipStore(deps: ControlPlaneDeps, secretsDir?: string): Me
 		revoke: (agentId, channelId, reason) => revokeChannelGrant(deps, agentId, channelId, reason),
 		reject: (rejection) => rejectChannelAdd(deps, rejection),
 		unneeded: (channelIds) => unneededChannels(deps, channelIds),
+		checked: (agentId, channelId, atMs) => markGrantChecked(deps, agentId, channelId, atMs),
 		token: (secretRef) => {
 			const path = resolveSecretPath(secretRef, secretsDir);
 			return secretFileState(path) === "private" ? readSecretFile(path) : null;

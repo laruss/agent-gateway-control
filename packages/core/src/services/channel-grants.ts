@@ -94,6 +94,7 @@ export async function loadMembershipState(deps: ControlPlaneDeps): Promise<Membe
 				botUserId: mattermostChannelGrants.botUserId,
 				sinceMs: mattermostChannelGrants.sinceMs,
 				revokedReason: mattermostChannelGrants.revokedReason,
+				checkedAtMs: mattermostChannelGrants.checkedAtMs,
 			})
 			.from(mattermostChannelGrants)
 			.where(eq(mattermostChannelGrants.teamId, teamId));
@@ -176,6 +177,7 @@ export async function grantChannel(
 			grantorUserId: input.grantorUserId,
 			evidencePostId: input.evidencePostId,
 			sinceMs: input.sinceMs,
+			checkedAtMs: input.sinceMs,
 			revokedReason: null,
 			grantedAt: uow.now,
 			revokedAt: null,
@@ -251,6 +253,31 @@ export async function revokeChannelGrant(
 			});
 		}
 		return channelStillFollowed(uow, channelId);
+	});
+}
+
+/**
+ * Records that an active grant's channel was checked for a re-add up to `atMs`; never moves the
+ * mark back.
+ */
+export async function markGrantChecked(
+	deps: ControlPlaneDeps,
+	agentId: AgentId,
+	channelId: MattermostId,
+	atMs: number,
+): Promise<void> {
+	await inTransaction(deps, async ({ tx }) => {
+		await tx.db
+			.update(mattermostChannelGrants)
+			.set({ checkedAtMs: atMs })
+			.where(
+				and(
+					eq(mattermostChannelGrants.agentId, agentId),
+					eq(mattermostChannelGrants.channelId, channelId),
+					eq(mattermostChannelGrants.state, "active"),
+					sql`coalesce(${mattermostChannelGrants.checkedAtMs}, 0) < ${atMs}`,
+				),
+			);
 	});
 }
 

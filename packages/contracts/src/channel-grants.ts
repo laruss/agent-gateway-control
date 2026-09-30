@@ -23,6 +23,8 @@ export type GrantRecord = Readonly<{
 	sinceMs: number;
 	/** Why a revoked record ended, e.g. `bot_left` or `config_removed`; null while active. */
 	revokedReason: string | null;
+	/** Up to when (ms) the channel was checked for a re-add of the bot; null before the first. */
+	checkedAtMs: number | null;
 }>;
 
 /** What the membership synchronizer works from; null before configuration and bootstrap. */
