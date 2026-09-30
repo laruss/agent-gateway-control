@@ -347,6 +347,14 @@ async function syncBot(pass: BotPass): Promise<void> {
 			const scan = await findChange(client, grant.channelId, bot.userId, after, READD_SCAN_PAGES);
 			// Who brought the bot back cannot be told (too many posts, or its add record is gone:
 			// the newest change is its removal although it is a member): fail closed.
+			if (
+				scan.change?.kind === "gone" &&
+				!(await client.isChannelMember(grant.channelId, bot.userId))
+			) {
+				// It left while this pass ran: an ordinary removal.
+				await options.store.revoke(bot.agentId, grant.channelId, "bot_left");
+				return;
+			}
 			if (!scan.complete || scan.change?.kind === "gone") {
 				await options.store.revoke(bot.agentId, grant.channelId, "add_unverified");
 				await options.store.reject({
