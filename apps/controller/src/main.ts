@@ -12,6 +12,8 @@ import {
 	startHealthServer,
 } from "@agent-gateway/service";
 import { withPendingApprovalCards } from "./approval-cards.ts";
+import { resolveConsolePasswordHash, startConsoleServer } from "./console-server.ts";
+import { collectConsoleStatus, createConsoleStatusCache } from "./console-status.ts";
 import { type ControllerOptions, startController } from "./controller.ts";
 import { loopbackApprovalCardDeliverer, loopbackPostDeliverer } from "./loopback-deliverer.ts";
 import { bridgeDeliverers, type MattermostBridgeOptions } from "./mattermost-bridge.ts";
@@ -40,6 +42,17 @@ if (delivery !== "mattermost" && environment !== "development" && environment !=
 		`OUTBOX_DELIVERY '${delivery}' delivers nothing; it needs GATEWAY_ENV=development or test`,
 	);
 }
+
+/**
+ * The owner's console (ADR-023) is off unless explicitly turned on, and its password hash is
+ * read and validated here, before the controller or health listener starts: a missing, exposed
+ * or unreadable hash file must fail the whole process closed, never start everything else and
+ * skip only the console, and never start a listener that would end up serving unauthenticated.
+ */
+const consoleEnabled = readSetting("CONSOLE_ENABLED") === "true";
+const consolePasswordHash = consoleEnabled
+	? resolveConsolePasswordHash(readSetting("SECRETS_DIR"))
+	: null;
 
 function bridgeOptions(): MattermostBridgeOptions {
 	const routingKey = requireSetting("GATEWAY_ROUTING_KEY");
@@ -85,7 +98,22 @@ const health = startHealthServer({
 });
 log.info("health endpoints listening", { port: health.port });
 
+const ownerConsole =
+	consoleEnabled && consolePasswordHash !== null
+		? startConsoleServer({
+				port: intSetting("CONSOLE_PORT", 8084),
+				hostname: readSetting("CONSOLE_HOST") ?? "127.0.0.1",
+				passwordHash: consolePasswordHash,
+				cache: createConsoleStatusCache((now) => collectConsoleStatus(controller.deps.pool, now)),
+				log,
+			})
+		: null;
+if (ownerConsole !== null) {
+	log.info("console listening", { port: ownerConsole.port });
+}
+
 onShutdown(log, async () => {
+	await ownerConsole?.stop();
 	await health.stop();
 	await controller.stop();
 	await deployment.release();
