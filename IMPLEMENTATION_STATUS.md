@@ -1799,4 +1799,8 @@ Since then:
 - Restore rehearsal in a second VM: every row count matched; it found that worker roles must
   exist before the dump restore (its pg-boss policies name them).
 
-Still to do: failure drills and the soak.
+- Failure drills on a restored copy (`scripts/soak/drills.sh`): controller and database
+  restarts, Mattermost network loss, duplicates, provider failures and invalid output pass; they
+  found that a worker kept running a cancelled turn until its deadline (fixed in 0.2.1).
+
+Still to do: the 14-day soak.

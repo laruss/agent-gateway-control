@@ -4,6 +4,8 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-30
+
 ### Fixed
 
 - A worker stops a turn as soon as its run is cancelled (a pause, `runs cancel`, `kill-all`).
