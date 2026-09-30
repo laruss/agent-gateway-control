@@ -21,9 +21,10 @@ import type { ConsoleSnapshot, ConsoleStatusCache } from "./console-status.ts";
  * configurable. Never a Mattermost username or any other identity the rest of the Gateway uses. */
 const OWNER_USERNAME = "owner";
 
-/** RFC 7617 gives no practical credential a reason to need more than this; a header past it is
- * refused before it is even looked at. */
-const MAX_AUTHORIZATION_HEADER_BYTES = 1024;
+/** Room for the longest password `gateway console password set` accepts (256 UTF-16 units, at
+ * most 768 UTF-8 bytes), base64-encoded after `owner:` behind `Basic `: about 1,040 bytes. A
+ * header past this is refused before it is even looked at. */
+const MAX_AUTHORIZATION_HEADER_BYTES = 2048;
 
 /** Failed logins share one bounded, global counter (ADR-023), never partitioned by a
  * client-supplied address (`X-Forwarded-For` and the like are never trusted for this). */

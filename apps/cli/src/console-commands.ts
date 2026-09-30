@@ -1,8 +1,9 @@
-import { hashConsolePassword, writeSecretFile } from "@agent-gateway/service";
-
-/** Short enough to type at a prompt, long enough to matter for a single owner credential. */
-export const CONSOLE_PASSWORD_MIN_LENGTH = 12;
-export const CONSOLE_PASSWORD_MAX_LENGTH = 256;
+import {
+	CONSOLE_PASSWORD_MAX_LENGTH,
+	CONSOLE_PASSWORD_MIN_LENGTH,
+	hashConsolePassword,
+	writeSecretFile,
+} from "@agent-gateway/service";
 
 export class ConsoleCommandError extends Error {
 	constructor(message: string) {

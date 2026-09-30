@@ -5,6 +5,11 @@
  * hashes and verifies Argon2id natively (`Bun.password`), so no dependency is needed for it.
  */
 
+/** Short enough to type at a prompt, long enough to matter for a single owner credential. The
+ * maximum, in UTF-16 units, also sizes the controller's Authorization header limit. */
+export const CONSOLE_PASSWORD_MIN_LENGTH = 12;
+export const CONSOLE_PASSWORD_MAX_LENGTH = 256;
+
 /**
  * OWASP's current Argon2id minimum (one lane, 19 MiB, two passes). This credential is checked
  * on every console request but hashed only when the owner rotates it, so the cost is picked for

@@ -1,11 +1,14 @@
 import { mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SettingError, verifyConsolePassword } from "@agent-gateway/service";
-import { describe, expect, it } from "vitest";
 import {
 	CONSOLE_PASSWORD_MAX_LENGTH,
 	CONSOLE_PASSWORD_MIN_LENGTH,
+	SettingError,
+	verifyConsolePassword,
+} from "@agent-gateway/service";
+import { describe, expect, it } from "vitest";
+import {
 	ConsoleCommandError,
 	ConsolePasswordCancelled,
 	consolePasswordSet,

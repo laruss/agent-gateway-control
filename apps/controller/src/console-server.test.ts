@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ConsoleStatus } from "@agent-gateway/core";
 import { type Logger, silentLogger } from "@agent-gateway/logging";
-import { hashConsolePassword } from "@agent-gateway/service";
+import { CONSOLE_PASSWORD_MAX_LENGTH, hashConsolePassword } from "@agent-gateway/service";
 import { afterEach, describe, expect, it } from "vitest";
 import { resolveConsolePasswordHash, startConsoleServer } from "./console-server.ts";
 import type { ConsoleSnapshot, ConsoleStatusCache } from "./console-status.ts";
@@ -116,6 +116,15 @@ describe("console server authentication", () => {
 		const { base } = await withServer();
 		const res = await fetch(`${base}/`, { headers: { authorization: header } });
 		expect(res.status).toBe(401);
+	});
+
+	it("accepts the longest password the CLI accepts, even in three-byte characters", async () => {
+		const longest = "漢".repeat(CONSOLE_PASSWORD_MAX_LENGTH);
+		const { base } = await withServer({ passwordHash: await hashConsolePassword(longest) });
+		const res = await fetch(`${base}/`, {
+			headers: { authorization: basicAuthHeader("owner", longest) },
+		});
+		expect(res.status).toBe(200);
 	});
 
 	it("rejects an oversize Authorization header with 400, before any verification", async () => {
