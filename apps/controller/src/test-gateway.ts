@@ -84,6 +84,8 @@ export type TestGateway = Readonly<{
 	stopController: () => Promise<void>;
 	startWorker: () => Promise<void>;
 	stopWorker: () => Promise<void>;
+	/** Run attempts the worker has in progress right now. */
+	workerActiveJobs: () => Promise<number>;
 	stop: () => Promise<void>;
 }>;
 
@@ -154,11 +156,17 @@ export async function startTestGateway(options: TestGatewayOptions = {}): Promis
 				workspaceRoot: join(tmpdir(), "agent-gateway-test-workspaces"),
 				log: silentLogger,
 				pollingIntervalSeconds: 0.5,
+				jobCheckMs: 500,
 			});
 		},
 		stopWorker: async () => {
 			await worker?.stop();
 			worker = null;
+		},
+		workerActiveJobs: async () => {
+			const text = (await worker?.metrics.render()) ?? "";
+			const line = text.split("\n").find((l) => l.startsWith("gateway_worker_run_jobs_active"));
+			return line === undefined ? 0 : Number(line.split(" ").at(-1));
 		},
 		stop: async () => {
 			try {

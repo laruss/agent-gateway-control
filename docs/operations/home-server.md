@@ -175,6 +175,28 @@ starts no runtime worker, connector or tool runner: a copy must not use the real
 counts with the original. The first rehearsal (2026-09-30) restored in under a minute plus the
 image pulls.
 
+## Failure drills
+
+`scripts/soak/drills.sh` runs on a restored copy (never the original), on the mock runtime: each
+drill breaks one thing while an agent works and checks every mention is answered exactly once.
+
+| Drill | What breaks |
+|-------|-------------|
+| `controller_restart` | the controller restarts while a mention is routed |
+| `database_restart` | PostgreSQL stops cleanly for a while; the services lose the deployment lock and come back |
+| `mattermost_network` | the controller loses the Mattermost network; the backlog is caught up |
+| `duplicates` | a full resync reads every channel again; no post is stored twice |
+| `provider_flaky` | the runtime fails once, then answers |
+| `invalid_once` | the model's answer is malformed once, then repaired |
+| `cascade` | the agent hands work to another agent (needs a second enabled agent in the channel) |
+| `worker_kill` | the worker is killed during a long turn; the operator cancels it and resumes the agent |
+| `provider_permanent`, `invalid_always` | runs that cannot succeed; each leaves the agent FAILED, so each gets a pass of its own |
+
+Run each pass on a fresh restore of the newest backup (restore, then
+`sudo drills.sh [drill ...]`): that repeats the restore rehearsal too. The first drills
+(2026-09-30) found that a worker kept running a cancelled turn until its deadline (fixed in
+0.2.1).
+
 ## Checks after a restart
 
 ```bash
