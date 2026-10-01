@@ -54,6 +54,12 @@ export function setUnauthorizedHandler(handler: (() => void) | null): void {
 	unauthorizedHandler = handler;
 }
 
+/** Bumped on every sign-in and sign-out. A request records the generation it started under
+ * (`request`, below) and reports a `401` only if that generation is still the current one: a
+ * request begun under an old session that resolves after a newer sign-in already succeeded (slow
+ * network, a tab left open) must not sign the fresh session back out. */
+let sessionGeneration = 0;
+
 /** What a failed request becomes for every caller: an HTTP status, the server's own (bounded)
  * body text, and which of the console's own documented cases it falls into, so a caller can
  * show the right thing — sign in again, a clear "forbidden"/"conflict" message, or a generic
@@ -110,9 +116,12 @@ function rawRequest(path: string, init: RequestInit, method: string): Promise<Re
  *   or a 403 still there after the retry, hands back the original/retried response as-is — never
  *   a second retry.
  * - A final `401` (this session is no longer valid) reports to {@link setUnauthorizedHandler}'s
- *   handler, so the whole app falls back to the sign-in screen together.
+ *   handler, so the whole app falls back to the sign-in screen together — but only if this
+ *   request's own session generation (captured before the fetch) is still current: a 401 that
+ *   arrives after a newer sign-in or sign-out must not act on a session that already moved on.
  */
 async function request(path: string, init: RequestInit = {}): Promise<Response> {
+	const generation = sessionGeneration;
 	const method = (init.method ?? "GET").toUpperCase();
 	let response = await rawRequest(path, init, method);
 	if (method !== "GET" && method !== "HEAD" && response.status === 403) {
@@ -127,7 +136,7 @@ async function request(path: string, init: RequestInit = {}): Promise<Response> 
 			}
 		}
 	}
-	if (response.status === 401) {
+	if (response.status === 401 && generation === sessionGeneration) {
 		unauthorizedHandler?.();
 	}
 	return response;
@@ -179,6 +188,7 @@ export async function signIn(password: string): Promise<SignInOutcome> {
 	if (response.status === 200) {
 		const body = LoginSuccessSchema.parse(await response.json());
 		setCsrfToken(body.csrfToken);
+		sessionGeneration += 1;
 		return { kind: "ok", expiresAt: body.expiresAt };
 	}
 	if (response.status === 401) {
@@ -210,6 +220,7 @@ export async function signOut(): Promise<void> {
 	const response = await request("/api/session", { method: "DELETE" });
 	if (response.status === 204 || response.status === 401) {
 		setCsrfToken(null);
+		sessionGeneration += 1;
 		return;
 	}
 	throw new ApiError(response.status, await bodyText(response));

@@ -49,7 +49,6 @@ import {
 	releaseKillSwitch,
 	resetGmailMailbox,
 	resumeAgent,
-	revokeAllConsoleSessions,
 	runtimeHealth,
 	setAgentEnabled,
 	setDirectoryEntry,
@@ -98,7 +97,11 @@ import {
 	configRollback,
 } from "./config-commands.ts";
 import { loadConfigDirectory } from "./config-files.ts";
-import { consolePasswordSet, nodeHiddenReader } from "./console-commands.ts";
+import {
+	consolePasswordSet,
+	nodeHiddenReader,
+	revokeConsoleSessionsAfterRotation,
+} from "./console-commands.ts";
 import { gmailAuthorize } from "./gmail-commands.ts";
 import { mattermostBootstrap, mattermostReconcile } from "./mattermost-commands.ts";
 
@@ -720,15 +723,7 @@ export async function runCommand(args: Readonly<string[]>, out: Output): Promise
 		// that restart.
 		const databaseUrl = readSetting("DATABASE_URL");
 		if (databaseUrl !== undefined) {
-			const pool = createPool(databaseUrl, 1);
-			try {
-				const revoked = await revokeAllConsoleSessions(pool, "password_rotated", new Date());
-				if (revoked > 0) {
-					out.print(`revoked ${revoked} active console session(s)`);
-				}
-			} finally {
-				await pool.end();
-			}
+			await revokeConsoleSessionsAfterRotation(databaseUrl, out.print);
 		}
 		return 0;
 	}

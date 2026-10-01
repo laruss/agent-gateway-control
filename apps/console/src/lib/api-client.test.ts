@@ -182,6 +182,36 @@ describe("api-client", () => {
 			await expect(fetchConsoleStatus()).rejects.toBeInstanceOf(ApiError);
 			expect(handler).toHaveBeenCalledTimes(1);
 		});
+
+		it("ignores a stale request's late 401 once a newer sign-in already succeeded", async () => {
+			const handler = vi.fn();
+			setUnauthorizedHandler(handler);
+
+			let resolveStaleRequest!: (response: Response) => void;
+			const staleRequest = new Promise<Response>((resolve) => {
+				resolveStaleRequest = resolve;
+			});
+
+			const fetchMock = vi.fn(async (_input: string, init?: RequestInit) => {
+				const method = (init?.method ?? "GET").toUpperCase();
+				if (method === "GET") {
+					// The status request that started before the sign-in; it hangs until resolved below.
+					return staleRequest;
+				}
+				return jsonResponse({
+					csrfToken: "fresh-token",
+					expiresAt: "2031-01-01T00:00:00.000Z",
+				});
+			});
+			vi.stubGlobal("fetch", fetchMock);
+
+			const stalePending = fetchConsoleStatus();
+			await signIn("correct horse battery staple"); // a fresh session begins first
+			resolveStaleRequest(new Response("unauthorized", { status: 401 })); // its stale 401 arrives late
+			await expect(stalePending).rejects.toBeInstanceOf(ApiError);
+
+			expect(handler).not.toHaveBeenCalled();
+		});
 	});
 
 	describe("signOut", () => {

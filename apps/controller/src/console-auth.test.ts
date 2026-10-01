@@ -44,4 +44,19 @@ describe("assertConsoleOrigin", () => {
 	it("rejects a scheme other than http/https", () => {
 		expect(() => assertConsoleOrigin("ftp://gateway.local")).toThrow(/must be an origin/);
 	});
+
+	// A browser's `Origin` header never carries a default port: `originAllowed`'s later exact-string
+	// comparison needs the configured value canonicalized the same way, or a configured
+	// `https://host:443` would never match the `https://host` the browser actually sends.
+	it("canonicalizes away the default https port (:443)", () => {
+		expect(assertConsoleOrigin("https://gateway.local:443")).toBe("https://gateway.local");
+	});
+
+	it("canonicalizes away the default http port (:80) on an allowed loopback host", () => {
+		expect(assertConsoleOrigin("http://localhost:80")).toBe("http://localhost");
+	});
+
+	it("keeps a non-default port", () => {
+		expect(assertConsoleOrigin("https://gateway.local:8443")).toBe("https://gateway.local:8443");
+	});
 });

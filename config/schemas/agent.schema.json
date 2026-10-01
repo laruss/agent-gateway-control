@@ -59,7 +59,8 @@
         },
         "model": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "maxLength": 255
         },
         "session_policy": {
           "type": "string",

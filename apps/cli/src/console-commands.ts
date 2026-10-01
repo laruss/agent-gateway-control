@@ -1,3 +1,6 @@
+import { revokeAllConsoleSessions } from "@agent-gateway/core";
+import { createPool } from "@agent-gateway/db";
+import { redactText } from "@agent-gateway/logging";
 import {
 	CONSOLE_PASSWORD_MAX_LENGTH,
 	CONSOLE_PASSWORD_MIN_LENGTH,
@@ -173,4 +176,41 @@ export async function consolePasswordSet(
 	print(
 		`console password set at ${options.secretPath}; restart the controller (bin/agw restart gateway-controller) to apply it, or bin/agw up -d gateway-controller if you just turned CONSOLE_ENABLED on`,
 	);
+}
+
+/** Bounds how long the best-effort session revocation below waits on a connection or statement:
+ * the credential is already rotated on disk by the time this runs, so this is a courtesy, never
+ * something worth hanging the command over. */
+const SESSION_REVOCATION_TIMEOUT_MS = 5_000;
+
+/**
+ * Revokes every active console session after `gateway console password set` wrote a new hash
+ * (ADR-025), so the rotation takes effect immediately instead of only once the controller
+ * restarts and starts comparing sessions against the new hash's `password_hash_fingerprint`.
+ * Best-effort and bounded: the password is already rotated by the time this runs, so a database
+ * that is slow or unreachable is a warning, never a failure the command exits non-zero for —
+ * existing sessions simply stay valid until that restart.
+ */
+export async function revokeConsoleSessionsAfterRotation(
+	databaseUrl: string,
+	print: (line: string) => void,
+): Promise<void> {
+	const pool = createPool(databaseUrl, 1, {
+		connectionTimeoutMs: SESSION_REVOCATION_TIMEOUT_MS,
+		statementTimeoutMs: SESSION_REVOCATION_TIMEOUT_MS,
+	});
+	try {
+		const revoked = await revokeAllConsoleSessions(pool, "password_rotated", new Date());
+		if (revoked > 0) {
+			print(`revoked ${revoked} active console session(s)`);
+		}
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		print(
+			`warning: could not revoke existing console sessions (${redactText(message)}); ` +
+				"they stay valid until the controller restarts",
+		);
+	} finally {
+		await pool.end().catch(() => undefined);
+	}
 }

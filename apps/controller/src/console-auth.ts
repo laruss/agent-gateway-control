@@ -102,7 +102,13 @@ export function originAllowed(request: Request, configuredOrigin: string): boole
 	return secFetchSite === null || secFetchSite === "same-origin";
 }
 
-const ORIGIN_SHAPE = /^(https?):\/\/([^/]+)$/;
+/** The literal shape a `CONSOLE_ORIGIN` value must have before it is handed to `URL` for parsing:
+ * `scheme://host[:port]` only, nothing else. Excluding `/`, `?`, `#` and `@` up front rejects a
+ * path, a query, a fragment and userinfo in one step; it also catches a trailing slash, which the
+ * `URL` parser alone could not — `new URL("https://gateway.local")` and
+ * `new URL("https://gateway.local/")` parse to the same `pathname` ("/", a special scheme's
+ * default), so they are otherwise indistinguishable after the fact. */
+const ORIGIN_SHAPE = /^https?:\/\/[^/?#@]+$/;
 
 /** The only hosts an `http:` `CONSOLE_ORIGIN` may name: the session cookie is `__Host-`/`Secure`
  * (ADR-025) and so needs TLS in every other case, but a loopback origin is never carried over the
@@ -110,26 +116,50 @@ const ORIGIN_SHAPE = /^(https?):\/\/([^/]+)$/;
  * `http://localhost:5173`) relies on. */
 const HTTP_ORIGIN_ALLOWED_HOSTS = new Set(["localhost", "127.0.0.1"]);
 
-/** Validates `CONSOLE_ORIGIN` at startup: a value that could never equal a browser's `Origin`
- * header (no scheme, a path, a trailing slash) is a configuration error, not a setting the
- * listener silently starts with anyway and then rejects every login and mutation against. An
- * `http:` origin is refused unless its host is a loopback address — the session cookie needs TLS
- * everywhere else, and a misconfigured `http://` pointed at a real host would otherwise carry it
- * in the clear. */
+function invalidConsoleOrigin(value: string): Error {
+	return new Error(
+		`CONSOLE_ORIGIN '${value}' must be an origin like 'https://gateway.local' (scheme and host, no path)`,
+	);
+}
+
+/**
+ * Validates `CONSOLE_ORIGIN` at startup and canonicalizes it to the exact form a browser's
+ * `Origin` header takes, so `originAllowed`'s later exact-string comparison actually matches one:
+ * parsed with `URL`, whose `origin` serialization drops a default port (`:443` on `https:`, `:80`
+ * on `http:`) a browser never sends either. A value that could never equal a browser's `Origin`
+ * header in the first place (no scheme, a path, a query, a fragment, userinfo, a trailing slash)
+ * is a configuration error, not a setting the listener silently starts with anyway and then
+ * rejects every login and mutation against. An `http:` origin is refused unless its host is a
+ * loopback address — the session cookie needs TLS everywhere else, and a misconfigured `http://`
+ * pointed at a real host would otherwise carry it in the clear.
+ */
 export function assertConsoleOrigin(value: string): string {
-	const match = ORIGIN_SHAPE.exec(value);
-	const scheme = match?.[1];
-	const hostAndPort = match?.[2];
-	if (scheme === undefined || hostAndPort === undefined) {
-		throw new Error(
-			`CONSOLE_ORIGIN '${value}' must be an origin like 'https://gateway.local' (scheme and host, no path)`,
-		);
+	if (!ORIGIN_SHAPE.test(value)) {
+		throw invalidConsoleOrigin(value);
 	}
-	if (scheme === "http" && !HTTP_ORIGIN_ALLOWED_HOSTS.has(hostAndPort.split(":")[0] ?? "")) {
+	let url: URL;
+	try {
+		url = new URL(value);
+	} catch {
+		throw invalidConsoleOrigin(value);
+	}
+	// Defends against a special scheme's own backslash-as-slash normalization (`URL` treats
+	// `https://host\path` the same as `https://host/path`), which `ORIGIN_SHAPE` alone would not
+	// catch since it only excludes forward slashes.
+	if (
+		url.username !== "" ||
+		url.password !== "" ||
+		url.pathname !== "/" ||
+		url.search !== "" ||
+		url.hash !== ""
+	) {
+		throw invalidConsoleOrigin(value);
+	}
+	if (url.protocol === "http:" && !HTTP_ORIGIN_ALLOWED_HOSTS.has(url.hostname)) {
 		throw new Error(
 			`CONSOLE_ORIGIN '${value}' must use 'https:' (the session cookie is '__Host-'/Secure); ` +
 				"'http:' is only allowed for 'http://localhost' or 'http://127.0.0.1'",
 		);
 	}
-	return value;
+	return url.origin;
 }

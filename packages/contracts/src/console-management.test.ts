@@ -60,6 +60,15 @@ describe("AgentRuntimePatchSchema", () => {
 		const parsed = AgentRuntimePatchSchema.safeParse({ model: "gpt-5" });
 		expect(parsed.success).toBe(true);
 	});
+
+	// A patch this schema accepts is later read back through `ConsoleAgentListItemSchema`/
+	// `ConsoleAgentDetailSchema` (the Agents list/detail response), which bound `model` to 255
+	// characters; a write side without the same bound could save a value the read side could never
+	// parse back.
+	it("rejects a model longer than the response's own 255-character bound", () => {
+		const parsed = AgentRuntimePatchSchema.safeParse({ model: "m".repeat(256) });
+		expect(parsed.success).toBe(false);
+	});
 });
 
 describe("AgentPatchSchema", () => {

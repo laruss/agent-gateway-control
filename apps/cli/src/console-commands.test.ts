@@ -1,4 +1,5 @@
 import { mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -14,9 +15,31 @@ import {
 	consolePasswordSet,
 	type HiddenLineReader,
 	nodeHiddenReader,
+	revokeConsoleSessionsAfterRotation,
 	type TtyInput,
 	type TtyOutput,
 } from "./console-commands.ts";
+
+/** A TCP port nothing listens on: bound then immediately closed, so a connection to it fails fast
+ * with ECONNREFUSED rather than relying on a hardcoded port that might be in use. */
+async function closedLocalPort(): Promise<number> {
+	return await new Promise((resolve, reject) => {
+		const server = createServer();
+		server.listen(0, "127.0.0.1", () => {
+			const address = server.address();
+			const port = typeof address === "object" && address !== null ? address.port : null;
+			server.close((error) => {
+				if (error) {
+					reject(error);
+				} else if (port === null) {
+					reject(new Error("could not allocate a port"));
+				} else {
+					resolve(port);
+				}
+			});
+		});
+	});
+}
 
 function tempSecretPath(name = "console_password_hash"): string {
 	return join(mkdtempSync(join(tmpdir(), "console-cmd-")), name);
@@ -190,6 +213,20 @@ describe("consolePasswordSet", () => {
 		).rejects.toThrow(ConsolePasswordCancelled);
 		expect(() => readFileSync(secretPath)).toThrow();
 	});
+});
+
+describe("revokeConsoleSessionsAfterRotation", () => {
+	it("warns and returns instead of throwing when DATABASE_URL is unreachable", async () => {
+		const port = await closedLocalPort();
+		const lines: string[] = [];
+		await revokeConsoleSessionsAfterRotation(`postgres://user:pass@127.0.0.1:${port}/db`, (line) =>
+			lines.push(line),
+		);
+		expect(lines.some((line) => line.startsWith("warning:"))).toBe(true);
+		expect(lines.some((line) => line.includes("stay valid until the controller restarts"))).toBe(
+			true,
+		);
+	}, 10_000);
 });
 
 describe("nodeHiddenReader", () => {

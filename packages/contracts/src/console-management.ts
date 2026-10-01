@@ -1,5 +1,7 @@
 import { z } from "zod";
 import {
+	AgentDisplayNameSchema,
+	AgentModelSchema,
 	AgentPermissionsSchema,
 	AgentRuntimeConfigSchema,
 	SessionPolicySchema,
@@ -23,7 +25,7 @@ import {
 	ConfigRevisionSourceSchema,
 	RolePromptSchema,
 } from "./management.ts";
-import { ModelNameSchema, TokenSchema } from "./system-status.ts";
+import { TokenSchema } from "./system-status.ts";
 
 /** `GET /api/agents`'s own last-run summary: just enough to show a status and a time, cheaper
  * than `SystemStatusLastRunSchema` (no usage join) since the list view shows neither tokens. */
@@ -49,11 +51,11 @@ export type ConsoleAgentLastRun = z.infer<typeof ConsoleAgentLastRunSchema>;
 /** `GET /api/agents`: one row of the agents table. */
 export const ConsoleAgentListItemSchema = z.strictObject({
 	id: AgentIdSchema,
-	displayName: z.string().min(1).max(64),
+	displayName: AgentDisplayNameSchema,
 	enabled: z.boolean(),
 	state: TokenSchema,
 	runtimeAdapter: RuntimeAdapterIdSchema,
-	model: ModelNameSchema.nullable(),
+	model: AgentModelSchema.nullable(),
 	channelCount: z.int().min(0),
 	lastRun: ConsoleAgentLastRunSchema.nullable(),
 	activeRevisionId: z.int().positive().nullable(),
@@ -96,7 +98,7 @@ export const ConsoleAgentDetailSchema = z.strictObject({
 	id: AgentIdSchema,
 	/** The revision whose snapshot this view was read from; `preview`/`commit`'s `baseRevisionId`. */
 	activeRevisionId: z.int().positive().nullable(),
-	displayName: z.string().min(1).max(64),
+	displayName: AgentDisplayNameSchema,
 	enabled: z.boolean(),
 	mattermost: ConsoleAgentMattermostSchema,
 	runtime: AgentRuntimeConfigSchema,
@@ -133,7 +135,7 @@ export const AgentRuntimePatchSchema = z
 		 * model); `undefined`/absent leaves it unchanged. A JSON body cannot tell "absent" and
 		 * "explicitly `undefined`" apart, which is exactly why clearing the field needs its own
 		 * value instead of reusing `undefined` for it. */
-		model: z.string().min(1).nullable().optional(),
+		model: AgentModelSchema.nullable().optional(),
 		session_policy: SessionPolicySchema.optional(),
 		timeout_seconds: z.int().min(10).max(86_400).optional(),
 	})
@@ -163,7 +165,7 @@ export type AgentPermissionsPatch = z.infer<typeof AgentPermissionsPatchSchema>;
  */
 export const AgentPatchSchema = z
 	.strictObject({
-		displayName: z.string().min(1).max(64).optional(),
+		displayName: AgentDisplayNameSchema.optional(),
 		enabled: z.boolean().optional(),
 		rolePrompt: RolePromptSchema.optional(),
 		runtime: AgentRuntimePatchSchema.optional(),
