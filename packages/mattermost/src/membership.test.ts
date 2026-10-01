@@ -32,6 +32,8 @@ class World {
 	channels = new Map<MattermostId, Channel>();
 	now = 1_000_000;
 	failListenerAdd = false;
+	/** The next check of the listener's own membership throws once, like a transient server error. */
+	failListenerCheckOnce = false;
 	/** Tokens whose every call fails, like a revoked one. */
 	broken = new Set<string>();
 
@@ -149,7 +151,13 @@ class World {
 				}
 				return user;
 			},
-			isChannelMember: async (channelId, userId) => this.at(channelId).members.has(userId),
+			isChannelMember: async (channelId, userId) => {
+				if (userId === LISTENER && this.failListenerCheckOnce) {
+					this.failListenerCheckOnce = false;
+					throw new Error("500 temporary");
+				}
+				return this.at(channelId).members.has(userId);
+			},
 			addChannelMember: async (channelId, userId) => {
 				if (userId === LISTENER && this.failListenerAdd) {
 					throw new Error("403 no permission to add members");
@@ -426,17 +434,64 @@ describe("the membership synchronizer", () => {
 		expect(records.grants).toEqual([expect.objectContaining({ channelId: LAB, state: "active" })]);
 	});
 
-	it("grants nothing while the listener cannot be brought in: the bot leaves, once", async () => {
+	it("revokes at once when the listener cannot be brought in: the bot leaves, once", async () => {
 		const { world, records, sync } = harness();
 		world.failListenerAdd = true;
 		world.add(LAB, OWNER, DEVELOPER_BOT);
 		await sync();
 		await sync();
-		expect(records.granted).toEqual([]);
+		// The grant is recorded (so no reader ever sees the listener a member of a channel its own
+		// grant does not cover yet), then revoked at once when the listener cannot join after all.
+		expect(records.grants).toEqual([
+			expect.objectContaining({
+				channelId: LAB,
+				state: "revoked",
+				revokedReason: "listener_not_added",
+			}),
+		]);
 		expect(records.rejections).toEqual([
 			expect.objectContaining({ reason: "listener_not_added", actorUserId: OWNER }),
 		]);
 		expect(world.at(LAB).members.has(DEVELOPER_BOT)).toBe(false);
+	});
+
+	it("heals a transient failure right after granting: the listener joins on the next poll", async () => {
+		const { world, records, sync } = harness();
+		world.add(LAB, OWNER, DEVELOPER_BOT);
+		// The listener's own membership check fails once, right after the grant is recorded: the
+		// join this pass meant to do never happens.
+		world.failListenerCheckOnce = true;
+		await sync();
+		expect(records.grants).toEqual([expect.objectContaining({ channelId: LAB, state: "active" })]);
+		expect(world.at(LAB).members.has(LISTENER)).toBe(false);
+		// Every pass checks every active grant, not only the one that recorded it: the next poll
+		// brings the listener in.
+		await sync();
+		expect(world.at(LAB).members.has(LISTENER)).toBe(true);
+	});
+
+	it("heals a grant the listener never joined before a restart: joins on the first pass", async () => {
+		const { world, records, sync } = harness();
+		world.add(LAB, OWNER, DEVELOPER_BOT);
+		const grantedAt = world.now;
+		// As if the controller restarted between recording the grant and bringing the listener in:
+		// a fresh run (the harness' own `memory`) finds the grant already active, but Mattermost
+		// still without the listener in the channel.
+		records.grants = [
+			{
+				agentId: "developer",
+				channelId: LAB,
+				state: "active",
+				botUserId: DEVELOPER_BOT,
+				sinceMs: grantedAt,
+				revokedReason: null,
+				checkedAtMs: grantedAt,
+			},
+		];
+		expect(world.at(LAB).members.has(LISTENER)).toBe(false);
+		await sync();
+		expect(world.at(LAB).members.has(LISTENER)).toBe(true);
+		expect(records.grants).toEqual([expect.objectContaining({ channelId: LAB, state: "active" })]);
 	});
 
 	it("judges a re-add between two polls by the newer add", async () => {
@@ -453,6 +508,28 @@ describe("the membership synchronizer", () => {
 		]);
 		expect(world.at(LAB).members.has(DEVELOPER_BOT)).toBe(false);
 		expect(world.at(LAB).members.has(LISTENER)).toBe(false);
+	});
+
+	it("judges a non-owner re-add before self-heal runs, even when its own check would fail", async () => {
+		const { world, records, sync } = harness();
+		world.add(LAB, OWNER, DEVELOPER_BOT);
+		await sync();
+		// Removed and added again by someone who may not grant, before the next poll.
+		world.at(LAB).members.delete(DEVELOPER_BOT);
+		world.add(LAB, MEMBER, DEVELOPER_BOT);
+		// Armed right before the revalidating pass: if self-heal ran before the re-add is judged
+		// (Codex's review of ebfdd5a), this failure would be spent for nothing, and could leave an
+		// unauthorized grant active instead of revoked.
+		world.failListenerCheckOnce = true;
+		await sync();
+		expect(records.grants).toEqual([expect.objectContaining({ channelId: LAB, state: "revoked" })]);
+		expect(records.rejections).toEqual([
+			expect.objectContaining({ actorUserId: MEMBER, reason: "not_owner_or_admin" }),
+		]);
+		expect(world.at(LAB).members.has(DEVELOPER_BOT)).toBe(false);
+		// Never reached: self-heal only runs once a grant has held up to revalidation, and this one
+		// did not, so the one-time failure is still armed.
+		expect(world.failListenerCheckOnce).toBe(true);
 	});
 
 	it("finds a re-add behind many newer posts in a busy channel", async () => {

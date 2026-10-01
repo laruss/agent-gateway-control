@@ -6,6 +6,35 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ### Added
 
+- The owner's console gains server-side sessions (ADR-025): a database-backed session cookie
+  (`__Host-gw_session`; 30-minute idle timeout, 12-hour absolute lifetime, at most 20 active
+  sessions at once), a rotating CSRF token required on every mutation, and a new
+  `CONSOLE_ORIGIN` setting every login and mutation must match exactly. A sign-in page replaces
+  the browser's HTTP Basic dialog; `gateway console password set` now also
+  revokes every active session when it can reach the database.
+- The owner's console is now a React single-page app (`apps/console`: React 19, Vite, Tailwind
+  CSS v4, shadcn/ui, TanStack Query, React Router; ADR-025's frontend section), replacing the
+  server-rendered dashboard and its stand-in sign-in form. It covers everything the old page
+  showed (agent states, tasks, recent runs, queues, alerts, budgets, context measurements,
+  stale/unavailable states) and adds navigation for the Agents, Skills and Instruments & utils
+  hubs, each shown as not available yet. Served
+  under a strict CSP with no `unsafe-inline`/`unsafe-eval` anywhere (`script-src 'self'; style-src
+  'self'`); built in its own Docker stage with only the static output copied into the release
+  image. `bun run console:build` builds it, `bun run console:dev` runs it against a local
+  controller.
+
+### Fixed
+
+- Channel grants (ADR-022): a grant is recorded before the listener joins the channel, so
+  `gateway mattermost reconcile` never reports the listener as an unauthorized member of a
+  channel whose grant was already decided; the listener's membership of every granted channel is
+  re-checked on each pass, after the grant is re-validated, so a transient failure or a restart
+  between granting and joining heals itself.
+
+## [0.4.0] - 2026-10-01
+
+### Added
+
 - Managed configuration (ADR-024): PostgreSQL is now the authoritative configuration store.
   Every applied configuration is kept as an immutable, content-addressed snapshot (organization,
   agents, constitution and resolved role prompts), and every change is a row in an append-only
@@ -28,22 +57,6 @@ All notable changes are documented here. The project follows Semantic Versioning
 - `gateway backup check --restore-test` verifies configuration history on a restore: the active
   revision exists and every snapshot still hashes to its own key. Backups taken before this
   release still verify.
-- The owner's console gains server-side sessions (ADR-025): a database-backed session cookie
-  (`__Host-gw_session`; 30-minute idle timeout, 12-hour absolute lifetime, at most 20 active
-  sessions at once), a rotating CSRF token required on every mutation, and a new
-  `CONSOLE_ORIGIN` setting every login and mutation must match exactly. A plain sign-in form
-  replaces the browser's HTTP Basic dialog at `/`; `gateway console password set` now also
-  revokes every active session when it can reach the database.
-- The owner's console is now a React single-page app (`apps/console`: React 19, Vite, Tailwind
-  CSS v4, shadcn/ui, TanStack Query, React Router; ADR-025's frontend section), replacing the
-  server-rendered dashboard and its stand-in sign-in form. It covers everything the old page
-  showed (agent states, tasks, recent runs, queues, alerts, budgets, context measurements,
-  stale/unavailable states) and adds navigation for the Agents, Skills and Instruments & utils
-  hubs, each an honest "not available yet" placeholder until later phases fill them in. Served
-  under a strict CSP with no `unsafe-inline`/`unsafe-eval` anywhere (`script-src 'self'; style-src
-  'self'`); built in its own Docker stage with only the static output copied into the release
-  image. `bun run console:build` builds it, `bun run console:dev` runs it against a local
-  controller.
 
 ### Changed
 
