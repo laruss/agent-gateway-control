@@ -13,7 +13,6 @@ import {
 	DialogTitle,
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import { Switch } from "@/components/ui/switch";
 import { ApiError, commitAgentChange, previewAgentChange } from "@/lib/api-client";
 import { deepEqual } from "./rebase-draft.ts";
@@ -254,7 +253,7 @@ export function ReviewChangesDialog({
 				)}
 
 				{preview !== null && (
-					<ScrollArea className="min-h-0 flex-1">
+					<div className="min-h-0 flex-1 overflow-y-auto">
 						<div className="flex flex-col gap-3 pr-4">
 							{preview.noop && (
 								<Alert>
@@ -324,7 +323,7 @@ export function ReviewChangesDialog({
 								</div>
 							)}
 						</div>
-					</ScrollArea>
+					</div>
 				)}
 
 				<DialogFooter>
