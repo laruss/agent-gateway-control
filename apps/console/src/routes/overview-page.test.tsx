@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import type { ConsoleSnapshot } from "@agent-gateway/contracts";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SessionProvider } from "@/lib/session-context";
 import { buildConsoleStatusFixture } from "./overview/fixtures.ts";
@@ -114,5 +114,47 @@ describe("OverviewPage", () => {
 		expect(await screen.findByText(/unavailable/i)).toBeInTheDocument();
 		expect(screen.getByText(/no collection has ever succeeded/)).toBeInTheDocument();
 		expect(screen.queryByText(/Director/)).not.toBeInTheDocument();
+	});
+
+	it("keeps the retained snapshot and shows a banner when a later poll fails (never hides the last-known data)", async () => {
+		const queryClient = new QueryClient();
+		let calls = 0;
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: string, init?: RequestInit) => {
+				const method = init?.method ?? "GET";
+				if (method === "GET" && input.endsWith("/api/session")) {
+					return jsonResponse({
+						authenticated: true,
+						csrfToken: "t",
+						expiresAt: "2031-01-01T00:00:00.000Z",
+					});
+				}
+				calls += 1;
+				if (calls === 1) {
+					return jsonResponse({
+						state: "ok",
+						asOf: "2031-06-01T12:00:00.000Z",
+						status: buildConsoleStatusFixture(),
+					});
+				}
+				return new Response("internal error", { status: 500 });
+			}),
+		);
+		render(
+			<QueryClientProvider client={queryClient}>
+				<SessionProvider>
+					<OverviewPage />
+				</SessionProvider>
+			</QueryClientProvider>,
+		);
+
+		expect(await screen.findByText(/Director/)).toBeInTheDocument();
+
+		await queryClient.refetchQueries({ queryKey: ["console-status"] });
+
+		await waitFor(() => expect(screen.getByText(/the last refresh failed/i)).toBeInTheDocument());
+		// The retained snapshot's own data is still shown, not hidden behind the failure banner.
+		expect(screen.getByText(/Director/)).toBeInTheDocument();
 	});
 });

@@ -64,21 +64,35 @@ one, a plain login form — is already behind the session and CSRF model the res
   so this is hygiene, not the organization's configurable content retention. A login does not
   separately try to clean up on its own critical path.
 
-### CSRF: a rotating, server-verified double-submit token
+### CSRF: a token derived from the session, never stored
 
-- **A per-session random token, distinct from the session token**, is returned to the client in
-  the login and session-check JSON response bodies and required, raw, in an `X-CSRF-Token`
-  header on every mutation; only its hash is ever stored (`csrf_token_hash`), compared in
-  constant time against the hash of whatever header arrives.
-- **`GET /api/session` rotates it.** Storing only a hash means the server cannot simply hand the
-  original token back on a later request — there is nothing to hand back. Instead, every call to
-  `GET /api/session` while authenticated mints a fresh token, stores its hash, and returns the
-  new raw value. This is how a reloaded page (its in-memory copy of the token gone) recovers a
-  token that still works, without the stored value ever being anything but a hash. The
-  consequence is explicit: an older browser tab holding a token from before the most recent `GET
-  /api/session` call (in another tab, or its own earlier load) finds its next mutation rejected
-  and must re-fetch the session check first. For a single owner operating one console at a time,
-  this is the right side to err on.
+- **The CSRF token is not a value the server stores at all.** It is derived, on every request
+  that needs it, from the session's own raw token: `csrf = base64url(HMAC-SHA256(key,
+  "console-csrf:" + rawSessionToken))`, where `key` is the controller's routing-key secret
+  (`GATEWAY_ROUTING_KEY`, the same HMAC key `routing-props.ts` uses to sign a post's routing
+  metadata) and `rawSessionToken` is the cookie value the request already carries. `deriveCsrfToken`
+  (`apps/controller/src/console-auth.ts`) is the one function that computes it; nothing calls
+  `createHash`/stores a second hash for this the way `token_hash` is stored for the session
+  itself. `"console-csrf:"` is this derivation's own domain-separation label: the routing
+  signature's own HMAC input is a canonical JSON object (`signedRoutingProps`), never a plain
+  `"console-csrf:"`-prefixed string, so the two uses of the same key can never collide. Reusing
+  the routing key avoids a secret file of its own; it is read again for this purpose, independent
+  of whatever `OUTBOX_DELIVERY` mode the controller actually runs with (`main.ts`), since the
+  console's own correctness must not depend on the Mattermost bridge being this process's
+  delivery mode.
+- **Deterministic, not rotating.** The same session token and key always derive the same CSRF
+  value, so `GET /api/session`, login, and every mutation check all compute (or compare against)
+  the identical value for as long as the session itself is valid — there is nothing to rotate,
+  and so nothing for a second tab's own `GET /api/session` to invalidate. Two tabs sharing one
+  session cookie (the only way two tabs share a session at all) always derive the same CSRF
+  token; opening or reloading either one never invalidates the other's copy. The session table's
+  `csrf_token_hash` column still exists (ADR-020's expand-migration guarantee: a release before
+  this derivation rolls back to a schema it still understands) but is nullable and never written
+  (migration `0023_console_csrf_derived`); nothing reads it either.
+- **A forged or cross-session token still fails.** Deriving the expected value from the
+  *request's own* session token (never from a client-supplied one) is what makes a token minted
+  for one session reject on another's cookie, and a random guess reject outright — the same
+  guarantees the rotating, hash-compared design had, from a different mechanism.
 
 ### Exact Origin, not inferred authority
 
@@ -117,11 +131,64 @@ one, a plain login form — is already behind the session and CSRF model the res
   attribute, makes the cookie host-only at the browser's own enforcement, not only by
   convention.
 - **`GET /api/session`** reports `{authenticated, csrfToken?, expiresAt?}` for whatever cookie
-  the request carries, rotating the CSRF token as above; it needs no session of its own to call.
+  the request carries, deriving the CSRF token as above; it needs no session of its own to call.
 - **`DELETE /api/session`** revokes the session and clears the cookie; like every other mutation,
   it requires the exact Origin and a matching CSRF header.
 - **Every other `/api/*` route requires a valid session**; `/api/status` is unchanged in shape,
   now returning `401` instead of challenging for Basic credentials.
+
+### The Agents hub's management API
+
+The console's first mutating surface beyond sessions: every agent's configuration, read from and
+written through the shared `prepareChange`/`commitChange` service (ADR-024), never a direct
+database write of its own. Every route below needs a valid session; a `POST` additionally needs
+the exact Origin and a matching CSRF header, the same as `DELETE /api/session`. Request and
+response bodies are explicit Zod schemas (`packages/contracts/src/console-management.ts`), shared
+with the SPA; an unrecognized field, not just a wrong type, is a `400` (every object is a
+`z.strictObject`). The routing itself (`apps/controller/src/console-management.ts`) is a plain
+method/path/query/body dispatcher with no `Request`/`Response` of its own — `console-server.ts`
+owns authentication, Origin and CSRF, and only calls it once a request has already passed every
+one of those checks.
+
+- **`GET /api/agents`** / **`GET /api/agents/:id`** — a read model built fresh from the active
+  snapshot each time (`consoleListAgents`/`consoleShowAgent`, `packages/core/src/services/
+  console-management.ts`), never a client-supplied database id beyond the id used in the URL
+  itself. The detail response's `mattermost.tokenSecretFile` is shown as metadata — a path is not
+  a credential — but is not a field the patch DTO below accepts; a client cannot set it.
+- **`POST /api/agents/:id/preview`** / **`POST /api/agents/:id/commit`** — body `{baseRevisionId,
+  changes}` (`commit` also carries a client-generated `idempotencyKey` UUID and an optional
+  `reason`). `changes` is an `AgentPatch`: only the fields the editor's tabs actually expose
+  (display name, enabled, role prompt, runtime, wake rules, allowed channels, the three tool
+  lists, `observe_system`) — never the whole `AgentConfig` shape, and never a field this phase's
+  editor has no tab for (the Mattermost identity, memory namespaces, concurrency). `planAgentPatch`
+  translates it into the change operations `prepareChange`/`commitChange` already understand:
+  `update_agent` with the patch merged onto the agent's current definition, `set_role_prompt` when
+  the prompt changed, or — when the patch is `{enabled}` alone — `set_agent_enabled` through the
+  same disable-with-fallback-to-`remove_agent` path `gateway agent disable` uses (a retained
+  agent whose own stored configuration no longer validates cannot be fixed by flipping its
+  `enabled` flag alone). Both routes always build this plan against the agent's *current* live
+  definition, exactly as `prepareChange` itself always previews against the live active revision
+  (never a client's possibly-stale view); a stale `baseRevisionId` is still caught correctly,
+  because `commitChange`'s own conflict check compares the caller's claimed base against the
+  actual current revision regardless of what content the plan computed. `preview` returns `200`
+  with the diff, any validation `problems`, and `impact` — a short list of destructive or
+  authority-reducing consequences (disables the agent, removes a channel, removes a tool grant,
+  removes `observe_system`) the console must show for explicit confirmation before letting a
+  commit proceed, derived from the before/after agent definitions directly rather than the
+  structural diff's `fieldPaths` (which names only that a list changed, never what left it).
+  `commit` returns `200` on success (including a replayed idempotency key), `409` with the
+  current revision id on a stale base, and `422` with `problems` for anything invalid — whether
+  caught by `prepareChange` before committing or only at commit time (a run-in-progress
+  protection, `AdminError`s `commitChange`/`writeConfigRevisionIn` can still raise).
+- **`GET /api/config/revisions`** / **`GET /api/config/revisions/:id/diff`** — the journal's own
+  history (`listConfigRevisions`, unchanged) and a structural diff of one revision against its
+  parent (`consoleRevisionDiff`, reusing `configDiff`) for any recorded revision, not only the
+  currently active one.
+- **Actor and source.** Every commit this surface makes carries `source: "console"` (reserved for
+  exactly this by ADR-024) and `actor: "console:owner"` — a fixed string, since the console has
+  exactly one account and no per-user identity of its own (ADR-023/025). `gateway config history`
+  already prints both fields verbatim, which is what makes a console-made change distinguishable
+  from a CLI apply or a management agent's own commits without any further change to that command.
 - **`GET`/`HEAD` on every non-`/api/*` path serves the React SPA**, built by the frontend step
   below: `/assets/*` is the build's own content-hashed files (`Cache-Control: public,
   max-age=31536000, immutable`), and every other path — `/`, a deep link like `/agents`, anything
@@ -145,9 +212,14 @@ one, a plain login form — is already behind the session and CSRF model the res
   production `bun install --production` stage never installs Vite, React or Tailwind.
 - **Routing: React Router**, not TanStack Router. Four top-level pages (Overview, Agents, Skills,
   Instruments & utils) and a sign-in screen do not need file-based route generation or its own
-  Vite plugin; `createBrowserRouter`'s JSX form is the smaller, more direct fit, and the
-  controller's own SPA fallback (above) is what makes every deep link work regardless of which
-  router renders it.
+  Vite plugin; the plain declarative `<BrowserRouter>`/`<Routes>`/`<Route>` JSX is the smaller,
+  more direct fit over a data router (`createBrowserRouter`), and the controller's own SPA
+  fallback (above) is what makes every deep link work regardless of which router renders it. One
+  consequence of not using a data router: `useBlocker` (blocking in-app navigation away from an
+  unsaved form) needs one and so is not available; the Agents hub's editor (below) guards its own
+  "back to Agents" action with a plain confirm dialog instead, and relies on `beforeunload` for
+  closing the tab or reloading — not a blanket block of every possible navigation away from an
+  unsaved edit.
 - **Data fetching: TanStack Query for the status poll, a small typed fetch wrapper
   (`lib/api-client.ts`) underneath it for everything.** The wrapper owns the transport concerns
   shared by every call — same-origin credentials, the `X-CSRF-Token` header on mutations, parsing
@@ -164,24 +236,32 @@ one, a plain login form — is already behind the session and CSRF model the res
   its existing callers. The console parses every `/api/status` and `/api/session` response
   against these schemas at the fetch boundary; a response that does not match is a parse error,
   never silently trusted shaped JSON.
-- **CSP: `script-src 'self'; style-src 'self'`, no `'unsafe-inline'` or `'unsafe-eval'`
-  anywhere.** Vite's production build emits no inline `<script>` (confirmed by inspecting the
-  built `index.html`) and `build.modulePreload.polyfill: false` removes the one inline snippet
-  Vite would otherwise add. shadcn/ui's components are built on Radix primitives, which do set
-  `element.style` directly in JavaScript (visibility, positioning) — but that is CSSOM
-  manipulation, which `style-src` governs only for a `style="..."` HTML attribute or a `<style>`
-  element, never for script setting `element.style.foo` — so it needed no loosening at all,
-  confirmed by loading the signed-in dashboard in a real browser with zero CSP violations
-  reported. `img-src 'self' data:` and `font-src 'self'` are the only other additions beyond
-  ADR-023's original policy, for the small inlined icons a component library tends to carry and
-  for the SPA's own fonts, should it ever ship any (today it ships none; the system font stack is
-  used throughout). One thing did need an explicit change, not a CSP exception: Zod builds each
-  object schema's fast parser at construction time by probing whether `new Function(...)` works,
-  catching the resulting error itself when it doesn't — but the browser still reports that caught
-  throw as a `script-src` violation before the catch runs. `z.config({ jitless: true })`
-  (`apps/console/src/lib/zod-config.ts`, imported first, before anything that constructs a
-  schema) skips the probe entirely; this is Zod's own documented fix for exactly this CSP
-  interaction, not a workaround of ours.
+- **CSP: `script-src 'self'; style-src 'self'; style-src-elem 'self' 'unsafe-inline'`, no
+  `'unsafe-inline'` on script and no `'unsafe-eval'` anywhere.** Vite's production build emits no
+  inline `<script>` (confirmed by inspecting the built `index.html`) and
+  `build.modulePreload.polyfill: false` removes the one inline snippet Vite would otherwise add.
+  shadcn/ui's components are built on Radix primitives, which do set `element.style` directly in
+  JavaScript (visibility, positioning) — that is CSSOM manipulation, which no `style-src*`
+  directive governs (only a `style="..."` HTML attribute or a `<style>` element would be), so it
+  needed no loosening. A `<style>` element is a real exception, though: Radix's scroll lock (every
+  popover-based component with a modal overlay — `Dialog`, `AlertDialog`, `Select` — the Agents
+  hub's editor and its "review changes" dialog all use at least one) inserts one, with static,
+  never attacker-influenced content, while open. `style-src-elem 'unsafe-inline'` allows exactly
+  that element and nothing else: a `style="..."` attribute is still refused (no
+  `style-src-attr 'unsafe-inline'`, and `style-src-attr` falls back to the unchanged `style-src`),
+  and no cross-origin stylesheet is allowed either. Confirmed by loading the signed-in dashboard
+  and the Agents hub's editor (open the dialog, apply a change) in a real browser, zero CSP
+  violations reported, before and after this directive was added (its absence was caught by that
+  exact reproduction, not assumed safe). `img-src 'self' data:` and `font-src 'self'` are the only
+  other additions beyond ADR-023's original policy, for the small inlined icons a component
+  library tends to carry and for the SPA's own fonts, should it ever ship any (today it ships
+  none; the system font stack is used throughout). One thing did need an explicit change, not a
+  CSP exception: Zod builds each object schema's fast parser at construction time by probing
+  whether `new Function(...)` works, catching the resulting error itself when it doesn't — but the
+  browser still reports that caught throw as a `script-src` violation before the catch runs.
+  `z.config({ jitless: true })` (`apps/console/src/lib/zod-config.ts`, imported first, before
+  anything that constructs a schema) skips the probe entirely; this is Zod's own documented fix
+  for exactly this CSP interaction, not a workaround of ours.
 - **`.claude/rules/basic-rules.md`'s shadcn exception, written for ADR-023's plain HTML page, is
   removed.** The SPA this section describes has fully replaced the server-rendered dashboard and
   its stand-in login form; every page in this repository now follows the shadcn-first rule the
@@ -194,11 +274,13 @@ one, a plain login form — is already behind the session and CSRF model the res
   self-contained signed token cannot be individually invalidated without also keeping that same
   list, at which point the signature buys nothing a random token's hashed lookup does not already
   give.
-- **Storing the CSRF token itself, not just its hash.** Rejected even though the token is handed
-  to the client anyway and so is not secret from it: storing every credential-shaped value
-  hashed, without exception, is a simpler invariant to keep than "hash this one, but not that
-  one, because of how it is used." Rotating it on every `GET /api/session` instead keeps that
-  invariant and still lets the client recover a working token after a reload.
+- **Storing the CSRF token (or its hash) at all, rotated on every `GET /api/session`.** This was
+  the original decision here; superseded once a second tab's own `GET /api/session` turned out to
+  invalidate the first tab's still-in-use token (a real, reported problem, not a hypothetical
+  one), since rotation and multi-tab correctness are in direct tension: storing a value that can
+  be rotated at all means some request, somewhere, is holding a copy that is about to go stale.
+  Deriving the token from the session instead (above) needs nothing stored and so has nothing to
+  rotate; a second tab's check computes the identical value instead of minting a new one.
 - **A separate server-side `/login` route.** Rejected: the controller serves the same
   `index.html` for every non-`/api/*` path regardless of authentication state (above); the SPA's
   own router, not the server, decides whether that renders the sign-in screen or the dashboard,
@@ -222,11 +304,14 @@ one, a plain login form — is already behind the session and CSRF model the res
   the table exists and does not need it; rolling back to it means HTTP Basic against the same
   password hash file resumes working exactly as ADR-023 left it, and the session rows left
   behind are simply inert until a later upgrade re-reads them under their own expiry rules.
-- A reloaded browser tab's in-memory CSRF token can go stale if another tab (or an earlier load
-  of the same one) has since called `GET /api/session`; the fix is the same call, which the SPA
-  already makes once on every load (`SessionProvider`) and whenever a 401 sends it back to the
-  sign-in screen. It does not yet retry a single failed mutation automatically after refreshing
-  the token — a stale-tab 403 surfaces as a clear, typed error (`ApiError.kind === "forbidden"`)
-  rather than being silently retried; this is a candidate for a later pass, not a correctness
-  gap, since the 12-hour/30-minute session itself is what makes a tab's token stale in the first
-  place, and whatever triggered that has already made the mutation it was attempting stale too.
+- A CSRF token derived from a revoked or expired session's own token is simply never checked
+  against anything live: `authenticate` (session validation) runs first and already returns
+  unauthenticated before any CSRF comparison happens, so there is no separate staleness window
+  for the CSRF value the way the earlier rotating design had. A tab's copy can only go wrong by
+  no longer having a valid session at all, which a `401` already reports as such.
+- The Agents hub's management API (`console-management.ts`, both the controller's routing module
+  and core's read models/change-set translation) reuses `prepareChange`/`commitChange` entirely:
+  it adds no new way to write configuration, only a bounded, typed patch DTO translated into the
+  same change operations `gateway agent enable|disable` and `config import` already produce. A
+  commit's `source: "console"` is a value ADR-024 already reserved for this; no migration or
+  `CHECK` constraint changed to add it.

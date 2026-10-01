@@ -1,4 +1,20 @@
-import { type ConsoleSnapshot, ConsoleSnapshotSchema } from "@agent-gateway/contracts";
+import {
+	type ConsoleAgentDetailResponse,
+	ConsoleAgentDetailResponseSchema,
+	type ConsoleAgentListResponse,
+	ConsoleAgentListResponseSchema,
+	type ConsoleCommitRequest,
+	ConsoleCommitResponseSchema,
+	type ConsolePreviewRequest,
+	type ConsolePreviewResponse,
+	ConsolePreviewResponseSchema,
+	type ConsoleRevisionDiffResponse,
+	ConsoleRevisionDiffResponseSchema,
+	type ConsoleRevisionListResponse,
+	ConsoleRevisionListResponseSchema,
+	type ConsoleSnapshot,
+	ConsoleSnapshotSchema,
+} from "@agent-gateway/contracts";
 import { z } from "zod";
 
 // ---------------------------------------------------------------------------
@@ -160,4 +176,112 @@ export async function fetchConsoleStatus(): Promise<ConsoleSnapshot> {
 		throw new ApiError(response.status, await bodyText(response));
 	}
 	return ConsoleSnapshotSchema.parse(await response.json());
+}
+
+// ---------------------------------------------------------------------------
+// The Agents hub (ADR-025): every route here needs a signed-in session (a 401 is a real error,
+// same as `fetchConsoleStatus`), and every mutation carries the CSRF header automatically
+// (`request`, above). `preview` never fails with a "the change is invalid" outcome of its own —
+// `ConsolePreviewResponse.problems` carries that instead, for the caller to show inline — so only
+// a transport-level failure (401, a shape error the server itself could not have sent for a
+// well-formed request, 5xx) throws `ApiError` here.
+// ---------------------------------------------------------------------------
+
+export async function fetchAgentsList(): Promise<ConsoleAgentListResponse> {
+	const response = await request("/api/agents");
+	if (!response.ok) {
+		throw new ApiError(response.status, await bodyText(response));
+	}
+	return ConsoleAgentListResponseSchema.parse(await response.json());
+}
+
+export async function fetchAgentDetail(agentId: string): Promise<ConsoleAgentDetailResponse> {
+	const response = await request(`/api/agents/${encodeURIComponent(agentId)}`);
+	if (!response.ok) {
+		throw new ApiError(response.status, await bodyText(response));
+	}
+	return ConsoleAgentDetailResponseSchema.parse(await response.json());
+}
+
+export async function previewAgentChange(
+	agentId: string,
+	body: ConsolePreviewRequest,
+): Promise<ConsolePreviewResponse> {
+	const response = await request(`/api/agents/${encodeURIComponent(agentId)}/preview`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+	});
+	if (!response.ok) {
+		throw new ApiError(response.status, await bodyText(response));
+	}
+	return ConsolePreviewResponseSchema.parse(await response.json());
+}
+
+/** `POST /api/agents/:id/commit`'s own documented outcomes (ADR-025): `conflict` (409, a stale
+ * base revision) and `invalid` (422, a business-rule problem only visible at commit time) are
+ * cases the editor's save flow reacts to directly, never generic `ApiError`s — only an
+ * unexpected status (401, a malformed request the preview step should already have caught, 5xx)
+ * throws. */
+export type CommitAgentOutcome =
+	| Readonly<{
+			kind: "ok";
+			revisionId: number;
+			hash: string;
+			noop: boolean;
+			replayed: boolean;
+			activeRevisionId: number | null;
+	  }>
+	| Readonly<{ kind: "conflict"; currentRevisionId: number | null }>
+	| Readonly<{ kind: "invalid"; problems: Readonly<string[]> }>;
+
+const ConflictBodySchema = z.strictObject({
+	error: z.string(),
+	currentRevisionId: z.int().positive().nullable(),
+});
+const InvalidBodySchema = z.strictObject({
+	error: z.string(),
+	problems: z.array(z.string()),
+});
+
+export async function commitAgentChange(
+	agentId: string,
+	body: ConsoleCommitRequest,
+): Promise<CommitAgentOutcome> {
+	const response = await request(`/api/agents/${encodeURIComponent(agentId)}/commit`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+	});
+	if (response.status === 409) {
+		const parsed = ConflictBodySchema.parse(await response.json());
+		return { kind: "conflict", currentRevisionId: parsed.currentRevisionId };
+	}
+	if (response.status === 422) {
+		const parsed = InvalidBodySchema.parse(await response.json());
+		return { kind: "invalid", problems: parsed.problems };
+	}
+	if (!response.ok) {
+		throw new ApiError(response.status, await bodyText(response));
+	}
+	const data = ConsoleCommitResponseSchema.parse(await response.json());
+	return { kind: "ok", ...data };
+}
+
+export async function fetchConfigRevisions(limit: number): Promise<ConsoleRevisionListResponse> {
+	const response = await request(`/api/config/revisions?limit=${limit}`);
+	if (!response.ok) {
+		throw new ApiError(response.status, await bodyText(response));
+	}
+	return ConsoleRevisionListResponseSchema.parse(await response.json());
+}
+
+export async function fetchConfigRevisionDiff(
+	revisionId: number,
+): Promise<ConsoleRevisionDiffResponse> {
+	const response = await request(`/api/config/revisions/${revisionId}/diff`);
+	if (!response.ok) {
+		throw new ApiError(response.status, await bodyText(response));
+	}
+	return ConsoleRevisionDiffResponseSchema.parse(await response.json());
 }

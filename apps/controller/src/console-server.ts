@@ -1,9 +1,9 @@
 import { CONSOLE_PASSWORD_HASH_SECRET_FILE } from "@agent-gateway/contracts";
 import {
 	CONSOLE_SESSION_MAX_ACTIVE,
+	type ControlPlaneDeps,
 	createConsoleSession,
 	revokeConsoleSession,
-	rotateConsoleSessionCsrf,
 	touchConsoleSession,
 } from "@agent-gateway/core";
 import { errorFields, type Logger } from "@agent-gateway/logging";
@@ -15,11 +15,11 @@ import {
 	secretFileState,
 	verifyConsolePassword,
 } from "@agent-gateway/service";
-import type pg from "pg";
 import {
 	CSRF_HEADER_NAME,
 	clearedSessionCookieHeader,
 	csrfTokenMatches,
+	deriveCsrfToken,
 	hashSessionToken,
 	originAllowed,
 	parseCookieHeader,
@@ -27,6 +27,18 @@ import {
 	SESSION_COOKIE_NAME,
 	sessionCookieHeader,
 } from "./console-auth.ts";
+import {
+	badRequest,
+	forbidden,
+	jsonResponse,
+	payloadTooLarge,
+	readBoundedText,
+	respond,
+	SECURITY_HEADERS,
+	textResponse,
+	unauthenticated,
+} from "./console-http.ts";
+import { MAX_MANAGEMENT_BODY_BYTES, routeConsoleManagement } from "./console-management.ts";
 import {
 	DEFAULT_CONSOLE_STATIC_DIR,
 	resolveConsoleStaticRoot,
@@ -67,64 +79,11 @@ const MAX_LOGIN_BODY_BYTES = 4096;
  * that function, reading further than it should. */
 const MAX_REQUEST_BODY_BYTES = 1024 * 1024;
 
-const SECURITY_HEADERS: Readonly<Record<string, string>> = {
-	"cache-control": "no-store",
-	// The React SPA (ADR-025's frontend section): no inline script or style, no eval, nothing
-	// cross-origin. `style-src 'self'` covers the SPA's own built stylesheet; Radix's inline
-	// `element.style.setProperty(...)` calls are CSSOM manipulation, which `style-src` does not
-	// govern (only a `style="..."` attribute or a `<style>` element would be), so they are
-	// unaffected by not having `'unsafe-inline'` here. `img-src` adds `data:` for the few small
-	// inlined icons a component library like this tends to carry; everything else is `'self'` or
-	// `'none'`.
-	"content-security-policy":
-		"default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
-	"x-content-type-options": "nosniff",
-	// `same-origin`, not `no-referrer`: per the Fetch spec, a non-GET/HEAD, non-CORS-mode request
-	// (a plain HTML form POST, in particular) sends `Origin: null` whenever the referrer policy in
-	// effect is `no-referrer`, or is `same-origin` and the request is cross-origin. The console's
-	// own login form posts to its own origin, so `same-origin` keeps that real Origin header on
-	// the wire (`originAllowed` below needs it) while still sending no referrer at all, and no
-	// Origin, to anything cross-site.
-	"referrer-policy": "same-origin",
-	"x-frame-options": "DENY",
-};
-
-function respond(
-	body: string,
-	status: number,
-	contentType: string,
-	headers: Readonly<Record<string, string>> = {},
-): Response {
-	return new Response(body, {
-		status,
-		headers: { ...SECURITY_HEADERS, "content-type": contentType, ...headers },
-	});
-}
-
-const textResponse = (
-	body: string,
-	status: number,
-	headers: Readonly<Record<string, string>> = {},
-) => respond(body, status, "text/plain; charset=utf-8", headers);
-const jsonResponse = (
-	value: unknown,
-	status: number,
-	headers: Readonly<Record<string, string>> = {},
-) => respond(JSON.stringify(value), status, "application/json; charset=utf-8", headers);
-
-const unauthenticated = () => textResponse("unauthorized", 401);
-const forbidden = (message: string) => textResponse(message, 403);
-const badRequest = (message: string) => textResponse(message, 400);
-
 function tooManyRequests(waitMs: number): Response {
 	const seconds = Math.max(1, Math.ceil(waitMs / 1000));
 	return textResponse("too many attempts", 429, {
 		"retry-after": String(seconds),
 	});
-}
-
-function payloadTooLarge(): Response {
-	return textResponse("payload too large", 413);
 }
 
 function serviceBusy(): Response {
@@ -147,46 +106,6 @@ export function resolveConsolePasswordHash(secretsDir?: string): string {
 		);
 	}
 	return readSecretFile(path);
-}
-
-type BoundedBody = Readonly<{ ok: true; text: string }> | Readonly<{ ok: false }>;
-
-/**
- * Reads a request body as UTF-8 text, refusing it (`{ ok: false }`) before or after reading when
- * it exceeds `maxBytes`: by its declared `Content-Length` if present, before a byte is read, and
- * otherwise by the bytes actually read off `request.body` as they arrive. A chunked request
- * carries no `Content-Length` at all, so that case is read incrementally and its reader
- * cancelled the moment the running total exceeds `maxBytes` — never buffered in full first, the
- * way `request.text()` would.
- */
-async function readBoundedText(request: Request, maxBytes: number): Promise<BoundedBody> {
-	const declared = request.headers.get("content-length");
-	if (declared !== null) {
-		const length = Number(declared);
-		if (!Number.isFinite(length) || length > maxBytes) {
-			return { ok: false };
-		}
-	}
-	const body = request.body;
-	if (body === null) {
-		return { ok: true, text: "" };
-	}
-	const reader = body.getReader();
-	const chunks: Uint8Array[] = [];
-	let total = 0;
-	for (;;) {
-		const { done, value } = await reader.read();
-		if (done) {
-			break;
-		}
-		total += value.byteLength;
-		if (total > maxBytes) {
-			await reader.cancel("body too large");
-			return { ok: false };
-		}
-		chunks.push(value);
-	}
-	return { ok: true, text: Buffer.concat(chunks, total).toString("utf8") };
 }
 
 /** `{"password": "..."}`; anything else (malformed JSON, a missing or non-string field) is not a
@@ -255,8 +174,15 @@ export type ConsoleServerOptions = Readonly<{
 	/** The exact `Origin` every login and mutation must carry (ADR-025), e.g.
 	 * `https://gateway.local` — `assertConsoleOrigin` in the caller validates its shape. */
 	origin: string;
-	/** Where `console_sessions` rows live; this listener is the only writer and reader of them. */
-	pool: pg.Pool;
+	/** The control plane this listener reads and writes: `deps.pool` is where `console_sessions`
+	 * rows live (this listener is their only writer and reader); the Agents hub's management API
+	 * (`console-management.ts`) uses the rest of `deps` to preview and commit configuration
+	 * changes through the same `prepareChange`/`commitChange` service the CLI uses. */
+	deps: ControlPlaneDeps;
+	/** The controller-held key the console's CSRF token is derived from (ADR-025): the routing
+	 * key (`GATEWAY_ROUTING_KEY`), reused under its own HMAC label (`deriveCsrfToken`) rather than
+	 * a secret file of its own. */
+	csrfKey: string;
 	cache: ConsoleStatusCache;
 	log: Logger;
 	/** The built console SPA's own directory (`vite build`'s `dist`); defaults to the path the
@@ -284,7 +210,9 @@ type LoginOutcome =
 
 type AuthenticatedSession = Readonly<{
 	id: string;
-	csrfTokenHash: string;
+	/** Derived from the request's own raw session cookie (`deriveCsrfToken`), never stored — see
+	 * ADR-025. Identical across every tab holding the same session cookie. */
+	csrfToken: string;
 	expiresAt: Date;
 }>;
 
@@ -328,18 +256,21 @@ export function startConsoleServer(options: ConsoleServerOptions): RunningConsol
 		// A fresh token is always minted here; nothing about the request (including any cookie it
 		// already carries) is ever consulted, which is what rules out session fixation.
 		const token = randomSessionToken();
-		const csrfToken = randomSessionToken();
 		const created = await createConsoleSession(
-			options.pool,
+			options.deps.pool,
 			{
 				tokenHash: hashSessionToken(token),
-				csrfTokenHash: hashSessionToken(csrfToken),
 				passwordHashFingerprint: fingerprint,
 			},
 			clock(),
 			maxActiveSessions,
 		);
-		return { kind: "ok", token, csrfToken, expiresAt: created.expiresAt };
+		return {
+			kind: "ok",
+			token,
+			csrfToken: deriveCsrfToken(options.csrfKey, token),
+			expiresAt: created.expiresAt,
+		};
 	}
 
 	async function authenticate(request: Request): Promise<AuthenticatedSession | null> {
@@ -347,7 +278,20 @@ export function startConsoleServer(options: ConsoleServerOptions): RunningConsol
 		if (token === null) {
 			return null;
 		}
-		return touchConsoleSession(options.pool, hashSessionToken(token), clock(), fingerprint);
+		const session = await touchConsoleSession(
+			options.deps.pool,
+			hashSessionToken(token),
+			clock(),
+			fingerprint,
+		);
+		if (session === null) {
+			return null;
+		}
+		return {
+			id: session.id,
+			expiresAt: session.expiresAt,
+			csrfToken: deriveCsrfToken(options.csrfKey, token),
+		};
 	}
 
 	function sessionMaxAgeSeconds(expiresAt: Date): number {
@@ -421,15 +365,14 @@ export function startConsoleServer(options: ConsoleServerOptions): RunningConsol
 			if (session === null) {
 				return jsonResponse({ authenticated: false }, 200);
 			}
-			// Rotated on every check, never returned twice: the stored value is always only a hash,
-			// so this is how the SPA recovers a usable CSRF token after a reload instead of the
-			// server ever handing back the one it minted at login.
-			const csrfToken = randomSessionToken();
-			await rotateConsoleSessionCsrf(options.pool, session.id, hashSessionToken(csrfToken));
+			// Derived fresh from the session cookie every time (`deriveCsrfToken`), never stored and
+			// never rotated: every tab holding this same cookie — this one, another one, or this same
+			// tab after a reload — derives the identical value, so a second tab's own `GET
+			// /api/session` never invalidates the first's copy (ADR-025).
 			return jsonResponse(
 				{
 					authenticated: true,
-					csrfToken,
+					csrfToken: session.csrfToken,
 					expiresAt: session.expiresAt.toISOString(),
 				},
 				200,
@@ -479,10 +422,10 @@ export function startConsoleServer(options: ConsoleServerOptions): RunningConsol
 			if (!originAllowed(request, options.origin)) {
 				return forbidden("origin not allowed");
 			}
-			if (!csrfTokenMatches(request.headers.get(CSRF_HEADER_NAME), session.csrfTokenHash)) {
+			if (!csrfTokenMatches(request.headers.get(CSRF_HEADER_NAME), session.csrfToken)) {
 				return forbidden("missing or invalid CSRF token");
 			}
-			await revokeConsoleSession(options.pool, session.id, "logout", clock());
+			await revokeConsoleSession(options.deps.pool, session.id, "logout", clock());
 			return respond("", 204, "text/plain; charset=utf-8", {
 				"set-cookie": clearedSessionCookieHeader(),
 			});
@@ -492,6 +435,52 @@ export function startConsoleServer(options: ConsoleServerOptions): RunningConsol
 		});
 	}
 
+	/**
+	 * The Agents hub's management API (`console-management.ts`): every route needs a valid
+	 * session, and — `GET`/`HEAD` read the active configuration, nothing more — a mutation
+	 * (`POST`) additionally needs the exact configured Origin and a matching CSRF header, exactly
+	 * like `DELETE /api/session` above. `console-management.ts` itself never sees a `Request`: it
+	 * is hand a parsed method/path/query/body and returns a status plus a JSON-serializable body.
+	 */
+	async function handleManagement(request: Request, pathname: string): Promise<Response> {
+		const session = await authenticate(request);
+		if (session === null) {
+			return unauthenticated();
+		}
+		const method = request.method;
+		if (method !== "GET" && method !== "POST") {
+			return textResponse("method not allowed", 405, { allow: "GET, POST" });
+		}
+		if (method === "POST") {
+			if (!originAllowed(request, options.origin)) {
+				return forbidden("origin not allowed");
+			}
+			if (!csrfTokenMatches(request.headers.get(CSRF_HEADER_NAME), session.csrfToken)) {
+				return forbidden("missing or invalid CSRF token");
+			}
+		}
+		let bodyText = "";
+		if (method === "POST") {
+			if (!(request.headers.get("content-type") ?? "").startsWith("application/json")) {
+				return badRequest("expected application/json");
+			}
+			const bounded = await readBoundedText(request, MAX_MANAGEMENT_BODY_BYTES);
+			if (!bounded.ok) {
+				return payloadTooLarge();
+			}
+			bodyText = bounded.text;
+		}
+		const url = new URL(request.url);
+		const result = await routeConsoleManagement({
+			method,
+			pathname,
+			search: url.searchParams,
+			bodyText,
+			deps: options.deps,
+		});
+		return jsonResponse(result.body, result.status);
+	}
+
 	async function handle(request: Request): Promise<Response> {
 		const { pathname } = new URL(request.url);
 		if (pathname === "/api/status") {
@@ -499,6 +488,9 @@ export function startConsoleServer(options: ConsoleServerOptions): RunningConsol
 		}
 		if (pathname === "/api/session") {
 			return handleSession(request);
+		}
+		if (pathname.startsWith("/api/agents") || pathname.startsWith("/api/config/")) {
+			return handleManagement(request, pathname);
 		}
 		if (pathname.startsWith("/api/")) {
 			return textResponse("not found", 404);

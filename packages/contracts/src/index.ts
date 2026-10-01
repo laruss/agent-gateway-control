@@ -3,6 +3,7 @@ export * from "./approval.ts";
 export * from "./channel-grants.ts";
 export * from "./common.ts";
 export * from "./config-bundle.ts";
+export * from "./console-management.ts";
 export * from "./console-status.ts";
 export * from "./event.ts";
 export * from "./ingest.ts";

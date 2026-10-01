@@ -1,4 +1,4 @@
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
 // ---------------------------------------------------------------------------
 // HTTP-level session, CSRF and Origin helpers for the owner's console (ADR-025). Pure functions
@@ -34,13 +34,30 @@ function timingSafeStringEqual(a: string, b: string): boolean {
 	return bufA.length === bufB.length && timingSafeEqual(bufA, bufB);
 }
 
-/** True when `header` is the raw CSRF token whose hash is `storedHash`. `null`/empty is never a
- * match, even against an (impossible) empty stored hash. */
-export function csrfTokenMatches(header: string | null, storedHash: string): boolean {
+/**
+ * The CSRF token for one session, derived from its own raw session token rather than stored
+ * anywhere: `base64url(HMAC-SHA256(key, "console-csrf:" + rawSessionToken))`. Deterministic for
+ * the same session token and key, so every tab holding the same session cookie derives the same
+ * value — unlike the rotating, server-stored token this replaces, opening or reloading a second
+ * tab never invalidates another tab's copy. `key` is the controller's routing-key secret
+ * (`GATEWAY_ROUTING_KEY`, read again for this derivation domain; see ADR-025): reusing it avoids
+ * a secret file of its own, and the `"console-csrf:"` label keeps this derivation's input shape
+ * (a plain prefixed string) from ever colliding with the routing signature's own input (a
+ * canonical JSON object, `routing-props.ts`), which also never reaches the key under a
+ * `"console-csrf:"`-prefixed input.
+ */
+export function deriveCsrfToken(key: string, rawSessionToken: string): string {
+	return createHmac("sha256", key)
+		.update(`console-csrf:${rawSessionToken}`, "utf8")
+		.digest("base64url");
+}
+
+/** True when `header` is exactly the session's derived CSRF token. `null`/empty never matches. */
+export function csrfTokenMatches(header: string | null, expected: string): boolean {
 	if (header === null || header === "") {
 		return false;
 	}
-	return timingSafeStringEqual(hashSessionToken(header), storedHash);
+	return timingSafeStringEqual(header, expected);
 }
 
 /** Reads one cookie by name from a `Cookie` request header; `null` if absent or there is none. */

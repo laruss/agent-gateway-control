@@ -162,6 +162,13 @@
       "when": 1790874012792,
       "tag": "0022_console_sessions",
       "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1790884119446,
+      "tag": "0023_console_csrf_derived",
+      "breakpoints": true
     }
   ]
 }

@@ -14,7 +14,7 @@ import { startTestGateway, type TestGateway } from "./test-gateway.ts";
 
 const PASSWORD = "integration test console password";
 const CONSOLE_CSP =
-	"default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+	"default-src 'none'; script-src 'self'; style-src 'self'; style-src-elem 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 /** A marker unique to the fixture's `index.html`, so a test can tell the SPA fallback actually
  * served the fixture's own content rather than merely returning 200. */
 const INDEX_MARKER = "console-static-fixture-index";
@@ -113,7 +113,8 @@ describe("the owner's console, wired against a real gateway (ADR-025)", () => {
 			hostname: "127.0.0.1",
 			passwordHash,
 			origin: ORIGIN,
-			pool: gateway.pool,
+			csrfKey: "a-test-only-csrf-derivation-key-at-least-32-chars",
+			deps: gateway.deps(),
 			cache: createConsoleStatusCache((now) => collectConsoleStatus(gateway.pool, now)),
 			log: silentLogger,
 			staticDir,
@@ -182,6 +183,42 @@ describe("the owner's console, wired against a real gateway (ADR-025)", () => {
 		expect(logout.headers.get("set-cookie")).toContain("Max-Age=0");
 
 		expect((await fetch(`${base}/api/status`, { headers: { cookie } })).status).toBe(401);
+	});
+
+	it("two tabs' own GET /api/session calls derive the same CSRF token, and either one's keeps working (ADR-025)", async () => {
+		const { base } = await withServer();
+		const login = await loginJson(base, PASSWORD);
+		const cookie = cookiePair(login.setCookie);
+
+		// Tab A loads, then tab B loads (its own `GET /api/session`, as every page load makes).
+		const tabA = (await (await fetch(`${base}/api/session`, { headers: { cookie } })).json()) as {
+			csrfToken: string;
+		};
+		const tabB = (await (await fetch(`${base}/api/session`, { headers: { cookie } })).json()) as {
+			csrfToken: string;
+		};
+		expect(tabA.csrfToken).toBe(tabB.csrfToken);
+
+		// Tab A's token, read before tab B's own check, still works: unlike a rotating, server-
+		// stored token, a second tab's `GET /api/session` never invalidates another tab's copy.
+		const logout = await fetch(`${base}/api/session`, {
+			method: "DELETE",
+			headers: { cookie, origin: ORIGIN, "x-csrf-token": tabA.csrfToken },
+		});
+		expect(logout.status).toBe(204);
+	});
+
+	it("refuses a forged CSRF token even when it is shaped like a real one", async () => {
+		const { base } = await withServer();
+		const login = await loginJson(base, PASSWORD);
+		const cookie = cookiePair(login.setCookie);
+		const forged = Buffer.from("not the derived token at all, just forged").toString("base64url");
+		const res = await fetch(`${base}/api/session`, {
+			method: "DELETE",
+			headers: { cookie, origin: ORIGIN, "x-csrf-token": forged },
+		});
+		expect(res.status).toBe(403);
+		expect((await fetch(`${base}/api/status`, { headers: { cookie } })).status).toBe(200);
 	});
 
 	it("refuses a wrong password without setting a cookie", async () => {

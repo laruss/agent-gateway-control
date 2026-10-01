@@ -13,7 +13,6 @@ import {
 	createConsoleSession,
 	revokeAllConsoleSessions,
 	revokeConsoleSession,
-	rotateConsoleSessionCsrf,
 	touchConsoleSession,
 } from "./console-sessions.ts";
 
@@ -22,7 +21,6 @@ const FINGERPRINT = "fingerprint-a";
 function newSession(suffix: string) {
 	return {
 		tokenHash: `token-hash-${suffix}`,
-		csrfTokenHash: `csrf-hash-${suffix}`,
 		passwordHashFingerprint: FINGERPRINT,
 	};
 }
@@ -59,7 +57,6 @@ describe("console session store (ADR-025)", () => {
 		expect(created.expiresAt.getTime()).toBe(now.getTime() + CONSOLE_SESSION_ABSOLUTE_MS);
 		const valid = await touchConsoleSession(pool, "token-hash-a", now, FINGERPRINT);
 		expect(valid?.id).toBe(created.id);
-		expect(valid?.csrfTokenHash).toBe("csrf-hash-a");
 		expect(valid?.expiresAt.getTime()).toBe(created.expiresAt.getTime());
 	});
 
@@ -235,15 +232,6 @@ describe("console session store (ADR-025)", () => {
 		expect(revoked).toBe(2);
 		expect(await touchConsoleSession(pool, "token-hash-revoke-all-a", now, FINGERPRINT)).toBeNull();
 		expect(await touchConsoleSession(pool, "token-hash-revoke-all-b", now, FINGERPRINT)).toBeNull();
-	});
-
-	it("rotates the CSRF token hash without changing session identity", async () => {
-		const now = new Date("2031-01-08T00:00:00.000Z");
-		const created = await createConsoleSession(pool, newSession("csrf"), now);
-		await rotateConsoleSessionCsrf(pool, created.id, "rotated-csrf-hash");
-		const valid = await touchConsoleSession(pool, "token-hash-csrf", now, FINGERPRINT);
-		expect(valid?.id).toBe(created.id);
-		expect(valid?.csrfTokenHash).toBe("rotated-csrf-hash");
 	});
 
 	it("deletes expired and revoked rows on cleanup, keeping sessions still active", async () => {

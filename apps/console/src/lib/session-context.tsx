@@ -32,12 +32,18 @@ const SessionContext = React.createContext<SessionContextValue | null>(null);
 
 export function SessionProvider({ children }: { children: React.ReactNode }): React.ReactElement {
 	const [state, setState] = React.useState<SessionState>({ status: "loading" });
+	// A direct `/sign-in` load lets the form submit while this startup check is still pending
+	// (`SignInPage` only redirects away once `state.status === "signed-in"`; it does not block the
+	// form during "loading"). If login wins that race, this flag makes the startup check's own,
+	// now-stale "signed-out" (or an error) a no-op instead of overwriting the fresh "signed-in"
+	// state once it finally resolves.
+	const settledByLogin = React.useRef(false);
 
 	React.useEffect(() => {
 		let cancelled = false;
 		checkSession()
 			.then((check) => {
-				if (cancelled) {
+				if (cancelled || settledByLogin.current) {
 					return;
 				}
 				setState(
@@ -47,7 +53,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }): Re
 				);
 			})
 			.catch(() => {
-				if (!cancelled) {
+				if (!cancelled && !settledByLogin.current) {
 					setState({ status: "signed-out" });
 				}
 			});
@@ -59,17 +65,23 @@ export function SessionProvider({ children }: { children: React.ReactNode }): Re
 	const signIn = React.useCallback(async (password: string): Promise<SignInOutcome> => {
 		const outcome = await apiSignIn(password);
 		if (outcome.kind === "ok") {
+			settledByLogin.current = true;
 			setState({ status: "signed-in", expiresAt: outcome.expiresAt });
 		}
 		return outcome;
 	}, []);
 
+	/**
+	 * Only a successful (2xx) or already-signed-out (401, treated as success by `apiSignOut`)
+	 * logout moves the session to signed-out; any other failure (403, 5xx, a network error)
+	 * leaves the session exactly as it was — the cookie is still valid on the server, so treating
+	 * it as signed out here would be a lie the next authenticated request would just contradict.
+	 * The caller sees the thrown error and is the one that decides how to surface it (a retryable
+	 * toast, in `AppSidebar`).
+	 */
 	const signOut = React.useCallback(async (): Promise<void> => {
-		try {
-			await apiSignOut();
-		} finally {
-			setState({ status: "signed-out" });
-		}
+		await apiSignOut();
+		setState({ status: "signed-out" });
 	}, []);
 
 	const reportUnauthorized = React.useCallback(() => {

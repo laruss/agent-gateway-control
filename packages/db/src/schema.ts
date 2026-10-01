@@ -959,7 +959,10 @@ export const consoleSessions = pgTable(
 	{
 		id: uuid("id").primaryKey().defaultRandom(),
 		tokenHash: text("token_hash").notNull(),
-		csrfTokenHash: text("csrf_token_hash").notNull(),
+		/** Unused since the console's CSRF token became derived, not stored (ADR-025): kept
+		 * nullable, and never written, so a release before that change rolls back to a schema it
+		 * still fully understands. */
+		csrfTokenHash: text("csrf_token_hash"),
 		passwordHashFingerprint: text("password_hash_fingerprint").notNull(),
 		createdAt: createdAt(),
 		lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).notNull().defaultNow(),

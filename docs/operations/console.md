@@ -73,21 +73,28 @@ Routes:
 |---|---|---|---|
 | `/assets/*` | `GET`/`HEAD` | — | The SPA's own built, content-hashed files; `Cache-Control: public, max-age=31536000, immutable`. |
 | any other non-`/api/*` path | `GET`/`HEAD` | — | The SPA's `index.html` (`Cache-Control: no-store`) — `/`, `/agents`, any deep link the SPA's own router recognizes. A missing build logs once and serves a plain `503` here only; `/api/*` is unaffected. |
-| `/api/session` | `GET` | — | `{authenticated, csrfToken?, expiresAt?}` for the current cookie; also mints a fresh CSRF token when authenticated. |
+| `/api/session` | `GET` | — | `{authenticated, csrfToken?, expiresAt?}` for the current cookie; the CSRF token is derived fresh from it when authenticated, never rotated. |
 | `/api/session` | `POST` | exact Origin | JSON `{password}`; returns `{csrfToken, expiresAt}` and sets the cookie. |
 | `/api/session` | `DELETE` | session, exact Origin, CSRF header | Logs out: revokes the session and clears the cookie. |
 | `/api/status` | `GET` | session | The same projection as JSON, for scripting or a quick `curl` once signed in. |
+| `/api/agents`, `/api/agents/:id` | `GET` | session | Every agent, or one agent's full editable configuration — see "Managing agents" below. |
+| `/api/agents/:id/preview`, `/api/agents/:id/commit` | `POST` | session, exact Origin, CSRF header | Preview or commit a configuration change to one agent. |
+| `/api/config/revisions`, `/api/config/revisions/:id/diff` | `GET` | session | The configuration's revision history, and a structural diff of one revision against its parent. |
 
 Every response — success, a failure, even a `503` for a missing build — carries
 `Cache-Control: no-store` (except the SPA's own immutable assets above), a restrictive CSP
-(`default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self';
-connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'` — no
-`unsafe-inline`/`unsafe-eval` anywhere), `X-Content-Type-Options: nosniff`,
+(`default-src 'none'; script-src 'self'; style-src 'self'; style-src-elem 'self' 'unsafe-inline';
+img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self';
+frame-ancestors 'none'` — no inline script anywhere, no `unsafe-eval`; `style-src-elem`'s
+`unsafe-inline` is narrow and documented in ADR-025, for Radix's own scroll-lock `<style>` element,
+never for an inline `style="..."` attribute), `X-Content-Type-Options: nosniff`,
 `Referrer-Policy: same-origin` and `X-Frame-Options: DENY`. There is no permissive CORS. A
 mutation (`POST`/`DELETE`) additionally requires the request's `Origin` header to equal
 `CONSOLE_ORIGIN` exactly, and, when the browser sends it, `Sec-Fetch-Site: same-origin`; a
 logout additionally requires the raw CSRF token `GET`/`POST /api/session` returned, in an
-`X-CSRF-Token` header, matching what the server holds for that session.
+`X-CSRF-Token` header, matching the value the server derives from the session's own cookie
+(ADR-025) — nothing is stored for this, so two tabs sharing one session always agree on the same
+token, and neither one's own session check invalidates the other's copy.
 
 Scripting a login without a browser:
 
@@ -96,6 +103,50 @@ curl -s -c cookies.txt -H 'content-type: application/json' -H 'origin: https://g
   -d '{"password":"..."}' https://gateway.local/api/session
 curl -s -b cookies.txt https://gateway.local/api/status
 ```
+
+## Managing agents
+
+The Agents hub (`/agents`) lists every configured agent and lets the owner edit an existing one;
+creating or deleting an agent is not available from the console yet (`gateway config apply`/
+`import` still does that). Open an agent from the list to its editor, which has one tab per group
+of fields:
+
+| Tab | Editable fields |
+|---|---|
+| Overview | Display name, enabled, plus the agent's current state and recent runs (from the same `/api/status` data the overview page shows — not a separate query). |
+| Instructions | The role prompt (monospace, bounded at 50,000 characters, the same limit `set_role_prompt` enforces everywhere else). |
+| Runtime | Runtime adapter, model, session policy, timeout. |
+| Assignments | Allowed Mattermost channels (from the organization's own configured list), wake rules (event type and an optional target agent). |
+| Permissions | The three tool-pattern lists (`tools_allow`, `tools_require_human_approval`, `tools_deny`) and `observe_system`. |
+| History | Revisions that touched this agent, each with its own diff. |
+
+The Mattermost identity (bot username, token secret path), memory namespaces, concurrency and any
+configured budget are shown but not editable here — there is no tab for them yet.
+
+Edits accumulate in a local draft; nothing is sent until **Review changes** is clicked, which
+shows a preview (the exact diff `prepareChange` computes, ADR-024) before anything is written.
+Disabling the agent, removing a channel, removing a tool grant or removing `observe_system` each
+appear in the preview's own "impact" list and must be acknowledged before **Apply** is enabled.
+Applying commits through the same `prepareChange`/`commitChange` service every other configuration
+surface uses:
+
+- **A conflict** (someone else committed a change to the same agent since this edit's preview was
+  computed) is refused with the revision that is now active; **Reload and try again** re-reads the
+  agent's current configuration and re-previews the same draft on top of it — the draft itself
+  (a patch of only the changed fields) does not need to change, only what it is compared against.
+- **An invalid change** (a business-rule problem — a configuration-breaking change, or a
+  protection like "pause a running agent before disabling it") is reported inline, with the
+  server's own message; nothing is written.
+- Applying twice with the same idempotency key (a retried request after a dropped response, say)
+  replays the first commit's result rather than writing a second revision.
+
+Every commit the console makes is a normal, auditable configuration revision: `gateway config
+history` shows it with `source: console` and `actor: console:owner`, the same way a `cli_apply`
+or an `import` shows up, and `gateway config export`/`diff`/`rollback` all see it exactly as they
+would any other revision — a console edit is not a separate kind of change the CLI's own tooling
+has to special-case. `config apply`/`import` from a YAML directory continue to work unchanged and
+independently of anything edited from the console; whichever happened most recently is simply the
+configuration that is now active, visible in the same journal either way.
 
 ## Building and running it in development
 
@@ -109,7 +160,9 @@ curl -s -b cookies.txt https://gateway.local/api/status
   `CONSOLE_DEV_PROXY_TARGET`) so the same relative API calls the built app makes work unchanged.
   Start a controller with the console enabled first (`CONSOLE_ENABLED=true`,
   `CONSOLE_ORIGIN=http://localhost:5173` to match Vite's own dev origin, a password set the same
-  way as any other environment) and point this at it.
+  way as any other environment, and `GATEWAY_ROUTING_KEY` set regardless of `OUTBOX_DELIVERY` —
+  the console's CSRF derivation reuses it independently of whether this controller is actually
+  running the Mattermost bridge) and point this at it.
 - Unit tests for the console live alongside its source (`*.test.tsx`, React Testing Library +
   happy-dom) and run as part of `bun run test` like everything else; `bun run fix`/`check`
   typecheck it too (`tsc -b apps/console`, its own project — a browser app needs the DOM lib and

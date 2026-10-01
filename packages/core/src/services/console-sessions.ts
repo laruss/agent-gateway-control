@@ -4,11 +4,14 @@ import type pg from "pg";
 
 // ---------------------------------------------------------------------------
 // The owner's console session store (ADR-025): every value here is a sha256 hash or a server
-// generated id, never a raw token — the raw session and CSRF tokens exist only in the HTTP layer
-// (`apps/controller/src/console-auth.ts`) that mints and compares them. This module owns the
-// `console_sessions` rows only: creation with eviction beyond the active cap (serialized across
-// concurrent logins by an advisory lock), the read-only validate-and-conditionally-slide-idle-
-// timeout check, revocation and periodic cleanup of rows nobody can use any more.
+// generated id, never a raw token — the raw session token exists only in the HTTP layer
+// (`apps/controller/src/console-auth.ts`) that mints and hashes it. The CSRF token is never
+// stored at all: it is derived from the raw session token and a controller-held key, recomputed
+// on every check (`deriveCsrfToken`), so `csrf_token_hash` is unused (kept, nullable, for
+// rollback compatibility — ADR-025). This module owns the `console_sessions` rows only: creation
+// with eviction beyond the active cap (serialized across concurrent logins by an advisory lock),
+// the read-only validate-and-conditionally-slide-idle-timeout check, revocation and periodic
+// cleanup of rows nobody can use any more.
 // ---------------------------------------------------------------------------
 
 /** Sliding idle timeout: a session with no authenticated request in this long is invalid. */
@@ -23,7 +26,6 @@ export const CONSOLE_SESSION_MAX_ACTIVE = 20;
 
 export type NewConsoleSession = Readonly<{
 	tokenHash: string;
-	csrfTokenHash: string;
 	passwordHashFingerprint: string;
 }>;
 
@@ -54,7 +56,6 @@ export async function createConsoleSession(
 			.insert(consoleSessions)
 			.values({
 				tokenHash: input.tokenHash,
-				csrfTokenHash: input.csrfTokenHash,
 				passwordHashFingerprint: input.passwordHashFingerprint,
 				createdAt: now,
 				lastSeenAt: now,
@@ -80,11 +81,10 @@ export async function createConsoleSession(
 	});
 }
 
-export type ConsoleSessionValid = Readonly<{ id: string; csrfTokenHash: string; expiresAt: Date }>;
+export type ConsoleSessionValid = Readonly<{ id: string; expiresAt: Date }>;
 
 type SessionRow = Readonly<{
 	id: string;
-	csrf_token_hash: string;
 	expires_at: Date;
 	last_seen_at: Date;
 }>;
@@ -109,7 +109,7 @@ export async function touchConsoleSession(
 	const touchThreshold = new Date(now.getTime() - CONSOLE_SESSION_TOUCH_INTERVAL_MS);
 	const select = () =>
 		pool.query<SessionRow>(
-			`select id, csrf_token_hash, expires_at, last_seen_at
+			`select id, expires_at, last_seen_at
 			   from console_sessions
 			  where token_hash = $1
 			    and revoked_at is null
@@ -139,24 +139,7 @@ export async function touchConsoleSession(
 			return null;
 		}
 	}
-	return { id: row.id, csrfTokenHash: row.csrf_token_hash, expiresAt: new Date(row.expires_at) };
-}
-
-/**
- * Mints and stores a new CSRF token hash for an already-authenticated session, returning nothing:
- * the caller already holds the raw token it generated and only needs it persisted (ADR-025) —
- * `GET /api/session` uses this so the SPA can recover a usable CSRF token after a reload without
- * the server ever storing anything but its hash.
- */
-export async function rotateConsoleSessionCsrf(
-	pool: pg.Pool,
-	id: string,
-	csrfTokenHash: string,
-): Promise<void> {
-	await pool.query("update console_sessions set csrf_token_hash = $2 where id = $1", [
-		id,
-		csrfTokenHash,
-	]);
+	return { id: row.id, expiresAt: new Date(row.expires_at) };
 }
 
 /** Revokes one session, idempotently (a second revoke of the same row is a no-op). */

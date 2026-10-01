@@ -8,20 +8,37 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 - The owner's console gains server-side sessions (ADR-025): a database-backed session cookie
   (`__Host-gw_session`; 30-minute idle timeout, 12-hour absolute lifetime, at most 20 active
-  sessions at once), a rotating CSRF token required on every mutation, and a new
-  `CONSOLE_ORIGIN` setting every login and mutation must match exactly. A sign-in page replaces
-  the browser's HTTP Basic dialog; `gateway console password set` now also
+  sessions at once), a CSRF token derived from the session on every check (never stored, so a
+  second tab's own session check can never invalidate the first tab's token) required on every
+  mutation, and a new `CONSOLE_ORIGIN` setting every login and mutation must match exactly. A
+  sign-in page replaces the browser's HTTP Basic dialog; `gateway console password set` now also
   revokes every active session when it can reach the database.
 - The owner's console is now a React single-page app (`apps/console`: React 19, Vite, Tailwind
   CSS v4, shadcn/ui, TanStack Query, React Router; ADR-025's frontend section), replacing the
   server-rendered dashboard and its stand-in sign-in form. It covers everything the old page
   showed (agent states, tasks, recent runs, queues, alerts, budgets, context measurements,
   stale/unavailable states) and adds navigation for the Agents, Skills and Instruments & utils
-  hubs, each shown as not available yet. Served
-  under a strict CSP with no `unsafe-inline`/`unsafe-eval` anywhere (`script-src 'self'; style-src
-  'self'`); built in its own Docker stage with only the static output copied into the release
-  image. `bun run console:build` builds it, `bun run console:dev` runs it against a local
-  controller.
+  hubs. Served under a strict CSP with no inline script anywhere and no `unsafe-eval`
+  (`script-src 'self'; style-src 'self'; style-src-elem 'self' 'unsafe-inline'` — the last for
+  Radix's own scroll-lock `<style>` element, never an inline `style` attribute); built in its own
+  Docker stage with only the static output copied into the release image. `bun run console:build`
+  builds it, `bun run console:dev` runs it against a local controller.
+- The Agents hub (`/agents`): a list of every configured agent (state, runtime and model, channel
+  count, last run) and an editor for an existing one (creating or deleting an agent is still a
+  YAML + `gateway config apply`/`import` operation), with one tab per group of fields — Overview
+  (display name, enabled), Instructions (role prompt), Runtime (adapter, model, session policy,
+  timeout), Assignments (allowed channels, wake rules), Permissions (the three tool-pattern lists,
+  `observe_system`) and History (the revisions that touched this agent, each with its own diff).
+  Edits accumulate in a local draft; "Review changes" previews the exact diff and an "impact" list
+  of destructive or authority-reducing consequences (disabling the agent, removing a channel or a
+  tool grant, removing `observe_system`) that must be acknowledged before applying. New management
+  API (`GET/POST /api/agents*`, `GET /api/config/revisions*`) translates the editor's bounded
+  patch DTO into the same `prepareChange`/`commitChange` change operations (ADR-024) every other
+  configuration surface uses, committing with `source: console` and `actor: console:owner` —
+  visible in `gateway config history` exactly like any other revision. A stale base is a `409`
+  naming the current revision; a business-rule problem (including a run-in-progress protection) is
+  a `422` with the server's own message; a repeated idempotency key replays its first commit's
+  result.
 
 ### Fixed
 
@@ -30,6 +47,17 @@ All notable changes are documented here. The project follows Semantic Versioning
   channel whose grant was already decided; the listener's membership of every granted channel is
   re-checked on each pass, after the grant is re-validated, so a transient failure or a restart
   between granting and joining heals itself.
+- The console's sign-out no longer signs the owner out locally on a failed `DELETE /api/session`
+  (a 403, a 500, a network error): the session cookie is still valid in that case, so the UI now
+  keeps the signed-in state and lets the caller show a retryable error instead of lying about
+  being signed out.
+- A direct `/sign-in` load's startup session check could resolve "unauthenticated" after a
+  sign-in submitted in the meantime had already won, undoing it; a sign-in now supersedes that
+  startup check's own, by-then-stale result.
+- The overview page's "could not load" banner no longer hides the last-known status snapshot
+  when a poll fails after an earlier one succeeded; the retained data and its timestamp are shown
+  together with the failure, and the data-less error view appears only when nothing has ever
+  loaded.
 
 ## [0.4.0] - 2026-10-01
 

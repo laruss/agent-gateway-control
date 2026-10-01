@@ -42,7 +42,11 @@ export function OverviewPage(): React.ReactElement {
 		);
 	}
 
-	if (query.isError) {
+	// A data-less error view only when nothing has ever loaded: once a poll has succeeded once,
+	// `query.data` keeps that last snapshot even if a later poll fails (`query.isError` reflects
+	// only the most recent attempt) — that retained snapshot, and its own timestamp, are still
+	// shown below, next to the failure banner, rather than hidden behind it.
+	if (query.data === undefined) {
 		return (
 			<Alert variant="destructive">
 				<AlertCircle />
@@ -71,6 +75,16 @@ export function OverviewPage(): React.ReactElement {
 	return (
 		<div className="flex flex-col gap-6">
 			<p className="text-sm text-muted-foreground">As of {formatTimestamp(snapshot.asOf)}</p>
+			{query.isError && (
+				<Alert variant="destructive">
+					<AlertCircle />
+					<AlertTitle>The last refresh failed</AlertTitle>
+					<AlertDescription>
+						Showing data from {formatTimestamp(snapshot.asOf)}:{" "}
+						{query.error instanceof Error ? query.error.message : "Unknown error."}
+					</AlertDescription>
+				</Alert>
+			)}
 			{snapshot.state === "stale" && (
 				<Alert>
 					<AlertCircle />

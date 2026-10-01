@@ -1,6 +1,7 @@
 import { Bot, LayoutDashboard, LogOut, Puzzle, Wrench } from "lucide-react";
 import * as React from "react";
 import { NavLink, useLocation } from "react-router";
+import { toast } from "sonner";
 import {
 	Sidebar,
 	SidebarContent,
@@ -31,6 +32,10 @@ export function AppSidebar(): React.ReactElement {
 		setSigningOut(true);
 		try {
 			await signOut();
+		} catch {
+			// The session is still valid server-side (`signOut` only changes local state on
+			// success); never tell the owner they are signed out when they are not.
+			toast.error("Sign-out failed. The session is still active — try again.");
 		} finally {
 			setSigningOut(false);
 		}
@@ -52,7 +57,11 @@ export function AppSidebar(): React.ReactElement {
 								<SidebarMenuItem key={item.to}>
 									<SidebarMenuButton
 										asChild
-										isActive={location.pathname === item.to}
+										isActive={
+											item.to === "/"
+												? location.pathname === "/"
+												: location.pathname.startsWith(item.to)
+										}
 										tooltip={item.label}
 									>
 										<NavLink to={item.to} end={item.to === "/"}>

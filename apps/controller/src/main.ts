@@ -63,6 +63,17 @@ const consolePasswordHash = consoleEnabled
 /** Exact `Origin` every console login and mutation must carry (ADR-025); read and validated here,
  * alongside the password hash, before anything the console serves starts. */
 const consoleOrigin = consoleEnabled ? assertConsoleOrigin(requireSetting("CONSOLE_ORIGIN")) : null;
+/**
+ * The console's CSRF token is derived from the session token with this key (ADR-025), under its
+ * own HMAC label (`deriveCsrfToken`) — not stored anywhere, so there is nothing to rotate or
+ * invalidate across tabs. Reusing the routing key avoids a secret file of its own; read here,
+ * independent of `OUTBOX_DELIVERY`, since the console does not depend on the Mattermost bridge
+ * being the delivery mode this process runs with.
+ */
+const consoleCsrfKey = consoleEnabled ? requireSetting("GATEWAY_ROUTING_KEY") : null;
+if (consoleCsrfKey !== null) {
+	assertRoutingKey(consoleCsrfKey);
+}
 
 function bridgeOptions(): MattermostBridgeOptions {
 	const routingKey = requireSetting("GATEWAY_ROUTING_KEY");
@@ -121,13 +132,17 @@ const consoleAddress = consoleEnabled
  * a fixture. */
 const consoleStaticDir = readSetting("CONSOLE_STATIC_DIR");
 const ownerConsole =
-	consoleAddress !== null && consolePasswordHash !== null && consoleOrigin !== null
+	consoleAddress !== null &&
+	consolePasswordHash !== null &&
+	consoleOrigin !== null &&
+	consoleCsrfKey !== null
 		? startConsoleServer({
 				port: intSetting("CONSOLE_PORT", 8084),
 				hostname: consoleAddress,
 				passwordHash: consolePasswordHash,
 				origin: consoleOrigin,
-				pool: controller.deps.pool,
+				csrfKey: consoleCsrfKey,
+				deps: controller.deps,
 				cache: createConsoleStatusCache((now) => collectConsoleStatus(controller.deps.pool, now)),
 				log,
 				...(consoleStaticDir === undefined ? {} : { staticDir: consoleStaticDir }),
