@@ -7,6 +7,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
 	CONSOLE_SESSION_ABSOLUTE_MS,
 	CONSOLE_SESSION_IDLE_MS,
+	CONSOLE_SESSION_MAX_ACTIVE,
 	CONSOLE_SESSION_TOUCH_INTERVAL_MS,
 	cleanupExpiredConsoleSessions,
 	createConsoleSession,
@@ -140,6 +141,62 @@ describe("console session store (ADR-025)", () => {
 		expect((await touchConsoleSession(pool, "token-hash-cap-4", base, FINGERPRINT))?.id).toBe(
 			ids[4],
 		);
+	});
+
+	it("serializes concurrent creations against the active cap: 19 existing plus 10 concurrent logins stays at exactly 20 active", async () => {
+		const base = new Date("2031-01-05T12:00:00.000Z");
+		for (let i = 0; i < 19; i += 1) {
+			await createConsoleSession(
+				pool,
+				newSession(`race-existing-${i}`),
+				new Date(base.getTime() + i),
+			);
+		}
+		const concurrentNow = new Date(base.getTime() + 1_000);
+		// Without serializing the insert-count-evict sequence, each of these can see only the 19
+		// pre-existing rows (plus its own, still-uncommitted insert) when it counts active sessions,
+		// conclude the cap of 20 is not yet exceeded, and skip eviction — leaving 29 active instead
+		// of 20 once all 10 commit.
+		await Promise.all(
+			Array.from({ length: 10 }, (_, i) =>
+				createConsoleSession(pool, newSession(`race-new-${i}`), concurrentNow),
+			),
+		);
+		const active = await pool.query<{ count: string }>(
+			"select count(*)::text as count from console_sessions where revoked_at is null and expires_at > $1",
+			[concurrentNow],
+		);
+		expect(Number(active.rows[0]?.count)).toBe(CONSOLE_SESSION_MAX_ACTIVE);
+	});
+
+	it("validates with a read-only SELECT: two touches inside the touch interval leave the row's xmin unchanged", async () => {
+		const now = new Date("2031-01-05T18:00:00.000Z");
+		await createConsoleSession(pool, newSession("xmin"), now);
+		const before = await pool.query<{ xmin: string }>(
+			"select xmin::text as xmin from console_sessions where token_hash = $1",
+			["token-hash-xmin"],
+		);
+
+		// Both well inside CONSOLE_SESSION_TOUCH_INTERVAL_MS (one minute) of session creation and of
+		// each other: neither should write to the row at all.
+		await touchConsoleSession(
+			pool,
+			"token-hash-xmin",
+			new Date(now.getTime() + 10_000),
+			FINGERPRINT,
+		);
+		await touchConsoleSession(
+			pool,
+			"token-hash-xmin",
+			new Date(now.getTime() + 20_000),
+			FINGERPRINT,
+		);
+
+		const after = await pool.query<{ xmin: string }>(
+			"select xmin::text as xmin from console_sessions where token_hash = $1",
+			["token-hash-xmin"],
+		);
+		expect(after.rows[0]?.xmin).toBe(before.rows[0]?.xmin);
 	});
 
 	it("revokes one session by id", async () => {

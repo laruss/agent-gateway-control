@@ -80,7 +80,7 @@ Routes:
 
 Every response — success, a failure, even the sign-in page itself — carries
 `Cache-Control: no-store`, a restrictive CSP, `X-Content-Type-Options: nosniff`,
-`Referrer-Policy: no-referrer` and `X-Frame-Options: DENY`. There is no permissive CORS. A
+`Referrer-Policy: same-origin` and `X-Frame-Options: DENY`. There is no permissive CORS. A
 mutation (`POST`/`DELETE`) additionally requires the request's `Origin` header to equal
 `CONSOLE_ORIGIN` exactly, and, when the browser sends it, `Sec-Fetch-Site: same-origin`; a
 logout additionally requires the raw CSRF token `GET`/`POST /api/session` returned, in an

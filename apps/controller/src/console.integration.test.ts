@@ -366,7 +366,64 @@ describe("the owner's console, wired against a real gateway (ADR-025)", () => {
 			expect(res.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
 			expect(res.headers.get("x-content-type-options")).toBe("nosniff");
 			expect(res.headers.get("x-frame-options")).toBe("DENY");
+			expect(res.headers.get("referrer-policy")).toBe("same-origin");
 		}
+	});
+
+	it("sets Referrer-Policy: same-origin (not no-referrer, which would null a same-origin POST's own Origin header) and still refuses a literal Origin: null", async () => {
+		const { base } = await withServer();
+		const page = await fetch(`${base}/`);
+		// `no-referrer` and `same-origin` both withhold the `Referer` header from a cross-site
+		// request; the difference that matters here is what a *same-origin* request sends. Per the
+		// Fetch spec, a non-GET/HEAD, non-CORS-mode request (a plain HTML form POST, in particular)
+		// carries `Origin: null` under `no-referrer`, which would make the console's own login form
+		// fail its own exact-Origin check. `same-origin` does not null it for a same-origin request,
+		// only for a cross-origin one.
+		expect(page.headers.get("referrer-policy")).toBe("same-origin");
+
+		// A request that actually carries the literal string "null" as its Origin — what a
+		// sandboxed or opaque-origin cross-site request sends — is still refused: switching away
+		// from `no-referrer` never widens what `originAllowed` accepts.
+		const nullOrigin = await fetch(`${base}/api/session`, {
+			method: "POST",
+			headers: { "content-type": "application/json", origin: "null" },
+			body: JSON.stringify({ password: PASSWORD }),
+		});
+		expect(nullOrigin.status).toBe(403);
+	});
+
+	it("rejects an oversized chunked body (no Content-Length) with 413, aborting well before reading it all", async () => {
+		const { base } = await withServer();
+		const chunk = new Uint8Array(1024);
+		let bytesProduced = 0;
+		// Never closes on its own: if the server read this to completion instead of aborting once
+		// it exceeds the login body limit, this request would never finish.
+		const stream = new ReadableStream<Uint8Array>({
+			pull(controller) {
+				bytesProduced += chunk.byteLength;
+				controller.enqueue(chunk);
+			},
+		});
+		const res = await fetch(`${base}/api/session`, {
+			method: "POST",
+			headers: { "content-type": "application/json", origin: ORIGIN },
+			body: stream,
+			duplex: "half",
+		});
+		expect(res.status).toBe(413);
+		// Well short of what "reading the whole (never-ending) body" would have produced: the
+		// server stopped pulling from the stream once the running total crossed the limit.
+		expect(bytesProduced).toBeLessThan(16 * 1024);
+	});
+
+	it("rejects an oversized body declared via Content-Length with 413", async () => {
+		const { base } = await withServer();
+		const res = await fetch(`${base}/api/session`, {
+			method: "POST",
+			headers: { "content-type": "application/json", origin: ORIGIN },
+			body: JSON.stringify({ password: "x".repeat(8192) }),
+		});
+		expect(res.status).toBe(413);
 	});
 
 	it("never logs the password, a session token or a cookie, even while erroring", async () => {

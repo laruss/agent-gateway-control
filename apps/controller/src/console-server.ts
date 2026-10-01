@@ -49,15 +49,28 @@ const MAX_LOGIN_FAILURES_PER_WINDOW = 10;
 const DEFAULT_MAX_CONCURRENT_VERIFICATIONS = 4;
 
 /** Well past the longest JSON or form body a login ever needs (a password up to 256 UTF-16
- * units, plus field overhead); a larger body is refused before it is even read. */
+ * units, plus field overhead); a larger body is refused — before it is even read when it is
+ * declared via `Content-Length`, or as soon as reading it crosses this bound otherwise. */
 const MAX_LOGIN_BODY_BYTES = 4096;
+
+/** A hard ceiling Bun itself enforces, before any handler code runs, on any body this listener
+ * will ever buffer — well above {@link MAX_LOGIN_BODY_BYTES}. `readBoundedText` already aborts a
+ * chunked body long before this; this is the backstop against a future route, or a defect in
+ * that function, reading further than it should. */
+const MAX_REQUEST_BODY_BYTES = 1024 * 1024;
 
 const SECURITY_HEADERS: Readonly<Record<string, string>> = {
 	"cache-control": "no-store",
 	"content-security-policy":
 		"default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
 	"x-content-type-options": "nosniff",
-	"referrer-policy": "no-referrer",
+	// `same-origin`, not `no-referrer`: per the Fetch spec, a non-GET/HEAD, non-CORS-mode request
+	// (a plain HTML form POST, in particular) sends `Origin: null` whenever the referrer policy in
+	// effect is `no-referrer`, or is `same-origin` and the request is cross-origin. The console's
+	// own login form posts to its own origin, so `same-origin` keeps that real Origin header on
+	// the wire (`originAllowed` below needs it) while still sending no referrer at all, and no
+	// Origin, to anything cross-site.
+	"referrer-policy": "same-origin",
 	"x-frame-options": "DENY",
 };
 
@@ -97,6 +110,10 @@ function tooManyRequests(waitMs: number): Response {
 	return textResponse("too many attempts", 429, { "retry-after": String(seconds) });
 }
 
+function payloadTooLarge(): Response {
+	return textResponse("payload too large", 413);
+}
+
 function serviceBusy(): Response {
 	return textResponse("busy", 503, { "retry-after": "1" });
 }
@@ -119,25 +136,44 @@ export function resolveConsolePasswordHash(secretsDir?: string): string {
 	return readSecretFile(path);
 }
 
-function utf8ByteLength(value: string): number {
-	return new TextEncoder().encode(value).length;
-}
+type BoundedBody = Readonly<{ ok: true; text: string }> | Readonly<{ ok: false }>;
 
 /**
- * Reads a request body as text, refusing it (returning `null`) before or after reading when it
- * exceeds `maxBytes` — by its declared `Content-Length` if present, and always by its actual
- * decoded size, since a chunked request carries no `Content-Length` at all.
+ * Reads a request body as UTF-8 text, refusing it (`{ ok: false }`) before or after reading when
+ * it exceeds `maxBytes`: by its declared `Content-Length` if present, before a byte is read, and
+ * otherwise by the bytes actually read off `request.body` as they arrive. A chunked request
+ * carries no `Content-Length` at all, so that case is read incrementally and its reader
+ * cancelled the moment the running total exceeds `maxBytes` — never buffered in full first, the
+ * way `request.text()` would.
  */
-async function readBoundedText(request: Request, maxBytes: number): Promise<string | null> {
+async function readBoundedText(request: Request, maxBytes: number): Promise<BoundedBody> {
 	const declared = request.headers.get("content-length");
 	if (declared !== null) {
 		const length = Number(declared);
 		if (!Number.isFinite(length) || length > maxBytes) {
-			return null;
+			return { ok: false };
 		}
 	}
-	const text = await request.text();
-	return utf8ByteLength(text) > maxBytes ? null : text;
+	const body = request.body;
+	if (body === null) {
+		return { ok: true, text: "" };
+	}
+	const reader = body.getReader();
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) {
+			break;
+		}
+		total += value.byteLength;
+		if (total > maxBytes) {
+			await reader.cancel("body too large");
+			return { ok: false };
+		}
+		chunks.push(value);
+	}
+	return { ok: true, text: Buffer.concat(chunks, total).toString("utf8") };
 }
 
 /** `{"password": "..."}`; anything else (malformed JSON, a missing or non-string field) is not a
@@ -312,8 +348,11 @@ export function startConsoleServer(options: ConsoleServerOptions): RunningConsol
 			) {
 				return badRequest("expected application/x-www-form-urlencoded");
 			}
-			const text = await readBoundedText(request, MAX_LOGIN_BODY_BYTES);
-			const password = text === null ? null : passwordFromForm(text);
+			const bounded = await readBoundedText(request, MAX_LOGIN_BODY_BYTES);
+			if (!bounded.ok) {
+				return payloadTooLarge();
+			}
+			const password = passwordFromForm(bounded.text);
 			if (password === null) {
 				return badRequest("missing password");
 			}
@@ -370,8 +409,11 @@ export function startConsoleServer(options: ConsoleServerOptions): RunningConsol
 			if (!(request.headers.get("content-type") ?? "").startsWith("application/json")) {
 				return badRequest("expected application/json");
 			}
-			const text = await readBoundedText(request, MAX_LOGIN_BODY_BYTES);
-			const password = text === null ? null : passwordFromJson(text);
+			const bounded = await readBoundedText(request, MAX_LOGIN_BODY_BYTES);
+			if (!bounded.ok) {
+				return payloadTooLarge();
+			}
+			const password = passwordFromJson(bounded.text);
 			if (password === null) {
 				return badRequest("missing password");
 			}
@@ -429,6 +471,7 @@ export function startConsoleServer(options: ConsoleServerOptions): RunningConsol
 	const server = Bun.serve({
 		port: options.port,
 		hostname: options.hostname,
+		maxRequestBodySize: MAX_REQUEST_BODY_BYTES,
 		fetch: async (request) => {
 			try {
 				return await handle(request);

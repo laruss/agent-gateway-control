@@ -6,9 +6,9 @@ import type pg from "pg";
 // The owner's console session store (ADR-025): every value here is a sha256 hash or a server
 // generated id, never a raw token — the raw session and CSRF tokens exist only in the HTTP layer
 // (`apps/controller/src/console-auth.ts`) that mints and compares them. This module owns the
-// `console_sessions` rows only: creation with eviction beyond the active cap, the combined
-// validate-and-slide-idle-timeout read, revocation and periodic cleanup of rows nobody can use
-// any more.
+// `console_sessions` rows only: creation with eviction beyond the active cap (serialized across
+// concurrent logins by an advisory lock), the read-only validate-and-conditionally-slide-idle-
+// timeout check, revocation and periodic cleanup of rows nobody can use any more.
 // ---------------------------------------------------------------------------
 
 /** Sliding idle timeout: a session with no authenticated request in this long is invalid. */
@@ -43,6 +43,13 @@ export async function createConsoleSession(
 ): Promise<ConsoleSessionCreated> {
 	const expiresAt = new Date(now.getTime() + CONSOLE_SESSION_ABSOLUTE_MS);
 	return withTransaction(pool, async (tx) => {
+		// Serializes creation-plus-eviction across concurrent logins: without this, two
+		// transactions can each count the active rows before the other's insert is visible, both
+		// conclude the cap is not yet exceeded, and both skip eviction — leaving more than
+		// `maxActive` sessions active. The lock is released automatically at commit or rollback.
+		await tx.client.query(
+			"select pg_advisory_xact_lock(hashtext('agent-gateway:console-sessions'))",
+		);
 		const [inserted] = await tx.db
 			.insert(consoleSessions)
 			.values({
@@ -76,11 +83,14 @@ export async function createConsoleSession(
 export type ConsoleSessionValid = Readonly<{ id: string; csrfTokenHash: string; expiresAt: Date }>;
 
 /**
- * Validates a session by its token hash and slides its idle timeout in the same statement. A
- * request past `expires_at`, more than `CONSOLE_SESSION_IDLE_MS` after the last one, already
- * revoked, or bound to a since-rotated password hash (`passwordHashFingerprint` no longer
- * matching the stored one) is invalid — `null`, never a thrown error, so a bad cookie is simply
- * unauthenticated. `last_seen_at` advances only once every `CONSOLE_SESSION_TOUCH_INTERVAL_MS`.
+ * Validates a session by its token hash and slides its idle timeout. A request past
+ * `expires_at`, more than `CONSOLE_SESSION_IDLE_MS` after the last one, already revoked, or
+ * bound to a since-rotated password hash (`passwordHashFingerprint` no longer matching the
+ * stored one) is invalid — `null`, never a thrown error, so a bad cookie is simply
+ * unauthenticated. Validation itself is a read-only `SELECT`: `last_seen_at` is only written —
+ * a separate, single-row `UPDATE` guarded by the same staleness check — once it is actually
+ * older than `CONSOLE_SESSION_TOUCH_INTERVAL_MS`, so a session touched well within that interval
+ * (an active tab polling the status endpoint, say) never dirties its row at all.
  */
 export async function touchConsoleSession(
 	pool: pg.Pool,
@@ -90,21 +100,34 @@ export async function touchConsoleSession(
 ): Promise<ConsoleSessionValid | null> {
 	const idleCutoff = new Date(now.getTime() - CONSOLE_SESSION_IDLE_MS);
 	const touchThreshold = new Date(now.getTime() - CONSOLE_SESSION_TOUCH_INTERVAL_MS);
-	const result = await pool.query<{ id: string; csrf_token_hash: string; expires_at: Date }>(
-		`update console_sessions
-		    set last_seen_at = case when last_seen_at < $3 then $2 else last_seen_at end
+	const result = await pool.query<{
+		id: string;
+		csrf_token_hash: string;
+		expires_at: Date;
+		last_seen_at: Date;
+	}>(
+		`select id, csrf_token_hash, expires_at, last_seen_at
+		   from console_sessions
 		  where token_hash = $1
 		    and revoked_at is null
 		    and expires_at > $2
-		    and last_seen_at > $4
-		    and password_hash_fingerprint = $5
-		  returning id, csrf_token_hash, expires_at`,
-		[tokenHash, now, touchThreshold, idleCutoff, passwordHashFingerprint],
+		    and last_seen_at > $3
+		    and password_hash_fingerprint = $4`,
+		[tokenHash, now, idleCutoff, passwordHashFingerprint],
 	);
 	const row = result.rows[0];
-	return row === undefined
-		? null
-		: { id: row.id, csrfTokenHash: row.csrf_token_hash, expiresAt: new Date(row.expires_at) };
+	if (row === undefined) {
+		return null;
+	}
+	if (new Date(row.last_seen_at).getTime() < touchThreshold.getTime()) {
+		// Guarded by the same staleness check it was just read under: a concurrent touch that
+		// already slid this past the threshold makes this a no-op instead of a second write.
+		await pool.query(
+			"update console_sessions set last_seen_at = $2 where id = $1 and last_seen_at < $3",
+			[row.id, now, touchThreshold],
+		);
+	}
+	return { id: row.id, csrfTokenHash: row.csrf_token_hash, expiresAt: new Date(row.expires_at) };
 }
 
 /**

@@ -34,10 +34,13 @@ one, a plain login form — is already behind the session and CSRF model the res
 - **Absolute lifetime 12 hours, idle timeout 30 minutes, sliding** on `last_seen_at`. Every
   authenticated request can extend a session, but `last_seen_at` is rewritten at most once a
   minute, so a tab polling the status endpoint does not turn into a write on every request.
-  Validating and sliding a session is one `UPDATE ... RETURNING` keyed on the token's hash,
-  checking `revoked_at`, `expires_at`, the idle cutoff and the fingerprint together, so an
-  invalid session is simply absent from the result rather than a separate read followed by a
-  racing write.
+  Validating a session is a read-only `SELECT` keyed on the token's hash, checking `revoked_at`,
+  `expires_at`, the idle cutoff and the fingerprint together, so an invalid session is simply
+  absent from the result; only when the row it finds is actually older than the one-minute touch
+  interval does a second, single-row `UPDATE ... WHERE id = $1 AND last_seen_at < $threshold`
+  slide it — guarded by the same staleness check it was just read under, so a session touched
+  well within the interval never dirties its row, and a concurrent touch that already slid it
+  makes a second one a no-op instead of a racing write.
 - **A password rotation invalidates every session bound to the old hash without a database
   write.** `gateway console password set` writes a new Argon2id hash file; the controller reads
   that file once at start and derives `password_hash_fingerprint` from its content once, at
@@ -51,7 +54,11 @@ one, a plain login form — is already behind the session and CSRF model the res
 - **At most 20 active sessions.** Creating one beyond the cap revokes the oldest (by
   `created_at`) in the same transaction as the insert — a single owner does not need unbounded
   concurrent logins, and an unrevoked trail of abandoned sessions is exactly what a cap and
-  cleanup both exist to prevent.
+  cleanup both exist to prevent. The insert, the count of currently active rows and the eviction
+  it implies are serialized across concurrent logins by a transaction-scoped advisory lock
+  (`pg_advisory_xact_lock`, released automatically at commit or rollback): without it, two
+  logins racing each other can each count the active rows before the other's insert is visible,
+  both conclude the cap is not yet exceeded, and both skip eviction, leaving more than 20 active.
 - **Expired and revoked rows are deleted by the controller's existing retention pass**
   (`applyRetention`, hourly), not on a schedule of their own: they carry no content to redact,
   so this is hygiene, not the organization's configurable content retention. A login does not
@@ -85,6 +92,15 @@ one, a plain login form — is already behind the session and CSRF model the res
   another origin that submits credentials (its own, to its own knowledge) into the console in the
   victim's browser, hoping the victim continues to use a session the attacker also knows the
   password to.
+- **`Referrer-Policy: same-origin`, not ADR-023's `no-referrer`.** An exact-Origin check makes
+  the `Origin` header load-bearing for the first time, and the Fetch spec ties that header to the
+  referrer policy for exactly the requests this ADR depends on: a non-GET/HEAD, non-CORS-mode
+  request (a plain HTML form `POST`, in particular) sends `Origin: null` whenever the referrer
+  policy in effect is `no-referrer`, or is `same-origin` and the request is cross-origin. The
+  stand-in login page posts to its own origin, so under `no-referrer` the browser's own real
+  login would have been rejected by the very check meant to protect it. `same-origin` keeps the
+  real `Origin` header on a same-origin request while still sending no referrer, and no Origin,
+  to anything cross-site — the same off-site leakage `no-referrer` was chosen to prevent.
 - **Never `X-Forwarded-*`.** Those headers name the edge proxy's own view of the request; the
   console's listener sees the connection Caddy actually made to it and nothing upstream of that
   is treated as an authenticated claim about where a request came from.
