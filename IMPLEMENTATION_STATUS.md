@@ -1865,3 +1865,5 @@ Known gaps, deferred:
 - There is no CLI command to discard a single dead-lettered job; `gateway dlq redrive` is the
   only action besides leaving it in `gateway dlq list` (ROLLBACK.md notes this for a version 2
   payload that must not be redriven under an older release).
+
+Released as 0.3.0 (no migration: head `0017_channel_grant_checks`, pg-boss schema 42).
