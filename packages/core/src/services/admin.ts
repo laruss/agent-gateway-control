@@ -1,11 +1,15 @@
 import {
 	type AgentConfig,
 	AgentConfigSchema,
+	CONFIG_SNAPSHOT_FORMAT,
+	type ConfigRevisionSource,
+	type ConfigSnapshotBundle,
 	type MattermostId,
 	MattermostIdSchema,
 	type OrganizationConfig,
 	OrganizationConfigSchema,
 	QUEUES,
+	RolePromptSchema,
 	type RuntimeAdapterId,
 	validateConfigBundle,
 } from "@agent-gateway/contracts";
@@ -15,6 +19,9 @@ import {
 	agentRuns,
 	agents,
 	approvalRequests,
+	configRevisionAcks,
+	configRevisions,
+	configSnapshots,
 	configVersions,
 	type DirectoryKind,
 	events,
@@ -78,6 +85,7 @@ export type ConfigApplyInput = Readonly<{
 
 export type ConfigApplyResult = Readonly<{
 	version: string;
+	revisionId: number;
 	created: Readonly<string[]>;
 	updated: Readonly<string[]>;
 	disabled: Readonly<string[]>;
@@ -92,6 +100,10 @@ export function configBundleProblems(input: ConfigApplyInput): Readonly<string[]
 			...organization.error.issues.map((i) => `organization: ${i.path.join(".")}: ${i.message}`),
 		);
 	}
+	// `config export` writes one file per distinct `role_file`/`constitution_file` path, verbatim:
+	// two agents sharing a path (or an agent sharing it with the constitution) must agree on the
+	// text that path holds, or an export would silently keep only one of them.
+	const roleFileText = new Map<string, Readonly<{ agentId: string; text: string }>>();
 	for (const agent of input.agents) {
 		const parsed = AgentConfigSchema.safeParse(agent);
 		if (!parsed.success) {
@@ -104,10 +116,55 @@ export function configBundleProblems(input: ConfigApplyInput): Readonly<string[]
 		}
 		if (!(agent.id in input.rolePrompts) || input.rolePrompts[agent.id]?.trim() === "") {
 			problems.push(`agent ${agent.id}: role prompt is missing or empty`);
+			continue;
+		}
+		const text = input.rolePrompts[agent.id] ?? "";
+		// The same bound `set_role_prompt`/`config import` enforce (`RolePromptSchema`): anything
+		// `commitChange`/`applyConfig` accepts must also be exportable and re-importable.
+		const roleBound = RolePromptSchema.safeParse(text);
+		if (!roleBound.success) {
+			problems.push(
+				...roleBound.error.issues.map((i) => `agent ${agent.id}: role prompt: ${i.message}`),
+			);
+		}
+		const path = agent.prompts.role_file;
+		const sharedWith = roleFileText.get(path);
+		if (sharedWith === undefined) {
+			roleFileText.set(path, { agentId: agent.id, text });
+		} else if (sharedWith.text !== text) {
+			problems.push(
+				`agent ${agent.id}: role prompt differs from agent ${sharedWith.agentId}'s, though both share role_file '${path}'`,
+			);
+		}
+		if (
+			organization.success &&
+			path === organization.data.organization.constitution_file &&
+			text !== input.constitution
+		) {
+			problems.push(
+				`agent ${agent.id}: role_file '${path}' is also the constitution file, but its role prompt differs from the constitution text`,
+			);
 		}
 	}
 	if (input.constitution.trim() === "") {
 		problems.push("organization: constitution is empty");
+	} else {
+		const constitutionBound = RolePromptSchema.safeParse(input.constitution);
+		if (!constitutionBound.success) {
+			problems.push(
+				...constitutionBound.error.issues.map((i) => `organization: constitution: ${i.message}`),
+			);
+		}
+	}
+	// A `rolePrompts` entry for an agent not in `input.agents` (e.g. a `replace_bundle` naming
+	// `rolePrompts.ghost` with no agent `ghost`) would validate and commit, yet `config export`
+	// only ever writes the role prompt of a configured agent: re-importing the export would then
+	// resolve to a different, smaller `rolePrompts` map and a different hash.
+	const configuredAgentIds = new Set(input.agents.map((agent) => agent.id));
+	for (const agentId of Object.keys(input.rolePrompts)) {
+		if (!configuredAgentIds.has(agentId)) {
+			problems.push(`rolePrompts: '${agentId}' has a role prompt but is not a configured agent`);
+		}
 	}
 	if (problems.length === 0) {
 		problems.push(
@@ -190,9 +247,553 @@ async function tombstoneUnconfiguredChannels(
 }
 
 /**
- * Stores a validated configuration as the active version and upserts its agents. Agents that
- * left the configuration are disabled, never deleted: their history stays referenced. An agent
- * with a run in progress cannot be disabled by config; pause it first.
+ * Orders agent definitions by id the same way wherever a bundle is assembled, so its hash never
+ * depends on where the agents came from: a config directory's read order, or a database query's
+ * collation (which can disagree with this plain code-unit order, e.g. for ids like `aa`/`a-z`).
+ */
+function compareAgentIds(a: string, b: string): number {
+	return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
+ * The canonical, content-addressed bundle a configuration apply hashes and stores: this is the
+ * value `canonicalHash` turns into `config_versions.version` / `config_snapshots.hash`. Agents
+ * are sorted by id, so the hash does not depend on the order a config directory lists them in.
+ */
+export function configSnapshotBundle(input: ConfigApplyInput): ConfigSnapshotBundle {
+	return {
+		organization: input.organization,
+		agents: [...input.agents].sort((a, b) => compareAgentIds(a.id, b.id)),
+		constitution: input.constitution,
+		rolePrompts: { ...input.rolePrompts },
+	};
+}
+
+/** The configuration row's history fields, as `gateway_controls` held them before this change. */
+type ActiveControlsRow = Readonly<{
+	version: string | null;
+	generation: number;
+	revision: number | null;
+}>;
+
+/**
+ * Whether the snapshot behind `snapshotHash` still agrees with the live `agents.enabled` column,
+ * for every agent of `configVersion` plus any other agent that is enabled although its own row
+ * lags behind it: false once an operational toggle moves the projection after that snapshot was
+ * recorded (`setAgentEnabled` once did this; an older release's own direct toggle still can), even
+ * though nothing bumped `config_generation` — including a release before configuration history
+ * existed re-enabling a row after the agent had already left the active configuration (its own
+ * `config_version` stays stale, but it is enabled and routing/scheduling runs it regardless of
+ * which version its row names; see `ensureConfigHistoryIn`). Compared against the last *recorded*
+ * snapshot — whether originally applied or itself an earlier backfill — rather than `agents.config`
+ * (which a backfill never rewrites, so it would otherwise never agree again once it first fell
+ * behind).
+ */
+async function recordedEnabledAgreesWithLive(
+	db: UnitOfWork["tx"]["db"],
+	snapshotHash: string,
+	configVersion: string,
+): Promise<boolean> {
+	const [snapshot] = await db
+		.select({ bundle: configSnapshots.bundle })
+		.from(configSnapshots)
+		.where(eq(configSnapshots.hash, snapshotHash));
+	if (snapshot === undefined) {
+		return false;
+	}
+	const recorded = new Map(snapshot.bundle.agents.map((agent) => [agent.id, agent.enabled]));
+	const live = await db
+		.select({ id: agents.id, enabled: agents.enabled })
+		.from(agents)
+		.where(or(eq(agents.configVersion, configVersion), eq(agents.enabled, true)));
+	return live.length === recorded.size && live.every((row) => recorded.get(row.id) === row.enabled);
+}
+
+/**
+ * Resolves the revision to record as the new one's parent, backfilling one for the active
+ * configuration first when it is not already represented by an up-to-date revision: either none
+ * has ever been recorded (a database upgraded from a release before configuration history
+ * existed), the recorded one is stale (an older release changed the active configuration directly
+ * — `active_config_version`/`config_generation` moved on — without writing a revision for it), or
+ * the live `agents.enabled` projection has drifted from what the recorded revision's snapshot says
+ * (an operational toggle that bypassed configuration history — see `recordedEnabledAgreesWithLive`):
+ * `config_generation` alone does not move for that, so it must be checked on its own. A no-op,
+ * returning `row.revision` unchanged, once the recorded revision's generation already matches and
+ * no agent has drifted since, or when there is no active configuration at all (a fresh database:
+ * the very first apply gets no parent).
+ *
+ * The backfilled snapshot holds the agent definitions and role prompts the active `config_version`
+ * still has (older, since-replaced ones were never retained, and role prompts of an agent no
+ * longer in the active bundle are lost with it), plus any other agent that is enabled although its
+ * row lags behind the active version — retained from before it left the configuration, by a
+ * release that re-enabled it directly, and still actually running regardless (`loadAgents` reads
+ * every row, not only those at the active version): its own stored, stale `config`/`role_prompt`
+ * are what the backfill has to go on, since nothing else was ever retained for it either. Sorted
+ * exactly as `configSnapshotBundle` sorts them, with each agent's `enabled` taken from the live
+ * `agents.enabled` column rather than its stored `config` — the backfill's whole point is to
+ * reflect what is actually running, not a value a bypassed toggle left stale. It is stored under
+ * its own recomputed hash — which can differ from `config_versions.version` of the same row, since
+ * nothing here reconstructs a role prompt or an ordering the original apply alone knew — never
+ * under a hash it does not actually reproduce.
+ */
+export async function ensureConfigHistoryIn(
+	uow: UnitOfWork,
+	row: ActiveControlsRow,
+	actor: string,
+): Promise<number | null> {
+	if (row.version === null) {
+		return row.revision;
+	}
+	const { db } = uow.tx;
+	if (row.revision !== null) {
+		const [existing] = await db
+			.select({
+				generation: configRevisions.generation,
+				snapshotHash: configRevisions.snapshotHash,
+			})
+			.from(configRevisions)
+			.where(eq(configRevisions.id, row.revision));
+		if (
+			existing !== undefined &&
+			existing.generation === row.generation &&
+			(await recordedEnabledAgreesWithLive(db, existing.snapshotHash, row.version))
+		) {
+			return row.revision;
+		}
+	}
+	const [versionRow] = await db
+		.select({
+			organization: configVersions.organization,
+			constitution: configVersions.constitution,
+		})
+		.from(configVersions)
+		.where(eq(configVersions.version, row.version));
+	if (versionRow === undefined) {
+		// `active_config_version` names no row: nothing to backfill from; leave the pointer as is.
+		return row.revision;
+	}
+	const agentRows = [
+		...(await db
+			.select({ config: agents.config, rolePrompt: agents.rolePrompt, enabled: agents.enabled })
+			.from(agents)
+			.where(or(eq(agents.configVersion, row.version), eq(agents.enabled, true)))),
+	].sort((a, b) => compareAgentIds(a.config.id, b.config.id));
+	const bundle: ConfigSnapshotBundle = {
+		organization: versionRow.organization,
+		agents: agentRows.map((agent) => ({ ...agent.config, enabled: agent.enabled })),
+		constitution: versionRow.constitution,
+		rolePrompts: Object.fromEntries(agentRows.map((agent) => [agent.config.id, agent.rolePrompt])),
+	};
+	const hash = canonicalHash(bundle);
+	await db
+		.insert(configSnapshots)
+		.values({
+			hash,
+			bundle,
+			format: CONFIG_SNAPSHOT_FORMAT,
+			origin: "backfill",
+			createdAt: uow.now,
+		})
+		.onConflictDoNothing();
+	const [revision] = await db
+		.insert(configRevisions)
+		.values({
+			snapshotHash: hash,
+			// The stale revision (if any) becomes this one's parent, same as a fresh backfill's
+			// null parent when none was ever recorded.
+			parentRevisionId: row.revision,
+			generation: row.generation,
+			actor,
+			source: "backfill",
+			createdAt: uow.now,
+		})
+		.returning({ id: configRevisions.id });
+	await audit(uow, actor, "config.history_backfill", "config", row.version, {
+		generation: row.generation,
+		snapshot_hash: hash,
+	});
+	if (row.revision !== null) {
+		// A revision was already recorded for this configuration, and it is now stale: something
+		// changed `config_versions`/`agents` outside the revision journal, most likely a release
+		// before this one that does not know the journal exists, running during a rollback
+		// interval. The projections just backfilled are what the Gateway actually runs — never the
+		// stale snapshot the old revision names — but a human should look at what changed.
+		uow.deps.log.warn(
+			`configuration changed outside revision history at generation ${row.generation}; ` +
+				`recorded as revision ${revision?.id} (backfill); review with 'gateway config diff'/'history'`,
+			{
+				generation: row.generation,
+				revision_id: revision?.id,
+				parent_revision_id: row.revision,
+				snapshot_hash: hash,
+			},
+		);
+	}
+	return revision?.id ?? null;
+}
+
+/**
+ * Backfills configuration history for the active configuration if it is not already represented
+ * by an up-to-date revision — none was ever recorded, or an older release changed the active
+ * configuration without recording one (see `ensureConfigHistoryIn`). Safe to call at every
+ * controller/CLI startup, whether or not backfilling is needed: a database whose recorded
+ * revision already matches, or with no active configuration, is left untouched.
+ */
+export async function ensureConfigHistory(deps: ControlPlaneDeps, actor: string): Promise<void> {
+	await inTransaction(deps, async (uow) => {
+		const { db } = uow.tx;
+		await db.insert(gatewayControls).values({ id: 1 }).onConflictDoNothing();
+		const [controls] = await db
+			.select({
+				version: gatewayControls.activeConfigVersion,
+				generation: gatewayControls.configGeneration,
+				revision: gatewayControls.activeConfigRevision,
+			})
+			.from(gatewayControls)
+			.where(eq(gatewayControls.id, 1))
+			.for("update");
+		if (controls === undefined) {
+			return;
+		}
+		const revisionId = await ensureConfigHistoryIn(uow, controls, actor);
+		if (revisionId !== controls.revision) {
+			await db
+				.update(gatewayControls)
+				.set({ activeConfigRevision: revisionId, updatedAt: uow.now })
+				.where(eq(gatewayControls.id, 1));
+		}
+	});
+}
+
+/**
+ * Whether `ensureConfigHistory` would backfill a revision right now, decided the same way it
+ * decides that (no active configuration at all, or none ever recorded for one, or the recorded
+ * revision's generation or live `agents.enabled` projection has since moved — see
+ * `ensureConfigHistoryIn`/`recordedEnabledAgreesWithLive`) without writing anything. `gateway
+ * doctor` is read-only and so never runs `ensureConfigHistory` itself (unlike every write command
+ * and the controller's own startup): right after a forward upgrade, before anything has triggered
+ * the backfill, the revision journal's latest entry still looks exactly as it did before the
+ * upgrade, understating drift that has already happened to the live projections. This predicate
+ * reports that drift truthfully whether or not it has been backfilled yet.
+ */
+export async function configHistoryNeedsBackfill(deps: ControlPlaneDeps): Promise<boolean> {
+	return inTransaction(deps, async ({ tx }) => {
+		const { db } = tx;
+		const [controls] = await db
+			.select({
+				version: gatewayControls.activeConfigVersion,
+				generation: gatewayControls.configGeneration,
+				revision: gatewayControls.activeConfigRevision,
+			})
+			.from(gatewayControls)
+			.where(eq(gatewayControls.id, 1));
+		if (controls === undefined || controls.version === null) {
+			return false;
+		}
+		if (controls.revision === null) {
+			return true;
+		}
+		const [existing] = await db
+			.select({
+				generation: configRevisions.generation,
+				snapshotHash: configRevisions.snapshotHash,
+			})
+			.from(configRevisions)
+			.where(eq(configRevisions.id, controls.revision));
+		if (existing === undefined || existing.generation !== controls.generation) {
+			return true;
+		}
+		return !(await recordedEnabledAgreesWithLive(db, existing.snapshotHash, controls.version));
+	});
+}
+
+/**
+ * Records that a human reviewed `revisionId` and accepts it, even though nothing about its
+ * content was ever recommitted. Clears the `config:backfill` alert and `gateway doctor`'s
+ * `config_history` check when `revisionId` is the drifted `backfill` revision they name
+ * (`configHistoryConditions`): `commitChange` treats identical content as a no-op, so replaying a
+ * `backfill` revision's own reviewed content (an import, or `config rollback` to it) writes no new
+ * revision to supersede it, and an acknowledgement is the only way to clear the signal short of a
+ * later, actually different change. Acknowledging does not change the configuration or write a
+ * revision. One row per revision; acknowledging an already-acknowledged one replaces it (a new
+ * actor, or the same one reaffirming) rather than failing, since acknowledging twice is harmless.
+ */
+export async function ackConfigRevision(
+	deps: ControlPlaneDeps,
+	revisionId: number,
+	actor: string,
+): Promise<void> {
+	await inTransaction(deps, async (uow) => {
+		const { db } = uow.tx;
+		const [revision] = await db
+			.select({ id: configRevisions.id })
+			.from(configRevisions)
+			.where(eq(configRevisions.id, revisionId));
+		if (revision === undefined) {
+			throw new AdminError(`config revision ${revisionId} does not exist`);
+		}
+		await db
+			.insert(configRevisionAcks)
+			.values({ revisionId, actor, ackedAt: uow.now })
+			.onConflictDoUpdate({
+				target: configRevisionAcks.revisionId,
+				set: { actor, ackedAt: uow.now },
+			});
+		await audit(uow, actor, "config.ack", "config", String(revisionId));
+	});
+}
+
+/** Everything {@link writeConfigRevisionIn} needs to write one configuration change. */
+export type WriteConfigRevisionInput = Readonly<{
+	input: ConfigApplyInput;
+	bundle: ConfigSnapshotBundle;
+	version: string;
+	generation: number;
+	parentRevisionId: number | null;
+	actor: string;
+	source: ConfigRevisionSource;
+	reason: string | null;
+	idempotencyKey: string | null;
+	changeHash: string | null;
+}>;
+
+/**
+ * The one code path that writes a configuration change: `config_versions`/`agents` projections,
+ * the snapshot and revision, channel tombstones and scheduling. Every caller — `applyConfig`'s
+ * whole-bundle replace and the managed-config service's finer-grained operations — has already
+ * validated the resulting bundle and resolved `generation`/`parentRevisionId` under the
+ * `gateway_controls` lock; this function only writes. Agents that left the configuration are
+ * disabled, never deleted: their history stays referenced. An agent with a run in progress cannot
+ * be disabled; pause it first.
+ */
+export async function writeConfigRevisionIn(
+	uow: UnitOfWork,
+	write: WriteConfigRevisionInput,
+): Promise<ConfigApplyResult> {
+	const {
+		input,
+		bundle,
+		version,
+		generation,
+		parentRevisionId,
+		actor,
+		source,
+		reason,
+		idempotencyKey,
+		changeHash,
+	} = write;
+	const { db } = uow.tx;
+	const previous = await loadActiveConfig(db);
+	if (
+		previous !== null &&
+		previous.organization.mattermost.team !== input.organization.mattermost.team
+	) {
+		// Another team: every channel's catch-up starts afresh once bootstrap resolves it, so
+		// switching away and back never replays the interval in between. The marker voids any
+		// start scanned before this generation.
+		await uow.tx.client.query(
+			"delete from source_cursors where source_id ~ '^mattermost:channel(-floor|-floor-posts)?:'",
+		);
+		await markChannelsLeft(uow, [TEAM_CHANGE_MARKER], generation);
+		// Grants were given in the old team's channels: another team starts without any.
+		await db
+			.update(mattermostChannelGrants)
+			.set({
+				state: "revoked",
+				revokedReason: "team_changed",
+				revokedAt: uow.now,
+				generation: sql`${mattermostChannelGrants.generation} + 1`,
+			})
+			.where(eq(mattermostChannelGrants.state, "active"));
+	} else if (previous !== null) {
+		// A channel leaving the configuration loses its catch-up at once: re-added later, it
+		// starts afresh instead of replaying what was posted while it was unmanaged.
+		// A channel an agent was granted stays followed: its catch-up is the grant's.
+		const kept = new Set(input.organization.mattermost.channels);
+		const resolved = await loadDirectory(db, "channel");
+		const granted = grantedChannels(await loadChannelAccess(db));
+		const ids = previous.organization.mattermost.channels
+			.filter((name) => !kept.has(name))
+			.flatMap((name) => {
+				const id = resolved.get(name);
+				return id === undefined || granted.has(id) ? [] : [id];
+			});
+		if (ids.length > 0) {
+			await uow.tx.client.query(
+				`delete from source_cursors
+					  where regexp_replace(source_id, '^mattermost:channel(-floor|-floor-posts)?:', '') = any($1::text[])
+					    and source_id ~ '^mattermost:channel(-floor|-floor-posts)?:'`,
+				[ids],
+			);
+			await markChannelsLeft(
+				uow,
+				ids.map((id) => `mattermost:channel-left:${id}`),
+				generation,
+			);
+		}
+	}
+	await db
+		.insert(configVersions)
+		.values({
+			version,
+			organization: input.organization,
+			constitution: input.constitution,
+			appliedAt: uow.now,
+		})
+		.onConflictDoNothing();
+	// Content-addressed: re-applying identical content hits the same row, and this change still
+	// gets its own revision below.
+	await db
+		.insert(configSnapshots)
+		.values({
+			hash: version,
+			bundle,
+			format: CONFIG_SNAPSHOT_FORMAT,
+			origin: "applied",
+			createdAt: uow.now,
+		})
+		.onConflictDoNothing();
+	const [revision] = await db
+		.insert(configRevisions)
+		.values({
+			snapshotHash: version,
+			parentRevisionId,
+			generation,
+			actor,
+			source,
+			reason,
+			idempotencyKey,
+			changeHash,
+			createdAt: uow.now,
+		})
+		.returning({ id: configRevisions.id });
+	if (revision === undefined) {
+		throw new AdminError("recording the configuration revision did not return its id");
+	}
+	await db
+		.insert(gatewayControls)
+		.values({
+			id: 1,
+			activeConfigVersion: version,
+			configGeneration: generation,
+			activeConfigRevision: revision.id,
+			updatedAt: uow.now,
+		})
+		.onConflictDoUpdate({
+			target: gatewayControls.id,
+			set: {
+				activeConfigVersion: version,
+				configGeneration: generation,
+				activeConfigRevision: revision.id,
+				updatedAt: uow.now,
+			},
+		});
+
+	// Every existing agent row, locked in id order up front: the apply touches most of them.
+	const before = await db
+		.select({ id: agents.id, config: agents.config, version: agents.configVersion })
+		.from(agents)
+		.orderBy(asc(agents.id))
+		.for("no key update");
+	if (
+		previous !== null &&
+		previous.organization.mattermost.team === input.organization.mattermost.team
+	) {
+		await tombstoneUnconfiguredChannels(
+			uow,
+			before.filter((row) => row.version === previous.version),
+			input.agents,
+		);
+	}
+	const created: string[] = [];
+	const updated: string[] = [];
+	const disabled: string[] = [];
+	const configured = new Set(input.agents.map((a) => a.id));
+	for (const agent of [...input.agents].sort((a, b) => (a.id < b.id ? -1 : 1))) {
+		const values = {
+			displayName: agent.display_name,
+			runtimeAdapter: agent.runtime.adapter,
+			runtimeProfile: agent.runtime.profile,
+			configVersion: version,
+			maxActiveRuns: agent.concurrency.max_active_runs,
+			config: agent,
+			rolePrompt: input.rolePrompts[agent.id] ?? "",
+			updatedAt: uow.now,
+		};
+		const existing = await lockAgent(db, agent.id);
+		if (existing === null) {
+			const state: AgentState = agent.enabled ? "idle" : "disabled";
+			await db.insert(agents).values({
+				id: agent.id,
+				...values,
+				enabled: agent.enabled,
+				state,
+				stateChangedAt: uow.now,
+				createdAt: uow.now,
+			});
+			created.push(agent.id);
+		} else {
+			await db.update(agents).set(values).where(eq(agents.id, agent.id));
+			await applyEnabled(uow, existing.id, existing.state, agent.enabled, actor);
+			updated.push(agent.id);
+		}
+		await db
+			.insert(mattermostIdentities)
+			.values({
+				agentId: agent.id,
+				username: agent.mattermost.username,
+				tokenSecretRef: agent.mattermost.token_secret_file,
+			})
+			.onConflictDoUpdate({
+				target: mattermostIdentities.agentId,
+				set: {
+					username: agent.mattermost.username,
+					tokenSecretRef: agent.mattermost.token_secret_file,
+				},
+			});
+	}
+	const known = await db.select({ id: agents.id }).from(agents).orderBy(asc(agents.id));
+	for (const { id } of known.filter((row) => !configured.has(row.id))) {
+		const row = await lockAgent(db, id);
+		if (row !== null && row.state !== "disabled") {
+			await applyEnabled(uow, id, row.state, false, actor);
+			disabled.push(id);
+		}
+	}
+	// Approved actions that have not begun are checked against the new policy.
+	await revokeQueuedActions(uow);
+	// Cards live in the approvals channel, and only replies there decide: when it moves (or the
+	// team changes), the requests still waiting are withdrawn (their agents learn it and may
+	// ask again).
+	if (
+		previous !== null &&
+		(previous.organization.mattermost.approvals_channel !==
+			input.organization.mattermost.approvals_channel ||
+			previous.organization.mattermost.team !== input.organization.mattermost.team)
+	) {
+		await withdrawOpenApprovals(uow, null, "the approvals channel changed", true);
+	}
+	// An agent enabled by this config may already have work waiting in its inbox.
+	for (const id of [...configured].sort()) {
+		await scheduleAgent(uow, id);
+	}
+	await audit(uow, actor, "config.apply", "config", version, {
+		revision: revision.id,
+		created: created.length,
+		updated: updated.length,
+		disabled: disabled.length,
+		source,
+	});
+	return { version, revisionId: revision.id, created, updated, disabled };
+}
+
+/**
+ * Stores a validated configuration as the active version and upserts its agents: the whole-bundle
+ * replace `config apply` has always performed, now written through {@link writeConfigRevisionIn}.
+ * The CLI has no revision it expects to still be active (a later step adds `--expected-revision`),
+ * so this reads the current one itself and always proceeds — the one case the managed-config
+ * service's `commitChange` would instead treat as a conflict never applies here, since there is
+ * nothing else a plain `config apply` could have been expecting.
  */
 export async function applyConfig(
 	deps: ControlPlaneDeps,
@@ -203,189 +804,46 @@ export async function applyConfig(
 	if (problems.length > 0) {
 		throw new AdminError(`configuration is invalid:\n- ${problems.join("\n- ")}`);
 	}
-	const version = canonicalHash({
-		organization: input.organization,
-		agents: [...input.agents].sort((a, b) => (a.id < b.id ? -1 : 1)),
-		constitution: input.constitution,
-		rolePrompts: input.rolePrompts,
-	});
+	const bundle = configSnapshotBundle(input);
+	const version = canonicalHash(bundle);
 	return inTransaction(deps, async (uow) => {
 		const { db } = uow.tx;
-		// The configuration row first, for update: applies are serialized, and `previous` is the
-		// configuration this apply really replaces. The row is made sure to exist before it is
-		// locked (a missing row would lock nothing).
+		// The configuration row first, for update: applies are serialized, and the generation and
+		// parent revision below are resolved under this lock.
 		await db.insert(gatewayControls).values({ id: 1 }).onConflictDoNothing();
 		const [controls] = await db
-			.select({ generation: gatewayControls.configGeneration })
+			.select({
+				version: gatewayControls.activeConfigVersion,
+				generation: gatewayControls.configGeneration,
+				revision: gatewayControls.activeConfigRevision,
+			})
 			.from(gatewayControls)
 			.where(eq(gatewayControls.id, 1))
 			.for("update");
 		const generation = (controls?.generation ?? 0) + 1;
-		const previous = await loadActiveConfig(db);
-		if (
-			previous !== null &&
-			previous.organization.mattermost.team !== input.organization.mattermost.team
-		) {
-			// Another team: every channel's catch-up starts afresh once bootstrap resolves it, so
-			// switching away and back never replays the interval in between. The marker voids any
-			// start scanned before this generation.
-			await uow.tx.client.query(
-				"delete from source_cursors where source_id ~ '^mattermost:channel(-floor|-floor-posts)?:'",
-			);
-			await markChannelsLeft(uow, [TEAM_CHANGE_MARKER], generation);
-			// Grants were given in the old team's channels: another team starts without any.
-			await db
-				.update(mattermostChannelGrants)
-				.set({
-					state: "revoked",
-					revokedReason: "team_changed",
-					revokedAt: uow.now,
-					generation: sql`${mattermostChannelGrants.generation} + 1`,
-				})
-				.where(eq(mattermostChannelGrants.state, "active"));
-		} else if (previous !== null) {
-			// A channel leaving the configuration loses its catch-up at once: re-added later, it
-			// starts afresh instead of replaying what was posted while it was unmanaged.
-			// A channel an agent was granted stays followed: its catch-up is the grant's.
-			const kept = new Set(input.organization.mattermost.channels);
-			const resolved = await loadDirectory(db, "channel");
-			const granted = grantedChannels(await loadChannelAccess(db));
-			const ids = previous.organization.mattermost.channels
-				.filter((name) => !kept.has(name))
-				.flatMap((name) => {
-					const id = resolved.get(name);
-					return id === undefined || granted.has(id) ? [] : [id];
-				});
-			if (ids.length > 0) {
-				await uow.tx.client.query(
-					`delete from source_cursors
-					  where regexp_replace(source_id, '^mattermost:channel(-floor|-floor-posts)?:', '') = any($1::text[])
-					    and source_id ~ '^mattermost:channel(-floor|-floor-posts)?:'`,
-					[ids],
-				);
-				await markChannelsLeft(
-					uow,
-					ids.map((id) => `mattermost:channel-left:${id}`),
-					generation,
-				);
-			}
-		}
-		await db
-			.insert(configVersions)
-			.values({
-				version,
-				organization: input.organization,
-				constitution: input.constitution,
-				appliedAt: uow.now,
-			})
-			.onConflictDoNothing();
-		await db
-			.insert(gatewayControls)
-			.values({
-				id: 1,
-				activeConfigVersion: version,
-				configGeneration: generation,
-				updatedAt: uow.now,
-			})
-			.onConflictDoUpdate({
-				target: gatewayControls.id,
-				set: { activeConfigVersion: version, configGeneration: generation, updatedAt: uow.now },
-			});
-
-		// Every existing agent row, locked in id order up front: the apply touches most of them.
-		const before = await db
-			.select({ id: agents.id, config: agents.config, version: agents.configVersion })
-			.from(agents)
-			.orderBy(asc(agents.id))
-			.for("no key update");
-		if (
-			previous !== null &&
-			previous.organization.mattermost.team === input.organization.mattermost.team
-		) {
-			await tombstoneUnconfiguredChannels(
-				uow,
-				before.filter((row) => row.version === previous.version),
-				input.agents,
-			);
-		}
-		const created: string[] = [];
-		const updated: string[] = [];
-		const disabled: string[] = [];
-		const configured = new Set(input.agents.map((a) => a.id));
-		for (const agent of [...input.agents].sort((a, b) => (a.id < b.id ? -1 : 1))) {
-			const values = {
-				displayName: agent.display_name,
-				runtimeAdapter: agent.runtime.adapter,
-				runtimeProfile: agent.runtime.profile,
-				configVersion: version,
-				maxActiveRuns: agent.concurrency.max_active_runs,
-				config: agent,
-				rolePrompt: input.rolePrompts[agent.id] ?? "",
-				updatedAt: uow.now,
-			};
-			const existing = await lockAgent(db, agent.id);
-			if (existing === null) {
-				const state: AgentState = agent.enabled ? "idle" : "disabled";
-				await db.insert(agents).values({
-					id: agent.id,
-					...values,
-					enabled: agent.enabled,
-					state,
-					stateChangedAt: uow.now,
-					createdAt: uow.now,
-				});
-				created.push(agent.id);
-			} else {
-				await db.update(agents).set(values).where(eq(agents.id, agent.id));
-				await applyEnabled(uow, existing.id, existing.state, agent.enabled, actor);
-				updated.push(agent.id);
-			}
-			await db
-				.insert(mattermostIdentities)
-				.values({
-					agentId: agent.id,
-					username: agent.mattermost.username,
-					tokenSecretRef: agent.mattermost.token_secret_file,
-				})
-				.onConflictDoUpdate({
-					target: mattermostIdentities.agentId,
-					set: {
-						username: agent.mattermost.username,
-						tokenSecretRef: agent.mattermost.token_secret_file,
-					},
-				});
-		}
-		const known = await db.select({ id: agents.id }).from(agents).orderBy(asc(agents.id));
-		for (const { id } of known.filter((row) => !configured.has(row.id))) {
-			const row = await lockAgent(db, id);
-			if (row !== null && row.state !== "disabled") {
-				await applyEnabled(uow, id, row.state, false, actor);
-				disabled.push(id);
-			}
-		}
-		// Approved actions that have not begun are checked against the new policy.
-		await revokeQueuedActions(uow);
-		// Cards live in the approvals channel, and only replies there decide: when it moves (or the
-		// team changes), the requests still waiting are withdrawn (their agents learn it and may
-		// ask again).
-		if (
-			previous !== null &&
-			(previous.organization.mattermost.approvals_channel !==
-				input.organization.mattermost.approvals_channel ||
-				previous.organization.mattermost.team !== input.organization.mattermost.team)
-		) {
-			await withdrawOpenApprovals(uow, null, "the approvals channel changed", true);
-		}
-		// An agent enabled by this config may already have work waiting in its inbox.
-		for (const id of [...configured].sort()) {
-			await scheduleAgent(uow, id);
-		}
-		await audit(uow, actor, "config.apply", "config", version, {
-			created: created.length,
-			updated: updated.length,
-			disabled: disabled.length,
+		// Backfills the history of a database upgraded from a release before it existed, so this
+		// apply's revision gets the right parent instead of starting a disconnected history.
+		const parentRevisionId = await ensureConfigHistoryIn(
+			uow,
+			{
+				version: controls?.version ?? null,
+				generation: controls?.generation ?? 0,
+				revision: controls?.revision ?? null,
+			},
+			actor,
+		);
+		return writeConfigRevisionIn(uow, {
+			input,
+			bundle,
+			version,
+			generation,
+			parentRevisionId,
+			actor,
+			source: "cli_apply",
+			reason: null,
+			idempotencyKey: null,
+			changeHash: null,
 		});
-		return { version, created, updated, disabled };
 	});
 }
 
@@ -575,27 +1033,6 @@ export async function showAgent(deps: ControlPlaneDeps, agentId: string) {
 			detail: runtime?.detail ?? null,
 		},
 	};
-}
-
-export async function setAgentEnabled(
-	deps: ControlPlaneDeps,
-	agentId: string,
-	enabled: boolean,
-	actor: string,
-): Promise<AgentState> {
-	return inTransaction(deps, async (uow) => {
-		const agent = await lockAgent(uow.tx.db, agentId);
-		if (agent === null) {
-			throw new AdminError(`agent '${agentId}' does not exist`);
-		}
-		await applyEnabled(uow, agentId, agent.state, enabled, actor);
-		await audit(uow, actor, enabled ? "agent.enable" : "agent.disable", "agent", agentId);
-		if (enabled) {
-			await scheduleAgent(uow, agentId);
-		}
-		const after = await lockAgent(uow.tx.db, agentId);
-		return after?.state ?? agent.state;
-	});
 }
 
 /** pg-boss jobs an operation made obsolete; the caller cancels them (the domain has no boss). */

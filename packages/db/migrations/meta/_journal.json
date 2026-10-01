@@ -127,6 +127,34 @@
       "when": 1790775656139,
       "tag": "0017_channel_grant_checks",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1790848839972,
+      "tag": "0018_config_history",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1790848856602,
+      "tag": "0019_config_history_guards",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1790852433321,
+      "tag": "0020_config_revision_idempotency",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1790864928089,
+      "tag": "0021_config_revision_acks",
+      "breakpoints": true
     }
   ]
 }

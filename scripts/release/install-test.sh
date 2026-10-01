@@ -225,6 +225,22 @@ check_versions() {
 	cli gateway version | jq -e --arg v "$expected" '.release == $v' >/dev/null || fail "CLI version"
 }
 
+# UPGRADE.md, "Upgrading past 0.3.0: configuration history": the running configuration has a
+# revision of its own after the upgrade (a fresh "backfill" one, when $first predates the journal;
+# an ordinary one already, when $first and $next are the same commit), and exporting it back out
+# diffs as a no-op against itself.
+check_config_history() {
+	log "configuration history (UPGRADE.md, ADR-024)"
+	cli gateway config history | jq -e 'length >= 1' >/dev/null ||
+		fail "no configuration revision after upgrade"
+	"${sudo_cmd[@]}" rm -rf "$GATEWAY_HOME/backups/config-export"
+	cli gateway config export /backups/config-export >/dev/null ||
+		fail "config export failed after upgrade"
+	cli gateway config diff /backups/config-export --root /backups/config-export --json |
+		jq -e '.noop' >/dev/null ||
+		fail "exporting the active revision and diffing it back is not a no-op"
+}
+
 # The containers run as the Gateway user, on a read-only root filesystem, without capabilities.
 check_hardening() {
 	log "hardening"
@@ -424,6 +440,7 @@ if [[ -n "$next" ]]; then
 	cli gateway db migrate
 	regrant
 	cli gateway db status | jq -e '.compatible' >/dev/null || fail "status after upgrade"
+	check_config_history
 	start_services
 	check_versions "$next_version"
 	check_console_compose
@@ -436,6 +453,9 @@ if [[ -n "$next" ]]; then
 	cli gateway db status | tee /dev/stderr | jq -e '.compatible' >/dev/null ||
 		fail "the previous release is not certified for the upgraded database"
 	regrant
+	# The previous release still starts on the expanded schema and runs its own configuration
+	# commands against it (ADR-024 is an expand migration; config_validate/config_apply are
+	# unchanged).
 	restore_config_under_first
 	start_services
 	check_versions "$first_version"

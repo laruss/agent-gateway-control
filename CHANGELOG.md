@@ -4,6 +4,47 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## [Unreleased]
 
+### Added
+
+- Managed configuration (ADR-024): PostgreSQL is now the authoritative configuration store.
+  Every applied configuration is kept as an immutable, content-addressed snapshot (organization,
+  agents, constitution and resolved role prompts), and every change is a row in an append-only
+  revision journal with its actor, source, parent and generation. `config_versions` and the
+  `agents` rows remain the projections an older release reads.
+- A shared prepare/commit path for configuration changes: a change set is previewed as a
+  deterministic structural diff against a base revision, then committed only if that base is
+  still active (otherwise a conflict naming the current revision), with an optional idempotency
+  key that replays an earlier commit instead of applying it twice.
+- `gateway config export|diff|import|history|rollback|ack`. `export` writes a revision as a
+  self-contained, byte-for-byte reproducible directory with a `manifest.json` of file hashes;
+  `diff` previews a directory against the active revision; `import` commits it and, once a
+  configuration is active, requires `--expected-revision`; `rollback` commits an earlier
+  revision's content as a new revision; `ack` acknowledges a change recorded from outside the
+  history.
+- Configuration changed by an older release during a rollback interval (`config apply`,
+  `agents enable|disable`) is recorded on the next start as a `backfill` revision of what is
+  actually running, logged, raised as the `config:backfill` alert and reported by
+  `gateway doctor` until acknowledged or superseded.
+- `gateway backup check --restore-test` verifies configuration history on a restore: the active
+  revision exists and every snapshot still hashes to its own key. Backups taken before this
+  release still verify.
+
+### Changed
+
+- `gateway agents enable|disable` is now a configuration change recorded in the revision
+  history, so a later import of the same content no longer silently reverts it.
+- `gateway config apply` still works unchanged, but is deprecated in favour of
+  `config diff` followed by `config import --expected-revision`.
+- Configuration validation is stricter on every path: role prompts and the constitution are
+  bounded and text-checked the same way everywhere, agents sharing a prompt file must have the
+  same prompt text, and every role prompt must belong to a configured agent.
+
+### Fixed
+
+- Home server: `setup-guest.sh` restarts avahi before the mDNS alias publishers and fails unless
+  both `mattermost.local` and `gateway.local` resolve to the VM's address, so a re-run no longer
+  leaves the names unresolvable.
+
 ## [0.3.0] - 2026-10-01
 
 ### Added

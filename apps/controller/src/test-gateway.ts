@@ -4,13 +4,20 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	AgentConfigSchema,
+	type ChangeSet,
 	type GatewayEvent,
 	OrganizationConfigSchema,
 	reportQueue,
 	runDeadLetterQueue,
 	runQueue,
 } from "@agent-gateway/contracts";
-import { applyConfig, type ControlPlaneDeps, setDirectoryEntry } from "@agent-gateway/core";
+import {
+	applyConfig,
+	type ControlPlaneDeps,
+	commitChange,
+	prepareChange,
+	setDirectoryEntry,
+} from "@agent-gateway/core";
 import { createPool, grantWorkerRole, migrateSchema } from "@agent-gateway/db";
 import { DEVELOPMENT_VERSION, silentLogger } from "@agent-gateway/logging";
 import type { Deliverer } from "@agent-gateway/outbox";
@@ -258,6 +265,27 @@ export async function eventually<T>(
 		}
 		await Bun.sleep(100);
 	}
+}
+
+/**
+ * Enables or disables an agent through the managed-config service — prepare, then commit a
+ * `set_agent_enabled` change set — exactly as `gateway agents enable|disable` does. Tests use this
+ * instead of flipping `agents.enabled` directly: there is no such bypass left to call.
+ */
+export async function setAgentEnabledThroughConfig(
+	deps: ControlPlaneDeps,
+	agentId: string,
+	enabled: boolean,
+	actor: string,
+): Promise<void> {
+	const changeSet: ChangeSet = [{ type: "set_agent_enabled", agentId, enabled }];
+	const preview = await prepareChange(deps, changeSet);
+	await commitChange(deps, {
+		changeSet,
+		baseRevisionId: preview.baseRevisionId,
+		actor,
+		source: "cli_apply",
+	});
 }
 
 /** A deliverer that fails its first `failures` calls; `calls` records every idempotency key. */

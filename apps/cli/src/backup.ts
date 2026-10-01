@@ -1,7 +1,9 @@
 import { createHash, randomBytes } from "node:crypto";
 import { createReadStream, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
+import type { ConfigSnapshotBundle } from "@agent-gateway/contracts";
 import { createPool } from "@agent-gateway/db";
+import { canonicalHash } from "@agent-gateway/events";
 import { redactText } from "@agent-gateway/logging";
 import pg from "pg";
 import { z } from "zod";
@@ -210,7 +212,7 @@ function toolError(result: ToolResult): string {
 	return lines.slice(-3).join(" ").slice(0, 400) || `exit code ${result.code}`;
 }
 
-/** Tables a restored Gateway database must have, and read. */
+/** Tables every restored Gateway database must have, whatever release produced the backup. */
 const KEY_TABLES: Readonly<string[]> = [
 	"events",
 	"agent_runs",
@@ -218,6 +220,20 @@ const KEY_TABLES: Readonly<string[]> = [
 	"tool_actions",
 	"audit_log",
 ];
+
+/**
+ * Added by migration `0018_config_history` (`config_snapshots`/`config_revisions` tables,
+ * `gateway_controls.active_config_revision`): a backup taken at an older schema (0.3.0 and
+ * earlier) has none of the three, and checking for them would fail a healthy backup.
+ */
+const CONFIG_HISTORY_TABLES: Readonly<string[]> = ["config_snapshots", "config_revisions"];
+/** The migration count (0000 through 0018 inclusive) at which `CONFIG_HISTORY_TABLES` exist. */
+const CONFIG_HISTORY_MIGRATIONS = 19;
+
+/** Whether the restored database's own migration history (as `schemaCheck` reads it) is at or past `0018_config_history`. */
+function hasConfigHistorySchema(migrations: number): boolean {
+	return migrations >= CONFIG_HISTORY_MIGRATIONS;
+}
 
 type SchemaVersion = BackupManifest["schema_version"];
 
@@ -513,9 +529,11 @@ async function invariantChecks(
 				? "gateway_controls is missing"
 				: `${controls.rows[0]?.n ?? 0} controls row(s)`,
 	});
+	const hasConfigHistory = hasConfigHistorySchema(restored?.migrations ?? 0);
+	const tables = hasConfigHistory ? [...KEY_TABLES, ...CONFIG_HISTORY_TABLES] : KEY_TABLES;
 	const counts: string[] = [];
 	const missing: string[] = [];
-	for (const table of KEY_TABLES) {
+	for (const table of tables) {
 		const result = await client
 			.query<{ n: number }>(`select count(*)::int as n from ${pg.escapeIdentifier(table)}`)
 			.catch(() => null);
@@ -530,6 +548,80 @@ async function invariantChecks(
 		ok: missing.length === 0,
 		detail:
 			missing.length === 0 ? counts.join(", ") : `missing or unreadable: ${missing.join(", ")}`,
+	});
+	// A backup taken before migration 0018 has neither the tables nor the column these checks
+	// read (`gateway_controls.active_config_revision`): nothing to verify, not a failure.
+	if (hasConfigHistory) {
+		checks.push(...(await configHistoryChecks(client)));
+	}
+	return checks;
+}
+
+/**
+ * The restored configuration history is internally consistent: `gateway_controls`' active
+ * revision (when one is set) names a `config_revisions` row, that row's snapshot exists in
+ * `config_snapshots`, and every stored snapshot's content still hashes to its own `hash` — the
+ * same canonical hash `applyConfig`/`ensureConfigHistory` compute when they write it (reused
+ * here, not reimplemented), so a restore that silently dropped or corrupted a snapshot is caught
+ * rather than only discovered the next time someone reads history. Callable only once
+ * `hasConfigHistorySchema` confirms the restored database has the column and tables this reads.
+ */
+async function configHistoryChecks(client: pg.ClientBase): Promise<BackupCheck[]> {
+	const checks: BackupCheck[] = [];
+	const [controls] = (
+		await client.query<{ active_config_revision: number | null }>(
+			"select active_config_revision::int as active_config_revision from gateway_controls where id = 1",
+		)
+	).rows;
+	const activeRevision = controls?.active_config_revision ?? null;
+	if (activeRevision === null) {
+		checks.push({
+			name: "restored:active_revision",
+			ok: true,
+			detail: "no active configuration revision",
+		});
+	} else {
+		const [revision] = (
+			await client.query<{ snapshot_hash: string }>(
+				"select snapshot_hash from config_revisions where id = $1",
+				[activeRevision],
+			)
+		).rows;
+		if (revision === undefined) {
+			checks.push({
+				name: "restored:active_revision",
+				ok: false,
+				detail: `active_config_revision ${activeRevision} has no config_revisions row`,
+			});
+		} else {
+			const snapshot = await client.query<{ n: number }>(
+				"select count(*)::int as n from config_snapshots where hash = $1",
+				[revision.snapshot_hash],
+			);
+			const found = (snapshot.rows[0]?.n ?? 0) > 0;
+			checks.push({
+				name: "restored:active_revision",
+				ok: found,
+				detail: found
+					? `revision ${activeRevision}, snapshot ${revision.snapshot_hash.slice(0, 12)}`
+					: `revision ${activeRevision}'s snapshot '${revision.snapshot_hash}' is missing`,
+			});
+		}
+	}
+
+	const snapshots = await client.query<{ hash: string; bundle: ConfigSnapshotBundle }>(
+		"select hash, bundle from config_snapshots",
+	);
+	const mismatched = snapshots.rows
+		.filter((row) => canonicalHash(row.bundle) !== row.hash)
+		.map((row) => row.hash);
+	checks.push({
+		name: "restored:snapshot_hashes",
+		ok: mismatched.length === 0,
+		detail:
+			mismatched.length === 0
+				? `${snapshots.rows.length} snapshot(s) verified`
+				: `${mismatched.length} of ${snapshots.rows.length} snapshot(s) do not match their hash: ${mismatched.map((h) => h.slice(0, 12)).join(", ")}`,
 	});
 	return checks;
 }

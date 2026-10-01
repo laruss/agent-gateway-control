@@ -1,8 +1,18 @@
 import { createHash } from "node:crypto";
-import { cpSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+	cpSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { CONFIG_SNAPSHOT_FORMAT } from "@agent-gateway/contracts";
 import { createPool, migrateDatabase } from "@agent-gateway/db";
+import { canonicalHash } from "@agent-gateway/events";
 import { POSTGRES_IMAGE } from "@agent-gateway/testkit";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -16,18 +26,54 @@ import {
 	scanManifests,
 } from "./backup.ts";
 
+/** Minimal, schema-shape-only bundle: the backup checks only hash it, never validate it. */
+function fixtureBundle(tag: string) {
+	return { organization: { id: tag }, agents: [], constitution: "Be helpful.", rolePrompts: {} };
+}
+
 const SCRIPT = join(import.meta.dirname, "../../../scripts/backup-gateway-db.sh");
 const PASSWORD = "gateway-backup-test";
+const DB_MIGRATIONS_DIR = join(import.meta.dirname, "../../../packages/db/migrations");
+/** `0018_config_history` is the first migration `backup.ts`'s config-history checks require. */
+const CONFIG_HISTORY_MIGRATION_TAG = "0018_config_history";
+
+type JournalEntry = Readonly<{ tag: string }>;
+
+/**
+ * A migrations folder holding only the migrations strictly before `0018_config_history`: the
+ * schema a 0.3.0-era database (and its backup) actually has, built from the real migration files
+ * so it can never drift from them. Deleted by the caller once the test is done with it.
+ */
+function buildPreConfigHistoryMigrationsFolder(): string {
+	const dir = mkdtempSync(join(tmpdir(), "pre-config-history-migrations-"));
+	mkdirSync(join(dir, "meta"));
+	const journal = JSON.parse(
+		readFileSync(join(DB_MIGRATIONS_DIR, "meta/_journal.json"), "utf8"),
+	) as {
+		entries: JournalEntry[];
+	};
+	const kept = journal.entries.filter((entry) => entry.tag < CONFIG_HISTORY_MIGRATION_TAG);
+	for (const entry of kept) {
+		cpSync(join(DB_MIGRATIONS_DIR, `${entry.tag}.sql`), join(dir, `${entry.tag}.sql`));
+	}
+	writeFileSync(
+		join(dir, "meta/_journal.json"),
+		JSON.stringify({ ...journal, entries: kept }, null, 2),
+	);
+	return dir;
+}
 
 let container: StartedPostgreSqlContainer;
 let liveUrl: string;
 let scratchUrl: string;
 let backupDir: string;
 let tools: PgTools;
+let configRevisionId: number;
+let configSnapshotHash: string;
 
 /** The client tools run inside the database container: the host's may be older than the server. */
-function containerTools(): PgTools {
-	const hostAddress = `${container.getHost()}:${container.getPort()}`;
+function containerTools(target: StartedPostgreSqlContainer): PgTools {
+	const hostAddress = `${target.getHost()}:${target.getPort()}`;
 	return {
 		pgRestore: async (args, stdinFile, env = {}) => {
 			const child = Bun.spawn(
@@ -37,7 +83,7 @@ function containerTools(): PgTools {
 					"-i",
 					"-e",
 					"PGPASSWORD",
-					container.getId(),
+					target.getId(),
 					"pg_restore",
 					...args.map((arg) => arg.replace(hostAddress, "localhost:5432")),
 				],
@@ -58,12 +104,16 @@ function containerTools(): PgTools {
 	};
 }
 
-async function runScript(dir: string): Promise<void> {
-	const exec = `docker exec -i -e PGPASSWORD ${container.getId()}`;
+async function runScript(
+	target: StartedPostgreSqlContainer,
+	dir: string,
+	database = "gateway_test",
+): Promise<void> {
+	const exec = `docker exec -i -e PGPASSWORD ${target.getId()}`;
 	const child = Bun.spawn(["bash", SCRIPT, dir], {
 		env: {
 			PATH: process.env.PATH ?? "",
-			DATABASE_URL: `postgres://gateway:${PASSWORD}@localhost:5432/gateway_test`,
+			DATABASE_URL: `postgres://gateway:${PASSWORD}@localhost:5432/${database}`,
 			PG_DUMP: `${exec} pg_dump`,
 			PSQL: `${exec} psql`,
 		},
@@ -116,12 +166,36 @@ beforeAll(async () => {
 			`insert into audit_log (actor, action, subject_type, subject_id, detail)
 			 values ('test', 'backup.seed', 'test', 'seed', '{}')`,
 		);
+		// A configuration history fixture, written directly (the way `applyConfig` itself would,
+		// minus the queue infrastructure this test has no need of): `gateway backup check
+		// --restore-test` must prove the restored history is whole, not only that the older tables
+		// came back.
+		const bundle = fixtureBundle("backup-test");
+		configSnapshotHash = canonicalHash(bundle);
+		await pool.query(
+			"insert into config_snapshots (hash, bundle, format, origin, created_at) values ($1, $2, $3, 'applied', now())",
+			[configSnapshotHash, JSON.stringify(bundle), CONFIG_SNAPSHOT_FORMAT],
+		);
+		const revision = await pool.query<{ id: number }>(
+			`insert into config_revisions (snapshot_hash, parent_revision_id, generation, actor, source, created_at)
+			 values ($1, null, 1, 'test', 'cli_apply', now()) returning id::int as id`,
+			[configSnapshotHash],
+		);
+		const revisionId = revision.rows[0]?.id;
+		if (revisionId === undefined) {
+			throw new Error("expected a config_revisions row to be inserted");
+		}
+		configRevisionId = revisionId;
+		await pool.query(
+			"update gateway_controls set active_config_version = $1, active_config_revision = $2, config_generation = 1 where id = 1",
+			[configSnapshotHash, configRevisionId],
+		);
 	} finally {
 		await pool.end();
 	}
-	tools = containerTools();
+	tools = containerTools(container);
 	backupDir = mkdtempSync(join(tmpdir(), "backup-it-"));
-	await runScript(backupDir);
+	await runScript(container, backupDir);
 }, 180_000);
 
 afterAll(async () => {
@@ -159,8 +233,22 @@ describe("gateway backup check against a real backup", () => {
 			"restored:migrations",
 			"restored:controls",
 			"restored:tables",
+			"restored:active_revision",
+			"restored:snapshot_hashes",
 		]);
-		expect(report.checks.at(-1)?.detail).toContain("audit_log 1");
+		const byName = (name: string) => report.checks.find((check) => check.name === name);
+		expect(byName("restored:tables")?.detail).toContain("audit_log 1");
+		expect(byName("restored:tables")?.detail).toContain("config_snapshots 1");
+		expect(byName("restored:tables")?.detail).toContain("config_revisions 1");
+		// The active revision, its snapshot, and the snapshot's own hash all survived the restore.
+		expect(byName("restored:active_revision")).toMatchObject({
+			ok: true,
+			detail: `revision ${configRevisionId}, snapshot ${configSnapshotHash.slice(0, 12)}`,
+		});
+		expect(byName("restored:snapshot_hashes")).toMatchObject({
+			ok: true,
+			detail: "1 snapshot(s) verified",
+		});
 		expect(JSON.stringify(report)).not.toContain(PASSWORD);
 		// Restoring again replaces the scratch database's contents.
 		expect((await checkBackup(options(backupDir, { restoreTest: true }))).ok).toBe(true);
@@ -253,5 +341,94 @@ describe("gateway backup check against a real backup", () => {
 				rmSync(dir, { recursive: true, force: true });
 			}
 		}
+	});
+
+	// Last: it writes directly into the live database a `config_snapshots` row the append-only
+	// trigger (migration 0019) then forbids ever deleting, so every test above runs against the
+	// single, honestly-hashed snapshot seeded in `beforeAll` first.
+	it("reports a config snapshot whose stored hash does not match its own content", async () => {
+		const pool = createPool(liveUrl, 1);
+		try {
+			await pool.query(
+				"insert into config_snapshots (hash, bundle, format, origin, created_at) values ($1, $2, $3, 'applied', now())",
+				["0".repeat(64), JSON.stringify(fixtureBundle("tampered")), CONFIG_SNAPSHOT_FORMAT],
+			);
+		} finally {
+			await pool.end();
+		}
+		const dir = mkdtempSync(join(tmpdir(), "backup-tamper-"));
+		try {
+			await runScript(container, dir);
+			const report = await checkBackup(options(dir, { restoreTest: true }));
+			expect(report.ok).toBe(false);
+			expect(
+				report.checks.find((check) => check.name === "restored:snapshot_hashes"),
+			).toMatchObject({ ok: false, detail: expect.stringContaining("0".repeat(12)) });
+			// Every other restored check (the ones unrelated to the tampered row) still passes.
+			expect(failed(report)).toEqual(["restored:snapshot_hashes"]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("gateway backup check against a pre-config-history (0.3.0-era) backup", () => {
+	let preContainer: StartedPostgreSqlContainer;
+	let preLiveUrl: string;
+	let preScratchUrl: string;
+	let preBackupDir: string;
+	let preTools: PgTools;
+	let migrationsFolder: string;
+
+	beforeAll(async () => {
+		preContainer = await new PostgreSqlContainer(POSTGRES_IMAGE)
+			.withDatabase("gateway_test_pre0018")
+			.withUsername("gateway")
+			.withPassword(PASSWORD)
+			.start();
+		preLiveUrl = preContainer.getConnectionUri();
+		preScratchUrl = preLiveUrl.replace(/\/gateway_test_pre0018$/u, "/gateway_scratch_pre0018");
+		migrationsFolder = buildPreConfigHistoryMigrationsFolder();
+		const pool = createPool(preLiveUrl, 1);
+		try {
+			await migrateDatabase(pool, migrationsFolder);
+			await pool.query("create database gateway_scratch_pre0018");
+			await pool.query(
+				`insert into audit_log (actor, action, subject_type, subject_id, detail)
+				 values ('test', 'backup.seed', 'test', 'seed', '{}')`,
+			);
+		} finally {
+			await pool.end();
+		}
+		preTools = containerTools(preContainer);
+		preBackupDir = mkdtempSync(join(tmpdir(), "backup-it-pre0018-"));
+		await runScript(preContainer, preBackupDir, "gateway_test_pre0018");
+	}, 180_000);
+
+	afterAll(async () => {
+		rmSync(preBackupDir, { recursive: true, force: true });
+		rmSync(migrationsFolder, { recursive: true, force: true });
+		await preContainer?.stop();
+	});
+
+	it("a healthy backup taken before migration 0018 passes --restore-test", async () => {
+		const report = await checkBackup({
+			dir: preBackupDir,
+			maxAgeHours: 26,
+			restoreTest: true,
+			liveUrl: preLiveUrl,
+			scratchUrl: preScratchUrl,
+			tools: preTools,
+			now: new Date(),
+		});
+		expect(failed(report)).toEqual([]);
+		expect(report.ok).toBe(true);
+		const byName = (name: string) => report.checks.find((check) => check.name === name);
+		// Neither table nor the active-revision column exist at this schema: nothing to check, and
+		// `restored:tables` must not demand them.
+		expect(byName("restored:tables")?.detail).not.toContain("config_snapshots");
+		expect(byName("restored:tables")?.detail).not.toContain("config_revisions");
+		expect(byName("restored:active_revision")).toBeUndefined();
+		expect(byName("restored:snapshot_hashes")).toBeUndefined();
 	});
 });

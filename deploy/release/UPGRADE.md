@@ -100,6 +100,37 @@ them on:
 Rolling back from 0.3.0 to 0.2.1 needs an extra check beyond the database: see ROLLBACK.md and
 [docs/operations/releases.md](../../docs/operations/releases.md#the-v2-compatibility-rule).
 
+## Upgrading past 0.3.0: configuration history
+
+Starting with the release after 0.3.0, configuration is also kept as immutable snapshots and an
+append-only revision journal in PostgreSQL (`config_snapshots`, `config_revisions`; ADR-024), on
+top of the `organization.yaml`/`agents/*.yaml` files `config apply` has always read.
+`config_versions`/`agents` (what 0.3.0 and earlier read and write) keep their exact shape and
+meaning, so nothing about the upgrade steps above changes. The first time this is true for a
+given database, do this once, right after step 6:
+
+```bash
+bin/agw run --rm gateway-cli gateway config history
+#   the first entry is a "backfill" revision: the configuration already running, given a place
+#   in the journal it never had before. Keep it as the baseline, not a change to review.
+bin/agw run --rm gateway-cli gateway config export /backups/config-bootstrap
+#   a portable copy of exactly that configuration (docs/operations/backups.md distinguishes this
+#   from the database backup step 3 already took). Keep it next to the backup, or wherever
+#   bootstrap artifacts live.
+```
+
+From here on, day-to-day configuration changes are `gateway config diff <dir> --root <dir>`
+(read-only preview) followed by `gateway config import <dir> --root <dir> --expected-revision
+<id>` (the id `config history` or the refused import itself names) rather than editing `/config`
+and re-running `config apply`. `config apply` keeps working — a documented, deprecated alias —
+for any script that still calls it.
+
+If a database already has configuration history by the time you read this (every upgrade past
+the first one), `gateway config history`'s latest entry is an ordinary revision of its own, not a
+`backfill`: there is nothing to bootstrap, and this section does not apply. `gateway doctor`'s
+`config_history` check (and the controller's own log) tell you which case you are in — see
+ROLLBACK.md for the one case a `backfill` revision can still show up again, after this.
+
 ## Rules the releases follow
 
 - `gateway db migrate` is the only thing that changes the schema. Services never migrate; they

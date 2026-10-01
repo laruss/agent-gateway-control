@@ -19,7 +19,11 @@
     "0014_schema_state": "expand",
     "0015_channel_grants": "expand",
     "0016_channel_grant_tombstones": "expand",
-    "0017_channel_grant_checks": "expand"
+    "0017_channel_grant_checks": "expand",
+    "0018_config_history": "expand",
+    "0019_config_history_guards": "expand",
+    "0020_config_revision_idempotency": "expand",
+    "0021_config_revision_acks": "expand"
   },
   "releases": [
     {

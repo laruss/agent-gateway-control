@@ -98,6 +98,39 @@ either in place breaks nothing.
 
 Once (a)-(d) are done, continue with the database-only steps below.
 
+## Rolling back past configuration history (to 0.3.0 or earlier, ADR-024)
+
+0.3.0 and earlier know nothing of `config_snapshots`/`config_revisions`: they read and write only
+`config_versions`/`agents`, which the expand migration keeps exactly as they were, so `config
+apply` and `agents enable`/`disable` under 0.3.0 work during the rollback the same way they
+always have. Nothing here blocks a rollback or needs doing before one; it is what to expect
+afterward.
+
+- **Before rolling back, stop making configuration changes on the release you are leaving**, the
+  same way UPGRADE.md's step 2 stops every service: a change committed seconds before the
+  rollback is still only as good as whatever you already captured. Take a `gateway config
+  export <dir>` (not only the database backup) so you have a portable copy of exactly what was
+  configured, in case you want to compare it later.
+- **While rolled back, 0.3.0 reads and writes the projections, not the journal.** A `config
+  apply` or `agents enable`/`disable` you run under 0.3.0 changes `config_versions`/`agents`
+  exactly as it always has; there is no `config_snapshots`/`config_revisions` row for it, because
+  0.3.0 does not write one.
+- **Upgrading forward again picks this up automatically, and reports it.** The next time a
+  release that knows configuration history starts (the controller, or any `gateway` CLI command),
+  it notices the projections moved without a matching revision and backfills exactly one revision
+  for them — the same way it already does for a database upgraded from before configuration
+  history existed at all (UPGRADE.md), except this backfilled revision now has a parent: an
+  earlier, real revision it is superseding. That is the signal this is a rollback-interval change,
+  not an initial bootstrap. You get told about it three ways: a structured warning in the
+  controller's log, `gateway doctor`'s `config_history` check, and the `config:backfill` alert —
+  all naming the generation and the new revision id. **Review it**: `gateway config diff` or
+  `config history` shows what changed while rolled back, same as reviewing anyone else's change.
+  **Then clear it**: `commitChange` treats identical content as a no-op, so re-importing the
+  reviewed configuration (or `config rollback` to it) writes no new revision and leaves the
+  backfill in place — acknowledge it directly instead, with `gateway config ack <revision-id>`
+  (the id the alert and the `config_history` check both name). The check and the alert clear on
+  the acknowledgement, or on their own once any later change supersedes the backfilled revision.
+
 ## Without a restore (the previous release is certified)
 
 ```bash

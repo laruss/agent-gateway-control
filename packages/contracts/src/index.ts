@@ -7,6 +7,7 @@ export * from "./event.ts";
 export * from "./ingest.ts";
 export * from "./jobs.ts";
 export * from "./json-schema.ts";
+export * from "./management.ts";
 export * from "./organization.ts";
 export * from "./outbox.ts";
 export * from "./system-status.ts";
