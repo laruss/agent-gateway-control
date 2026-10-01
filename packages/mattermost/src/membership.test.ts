@@ -510,6 +510,28 @@ describe("the membership synchronizer", () => {
 		expect(world.at(LAB).members.has(LISTENER)).toBe(false);
 	});
 
+	it("judges a non-owner re-add before self-heal runs, even when its own check would fail", async () => {
+		const { world, records, sync } = harness();
+		world.add(LAB, OWNER, DEVELOPER_BOT);
+		await sync();
+		// Removed and added again by someone who may not grant, before the next poll.
+		world.at(LAB).members.delete(DEVELOPER_BOT);
+		world.add(LAB, MEMBER, DEVELOPER_BOT);
+		// Armed right before the revalidating pass: if self-heal ran before the re-add is judged
+		// (Codex's review of ebfdd5a), this failure would be spent for nothing, and could leave an
+		// unauthorized grant active instead of revoked.
+		world.failListenerCheckOnce = true;
+		await sync();
+		expect(records.grants).toEqual([expect.objectContaining({ channelId: LAB, state: "revoked" })]);
+		expect(records.rejections).toEqual([
+			expect.objectContaining({ actorUserId: MEMBER, reason: "not_owner_or_admin" }),
+		]);
+		expect(world.at(LAB).members.has(DEVELOPER_BOT)).toBe(false);
+		// Never reached: self-heal only runs once a grant has held up to revalidation, and this one
+		// did not, so the one-time failure is still armed.
+		expect(world.failListenerCheckOnce).toBe(true);
+	});
+
 	it("finds a re-add behind many newer posts in a busy channel", async () => {
 		const { world, records, sync } = harness();
 		world.add(LAB, OWNER, DEVELOPER_BOT);

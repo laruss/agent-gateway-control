@@ -284,10 +284,11 @@ async function judgeAdd(pass: BotPass, channel: ApiChannel, add: ApiPost): Promi
  */
 async function ensureListenerIn(pass: BotPass, channel: ApiChannel): Promise<void> {
 	const { options, state, client } = pass;
-	if (await client.isChannelMember(channel.id, state.listener.userId)) {
-		return;
-	}
+	// Never throws: a failure here is retried on the next pass and must not stop the rest of it.
 	try {
+		if (await client.isChannelMember(channel.id, state.listener.userId)) {
+			return;
+		}
 		await client.addChannelMember(channel.id, state.listener.userId);
 	} catch (error) {
 		options.log.warn("the listener could not be added to a granted channel", {
@@ -363,10 +364,6 @@ async function syncBot(pass: BotPass): Promise<void> {
 			if (bot.configuredChannelIds.has(grant.channelId)) {
 				return;
 			}
-			// Every pass, not only the one that recorded the grant: a transient failure right after
-			// granting it, or a restart in between, left the listener out with no other chance to
-			// bring it back in.
-			await ensureListenerIn(pass, channel);
 			// Removed and added again between two polls: the newer add decides, not the old one.
 			// Only posts since the last check are read (newest first, overlapping a little); the
 			// check counts as done only once whatever it found was judged.
@@ -401,6 +398,10 @@ async function syncBot(pass: BotPass): Promise<void> {
 					return;
 				}
 			}
+			// Every pass, not only the one that recorded the grant, and only once the grant has held
+			// up: a transient failure right after granting, or a restart in between, left the
+			// listener out with no other chance to bring it back in.
+			await ensureListenerIn(pass, channel);
 			await routeMentions(pass, grant.channelId, Math.max(grant.sinceMs, after - SCAN_OVERLAP_MS));
 			// By Mattermost's own clock: the newest post read, a little back. The controller's clock
 			// may run ahead of the server's, and posts are dated by the server.
