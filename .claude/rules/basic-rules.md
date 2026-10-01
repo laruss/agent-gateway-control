@@ -2,8 +2,10 @@
 
 1. always use bun instead of npm;
 2. if you need a new UI component, try to get first from `shadcn/ui`, if it's not there, create a new one.
-   - Exception: the owner's console (ADR-023) is plain, controller-rendered HTML with no client
-     framework or build step; it does not use shadcn/ui.
+   - Exception: the owner's console (ADR-023, ADR-025) is plain, controller-rendered HTML with no
+     client framework or build step; it does not use shadcn/ui. This exception ends once the
+     console becomes the React SPA (ADR-025); until that lands, any page the controller renders
+     for it — including its login form — stays plain HTML like the rest of it.
 3. if you write tailwind classes, use spacing (1 = 4px) values, not pixel values (e.g. `w-16` instead of `w-[64px]`)
 
 ## Validation

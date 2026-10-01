@@ -57,7 +57,8 @@ function isControl(ch: string): boolean {
  * Reads one line with the terminal's echo off. Raw mode is restored whichever way the line
  * ends: Enter, Ctrl-C, or an error partway through. Backspace removes a whole character and
  * Ctrl-U the whole entry; any other control key (arrows and other escape sequences included)
- * ends the entry with an error rather than storing bytes an HTTP Basic dialog cannot type.
+ * ends the entry with an error rather than storing bytes a login form's password field cannot
+ * type.
  */
 function readHiddenLine(stdin: TtyInput, stdout: TtyOutput, prompt: string): Promise<string> {
 	return new Promise((resolve, reject) => {

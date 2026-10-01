@@ -28,6 +28,12 @@ All notable changes are documented here. The project follows Semantic Versioning
 - `gateway backup check --restore-test` verifies configuration history on a restore: the active
   revision exists and every snapshot still hashes to its own key. Backups taken before this
   release still verify.
+- The owner's console gains server-side sessions (ADR-025): a database-backed session cookie
+  (`__Host-gw_session`; 30-minute idle timeout, 12-hour absolute lifetime, at most 20 active
+  sessions at once), a rotating CSRF token required on every mutation, and a new
+  `CONSOLE_ORIGIN` setting every login and mutation must match exactly. A plain sign-in form
+  replaces the browser's HTTP Basic dialog at `/`; `gateway console password set` now also
+  revokes every active session when it can reach the database.
 
 ### Changed
 

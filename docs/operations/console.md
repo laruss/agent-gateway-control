@@ -1,17 +1,19 @@
 # The owner's console
 
-A read-only status page for one owner: which agents are running, what they are doing, how deep
-the queues are, what alerts are firing, today's budgets, and the Gateway's own context
-measurements. The design is [ADR-023](../adr/023-console-and-operator.md); the operator agent
-that answers the same question in Mattermost is in
-[the observability guide](observability.md#the-console) and its own section below.
+A management console for one owner: today, a status page showing which agents are running, what
+they are doing, how deep the queues are, what alerts are firing, today's budgets, and the
+Gateway's own context measurements. The read-only design is [ADR-023](../adr/023-console-and-operator.md);
+session authentication, CSRF and exact Origin checks are [ADR-025](../adr/025-management-console.md),
+which also replaces ADR-023's HTTP Basic. The operator agent that answers the same "what's going
+on" question in Mattermost is in [the observability guide](observability.md#the-console) and its
+own section below.
 
 ## Enabling it
 
-The console is off by default. On the home server it needs three things: a password, the
-setting turned on, and Caddy already proxying `gateway.local`. A first install gets that from
-[home-server.md](home-server.md#mattermost) already; turning the console on after an upgrade
-from an older home server kit needs an extra step first, in
+The console is off by default. On the home server it needs: a password, `CONSOLE_ORIGIN` left at
+its default, the setting turned on, and Caddy already proxying `gateway.local`. A first install
+gets that from [home-server.md](home-server.md#mattermost) already; turning the console on after
+an upgrade from an older home server kit needs an extra step first, in
 [UPGRADE.md](../../deploy/release/UPGRADE.md#upgrading-to-030).
 
 1. Set the password (hidden entry, confirmed twice; only its Argon2id hash is written, to
@@ -27,6 +29,10 @@ from an older home server kit needs an extra step first, in
    CONSOLE_ENABLED=true
    ```
 
+   `CONSOLE_ORIGIN` already defaults to `https://gateway.local` in `gateway.env.example`; change
+   it only together with whatever Caddy site actually serves the console, since every login and
+   mutation is refused unless the browser's `Origin` header matches it exactly.
+
 3. Apply it: `CONSOLE_ENABLED` is a `gateway.env` change, and `docker compose restart` does not
    re-read an updated `.env` file, only recreating the container does:
 
@@ -36,34 +42,57 @@ from an older home server kit needs an extra step first, in
 
 The controller reads the password hash once, at start; it refuses to start at all if
 `CONSOLE_ENABLED=true` and the hash file is missing, empty, or not private (mode `0600`, no
-symlink, not group- or world-readable). This is deliberate: a half-configured console must
-never end up serving unauthenticated, or silently skip only the console and start everything
-else.
+symlink, not group- or world-readable), or if `CONSOLE_ORIGIN` is not a plain origin (scheme and
+host, no path). This is deliberate: a half-configured console must never end up serving
+unauthenticated, or silently skip only the console and start everything else.
 
-**Rotating the password** is different: only the hash file's content changes, and the
-controller still reads it just once at start, so a plain restart is enough to pick it up — run
-`gateway console password set` again, then `bin/agw restart gateway-controller`. There is one
-account, fixed to the username `owner`; it is never a Mattermost username or any other identity
-the rest of the Gateway uses.
+**Rotating the password** writes a new hash file and, when the CLI can also reach the database,
+revokes every active session immediately; either way, a plain restart (`bin/agw restart
+gateway-controller`) is enough to make sure, since the controller also stops accepting any
+session created under the old hash the moment it restarts with the new one. There is one
+account; it is never a Mattermost username or any other identity the rest of the Gateway uses.
 
 ## Opening it
 
 `https://gateway.local`, from any device on the home network that already trusts the home
 server's Caddy root certificate (the same one trusted for `mattermost.local`; see
-[home-server.md](home-server.md#mattermost)). The browser's own HTTP Basic dialog asks for the
-username (`owner`) and the password just set.
+[home-server.md](home-server.md#mattermost)). Visiting it shows a plain sign-in form (just a
+password field — there is no username any more); signing in sets a session cookie good for 12
+hours, or 30 minutes of inactivity, whichever comes first. **Sign out** by calling `DELETE
+/api/session` (the SPA, once it lands, will give this a button; today it's one `curl` call away
+— see below).
 
 There is no host port: the controller's listener binds only its own alias on the `agent-mm`
 network (`gateway-console`, port 8084), the same network Caddy and Mattermost share. Nothing on
 `agent-control` (the workers, connectors and tool runner) can reach it, and nothing outside the
 home server's LAN can either, unless the home server's own network is exposed further.
 
-Two routes exist, both read-only and both requiring the same credential: `GET /` (the HTML
-page below) and `GET /api/status` (the same projection as JSON, for scripting or a quick
-`curl`). Every response — success, a failure, even the `401` challenge itself — carries
+Routes:
+
+| Route | Method | Needs | What it does |
+|---|---|---|---|
+| `/` | `GET` | — | The dashboard if a valid session cookie is present, otherwise the sign-in form. |
+| `/` | `POST` | exact Origin | The sign-in form's own submission (`application/x-www-form-urlencoded`); sets the cookie and redirects back to `/`. |
+| `/api/session` | `GET` | — | `{authenticated, csrfToken?, expiresAt?}` for the current cookie; also mints a fresh CSRF token when authenticated. |
+| `/api/session` | `POST` | exact Origin | JSON `{password}`; returns `{csrfToken, expiresAt}` and sets the cookie. |
+| `/api/session` | `DELETE` | session, exact Origin, CSRF header | Logs out: revokes the session and clears the cookie. |
+| `/api/status` | `GET` | session | The same projection as JSON, for scripting or a quick `curl` once signed in. |
+
+Every response — success, a failure, even the sign-in page itself — carries
 `Cache-Control: no-store`, a restrictive CSP, `X-Content-Type-Options: nosniff`,
-`Referrer-Policy: no-referrer` and `X-Frame-Options: DENY`. There is no permissive CORS and no
-mutation route of any kind.
+`Referrer-Policy: no-referrer` and `X-Frame-Options: DENY`. There is no permissive CORS. A
+mutation (`POST`/`DELETE`) additionally requires the request's `Origin` header to equal
+`CONSOLE_ORIGIN` exactly, and, when the browser sends it, `Sec-Fetch-Site: same-origin`; a
+logout additionally requires the raw CSRF token `GET`/`POST /api/session` returned, in an
+`X-CSRF-Token` header, matching what the server holds for that session.
+
+Scripting a login without a browser:
+
+```bash
+curl -s -c cookies.txt -H 'content-type: application/json' -H 'origin: https://gateway.local' \
+  -d '{"password":"..."}' https://gateway.local/api/session
+curl -s -b cookies.txt https://gateway.local/api/status
+```
 
 ## What each section shows
 
@@ -119,10 +148,16 @@ for one.
 
 ## Limits and troubleshooting
 
-- **`401 unauthorized`:** no `Authorization` header, or a wrong username/password. The browser
-  re-prompts on its own; check the password was actually set (`console_password_hash` exists)
-  and the controller picked it up: `bin/agw up -d gateway-controller` after first turning
-  `CONSOLE_ENABLED` on, `bin/agw restart gateway-controller` after only rotating the password.
+- **`401 unauthorized`:** no session cookie, or an expired/revoked/wrong-password one. `/` shows
+  the sign-in form instead of a browser dialog; signing in again is all that's needed. Check the
+  password was actually set (`console_password_hash` exists) and the controller picked it up:
+  `bin/agw up -d gateway-controller` after first turning `CONSOLE_ENABLED` on, `bin/agw restart
+  gateway-controller` after only rotating the password.
+- **`403` on sign-in or a mutation:** the request's `Origin` header did not exactly equal
+  `CONSOLE_ORIGIN`, carried `Sec-Fetch-Site: cross-site`, or (for `DELETE /api/session`) its
+  `X-CSRF-Token` header was missing or did not match. A browser pointed at anything other than
+  `CONSOLE_ORIGIN` itself (a different hostname, `http://` instead of `https://`, a port) always
+  gets this; a plain `curl` needs the matching `-H 'origin: ...'` shown above.
 - **`429 too many attempts` (with `Retry-After`):** failed logins share one bounded, global
   counter — ten failures per minute, across every client, not partitioned by address. A
   password-guessing attempt from anywhere blocks the owner too, along with the attacker;
@@ -138,8 +173,12 @@ for one.
   started. This is different from stale: there is no last-known snapshot to fall back to yet.
 - **`503 busy`:** too many concurrent login attempts are already verifying their password hash
   (Argon2id is deliberately expensive); retry shortly.
-- A request with an `Authorization` header longer than expected (well past the longest password
-  `gateway console password set` accepts) is refused with `400` before anything is parsed.
+- A login body larger than expected (well past the longest password `gateway console password
+  set` accepts, plus field overhead) is refused with `400` before anything is parsed.
+- **Signed out sooner than expected:** sessions are capped at 20 active at once (creating one
+  beyond that revokes the oldest), idle out after 30 minutes of no request, and expire
+  absolutely after 12 hours regardless of activity. Signing in again is the only recovery; none
+  of this is configurable per ADR-025's threat model (one owner, one browser at a time).
 
 ## The operator agent
 

@@ -90,19 +90,29 @@ th, td { text-align: left; padding: 0.3rem 0.5rem; border-bottom: 1px solid var(
 .section { margin-bottom: 1.5rem; }
 footer { color: var(--muted); font-size: 0.75rem; margin-top: 1.5rem; }
 ul { margin: 0.2rem 0; padding-left: 1.1rem; font-size: 0.85rem; }
+form.login { max-width: 320px; margin: 2rem auto 0; display: grid; gap: 0.75rem; }
+form.login input {
+	padding: 0.5rem 0.6rem; border: 1px solid var(--border); border-radius: 0.4rem;
+	background: var(--panel); color: var(--text); font: inherit; width: 100%;
+}
+form.login button {
+	padding: 0.5rem 0.6rem; border-radius: 0.4rem; border: 1px solid var(--accent);
+	background: var(--accent); color: #fff; font: inherit; cursor: pointer;
+}
+form.login .error { color: var(--bad); font-size: 0.85rem; }
 @media (max-width: 480px) {
 	body { padding: 0.6rem; font-size: 14px; }
 	.kv dd { text-align: left; }
 }
 `;
 
-function pageShell(title: string, body: string): string {
+function pageShell(title: string, body: string, refresh: boolean = true): string {
 	return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="15">
+${refresh ? '<meta http-equiv="refresh" content="15">' : ""}
 <title>${esc(title)}</title>
 <style>${STYLE}</style>
 </head>
@@ -287,6 +297,22 @@ function footerLine(status: ConsoleStatus): string {
 }
 
 const TITLE = "Agent Gateway Console";
+
+/**
+ * The console's minimal, no-JavaScript login page (ADR-025): a plain form, posting to `/` as
+ * `application/x-www-form-urlencoded`, which the CSP's `form-action 'self'` permits without
+ * loosening `script-src`. Replaced once the owner's console becomes the React SPA.
+ */
+export function renderLoginPage(error: string | null): string {
+	const body = `<h1>${esc(TITLE)}</h1>
+<form class="login" method="post" action="/">
+<label for="password">Password</label>
+<input type="password" id="password" name="password" autocomplete="current-password" autofocus required>
+${error === null ? "" : `<p class="error">${esc(error)}</p>`}
+<button type="submit">Sign in</button>
+</form>`;
+	return pageShell(TITLE, body, false);
+}
 
 /** Renders the console's one page: the full dashboard when data is available (even if stale),
  * or a minimal unavailable page before any collection has ever succeeded. Pure: every dynamic

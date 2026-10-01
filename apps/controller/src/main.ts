@@ -13,6 +13,7 @@ import {
 	startHealthServer,
 } from "@agent-gateway/service";
 import { withPendingApprovalCards } from "./approval-cards.ts";
+import { assertConsoleOrigin } from "./console-auth.ts";
 import { resolveConsolePasswordHash, startConsoleServer } from "./console-server.ts";
 import { collectConsoleStatus, createConsoleStatusCache } from "./console-status.ts";
 import { type ControllerOptions, startController } from "./controller.ts";
@@ -45,15 +46,19 @@ if (delivery !== "mattermost" && environment !== "development" && environment !=
 }
 
 /**
- * The owner's console (ADR-023) is off unless explicitly turned on, and its password hash is
- * read and validated here, before the controller or health listener starts: a missing, exposed
- * or unreadable hash file must fail the whole process closed, never start everything else and
- * skip only the console, and never start a listener that would end up serving unauthenticated.
+ * The owner's console (ADR-023, ADR-025) is off unless explicitly turned on, and its password
+ * hash is read and validated here, before the controller or health listener starts: a missing,
+ * exposed or unreadable hash file must fail the whole process closed, never start everything
+ * else and skip only the console, and never start a listener that would end up serving
+ * unauthenticated.
  */
 const consoleEnabled = readSetting("CONSOLE_ENABLED") === "true";
 const consolePasswordHash = consoleEnabled
 	? resolveConsolePasswordHash(readSetting("SECRETS_DIR"))
 	: null;
+/** Exact `Origin` every console login and mutation must carry (ADR-025); read and validated here,
+ * alongside the password hash, before anything the console serves starts. */
+const consoleOrigin = consoleEnabled ? assertConsoleOrigin(requireSetting("CONSOLE_ORIGIN")) : null;
 
 function bridgeOptions(): MattermostBridgeOptions {
 	const routingKey = requireSetting("GATEWAY_ROUTING_KEY");
@@ -105,11 +110,13 @@ const consoleAddress = consoleEnabled
 	? (await lookup(readSetting("CONSOLE_HOST") ?? "127.0.0.1", { family: 4 })).address
 	: null;
 const ownerConsole =
-	consoleAddress !== null && consolePasswordHash !== null
+	consoleAddress !== null && consolePasswordHash !== null && consoleOrigin !== null
 		? startConsoleServer({
 				port: intSetting("CONSOLE_PORT", 8084),
 				hostname: consoleAddress,
 				passwordHash: consolePasswordHash,
+				origin: consoleOrigin,
+				pool: controller.deps.pool,
 				cache: createConsoleStatusCache((now) => collectConsoleStatus(controller.deps.pool, now)),
 				log,
 			})

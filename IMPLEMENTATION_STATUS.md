@@ -1901,3 +1901,37 @@ Deliberate choices in this phase ([ADR-024](docs/adr/024-managed-configuration.m
 - `config export` writes only into a new or empty directory; replacing an earlier export is left
   to the operator.
 
+## Phase 13 - Authenticated management console and agent editor (in progress)
+
+### Session authentication and mutation protections
+
+Status: **done**
+
+| Item | State | Evidence |
+|------|-------|----------|
+| `console_sessions`: hashed token, rotating hashed CSRF token, `password_hash_fingerprint`, sliding 30-minute idle timeout (touched at most once a minute), 12-hour absolute expiry, a 20-session active cap evicting the oldest | done | `packages/db/migrations/0022_console_sessions.sql`, `packages/core/src/services/console-sessions.ts` |
+| `POST/GET/DELETE /api/session`, `GET`/`POST /` (dashboard or a plain sign-in form, and its submission); every other `/api/*` route needs a valid session, every mutation needs the exact `CONSOLE_ORIGIN` and a matching CSRF header; HTTP Basic removed | done | `apps/controller/src/console-server.ts`, `console-auth.ts`, `console-render.ts` |
+| `CONSOLE_ORIGIN` setting, validated at start alongside the password hash | done | `apps/controller/src/main.ts`, `deploy/release/compose.yaml`, `deploy/release/gateway.env.example` |
+| `gateway console password set` revokes every active session directly when it can reach the database, on top of the fingerprint check that invalidates them on the next controller restart regardless | done | `apps/cli/src/commands.ts`, `packages/service/src/console-auth.ts` |
+| Expired/revoked session cleanup hooked into the existing retention pass | done | `packages/core/src/services/retention.ts` |
+
+Acceptance:
+
+- [x] Login always mints a fresh session; a client-supplied cookie is never consulted (session
+  fixation is not possible).
+- [x] Idle timeout, absolute expiry, logout and a password rotation each invalidate a session;
+  verified against an injected clock, not real sleeps.
+- [x] A missing or foreign `Origin`, `Sec-Fetch-Site: cross-site`, and a missing, wrong or
+  cross-session CSRF token are each refused on login and/or on a mutation as appropriate.
+- [x] An unauthenticated `/api/status` returns `401`; no password, token or cookie value appears
+  in a log line or an error body.
+
+Deliberate choices here ([ADR-025](docs/adr/025-management-console.md)):
+
+- The CSRF token is stored only as a hash, like the session token; `GET /api/session` rotates it
+  so a reloaded page can recover a usable one without the server ever holding the raw value.
+- `GET /` and `POST /` carry the sign-in form at the same path the SPA will later serve from,
+  rather than a separate `/login` route it would otherwise have to deprecate.
+- Session validation and `Origin`/CSRF checks never consult `X-Forwarded-*`: only the connection
+  Caddy actually made to the listener counts.
+

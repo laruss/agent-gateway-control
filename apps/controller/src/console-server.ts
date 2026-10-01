@@ -1,30 +1,43 @@
 import { CONSOLE_PASSWORD_HASH_SECRET_FILE } from "@agent-gateway/contracts";
+import {
+	CONSOLE_SESSION_MAX_ACTIVE,
+	createConsoleSession,
+	revokeConsoleSession,
+	rotateConsoleSessionCsrf,
+	touchConsoleSession,
+} from "@agent-gateway/core";
 import { errorFields, type Logger } from "@agent-gateway/logging";
 import {
+	consolePasswordHashFingerprint,
 	readSecretFile,
 	resolveSecretPath,
 	SettingError,
 	secretFileState,
 	verifyConsolePassword,
 } from "@agent-gateway/service";
-import { renderConsolePage } from "./console-render.ts";
+import type pg from "pg";
+import {
+	CSRF_HEADER_NAME,
+	clearedSessionCookieHeader,
+	csrfTokenMatches,
+	hashSessionToken,
+	originAllowed,
+	parseCookieHeader,
+	randomSessionToken,
+	SESSION_COOKIE_NAME,
+	sessionCookieHeader,
+} from "./console-auth.ts";
+import { renderConsolePage, renderLoginPage } from "./console-render.ts";
 import type { ConsoleSnapshot, ConsoleStatusCache } from "./console-status.ts";
 
 // ---------------------------------------------------------------------------
-// The owner's console listener (ADR-023): a separate Bun.serve, authenticated with HTTP Basic
-// against one Argon2id hash, serving the same cached, read-only projection as HTML (`GET /`) and
-// JSON (`GET /api/status`). No mutation route, no permissive CORS, and every response (success,
-// error, or the 401 challenge itself) carries the same fixed set of security headers.
+// The owner's console listener (ADR-025): a separate Bun.serve, authenticated with a server-side
+// session cookie and CSRF-protected mutations instead of HTTP Basic (superseding that part of
+// ADR-023). `GET /` and `POST /` carry the server-rendered dashboard and its stand-in login page
+// for now; `/api/session` and `/api/status` are the console's
+// JSON surface. Every response — success, error, even the login page itself — carries the same
+// fixed set of security headers.
 // ---------------------------------------------------------------------------
-
-/** The console's one account; there is exactly one owner, so the name is fixed rather than
- * configurable. Never a Mattermost username or any other identity the rest of the Gateway uses. */
-const OWNER_USERNAME = "owner";
-
-/** Room for the longest password `gateway console password set` accepts (256 UTF-16 units, at
- * most 768 UTF-8 bytes), base64-encoded after `owner:` behind `Basic `: about 1,040 bytes. A
- * header past this is refused before it is even looked at. */
-const MAX_AUTHORIZATION_HEADER_BYTES = 2048;
 
 /** Failed logins share one bounded, global counter (ADR-023), never partitioned by a
  * client-supplied address (`X-Forwarded-For` and the like are never trusted for this). */
@@ -35,10 +48,14 @@ const MAX_LOGIN_FAILURES_PER_WINDOW = 10;
  * at once, so a burst of requests cannot turn that cost into unbounded memory pressure. */
 const DEFAULT_MAX_CONCURRENT_VERIFICATIONS = 4;
 
+/** Well past the longest JSON or form body a login ever needs (a password up to 256 UTF-16
+ * units, plus field overhead); a larger body is refused before it is even read. */
+const MAX_LOGIN_BODY_BYTES = 4096;
+
 const SECURITY_HEADERS: Readonly<Record<string, string>> = {
 	"cache-control": "no-store",
 	"content-security-policy":
-		"default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+		"default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
 	"x-content-type-options": "nosniff",
 	"referrer-policy": "no-referrer",
 	"x-frame-options": "DENY",
@@ -63,14 +80,17 @@ const textResponse = (
 ) => respond(body, status, "text/plain; charset=utf-8", headers);
 const htmlResponse = (body: string, status: number) =>
 	respond(body, status, "text/html; charset=utf-8");
-const jsonResponse = (value: unknown, status: number) =>
-	respond(JSON.stringify(value), status, "application/json; charset=utf-8");
+const jsonResponse = (
+	value: unknown,
+	status: number,
+	headers: Readonly<Record<string, string>> = {},
+) => respond(JSON.stringify(value), status, "application/json; charset=utf-8", headers);
+const redirectToRoot = (headers: Readonly<Record<string, string>>) =>
+	respond("", 303, "text/plain; charset=utf-8", { ...headers, location: "/" });
 
-function unauthorized(): Response {
-	return textResponse("unauthorized", 401, {
-		"www-authenticate": 'Basic realm="Agent Gateway", charset="UTF-8"',
-	});
-}
+const unauthenticated = () => textResponse("unauthorized", 401);
+const forbidden = (message: string) => textResponse(message, 403);
+const badRequest = (message: string) => textResponse(message, 400);
 
 function tooManyRequests(waitMs: number): Response {
 	const seconds = Math.max(1, Math.ceil(waitMs / 1000));
@@ -99,32 +119,47 @@ export function resolveConsolePasswordHash(secretsDir?: string): string {
 	return readSecretFile(path);
 }
 
-type BasicCredentials = Readonly<{ username: string; password: string }>;
-
-const BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
-
-/** Parses `Authorization: Basic <base64(username:password)>`. Anything else — a different
- * scheme, non-base64 content, or a decoded value with no colon — is not a credential, not a
- * crash: `null`. */
-function parseBasicAuth(header: string): BasicCredentials | null {
-	const match = /^Basic\s+(\S+)$/i.exec(header.trim());
-	if (match === null) {
-		return null;
-	}
-	const token = match[1];
-	if (token === undefined || !BASE64.test(token)) {
-		return null;
-	}
-	const decoded = Buffer.from(token, "base64").toString("utf8");
-	const separator = decoded.indexOf(":");
-	if (separator < 0) {
-		return null;
-	}
-	return { username: decoded.slice(0, separator), password: decoded.slice(separator + 1) };
-}
-
 function utf8ByteLength(value: string): number {
 	return new TextEncoder().encode(value).length;
+}
+
+/**
+ * Reads a request body as text, refusing it (returning `null`) before or after reading when it
+ * exceeds `maxBytes` — by its declared `Content-Length` if present, and always by its actual
+ * decoded size, since a chunked request carries no `Content-Length` at all.
+ */
+async function readBoundedText(request: Request, maxBytes: number): Promise<string | null> {
+	const declared = request.headers.get("content-length");
+	if (declared !== null) {
+		const length = Number(declared);
+		if (!Number.isFinite(length) || length > maxBytes) {
+			return null;
+		}
+	}
+	const text = await request.text();
+	return utf8ByteLength(text) > maxBytes ? null : text;
+}
+
+/** `{"password": "..."}`; anything else (malformed JSON, a missing or non-string field) is not a
+ * credential, not a crash: `null`. */
+function passwordFromJson(text: string): string | null {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(text);
+	} catch {
+		return null;
+	}
+	if (typeof parsed !== "object" || parsed === null) {
+		return null;
+	}
+	const password = (parsed as Record<string, unknown>).password;
+	return typeof password === "string" ? password : null;
+}
+
+/** `password=...`, `application/x-www-form-urlencoded`, for the no-JavaScript login form. */
+function passwordFromForm(text: string): string | null {
+	const params = new URLSearchParams(text);
+	return params.has("password") ? (params.get("password") ?? "") : null;
 }
 
 /** A bounded gate on concurrent Argon2id verifications: over the limit, `run` returns `"busy"`
@@ -174,20 +209,37 @@ export type ConsoleServerOptions = Readonly<{
 	/** Already read and validated (`resolveConsolePasswordHash`); never re-read per request, the
 	 * same choice `gateway console password set` documents ("restart ... to apply it"). */
 	passwordHash: string;
+	/** The exact `Origin` every login and mutation must carry (ADR-025), e.g.
+	 * `https://gateway.local` — `assertConsoleOrigin` in the caller validates its shape. */
+	origin: string;
+	/** Where `console_sessions` rows live; this listener is the only writer and reader of them. */
+	pool: pg.Pool;
 	cache: ConsoleStatusCache;
 	log: Logger;
 	clock?: () => Date;
 	maxConcurrentVerifications?: number;
+	/** Active sessions kept at once; the oldest beyond this are revoked on the next login. */
+	maxActiveSessions?: number;
 	/** Overrides `verifyConsolePassword` for tests only; production always uses the real one. */
 	verifyPassword?: (password: string, hash: string) => Promise<boolean>;
 }>;
 
 export type RunningConsoleServer = Readonly<{ port: number; stop: () => Promise<void> }>;
 
+type LoginOutcome =
+	| Readonly<{ kind: "ok"; token: string; csrfToken: string; expiresAt: Date }>
+	| Readonly<{ kind: "invalid" }>
+	| Readonly<{ kind: "rate-limited"; waitMs: number }>
+	| Readonly<{ kind: "busy" }>;
+
+type AuthenticatedSession = Readonly<{ id: string; csrfTokenHash: string; expiresAt: Date }>;
+
 /**
- * Starts the owner's console listener. Every request is authenticated before anything else
- * happens (before the cached projection is even read); only `GET /` and `GET /api/status` exist,
- * both read-only, both requiring the same credential.
+ * Starts the owner's console listener. `GET /` and `POST /` carry the dashboard and its
+ * stand-in login page, `/api/status` the same projection as JSON, and `/api/session` the
+ * session lifecycle; every route but login and the session check requires an authenticated
+ * session, and every mutation additionally requires the exact configured Origin and a matching
+ * CSRF header.
  */
 export function startConsoleServer(options: ConsoleServerOptions): RunningConsoleServer {
 	const clock = options.clock ?? (() => new Date());
@@ -196,57 +248,182 @@ export function startConsoleServer(options: ConsoleServerOptions): RunningConsol
 		options.maxConcurrentVerifications ?? DEFAULT_MAX_CONCURRENT_VERIFICATIONS,
 	);
 	const limiter = createLoginLimiter(clock);
+	const fingerprint = consolePasswordHashFingerprint(options.passwordHash);
+	const maxActiveSessions = options.maxActiveSessions ?? CONSOLE_SESSION_MAX_ACTIVE;
 
-	async function authenticate(request: Request): Promise<Response | null> {
-		const header = request.headers.get("authorization");
-		if (header !== null && utf8ByteLength(header) > MAX_AUTHORIZATION_HEADER_BYTES) {
-			return textResponse("bad request", 400);
-		}
+	async function attemptLogin(password: string): Promise<LoginOutcome> {
 		const blockedMs = limiter.blockedFor();
 		if (blockedMs !== null) {
-			return tooManyRequests(blockedMs);
+			return { kind: "rate-limited", waitMs: blockedMs };
 		}
-		if (header === null) {
-			return unauthorized();
-		}
-		const credentials = parseBasicAuth(header);
-		if (credentials === null) {
-			limiter.recordFailure();
-			return unauthorized();
-		}
-		const verified = await gate.run(() => verify(credentials.password, options.passwordHash));
+		const verified = await gate.run(() => verify(password, options.passwordHash));
 		if (verified === "busy") {
-			return serviceBusy();
+			return { kind: "busy" };
 		}
-		// Both the username and the Argon2id check run every time, so a wrong username takes the
-		// same shape of work as a wrong password: neither ever short-circuits the other.
-		const usernameOk = credentials.username === OWNER_USERNAME;
-		if (!usernameOk || !verified) {
+		if (!verified) {
 			limiter.recordFailure();
-			return unauthorized();
+			return { kind: "invalid" };
 		}
-		return null;
+		// A fresh token is always minted here; nothing about the request (including any cookie it
+		// already carries) is ever consulted, which is what rules out session fixation.
+		const token = randomSessionToken();
+		const csrfToken = randomSessionToken();
+		const created = await createConsoleSession(
+			options.pool,
+			{
+				tokenHash: hashSessionToken(token),
+				csrfTokenHash: hashSessionToken(csrfToken),
+				passwordHashFingerprint: fingerprint,
+			},
+			clock(),
+			maxActiveSessions,
+		);
+		return { kind: "ok", token, csrfToken, expiresAt: created.expiresAt };
 	}
 
-	async function handle(request: Request): Promise<Response> {
-		const denied = await authenticate(request);
-		if (denied !== null) {
-			return denied;
+	async function authenticate(request: Request): Promise<AuthenticatedSession | null> {
+		const token = parseCookieHeader(request.headers.get("cookie"), SESSION_COOKIE_NAME);
+		if (token === null) {
+			return null;
 		}
-		const { pathname } = new URL(request.url);
-		if (pathname !== "/" && pathname !== "/api/status") {
-			return textResponse("not found", 404);
+		return touchConsoleSession(options.pool, hashSessionToken(token), clock(), fingerprint);
+	}
+
+	function sessionMaxAgeSeconds(expiresAt: Date): number {
+		return Math.max(0, Math.round((expiresAt.getTime() - clock().getTime()) / 1000));
+	}
+
+	async function handleRoot(request: Request): Promise<Response> {
+		if (request.method === "GET") {
+			const session = await authenticate(request);
+			if (session === null) {
+				return htmlResponse(renderLoginPage(null), 200);
+			}
+			const snapshot: ConsoleSnapshot = await options.cache.get();
+			const status = snapshot.state === "unavailable" ? 503 : 200;
+			return htmlResponse(renderConsolePage(snapshot), status);
 		}
-		// HEAD is refused outright rather than answered with an empty body: this listener has
-		// exactly two GET routes and nothing worth a conditional-request shortcut.
+		if (request.method === "POST") {
+			if (!originAllowed(request, options.origin)) {
+				return forbidden("origin not allowed");
+			}
+			if (
+				!(request.headers.get("content-type") ?? "").startsWith("application/x-www-form-urlencoded")
+			) {
+				return badRequest("expected application/x-www-form-urlencoded");
+			}
+			const text = await readBoundedText(request, MAX_LOGIN_BODY_BYTES);
+			const password = text === null ? null : passwordFromForm(text);
+			if (password === null) {
+				return badRequest("missing password");
+			}
+			const outcome = await attemptLogin(password);
+			if (outcome.kind === "rate-limited") {
+				return tooManyRequests(outcome.waitMs);
+			}
+			if (outcome.kind === "busy") {
+				return serviceBusy();
+			}
+			if (outcome.kind === "invalid") {
+				return htmlResponse(renderLoginPage("wrong password"), 401);
+			}
+			return redirectToRoot({
+				"set-cookie": sessionCookieHeader(outcome.token, sessionMaxAgeSeconds(outcome.expiresAt)),
+			});
+		}
+		return textResponse("method not allowed", 405, { allow: "GET, POST" });
+	}
+
+	async function handleStatus(request: Request): Promise<Response> {
 		if (request.method !== "GET") {
 			return textResponse("method not allowed", 405, { allow: "GET" });
 		}
+		const session = await authenticate(request);
+		if (session === null) {
+			return unauthenticated();
+		}
 		const snapshot: ConsoleSnapshot = await options.cache.get();
 		const status = snapshot.state === "unavailable" ? 503 : 200;
-		return pathname === "/api/status"
-			? jsonResponse(snapshot, status)
-			: htmlResponse(renderConsolePage(snapshot), status);
+		return jsonResponse(snapshot, status);
+	}
+
+	async function handleSession(request: Request): Promise<Response> {
+		if (request.method === "GET") {
+			const session = await authenticate(request);
+			if (session === null) {
+				return jsonResponse({ authenticated: false }, 200);
+			}
+			// Rotated on every check, never returned twice: the stored value is always only a hash,
+			// so this is how the SPA recovers a usable CSRF token after a reload instead of the
+			// server ever handing back the one it minted at login.
+			const csrfToken = randomSessionToken();
+			await rotateConsoleSessionCsrf(options.pool, session.id, hashSessionToken(csrfToken));
+			return jsonResponse(
+				{ authenticated: true, csrfToken, expiresAt: session.expiresAt.toISOString() },
+				200,
+			);
+		}
+		if (request.method === "POST") {
+			if (!originAllowed(request, options.origin)) {
+				return forbidden("origin not allowed");
+			}
+			if (!(request.headers.get("content-type") ?? "").startsWith("application/json")) {
+				return badRequest("expected application/json");
+			}
+			const text = await readBoundedText(request, MAX_LOGIN_BODY_BYTES);
+			const password = text === null ? null : passwordFromJson(text);
+			if (password === null) {
+				return badRequest("missing password");
+			}
+			const outcome = await attemptLogin(password);
+			if (outcome.kind === "rate-limited") {
+				return tooManyRequests(outcome.waitMs);
+			}
+			if (outcome.kind === "busy") {
+				return serviceBusy();
+			}
+			if (outcome.kind === "invalid") {
+				return jsonResponse({ error: "invalid credentials" }, 401);
+			}
+			return jsonResponse(
+				{ csrfToken: outcome.csrfToken, expiresAt: outcome.expiresAt.toISOString() },
+				200,
+				{
+					"set-cookie": sessionCookieHeader(outcome.token, sessionMaxAgeSeconds(outcome.expiresAt)),
+				},
+			);
+		}
+		if (request.method === "DELETE") {
+			const session = await authenticate(request);
+			if (session === null) {
+				return unauthenticated();
+			}
+			if (!originAllowed(request, options.origin)) {
+				return forbidden("origin not allowed");
+			}
+			if (!csrfTokenMatches(request.headers.get(CSRF_HEADER_NAME), session.csrfTokenHash)) {
+				return forbidden("missing or invalid CSRF token");
+			}
+			await revokeConsoleSession(options.pool, session.id, "logout", clock());
+			return respond("", 204, "text/plain; charset=utf-8", {
+				"set-cookie": clearedSessionCookieHeader(),
+			});
+		}
+		return textResponse("method not allowed", 405, { allow: "GET, POST, DELETE" });
+	}
+
+	async function handle(request: Request): Promise<Response> {
+		const { pathname } = new URL(request.url);
+		if (pathname === "/") {
+			return handleRoot(request);
+		}
+		if (pathname === "/api/status") {
+			return handleStatus(request);
+		}
+		if (pathname === "/api/session") {
+			return handleSession(request);
+		}
+		return textResponse("not found", 404);
 	}
 
 	const server = Bun.serve({
@@ -256,7 +433,7 @@ export function startConsoleServer(options: ConsoleServerOptions): RunningConsol
 			try {
 				return await handle(request);
 			} catch (error) {
-				// Never the request itself (and so never its Authorization header) in the log.
+				// Never the request itself (and so never a password or a cookie) in the log.
 				options.log.error("console request failed", errorFields(error));
 				return textResponse("internal error", 500);
 			}

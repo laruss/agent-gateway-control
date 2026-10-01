@@ -49,6 +49,7 @@ import {
 	releaseKillSwitch,
 	resetGmailMailbox,
 	resumeAgent,
+	revokeAllConsoleSessions,
 	runtimeHealth,
 	setAgentEnabled,
 	setDirectoryEntry,
@@ -192,9 +193,10 @@ export const USAGE = `gateway <command>
   gmail reset <mailbox-id>            forget a mailbox's cursor (e.g. after authorizing another
                                       account); its connector starts it anew at the present
   console password set [--secrets-dir <dir>]
-                                      hidden entry, confirmed: set the console's HTTP Basic
-                                      password (only its Argon2id hash is stored); restart the
-                                      controller to apply it
+                                      hidden entry, confirmed: set the console's sign-in
+                                      password (only its Argon2id hash is stored); revokes every
+                                      active session if the database is reachable, and restart
+                                      the controller to apply it everywhere else
   runtime doctor <adapter> [--model <id>]
                                       preflight of a runtime on this host, configured like
                                       its worker: version, auth, a real structured turn,
@@ -711,6 +713,23 @@ export async function runCommand(args: Readonly<string[]>, out: Output): Promise
 			},
 			out.print,
 		);
+		// A rotated password invalidates every session bound to the old hash through its
+		// `password_hash_fingerprint` (ADR-025), but only once the controller restarts and
+		// re-reads the file. When the database is reachable from here, every active session is
+		// also revoked directly, so the rotation takes effect immediately instead of waiting for
+		// that restart.
+		const databaseUrl = readSetting("DATABASE_URL");
+		if (databaseUrl !== undefined) {
+			const pool = createPool(databaseUrl, 1);
+			try {
+				const revoked = await revokeAllConsoleSessions(pool, "password_rotated", new Date());
+				if (revoked > 0) {
+					out.print(`revoked ${revoked} active console session(s)`);
+				}
+			} finally {
+				await pool.end();
+			}
+		}
 		return 0;
 	}
 	if (group === "runtime" && action === "doctor") {

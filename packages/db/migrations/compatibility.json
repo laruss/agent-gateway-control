@@ -23,7 +23,8 @@
     "0018_config_history": "expand",
     "0019_config_history_guards": "expand",
     "0020_config_revision_idempotency": "expand",
-    "0021_config_revision_acks": "expand"
+    "0021_config_revision_acks": "expand",
+    "0022_console_sessions": "expand"
   },
   "releases": [
     {

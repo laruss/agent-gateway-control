@@ -58,12 +58,14 @@ Each other service reports its own:
 ## The console
 
 Health endpoints and metrics are for machines; the owner's console
-([console.md](console.md), [ADR-023](../adr/023-console-and-operator.md)) is the human view of
-the same operational state — agent states, current tasks, queues, alerts, budgets and the
-Gateway's own context measurements, refreshed every 15 seconds. It is off by default
-(`CONSOLE_ENABLED`) and, once a password is set, reachable only through the home server's Caddy
-at `https://gateway.local`, authenticated with HTTP Basic against one Argon2id hash. It never
-shows message bodies, run summaries or anything a log line already redacts.
+([console.md](console.md), [ADR-023](../adr/023-console-and-operator.md),
+[ADR-025](../adr/025-management-console.md)) is the human view of the same operational state —
+agent states, current tasks, queues, alerts, budgets and the Gateway's own context measurements,
+refreshed every 15 seconds. It is off by default (`CONSOLE_ENABLED`) and, once a password is
+set, reachable only through the home server's Caddy at `https://gateway.local`, authenticated
+with a server-side session behind a sign-in form (an Argon2id password check, a CSRF-protected
+cookie and an exact `Origin` check — see console.md). It never shows message bodies, run
+summaries or anything a log line already redacts.
 
 The `operator` example agent answers the same "what's going on" question inside Mattermost,
 from `permissions.observe_system` rather than the console's own cached projection: the scheduler
