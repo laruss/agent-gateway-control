@@ -23,6 +23,7 @@ import {
 } from "./common.ts";
 import { GatewayEventSchema, mattermostPostTrustIssue } from "./event.ts";
 import { OrganizationLimitsSchema, OrganizationRuleSchema } from "./organization.ts";
+import { SystemStatusSchema } from "./system-status.ts";
 import { WaitConditionSchema } from "./wait.ts";
 
 /** Mattermost post limit is 16383 characters; keep headroom for the visible @mentions. */
@@ -404,24 +405,42 @@ export const ChannelRefSchema = z.strictObject({
 });
 export type ChannelRef = z.infer<typeof ChannelRefSchema>;
 
-export const AgentTurnInputSchema = z.strictObject({
-	schemaVersion: z.literal(1),
-	runId: UuidSchema,
-	agent: AgentIdentitySnapshotSchema,
-	organization: OrganizationSnapshotSchema,
-	trigger: GatewayEventSchema,
-	durableState: DurableAgentStateSchema,
-	/** Channels the agent may post to; turns without a thread pick their channel from here. */
-	channels: z.array(ChannelRefSchema).min(1),
-	threadContext: ThreadContextSchema.nullable(),
-	/** Accepted memory of the agent's namespaces, newest first, within the context budget. */
-	memories: z.array(MemoryItemSchema),
-	memoryNamespaces: MemoryNamespacesSchema,
-	pendingInbox: z.array(GatewayEventSchema),
-	workspace: WorkspaceDescriptorSchema.nullable(),
-	toolPolicy: ToolPolicySnapshotSchema,
-	/** JSON Schema of `AgentTurnModelOutput` the runtime must produce. */
-	outputSchema: JsonObjectSchema,
-	deadline: TimestampSchema,
-});
+/**
+ * Version 1 is every turn; version 2 adds the Gateway's system status for agents that observe
+ * the system (ADR-023). A version 1 reader refuses version 2, so an older release fails such a
+ * run instead of silently dropping the status.
+ */
+export const AgentTurnInputSchema = z
+	.strictObject({
+		schemaVersion: z.union([z.literal(1), z.literal(2)]),
+		runId: UuidSchema,
+		agent: AgentIdentitySnapshotSchema,
+		organization: OrganizationSnapshotSchema,
+		trigger: GatewayEventSchema,
+		durableState: DurableAgentStateSchema,
+		/** Channels the agent may post to; turns without a thread pick their channel from here. */
+		channels: z.array(ChannelRefSchema).min(1),
+		threadContext: ThreadContextSchema.nullable(),
+		/** Accepted memory of the agent's namespaces, newest first, within the context budget. */
+		memories: z.array(MemoryItemSchema),
+		memoryNamespaces: MemoryNamespacesSchema,
+		pendingInbox: z.array(GatewayEventSchema),
+		workspace: WorkspaceDescriptorSchema.nullable(),
+		toolPolicy: ToolPolicySnapshotSchema,
+		/** JSON Schema of `AgentTurnModelOutput` the runtime must produce. */
+		outputSchema: JsonObjectSchema,
+		deadline: TimestampSchema,
+		/** Version 2 only: the Gateway's read-only snapshot of its own operation. */
+		systemStatus: SystemStatusSchema.optional(),
+	})
+	.check((ctx) => {
+		if ((ctx.value.schemaVersion === 2) !== (ctx.value.systemStatus !== undefined)) {
+			ctx.issues.push({
+				code: "custom",
+				input: ctx.value.schemaVersion,
+				path: ["schemaVersion"],
+				message: "schemaVersion 2 carries systemStatus, and only version 2 does",
+			});
+		}
+	});
 export type AgentTurnInput = z.infer<typeof AgentTurnInputSchema>;

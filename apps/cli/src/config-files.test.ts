@@ -16,6 +16,7 @@ describe("config files", () => {
 			"director",
 			"finance",
 			"mail-follower",
+			"operator",
 			"research",
 		]);
 		expect(input.constitution.length).toBeGreaterThan(0);

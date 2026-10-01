@@ -1804,3 +1804,64 @@ Since then:
   found that a worker kept running a cancelled turn until its deadline (fixed in 0.2.1).
 
 Still to do: the 14-day soak.
+
+## Phase 11 - The owner's console and the operator agent
+
+Status: **done**
+
+| Item | State | Evidence |
+|------|-------|----------|
+| The owner's console: a separate listener, HTTP Basic against one Argon2id hash, a bounded global failed-login counter, fixed security headers on every response, `GET /` (HTML) and `GET /api/status` (JSON), a shared collection cached for 15 s with stale/unavailable states | done | `apps/controller/src/console-server.ts`, `console-status.ts`, `console-render.ts` |
+| `gateway console password set`: hidden entry, confirmed twice, control keys rejected, 12-256 characters | done | `apps/cli/src/console-commands.ts`, `packages/service/src/console-auth.ts` |
+| `permissions.observe_system` and `SystemStatus` (ADR-023): operational metadata only (states, run ids, queue depths, alert keys, token/cost counts), every list bounded, never message content | done | `packages/contracts/src/agent-config.ts`, `system-status.ts` |
+| Turn input version 2: `AgentTurnInput.schemaVersion` `1 \| 2`, `systemStatus` present if and only if version 2; the scheduler collects and places it only for an agent that observes the system | done | `packages/contracts/src/turn.ts`, `packages/core/src/turn-context.ts`, `services/scheduler.ts` |
+| An explicit `memory.write` deny now also removes every writable memory namespace, private and shared, not only the tool call itself; a retried attempt's usage is saved too | done | `packages/core/src/turn-context.ts`, `services/runs.ts` |
+| The `operator` example agent: Codex, replies only in its channels, `observe_system: true`, no other grant (`tools_allow: [mattermost.post]`, `memory.write` denied) | done | `config/examples/agents/operator.yaml`, `prompts/examples/agents/operator.md` |
+| Deployment: `gateway.local` through the home server's Caddy (`local_certs`, the same authority already trusted for `mattermost.local`), a second mDNS alias, the controller bound only to its own alias on `agent-mm` (`gateway-console`), no host port, workers and connectors unable to reach it | done | `deploy/release/compose.yaml`, `deploy/home-server/mattermost/{Caddyfile,compose.yaml}`, `deploy/home-server/guest/setup-guest.sh` |
+| The release-compatibility rule for rolling back past this release (config and queued-input, distinct from database certification), documented and rehearsed | done | `deploy/release/ROLLBACK.md`, [docs/operations/releases.md](docs/operations/releases.md), `scripts/release/install-test.sh` |
+
+Acceptance:
+
+- [x] An agent configured with `observe_system: true` receives a `SystemStatus` snapshot as its
+  turn's metadata only — agent states, run ids and statuses, queue depths, alert keys and
+  timestamps, token and cost counts — never message text, thread content, run summaries, wait
+  conditions or memory content, and never for an agent that does not have the permission.
+- [x] The console shows the same shape of state (agents, current tasks, recent runs, waits,
+  queues, alerts, budgets, context measurements) without a synthesized context-window
+  percentage, and marks a failed or slow collection as stale (with its last-known time) or
+  unavailable rather than showing an empty, healthy-looking system.
+- [x] The console is reachable only through the home server's Caddy at `https://gateway.local`:
+  no host port, and no service on `agent-control` (workers, connectors, the tool runner) can
+  reach the controller's console alias or hold its secret.
+- [x] Enabling the console with a missing or invalid password hash refuses to start the
+  controller outright, rather than starting unauthenticated or with just the console skipped.
+- [x] Rolling back past this release is documented (`ROLLBACK.md`) and rehearsed by the install
+  test: the operator's permission removed and its config re-applied, no queued or running
+  observer run left outstanding, and the restored configuration validates and applies under the
+  release being rolled back to.
+
+Deliberate choices in this phase ([ADR-023](docs/adr/023-console-and-operator.md)):
+
+- Server-side HTML with no client framework and no build step for a single-owner, read-only
+  page: an explicit, documented exception to the shadcn-first UI rule
+  (`.claude/rules/basic-rules.md`).
+- HTTP Basic behind Argon2id and a global rate limit instead of session cookies: no session
+  store or CSRF handling needed for a single-user, read-only page.
+- `observe_system` is its own explicit, off-by-default permission rather than something every
+  agent receives automatically: visibility across every agent's state and the whole queue is
+  strictly more than a channel grant conveys (ADR-022).
+- Turn input version 2 is refused outright by an older release rather than silently downgraded,
+  so a rollback past this release must first ensure no version 2 work is outstanding — a
+  release-runbook step (ROLLBACK.md), not a database migration.
+
+Known gaps, deferred:
+
+- The install test's rollback rehearsal exercises the documented recipe (remove the permission,
+  settle outstanding work, confirm the restored configuration re-applies) against the
+  same-commit bundle pair `package.yml` builds; it does not by itself prove that a genuine
+  pre-ADR-023 release rejects `observe_system` or a version 2 run job — that half of the rule is
+  covered by the contracts' own schema tests. Rehearsing the actual rejection needs a real
+  previous release bundle passed as the test's first argument, which `package.yml` does not do.
+- There is no CLI command to discard a single dead-lettered job; `gateway dlq redrive` is the
+  only action besides leaving it in `gateway dlq list` (ROLLBACK.md notes this for a version 2
+  payload that must not be redriven under an older release).

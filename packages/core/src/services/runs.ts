@@ -268,7 +268,7 @@ async function applyFailure(
 	const retry = error.retryable && run.attempt < run.maxAttempts;
 	const hold = retry ? await budgetHoldFor(uow, agent.id) : null;
 	if (hold !== null) {
-		return deferForBudget(uow, run, agent, error, hold.reason, runtimeVersion);
+		return deferForBudget(uow, run, agent, error, hold.reason, runtimeVersion, usage);
 	}
 	if (retry) {
 		const attempt = run.attempt + 1;
@@ -283,8 +283,16 @@ async function applyFailure(
 		if (snapshot === undefined) {
 			throw new Error(`run '${run.id}' has no context snapshot`);
 		}
+		// The deadline is the only field this rewrite changes; the stored size still has to reflect
+		// it exactly; `systemStatus` (present only for an observing agent, ADR-023) rewrites with
+		// the rest of the input unchanged, so a retry of the same run keeps its original status
+		// and `asOf` rather than querying a fresh one.
 		const input = { ...snapshot.input, deadline: deadline.toISOString() };
-		await db.update(contextSnapshots).set({ input }).where(eq(contextSnapshots.runId, run.id));
+		const inputBytes = Buffer.byteLength(JSON.stringify(input), "utf8");
+		await db
+			.update(contextSnapshots)
+			.set({ input, sizeBytes: inputBytes })
+			.where(eq(contextSnapshots.runId, run.id));
 		await db
 			.update(agentRuns)
 			.set({
@@ -295,6 +303,10 @@ async function applyFailure(
 				errorCode: error.code,
 				errorDetailRedacted: detail,
 				runtimeVersion,
+				// The runtime's own usage report for the attempt that just failed: retained so
+				// `agent_runs.usage` reflects the last reported attempt even when it is retried,
+				// not only on a terminal outcome.
+				usage,
 			})
 			.where(eq(agentRuns.id, run.id));
 		await setAgentState(
@@ -365,6 +377,7 @@ async function deferForBudget(
 	error: RunError,
 	reason: string,
 	runtimeVersion: string,
+	usage: RuntimeUsage | null,
 ): Promise<ReportOutcome> {
 	const { db } = uow.tx;
 	await db
@@ -375,6 +388,7 @@ async function deferForBudget(
 			errorCode: error.code,
 			errorDetailRedacted: redactForStorage(`${error.detail}; retry deferred: ${reason}`),
 			runtimeVersion,
+			usage,
 		})
 		.where(eq(agentRuns.id, run.id));
 	await db

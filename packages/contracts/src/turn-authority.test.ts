@@ -257,4 +257,18 @@ describe("checkTurnResultAuthority", () => {
 		};
 		expect(paths(result)).toEqual(["memoryProposals.0.namespace"]);
 	});
+
+	it("rejects every memory write once no namespace is writable (an explicit memory.write deny)", () => {
+		const noWritableNamespace: TurnAuthorityContext = { ...context, writableMemoryNamespaces: [] };
+		const result = {
+			...idleResult(),
+			memoryProposals: [
+				// Even the agent's own private namespace is rejected: the deny leaves none writable.
+				{ namespace: "agents/developer", key: "k", content: "c", visibility: "private" as const },
+			],
+		};
+		expect(
+			checkTurnResultAuthority(result, noWritableNamespace).map((issue) => issue.path),
+		).toEqual(["memoryProposals.0.namespace"]);
+	});
 });

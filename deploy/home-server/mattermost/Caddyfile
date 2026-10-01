@@ -1,5 +1,6 @@
-# TLS for Mattermost on the LAN, from Caddy's own certificate authority: clients trust its
-# root certificate once (docs/operations/home-server.md). HTTP redirects to HTTPS.
+# TLS for Mattermost and the Gateway's owner console on the LAN, from Caddy's own certificate
+# authority: clients trust its root certificate once (docs/operations/home-server.md). HTTP
+# redirects to HTTPS.
 {
 	local_certs
 }
@@ -7,4 +8,13 @@
 {$MATTERMOST_HOST} {
 	encode zstd gzip
 	reverse_proxy mattermost:8065
+}
+
+# The owner's console (ADR-023): read-only, its own HTTP Basic authentication, so the
+# Authorization header passes through untouched and nothing here adds authentication of its
+# own. Reaches nothing until the Gateway's CONSOLE_ENABLED=true and a password is set
+# (gateway console password set); until then this returns a proxy error.
+{$GATEWAY_HOST} {
+	encode zstd gzip
+	reverse_proxy gateway-console:8084
 }

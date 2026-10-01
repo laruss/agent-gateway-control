@@ -73,7 +73,9 @@ sudo LAN_ADDRESS=192.168.18.254/24 LAN_GATEWAY=192.168.18.1 MDNS_NAME=mattermost
 
 `setup-guest.sh` fixes the LAN address (pick one outside the router's DHCP pool), announces
 the name over mDNS and loads the Gateway's egress firewall at every boot, before Docker. It is
-safe to run again.
+safe to run again. It also announces a second mDNS name for the owner's console
+(ADR-023), `GATEWAY_MDNS_NAME`, which defaults to `gateway.local` and needs no variable set
+unless you want a different one.
 
 ## Mattermost
 
@@ -85,6 +87,14 @@ docker compose --env-file /srv/mattermost/mattermost.env up -d
 
 - Mattermost 11.7 ESR, its own PostgreSQL, Caddy with its own certificate authority
   (`local_certs`); plugins are off, open sign-up is off.
+- **The same Caddy also serves the Gateway's owner console** (ADR-023), as a second site block
+  in `home-server/mattermost/Caddyfile`, reverse-proxied to `gateway-console:8084` (the
+  controller's own alias on the shared `agent-mm` network; the Gateway publishes no host port
+  for it). Its name, `GATEWAY_HOST` in `mattermost.env` (default `gateway.local`), must match
+  the mDNS name `setup-guest.sh` announces (`GATEWAY_MDNS_NAME`, same default). Until
+  `CONSOLE_ENABLED=true` and a console password are both set (`docs/operations/console.md`),
+  this site block just returns a proxy error — harmless, and expected before the console is
+  turned on.
 - **Trust Caddy's root certificate** on every client. Copy it out of the VM:
 
   ```bash
@@ -97,7 +107,9 @@ docker compose --env-file /srv/mattermost/mattermost.env up -d
     on full trust in Settings → General → About → Certificate Trust Settings.
 
   The root lives in the `caddy-data` volume, which the backup includes: losing it means every
-  client must trust a new one.
+  client must trust a new one. It is the one certificate authority for both site blocks: a
+  client that already trusts it for `https://mattermost.local` needs nothing further to open
+  `https://gateway.local` too.
 - Open `https://mattermost.local` and create the first account: it becomes the system admin.
   Then create the team, the channels named in `organization.yaml` and the owners' accounts.
 - `mmctl` works inside the container without a token (local mode):

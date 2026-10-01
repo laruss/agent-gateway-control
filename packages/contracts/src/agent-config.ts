@@ -59,9 +59,19 @@ export const AgentPermissionsSchema = z
 		tools_allow: z.array(ToolPatternSchema).max(64),
 		tools_require_human_approval: z.array(ToolPatternSchema).max(64),
 		tools_deny: z.array(ToolPatternSchema).max(64),
+		/**
+		 * The agent's turns carry the Gateway's system status: states, runs, queues and alerts of
+		 * every agent, as operational metadata (ADR-023). For an operator agent; off by default.
+		 */
+		observe_system: z.boolean().optional(),
 	})
 	.check((ctx) => {
-		for (const overlap of toolPatternOverlaps(ctx.value)) {
+		const { tools_allow, tools_require_human_approval, tools_deny } = ctx.value;
+		for (const overlap of toolPatternOverlaps({
+			tools_allow,
+			tools_require_human_approval,
+			tools_deny,
+		})) {
 			ctx.issues.push({
 				code: "custom",
 				input: ctx.value,

@@ -6,7 +6,9 @@
 #
 # - a fixed LAN address on the bridged interface (lima0), outside the router's DHCP pool, for
 #   routers that cannot reserve one;
-# - the Mattermost name announced over mDNS (avahi), for LANs without a DNS server of their own;
+# - the Mattermost name and the Gateway console's name (ADR-023), both announced over mDNS
+#   (avahi), for LANs without a DNS server of their own; GATEWAY_MDNS_NAME defaults to
+#   gateway.local and does not need to be set;
 # - the Gateway's egress firewall (the bundle's bin/egress-firewall.sh), loaded at every boot
 #   before Docker starts.
 # Safe to run again; each part is replaced, not added twice.
@@ -15,6 +17,7 @@ bundle=${1:?usage: setup-guest.sh <release bundle directory>}
 : "${LAN_ADDRESS:?set LAN_ADDRESS, e.g. 192.168.18.254/24}"
 : "${LAN_GATEWAY:?set LAN_GATEWAY, e.g. 192.168.18.1}"
 : "${MDNS_NAME:?set MDNS_NAME, e.g. mattermost.local}"
+: "${GATEWAY_MDNS_NAME:=gateway.local}"
 [ "$(id -u)" = 0 ] || { echo "run it with sudo" >&2; exit 1; }
 address=${LAN_ADDRESS%/*}
 
@@ -36,23 +39,34 @@ NETPLAN
 chmod 0600 /etc/netplan/60-lan-address.yaml
 netplan apply
 
-# The Mattermost name over mDNS, pointing at the LAN address.
+# The Mattermost name and the Gateway console's name over mDNS, both pointing at the LAN
+# address. avahi-publish takes one address record per instance, so each name gets its own unit;
+# rewriting both files completely on every run keeps this idempotent and keeps the two names
+# independent (one is never dropped or overwritten to add the other).
 DEBIAN_FRONTEND=noninteractive apt-get install -y avahi-daemon avahi-utils >/dev/null
-cat >/etc/systemd/system/agw-mdns-alias.service <<UNIT
+publish_alias() {
+	# $1: unit file suffix (unique per name); $2: the mDNS name; $3: unit description.
+	unit_suffix=$1
+	mdns_name=$2
+	description=$3
+	cat >"/etc/systemd/system/agw-mdns-alias${unit_suffix}.service" <<UNIT
 [Unit]
-Description=Announce $MDNS_NAME for Mattermost over mDNS
+Description=$description
 After=avahi-daemon.service network-online.target
 Requires=avahi-daemon.service
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/bin/avahi-publish --address --no-reverse $MDNS_NAME $address
+ExecStart=/usr/bin/avahi-publish --address --no-reverse $mdns_name $address
 Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 UNIT
+}
+publish_alias "" "$MDNS_NAME" "Announce $MDNS_NAME for Mattermost over mDNS"
+publish_alias "-gateway" "$GATEWAY_MDNS_NAME" "Announce $GATEWAY_MDNS_NAME for the Gateway console over mDNS"
 
 # The egress firewall, from the release bundle, before Docker creates the bridge.
 install -m 0755 "$bundle/bin/egress-firewall.sh" /usr/local/sbin/agw-egress-firewall
@@ -72,6 +86,6 @@ ExecStart=/usr/local/sbin/agw-egress-firewall
 WantedBy=multi-user.target docker.service
 UNIT
 systemctl daemon-reload
-systemctl enable --now avahi-daemon agw-mdns-alias agw-egress-firewall
-systemctl restart agw-mdns-alias agw-egress-firewall
-echo "LAN address $LAN_ADDRESS, mDNS $MDNS_NAME, egress firewall loaded"
+systemctl enable --now avahi-daemon agw-mdns-alias agw-mdns-alias-gateway agw-egress-firewall
+systemctl restart agw-mdns-alias agw-mdns-alias-gateway agw-egress-firewall
+echo "LAN address $LAN_ADDRESS, mDNS $MDNS_NAME and $GATEWAY_MDNS_NAME, egress firewall loaded"

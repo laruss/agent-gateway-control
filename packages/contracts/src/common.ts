@@ -33,6 +33,9 @@ export type SecretFile = z.infer<typeof SecretFileSchema>;
 /** The controller's HMAC key for agent routing props; no bot token may live there. */
 export const ROUTING_KEY_SECRET_FILE: SecretFile = "/run/secrets/gateway_routing_key";
 
+/** The console's HTTP Basic credential: only its Argon2id hash is ever stored, never the password. */
+export const CONSOLE_PASSWORD_HASH_SECRET_FILE: SecretFile = "/run/secrets/console_password_hash";
+
 export const TimestampSchema = z.iso.datetime({ offset: true });
 export type Timestamp = z.infer<typeof TimestampSchema>;
 

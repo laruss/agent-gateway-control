@@ -55,6 +55,28 @@ Each other service reports its own:
 - the Gmail connector: `gateway_gmail_authorized`, `gateway_gmail_last_sync_timestamp_seconds`,
   `gateway_gmail_watch_expiry_timestamp_seconds` and `gateway_gmail_pulling`.
 
+## The console
+
+Health endpoints and metrics are for machines; the owner's console
+([console.md](console.md), [ADR-023](../adr/023-console-and-operator.md)) is the human view of
+the same operational state — agent states, current tasks, queues, alerts, budgets and the
+Gateway's own context measurements, refreshed every 15 seconds. It is off by default
+(`CONSOLE_ENABLED`) and, once a password is set, reachable only through the home server's Caddy
+at `https://gateway.local`, authenticated with HTTP Basic against one Argon2id hash. It never
+shows message bodies, run summaries or anything a log line already redacts.
+
+The `operator` example agent answers the same "what's going on" question inside Mattermost,
+from `permissions.observe_system` rather than the console's own cached projection: the scheduler
+hands its turn a `SystemStatus` snapshot (agent states, run ids, queue depths, alert keys,
+token and cost counts — the same operational metadata the console shows, never message content)
+alongside the ordinary turn input. `observe_system` is off by default and, when granted, spans
+every agent's state and the whole queue, not only the channels the observing agent shares —
+deliberately more than any channel grant conveys (ADR-022), which is why it is its own explicit
+permission rather than something every agent receives. The operator has no other grant: no
+shell, filesystem, web, admin or execution tool, and an explicit `memory.write` deny leaves it
+no writable namespace at all; it can only reply in its channels and tell the owner which
+`gateway` command to run.
+
 ## Logs and traces
 
 Every service writes one JSON object per line to stdout. Each line has:

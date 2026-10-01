@@ -9,13 +9,23 @@ import {
 	modelOutputJsonSchema,
 	type OrganizationConfig,
 	type ResolvedWait,
+	type SystemStatus,
 	type ThreadContext,
 	type TurnAuthorityContext,
+	toolPatternCovers,
 	type Uuid,
 	type WorkingSummary,
 } from "@agent-gateway/contracts";
 import type { AgentState } from "@agent-gateway/db";
 import { agentChannelRefs, type ChannelAccess } from "./channel-access.ts";
+
+/**
+ * The largest turn input a run starts with, serialized. A neutral constant (no IO, no service
+ * dependency): the scheduler enforces it when it builds a turn's input, and the system status
+ * read model (ADR-023) reports it as the console's byte budget, without either importing the
+ * other.
+ */
+export const MAX_TURN_INPUT_BYTES = 2 * 1024 * 1024;
 
 export type AgentRecord = Readonly<{
 	id: AgentId;
@@ -45,6 +55,13 @@ export type TurnContextSources = Readonly<{
 	memories: Readonly<MemoryItem[]>;
 	/** Humans who posted in the run's threads, and the owners. */
 	waitableUserIds: Readonly<MattermostId[]>;
+	/**
+	 * The Gateway's own operational snapshot (ADR-023), collected by the caller only for an agent
+	 * whose permissions grant `observe_system`; null for every other agent. This function does no
+	 * IO itself, so it only places what it is given: a status handed to a non-observing agent, or
+	 * an observing agent handed none, is refused rather than silently reconciled.
+	 */
+	systemStatus: SystemStatus | null;
 	now: Date;
 }>;
 
@@ -77,8 +94,37 @@ export function buildTurnContext(sources: TurnContextSources): TurnContextResult
 		deny: permissions.tools_deny,
 	};
 
+	// Namespace authorization alone would still let an agent propose memory writes; an explicit
+	// `memory.write` deny (a concrete pattern or a covering wildcard like `memory.*`) leaves it no
+	// writable namespace at all, private or shared, so the existing namespace check in
+	// `checkTurnResultAuthority` rejects every proposal rather than needing its own tool check.
+	// `memoryNamespaces.shared` below is never filtered by this: shared memory is still folded
+	// into `memories` for reading whether or not writes are denied, and the prompt (runtime-sdk)
+	// derives writability from `toolPolicy.deny` itself, so hiding the namespace here would only
+	// make the turn input inaccurate without gating anything the authority check does not already.
+	const memoryWriteDenied = permissions.tools_deny.some((pattern) =>
+		toolPatternCovers(pattern, "memory.write"),
+	);
+
+	// The status is placed, never collected: the caller only queries it for an agent whose
+	// permissions actually grant observation (ADR-023). A mismatch here is the caller's bug, not
+	// silently reconciled into whichever version fits what it happened to pass.
+	const observesSystem = permissions.observe_system === true;
+	let systemStatus: SystemStatus | undefined;
+	if (observesSystem) {
+		if (sources.systemStatus === null) {
+			return { ok: false, reason: `'${agent.id}' observes the system but no status was supplied` };
+		}
+		systemStatus = sources.systemStatus;
+	} else if (sources.systemStatus !== null) {
+		return {
+			ok: false,
+			reason: `'${agent.id}' does not observe the system but a status was supplied`,
+		};
+	}
+
 	const candidate = {
-		schemaVersion: 1,
+		schemaVersion: observesSystem ? 2 : 1,
 		runId: sources.runId,
 		agent: {
 			agentId: agent.id,
@@ -110,6 +156,7 @@ export function buildTurnContext(sources: TurnContextSources): TurnContextResult
 		toolPolicy,
 		outputSchema: modelOutputJsonSchema(),
 		deadline: new Date(now.getTime() + runtime.timeout_seconds * 1000).toISOString(),
+		systemStatus,
 	};
 	const parsed = AgentTurnInputSchema.safeParse(candidate);
 	if (!parsed.success) {
@@ -134,7 +181,9 @@ export function buildTurnContext(sources: TurnContextSources): TurnContextResult
 				allowedChannelIds: channels.map((c) => c.channelId),
 				registeredAgentIds: sources.agents.map((a) => a.id),
 				addressableAgents,
-				writableMemoryNamespaces: [memory.private_namespace, ...memory.shared_namespaces],
+				writableMemoryNamespaces: memoryWriteDenied
+					? []
+					: [memory.private_namespace, ...memory.shared_namespaces],
 				attachableArtifactIds: [],
 				waitableUserIds: [...new Set(sources.waitableUserIds)].sort(),
 				toolPolicy,

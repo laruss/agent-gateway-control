@@ -1,6 +1,8 @@
 # The home server's Mattermost: the pinned ESR, its own PostgreSQL, and Caddy terminating TLS
 # with its own certificate authority. A separate stack with its own lifecycle; the Gateway's
 # controller joins the `agent-mm` network and reaches Mattermost at http://mattermost:8065.
+# Caddy joins that same network to reach the controller's owner console (ADR-023), at
+# gateway-console:8084 (the controller's alias there); the Gateway publishes no host port.
 #
 #   docker compose --env-file "$MATTERMOST_HOME/mattermost.env" -f compose.yaml up -d
 #
@@ -113,6 +115,9 @@ services:
     depends_on: [mattermost]
     environment:
       MATTERMOST_HOST: ${MATTERMOST_HOST}
+      # The owner's console (ADR-023); see the Caddyfile. Defaults keep working for an
+      # unedited mattermost.env from before this variable existed.
+      GATEWAY_HOST: ${GATEWAY_HOST:-gateway.local}
     ports:
       - "80:80"
       - "443:443"
@@ -126,3 +131,8 @@ services:
     tmpfs: [/tmp]
     mem_limit: 512m
     pids_limit: 256
+    # To reach the controller's console (ADR-023) at gateway-console:8084; keeps its
+    # default network for Mattermost, on the same host.
+    networks:
+      default: {}
+      agent-mm: {}

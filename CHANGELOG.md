@@ -4,6 +4,39 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## [Unreleased]
 
+### Added
+
+- The owner's console (ADR-023): a read-only status page for agent states, current tasks,
+  recent runs, waits, queue depths, alerts, budgets and context measurements, refreshed every
+  15 seconds. Off by default (`CONSOLE_ENABLED`); `gateway console password set` writes one
+  Argon2id-hashed owner password (hidden entry, confirmed twice); HTTP Basic authentication, a
+  global rate limit on failed logins, and a fixed set of security headers on every response. On
+  the home server kit, served at `https://gateway.local` through Caddy, the same certificate
+  authority already trusted for `mattermost.local`; the controller publishes no host port and
+  binds only its own network alias, unreachable from the workers, connectors or tool runner.
+  See [docs/operations/console.md](docs/operations/console.md).
+- The `operator` example agent (`config/examples/agents/operator.yaml`): answers "what's going
+  on" in Mattermost from `permissions.observe_system`, a new permission that hands an agent's
+  turn the Gateway's own `SystemStatus` (agent states, run ids, queue depths, alert keys, token
+  and cost counts — operational metadata only, never message content). Off by default; the
+  operator has no other grant (only `mattermost.post`, `memory.write` denied) and cannot change
+  anything itself — it points the owner at the `gateway` command to run instead.
+- `AgentTurnInput.schemaVersion` `2`, carrying `systemStatus` for an agent that observes the
+  system; version 1 is unchanged. An older release rejects a version 2 job outright, and a
+  configuration with `permissions.observe_system` set; see `deploy/release/ROLLBACK.md` and
+  [docs/operations/releases.md](docs/operations/releases.md#the-v2-compatibility-rule) for what
+  rolling back past this release needs.
+
+### Changed
+
+- A run's displayed last-attempt usage (`agent_runs.usage`) now reflects a retried attempt too,
+  not only a run's first one: the console and an observing agent's `SystemStatus` both show the
+  last attempt's own reported tokens, whichever attempt that was. The budget ledger itself is
+  unaffected by this change: it already booked every attempt before and after.
+- An explicit `memory.write` deny now also removes every writable memory namespace, private and
+  shared, not only the tool call itself: an agent denied `memory.write` is left with no
+  namespace to propose a memory write into at all.
+
 ## [0.2.1] - 2026-09-30
 
 ### Fixed

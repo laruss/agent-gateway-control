@@ -1,0 +1,39 @@
+# yaml-language-server: $schema=../../schemas/agent.schema.json
+schema_version: 1
+id: operator
+display_name: Operator
+enabled: true
+
+mattermost:
+  username: operator
+  token_secret_file: /run/secrets/mm_operator_token
+  allowed_channels: [hq]
+
+runtime:
+  adapter: codex
+  profile: default
+  session_policy: resumable-if-available
+  timeout_seconds: 900
+
+prompts:
+  role_file: prompts/examples/agents/operator.md
+
+wake_rules:
+  - event_type: mattermost.agent.mentioned
+    target_agent_id: operator
+
+concurrency:
+  max_active_runs: 1
+  while_running: enqueue-and-coalesce
+
+permissions:
+  tools_allow: [mattermost.post]
+  tools_require_human_approval: []
+  # Read-only by construction: no shell, filesystem, web, admin or execution tool, and an
+  # explicit memory.write deny leaves it no writable namespace (private or shared) at all.
+  tools_deny: [finance.*, deploy.*, mail.*, workspace.write, memory.write]
+  observe_system: true
+
+memory:
+  private_namespace: agents/operator
+  shared_namespaces: []

@@ -2,7 +2,8 @@ import type { z } from "zod";
 import type { AgentConfig } from "./agent-config.ts";
 import type { GmailMessageData } from "./event.ts";
 import { type OrganizationConfig, OrganizationRetentionSchema } from "./organization.ts";
-import type { AgentTurnResult, PublicMessage } from "./turn.ts";
+import type { SystemStatus } from "./system-status.ts";
+import type { AgentTurnInput, AgentTurnResult, PublicMessage } from "./turn.ts";
 import type { WaitCondition } from "./wait.ts";
 
 /** Test-only fixtures. Not exported from the package entry point. */
@@ -55,6 +56,71 @@ export function idleResult(): AgentTurnResult {
 		artifacts: [],
 		usage: null,
 		session: null,
+	};
+}
+
+/** A version 1 `AgentTurnInput` without a Mattermost thread; pass `schemaVersion: 2` for version 2. */
+export function agentTurnInput(overrides: Partial<AgentTurnInput> = {}): AgentTurnInput {
+	return {
+		schemaVersion: 1,
+		runId: RUN_ID,
+		agent: {
+			agentId: "mail-follower",
+			displayName: "Mail Follower",
+			mattermostUsername: "mail-follower",
+			rolePrompt: "Sort incoming mail.",
+			configVersion: "1",
+		},
+		organization: {
+			organizationId: "lab",
+			globalGoal: "goal",
+			constitution: "rules",
+			rules: [],
+			limits: organization().organization.default_limits,
+			directory: [],
+		},
+		trigger: {
+			specversion: "1.0",
+			id: "gmail-message:primary:18c2a1b2c3d4e5f6",
+			source: "gmail://primary",
+			type: "google.gmail.message.received",
+			time: "2026-09-24T14:00:00Z",
+			datacontenttype: "application/json",
+			correlationid: "gmail-thread:primary:18c2a1b2c3d4e5f6",
+			causationid: null,
+			trustlevel: "external-untrusted",
+			hop: 0,
+			data: gmailMessageData(),
+		},
+		durableState: { previousRunId: null, previousSummary: null, resolvedWaits: [] },
+		channels: [{ channelId: CHANNEL_ID, name: "mail" }],
+		threadContext: null,
+		memories: [],
+		memoryNamespaces: { private: "agents/mail-follower", shared: ["organization/customers"] },
+		pendingInbox: [],
+		workspace: null,
+		toolPolicy: { policyVersion: "1", allow: ["mail.read"], requireHumanApproval: [], deny: [] },
+		outputSchema: { type: "object" },
+		deadline: "2026-09-24T14:15:00Z",
+		...overrides,
+	};
+}
+
+/** An empty but valid `SystemStatus` snapshot (ADR-023); every list defaults to none. */
+export function systemStatus(overrides: Partial<SystemStatus> = {}): SystemStatus {
+	return {
+		asOf: "2026-09-24T14:00:00Z",
+		killSwitch: false,
+		agents: [],
+		omittedAgents: 0,
+		runtimes: [],
+		queues: [],
+		outbox: { pending: 0, dead: 0 },
+		approvalsPending: 0,
+		toolActionsUnknown: 0,
+		alerts: [],
+		maintenance: [],
+		...overrides,
 	};
 }
 

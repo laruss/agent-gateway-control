@@ -64,6 +64,15 @@ describe("config examples", () => {
 		}
 	});
 
+	it("gives the operator observation only: ordinary replies, no mutating tool, no writable memory", () => {
+		const operator = agents.find((agent) => agent.id === "operator");
+		expect(operator?.permissions.observe_system).toBe(true);
+		expect(operator?.permissions.tools_allow).toEqual(["mattermost.post"]);
+		expect(operator?.permissions.tools_require_human_approval).toEqual([]);
+		expect(operator?.permissions.tools_deny).toContain("memory.write");
+		expect(operator?.memory.shared_namespaces).toEqual([]);
+	});
+
 	it("never lets a non-finance agent reach a finance tool", () => {
 		for (const agent of agents.filter((a) => a.id !== organization.organization.finance_agent_id)) {
 			const reachable = [

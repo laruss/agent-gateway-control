@@ -4,6 +4,7 @@ import { userInfo } from "node:os";
 import { resolve } from "node:path";
 import { GOOGLE_ENDPOINTS } from "@agent-gateway/connector-gmail";
 import {
+	CONSOLE_PASSWORD_HASH_SECRET_FILE,
 	GatewayEventSchema,
 	GmailMailboxIdSchema,
 	MattermostIdSchema,
@@ -78,6 +79,7 @@ import {
 	intSetting,
 	readSetting,
 	requireSetting,
+	resolveSecretPath,
 	secretFileExists,
 	writeSecretFile,
 } from "@agent-gateway/service";
@@ -85,6 +87,7 @@ import { createRuntimeAdapter, workspaceRoot } from "@agent-gateway/worker";
 import type { PgBoss } from "pg-boss";
 import { type BackupCheckReport, checkBackup, localPgTools } from "./backup.ts";
 import { loadConfigDirectory } from "./config-files.ts";
+import { consolePasswordSet, nodeHiddenReader } from "./console-commands.ts";
 import { gmailAuthorize } from "./gmail-commands.ts";
 import { mattermostBootstrap, mattermostReconcile } from "./mattermost-commands.ts";
 
@@ -154,6 +157,10 @@ export const USAGE = `gateway <command>
   gmail status                        cursor, watch and last sync of each watched mailbox
   gmail reset <mailbox-id>            forget a mailbox's cursor (e.g. after authorizing another
                                       account); its connector starts it anew at the present
+  console password set [--secrets-dir <dir>]
+                                      hidden entry, confirmed: set the console's HTTP Basic
+                                      password (only its Argon2id hash is stored); restart the
+                                      controller to apply it
   runtime doctor <adapter> [--model <id>]
                                       preflight of a runtime on this host, configured like
                                       its worker: version, auth, a real structured turn,
@@ -601,6 +608,18 @@ export async function runCommand(args: Readonly<string[]>, out: Output): Promise
 				endpoints: GOOGLE_ENDPOINTS,
 				pubsub: args.includes("--pubsub"),
 				...(port === null ? {} : { port }),
+			},
+			out.print,
+		);
+		return 0;
+	}
+	if (group === "console" && action === "password" && args[2] === "set") {
+		const secretsDirFlag = flag(args, "secrets-dir") ?? readSetting("SECRETS_DIR");
+		const secretsDir = secretsDirFlag === undefined ? undefined : resolve(secretsDirFlag);
+		await consolePasswordSet(
+			{
+				secretPath: resolveSecretPath(CONSOLE_PASSWORD_HASH_SECRET_FILE, secretsDir),
+				reader: nodeHiddenReader(),
 			},
 			out.print,
 		);

@@ -13,6 +13,7 @@ import {
 	RuntimeSessionHandleSchema,
 	runQueue,
 	type SessionPolicy,
+	type SystemStatus,
 	type WaitCondition,
 	type WorkingSummary,
 } from "@agent-gateway/contracts";
@@ -44,7 +45,7 @@ import {
 } from "drizzle-orm";
 import { agentChannelFloors, agentChannelIds, agentGrantsRecorded } from "../channel-access.ts";
 import { requireTransition } from "../state-machine.ts";
-import { type AgentRecord, buildTurnContext } from "../turn-context.ts";
+import { type AgentRecord, buildTurnContext, MAX_TURN_INPUT_BYTES } from "../turn-context.ts";
 import { budgetHoldFor } from "./budgets.ts";
 import {
 	assembleThread,
@@ -72,6 +73,7 @@ import {
 	toAgentRecord,
 	toGatewayEvent,
 } from "./store.ts";
+import { loadSystemStatus } from "./system-status.ts";
 import { matchMissedAnswers } from "./wait-store.ts";
 
 async function hourlyQuotaReached(uow: UnitOfWork, agentId: string): Promise<boolean> {
@@ -392,6 +394,30 @@ export async function scheduleAgent(
 					},
 	});
 
+	// Collected only for an agent whose current permissions grant it (ADR-023), in this same
+	// scheduling transaction and before the input is serialized or stored: no console collection,
+	// no network IO, and every other agent's turn issues no status query at all. Redrive and wait
+	// resumption are ordinary calls of this function, so they always see the agent's permissions
+	// as they stand right now, not as they stood at an earlier attempt.
+	const observesSystem = agent.config.permissions.observe_system === true;
+	let systemStatus: SystemStatus | null = null;
+	if (observesSystem) {
+		// This transaction is shared with ingest of other agents, run completion and
+		// `sweepSchedules`: a row that fails `SystemStatusSchema` here must never throw and take
+		// all of that down with it. Handled exactly like a `buildTurnContext` failure below, on
+		// the same alert key, so only this agent's scheduling is skipped.
+		const status = await loadSystemStatus(uow.tx, uow.now);
+		if (!status.ok) {
+			await raiseAlert(
+				uow,
+				`context:${agentId}:${trigger.event.id}`,
+				`Cannot start a run of @${agentId}: its system status is ${status.reason}`,
+			);
+			return { skipped: "context_unavailable" };
+		}
+		systemStatus = status.status;
+	}
+
 	const runId = randomUUID();
 	const built = buildTurnContext({
 		runId,
@@ -407,6 +433,7 @@ export async function scheduleAgent(
 		threadContext: context.thread?.context ?? null,
 		memories: context.memories,
 		waitableUserIds: context.waitableUserIds,
+		systemStatus,
 		now: uow.now,
 	});
 	if (!built.ok) {
@@ -503,9 +530,6 @@ export async function scheduleAgent(
 	});
 	return { runId };
 }
-
-/** The largest turn input a run starts with, serialized. */
-export const MAX_TURN_INPUT_BYTES = 2 * 1024 * 1024;
 
 export type AttemptInit = Readonly<{
 	runId: string;
