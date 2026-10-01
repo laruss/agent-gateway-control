@@ -426,13 +426,21 @@ describe("the membership synchronizer", () => {
 		expect(records.grants).toEqual([expect.objectContaining({ channelId: LAB, state: "active" })]);
 	});
 
-	it("grants nothing while the listener cannot be brought in: the bot leaves, once", async () => {
+	it("revokes at once when the listener cannot be brought in: the bot leaves, once", async () => {
 		const { world, records, sync } = harness();
 		world.failListenerAdd = true;
 		world.add(LAB, OWNER, DEVELOPER_BOT);
 		await sync();
 		await sync();
-		expect(records.granted).toEqual([]);
+		// The grant is recorded (so no reader ever sees the listener a member of a channel its own
+		// grant does not cover yet), then revoked at once when the listener cannot join after all.
+		expect(records.grants).toEqual([
+			expect.objectContaining({
+				channelId: LAB,
+				state: "revoked",
+				revokedReason: "listener_not_added",
+			}),
+		]);
 		expect(records.rejections).toEqual([
 			expect.objectContaining({ reason: "listener_not_added", actorUserId: OWNER }),
 		]);

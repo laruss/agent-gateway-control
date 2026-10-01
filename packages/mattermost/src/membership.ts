@@ -236,6 +236,22 @@ async function judgeAdd(pass: BotPass, channel: ApiChannel, add: ApiPost): Promi
 		});
 		return;
 	}
+	// Recorded before the listener joins: no one reading the grants can ever see the listener a
+	// member of a channel its own grant does not cover yet (reconcile included).
+	pending.delete(key);
+	const granted = await options.store.grant({
+		agentId: bot.agentId,
+		botUserId: bot.userId,
+		teamId: state.teamId,
+		channelId: channel.id,
+		channelName: channel.name,
+		grantorUserId: add.user_id,
+		evidencePostId: add.id,
+		sinceMs: add.create_at,
+	});
+	if (!granted) {
+		return;
+	}
 	// The agent's own bot brings the listener in: a plain member may add members by default, so
 	// no admin credential is needed.
 	if (!(await client.isChannelMember(channel.id, state.listener.userId))) {
@@ -255,20 +271,6 @@ async function judgeAdd(pass: BotPass, channel: ApiChannel, add: ApiPost): Promi
 			});
 			return;
 		}
-	}
-	pending.delete(key);
-	const granted = await options.store.grant({
-		agentId: bot.agentId,
-		botUserId: bot.userId,
-		teamId: state.teamId,
-		channelId: channel.id,
-		channelName: channel.name,
-		grantorUserId: add.user_id,
-		evidencePostId: add.id,
-		sinceMs: add.create_at,
-	});
-	if (!granted) {
-		return;
 	}
 	options.log.info("channel granted", { agent_id: bot.agentId, channel_id: channel.id });
 	await routeMentions(pass, channel.id, add.create_at);
