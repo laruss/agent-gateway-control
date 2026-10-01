@@ -277,6 +277,27 @@ async function judgeAdd(pass: BotPass, channel: ApiChannel, add: ApiPost): Promi
 }
 
 /**
+ * Self-heals a granted channel the listener fell out of: a transient failure right after the
+ * grant was recorded, or a restart between recording it and the join. Checked on every pass for
+ * every active grant, so a failure here is only logged (the next pass tries again), never fatal
+ * to the rest of the bot's channels.
+ */
+async function ensureListenerIn(pass: BotPass, channel: ApiChannel): Promise<void> {
+	const { options, state, client } = pass;
+	if (await client.isChannelMember(channel.id, state.listener.userId)) {
+		return;
+	}
+	try {
+		await client.addChannelMember(channel.id, state.listener.userId);
+	} catch (error) {
+		options.log.warn("the listener could not be added to a granted channel", {
+			channel_id: channel.id,
+			...errorFields(error),
+		});
+	}
+}
+
+/**
  * Routes the posts after `afterMs` that mention the agent to it: in a channel the listener
  * already followed, a mention right after the add was stored before the agent could be
  * addressed there. Routing is idempotent (a post routed to the agent once is left alone), so
@@ -342,6 +363,10 @@ async function syncBot(pass: BotPass): Promise<void> {
 			if (bot.configuredChannelIds.has(grant.channelId)) {
 				return;
 			}
+			// Every pass, not only the one that recorded the grant: a transient failure right after
+			// granting it, or a restart in between, left the listener out with no other chance to
+			// bring it back in.
+			await ensureListenerIn(pass, channel);
 			// Removed and added again between two polls: the newer add decides, not the old one.
 			// Only posts since the last check are read (newest first, overlapping a little); the
 			// check counts as done only once whatever it found was judged.
