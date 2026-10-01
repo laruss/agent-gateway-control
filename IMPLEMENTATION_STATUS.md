@@ -1901,3 +1901,4 @@ Deliberate choices in this phase ([ADR-024](docs/adr/024-managed-configuration.m
 - `config export` writes only into a new or empty directory; replacing an earlier export is left
   to the operator.
 
+Released as 0.4.0 (migrations `0018_config_history` to `0021_config_revision_acks`, all expand; head `0021_config_revision_acks`, pg-boss schema 42).

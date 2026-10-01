@@ -4,6 +4,8 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-01
+
 ### Added
 
 - Managed configuration (ADR-024): PostgreSQL is now the authoritative configuration store.
