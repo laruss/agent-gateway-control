@@ -1,7 +1,8 @@
 // @vitest-environment happy-dom
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter } from "react-router";
+import type * as React from "react";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SessionProvider } from "@/lib/session-context";
 import { SignInPage } from "./sign-in-page.tsx";
@@ -35,6 +36,40 @@ async function fillAndSubmit(password: string): Promise<void> {
 	await waitFor(() => expect(screen.getByLabelText(/password/i)).toBeInTheDocument());
 	await user.type(screen.getByLabelText(/password/i), password);
 	await user.click(screen.getByRole("button", { name: /sign in/i }));
+}
+
+/** Wherever `<Navigate>` actually lands, once sign-in succeeds. */
+function Destination(): React.ReactElement {
+	const location = useLocation();
+	return <div data-testid="destination">{`${location.pathname}${location.search}`}</div>;
+}
+
+/** `SignInPage` plus a catch-all route, so the test can see which path it is sent to (the plain
+ * `renderSignIn` above only checks that the form itself goes away, never where it went). */
+function renderSignInWithDestination(from: unknown): ReturnType<typeof render> {
+	return render(
+		<MemoryRouter initialEntries={[{ pathname: "/sign-in", state: { from } }]}>
+			<SessionProvider>
+				<Routes>
+					<Route path="/sign-in" element={<SignInPage />} />
+					<Route path="*" element={<Destination />} />
+				</Routes>
+			</SessionProvider>
+		</MemoryRouter>,
+	);
+}
+
+function stubSuccessfulSignIn(): void {
+	vi.stubGlobal(
+		"fetch",
+		vi.fn(async (_input: string, init?: RequestInit) => {
+			const method = init?.method ?? "GET";
+			if (method === "GET") {
+				return jsonResponse({ authenticated: false });
+			}
+			return jsonResponse({ csrfToken: "t", expiresAt: "2031-01-01T00:00:00.000Z" });
+		}),
+	);
 }
 
 describe("SignInPage", () => {
@@ -101,5 +136,26 @@ describe("SignInPage", () => {
 		await fillAndSubmit("whatever");
 
 		expect(await screen.findByText(/12s/)).toBeInTheDocument();
+	});
+
+	it("returns to the deep-linked path carried in location.state.from once sign-in succeeds", async () => {
+		stubSuccessfulSignIn();
+
+		renderSignInWithDestination("/agents/director?tab=runtime");
+		await fillAndSubmit("correct horse battery staple");
+
+		expect(await screen.findByTestId("destination")).toHaveTextContent(
+			"/agents/director?tab=runtime",
+		);
+	});
+
+	it("ignores an unsafe redirect target (a protocol-relative URL) and falls back to the console root", async () => {
+		stubSuccessfulSignIn();
+
+		renderSignInWithDestination("//attacker.example/phish");
+		await fillAndSubmit("correct horse battery staple");
+
+		const destination = await screen.findByTestId("destination");
+		expect(destination.textContent).toBe("/");
 	});
 });

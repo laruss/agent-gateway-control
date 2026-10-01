@@ -20,9 +20,10 @@ import {
 	type ConfigDraftBundle,
 	commitChange,
 	configDiff,
+	findConfigRevisionByIdempotencyKey,
 	loadActiveBundle,
 	ManagementConflictError,
-	prepareChange,
+	previewChangeSetAgainst,
 } from "./management.ts";
 
 // ---------------------------------------------------------------------------
@@ -124,12 +125,15 @@ async function loadCurrentAgent(
 ): Promise<Readonly<{
 	revisionId: number | null;
 	bundle: ConfigDraftBundle;
+	hash: string | null;
 	agent: AgentConfig;
 }> | null> {
 	const revisionId = await activeConfigRevisionId(deps);
-	const { bundle } = await inTransaction(deps, ({ tx }) => loadActiveBundle(tx.db, revisionId));
+	const { bundle, hash } = await inTransaction(deps, ({ tx }) =>
+		loadActiveBundle(tx.db, revisionId),
+	);
 	const agent = bundle.agents.find((candidate) => candidate.id === agentId);
-	return agent === undefined ? null : { revisionId, bundle, agent };
+	return agent === undefined ? null : { revisionId, bundle, hash, agent };
 }
 
 /** `GET /api/agents/:id`: null when the agent does not exist in the active configuration. */
@@ -342,12 +346,26 @@ export function agentPatchImpact(before: AgentConfig, after: AgentConfig): Reado
 			impact.push(`removes the deny rule for '${pattern}'`);
 		}
 	}
+	const beforeApproval = new Set(before.permissions.tools_require_human_approval);
 	const afterApproval = new Set(after.permissions.tools_require_human_approval);
 	for (const pattern of before.permissions.tools_require_human_approval) {
 		if (!afterApproval.has(pattern)) {
 			// The most dangerous reduction this surface can make: a tool the agent could already
 			// reach no longer needs a human to approve each action first.
 			impact.push(`removes the human-approval requirement for '${pattern}'`);
+		}
+	}
+	for (const pattern of after.permissions.tools_require_human_approval) {
+		if (!beforeApproval.has(pattern)) {
+			// Added: an authority increase (denied, or merely deny-by-default, access becomes
+			// approval-gated access) unless the pattern was already freely allowed, in which case
+			// it is a reduction (a new approval gate on access the agent already had, without it) —
+			// either way a behavior change the owner must notice before committing.
+			impact.push(
+				beforeAllow.has(pattern)
+					? `now requires human approval for '${pattern}'`
+					: `allows '${pattern}' with human approval`,
+			);
 		}
 	}
 	if (before.permissions.observe_system === true && after.permissions.observe_system !== true) {
@@ -376,19 +394,39 @@ export type ConsoleAgentPreviewResult =
  * (removal does not fix it either) resolves to the plain disable, whose own refusal names the real
  * problem. Shared by `previewAgentPatch` (so the console sees the fallback's own diff and impact
  * before committing) and `commitAgentPatch`/`commitEnabledChange` (so the same resolution is what
- * actually gets committed) — the fallback must be reachable from both, not only from commit. */
+ * actually gets committed) — the fallback must be reachable from both, not only from commit.
+ * Resolved against `base` (the caller's own already-loaded snapshot, confirmed to be the active
+ * revision), never by re-reading live state: both callers have already confirmed `base` is the
+ * active revision by the time this runs, and validating against anything else would make the
+ * fallback's own choice of change set depend on exactly when it happened to run, breaking the
+ * determinism an idempotent retry relies on (see `previewChangeSetAgainst`). */
 async function resolveEnabledChangeSet(
 	deps: ControlPlaneDeps,
+	base: ConfigDraftBundle,
+	baseRevisionId: number | null,
+	baseHash: string | null,
 	agentId: string,
 	enabled: boolean,
 ): Promise<Readonly<{ changeSet: ChangeSet; preview: ChangePreview; usedFallback: boolean }>> {
 	const disableChangeSet: ChangeSet = [{ type: "set_agent_enabled", agentId, enabled }];
-	const preview = await prepareChange(deps, disableChangeSet);
+	const preview = await previewChangeSetAgainst(
+		deps,
+		baseRevisionId,
+		base,
+		baseHash,
+		disableChangeSet,
+	);
 	if (enabled || preview.problems.length === 0) {
 		return { changeSet: disableChangeSet, preview, usedFallback: false };
 	}
 	const removeChangeSet: ChangeSet = [{ type: "remove_agent", agentId }];
-	const removePreview = await prepareChange(deps, removeChangeSet);
+	const removePreview = await previewChangeSetAgainst(
+		deps,
+		baseRevisionId,
+		base,
+		baseHash,
+		removeChangeSet,
+	);
 	if (removePreview.problems.length > 0) {
 		return { changeSet: disableChangeSet, preview, usedFallback: false };
 	}
@@ -399,10 +437,11 @@ async function resolveEnabledChangeSet(
  * active right now — the editor's own loaded view, never silently previewed against the live
  * state in its place (see `commitAgentPatch` for why committing against a stale base must refuse
  * the same way). Otherwise built against the agent's current live definition, which is also what
- * `baseRevisionId` was just confirmed to match. An enabled-only disable whose own retained
- * configuration no longer validates resolves through `resolveEnabledChangeSet`'s fallback here
- * too, so the preview's diff and impact already show what committing it will actually do (removing
- * the agent from the configuration, not merely flipping its `enabled` flag in place). */
+ * `baseRevisionId` was just confirmed to match, and validated against that same loaded snapshot
+ * (`previewChangeSetAgainst`), never a fresh read of live state. An enabled-only disable whose own
+ * retained configuration no longer validates resolves through `resolveEnabledChangeSet`'s fallback
+ * here too, so the preview's diff and impact already show what committing it will actually do
+ * (removing the agent from the configuration, not merely flipping its `enabled` flag in place). */
 export async function previewAgentPatch(
 	deps: ControlPlaneDeps,
 	agentId: string,
@@ -418,14 +457,27 @@ export async function previewAgentPatch(
 	}
 	const plan = planAgentPatch(current.agent, patch);
 	if (plan.enabledOnly && patch.enabled === false) {
-		const resolved = await resolveEnabledChangeSet(deps, agentId, false);
+		const resolved = await resolveEnabledChangeSet(
+			deps,
+			current.bundle,
+			current.revisionId,
+			current.hash,
+			agentId,
+			false,
+		);
 		const impact = [
 			...agentPatchImpact(plan.before, plan.after),
 			...(resolved.usedFallback ? ["removes the agent from the configuration"] : []),
 		];
 		return { kind: "ok", preview: resolved.preview, impact };
 	}
-	const preview = await prepareChange(deps, plan.changeSet);
+	const preview = await previewChangeSetAgainst(
+		deps,
+		current.revisionId,
+		current.bundle,
+		current.hash,
+		plan.changeSet,
+	);
 	return { kind: "ok", preview, impact: agentPatchImpact(plan.before, plan.after) };
 }
 
@@ -441,6 +493,8 @@ export type ConsoleAgentCommitResult =
  * does not accept. */
 async function commitEnabledChange(
 	deps: ControlPlaneDeps,
+	base: ConfigDraftBundle,
+	baseHash: string | null,
 	agentId: string,
 	enabled: boolean,
 	baseRevisionId: number | null,
@@ -448,7 +502,14 @@ async function commitEnabledChange(
 	actor: string,
 	reason: string | undefined,
 ): Promise<CommitChangeResult> {
-	const { changeSet } = await resolveEnabledChangeSet(deps, agentId, enabled);
+	const { changeSet } = await resolveEnabledChangeSet(
+		deps,
+		base,
+		baseRevisionId,
+		baseHash,
+		agentId,
+		enabled,
+	);
 	return commitChange(deps, {
 		changeSet,
 		baseRevisionId,
@@ -460,18 +521,21 @@ async function commitEnabledChange(
 }
 
 /**
- * `POST /api/agents/:id/commit`: builds the change set from the agent's definition in the
- * snapshot `baseRevisionId` itself names (see the determinism note below — not "whatever is live
- * right now", unlike `previewAgentPatch`, which has already confirmed the two agree by this
- * point). An enabled-only patch always routes through `commitEnabledChange`, which validates and
- * resolves its own fallback itself (`resolveEnabledChangeSet`) — bailing out here on the plain
- * disable's own `problems` first, before that fallback ever ran, is exactly what made the
- * fallback unreachable from the console. Every other patch is re-validated here first (so a patch
- * that became invalid between preview and commit is still reported as `invalid`, never attempted)
- * and then committed through `commitChange` directly. A stale `baseRevisionId` is a `conflict`; a
- * run-in-progress protection or any other business-rule refusal raised only at commit time is
- * reported the same way as an `invalid` preview problem, both meaning "422, with a message" to
- * the caller.
+ * `POST /api/agents/:id/commit`: replays first (an idempotency key already recorded — the
+ * response an earlier, possibly lost-in-transit success already committed, regardless of what has
+ * happened since); then refuses a stale `baseRevisionId` with `conflict`, before anything plans or
+ * validates against it; only then builds the change set from the agent's definition in the
+ * snapshot `baseRevisionId` itself names (see the determinism note on `previewChangeSetAgainst` —
+ * not "whatever is live right now") and validates it, `invalid` on problems; and finally commits.
+ * That order matters: validating a plan built from a since-stale base against live state instead
+ * (the order this once had) reports an unrelated live-state mismatch as `invalid` when the real
+ * answer is either "replay" (an already-recorded idempotency key) or `conflict` (a base that has
+ * simply moved on) — never a problem with the patch itself. An enabled-only patch always routes
+ * through `commitEnabledChange`, which resolves its own disable-with-fallback itself
+ * (`resolveEnabledChangeSet`); every other patch is validated here directly and then committed
+ * through `commitChange`. A run-in-progress protection or any other business-rule refusal raised
+ * only at commit time is reported the same way as an `invalid` preview problem, both meaning "422,
+ * with a message" to the caller.
  */
 export async function commitAgentPatch(
 	deps: ControlPlaneDeps,
@@ -483,20 +547,27 @@ export async function commitAgentPatch(
 	reason: string | undefined,
 ): Promise<ConsoleAgentCommitResult> {
 	try {
-		// Built from the request's own claimed base — never "whatever is live right now"
-		// (`loadCurrentAgent`, which `previewAgentPatch` uses once it has already confirmed the base
-		// matches live). A snapshot is immutable and content-addressed, so recomputing this plan for
-		// the same (`baseRevisionId`, `patch`) pair always produces the identical change set,
-		// regardless of what has happened to the live configuration since. That determinism is what
-		// lets a retry under the same idempotency key replay correctly — `commitChange`'s own
-		// idempotency check (inside its transaction, before it ever compares `baseRevisionId`
-		// against the current live revision) compares the two change sets' hashes, and a
-		// live-state-dependent plan could disagree with its own first attempt purely because an
-		// unrelated, intervening change had moved live state on by the time the retry ran, which
-		// `commitChange` would otherwise see as "the same key, a different change set" and refuse.
-		// A genuinely stale (non-retried) base is still refused: `commitChange`'s own lock-protected
-		// conflict check runs regardless of where this plan's content came from.
-		const { bundle } = await inTransaction(deps, ({ tx }) =>
+		const existing = await findConfigRevisionByIdempotencyKey(deps, idempotencyKey);
+		if (existing !== null) {
+			return {
+				kind: "ok",
+				result: {
+					revisionId: existing.id,
+					hash: existing.hash,
+					noop: false,
+					replayed: true,
+					activeRevisionId: await activeConfigRevisionId(deps),
+				},
+			};
+		}
+		const currentRevisionId = await activeConfigRevisionId(deps);
+		if (baseRevisionId !== currentRevisionId) {
+			return { kind: "conflict", currentRevisionId };
+		}
+		// Built from the request's own claimed base — never "whatever is live right now" — so
+		// recomputing this plan for the same (`baseRevisionId`, `patch`) pair always produces the
+		// identical change set (see `previewChangeSetAgainst`'s own determinism note).
+		const { bundle, hash } = await inTransaction(deps, ({ tx }) =>
 			loadActiveBundle(tx.db, baseRevisionId),
 		);
 		const agent = bundle.agents.find((candidate) => candidate.id === agentId);
@@ -507,6 +578,8 @@ export async function commitAgentPatch(
 		if (plan.enabledOnly) {
 			const result = await commitEnabledChange(
 				deps,
+				bundle,
+				hash,
 				agentId,
 				patch.enabled === true,
 				baseRevisionId,
@@ -516,7 +589,13 @@ export async function commitAgentPatch(
 			);
 			return { kind: "ok", result };
 		}
-		const preview = await prepareChange(deps, plan.changeSet);
+		const preview = await previewChangeSetAgainst(
+			deps,
+			baseRevisionId,
+			bundle,
+			hash,
+			plan.changeSet,
+		);
 		if (preview.problems.length > 0) {
 			return { kind: "invalid", problems: preview.problems };
 		}

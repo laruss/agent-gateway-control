@@ -84,6 +84,157 @@ describe("agentPatchImpact", () => {
 		);
 	});
 
+	it("flags adding a tool pattern to tools_require_human_approval as an authority increase, when it was not already allowed", () => {
+		const before = agent({
+			permissions: { tools_allow: [], tools_require_human_approval: [], tools_deny: [] },
+		});
+		const after = agent({
+			permissions: {
+				tools_allow: [],
+				tools_require_human_approval: ["deploy.rollback"],
+				tools_deny: [],
+			},
+		});
+		expect(agentPatchImpact(before, after)).toEqual([
+			"allows 'deploy.rollback' with human approval",
+		]);
+	});
+
+	it("flags moving an already-allowed tool pattern to tools_require_human_approval as a behavior change, not a plain increase", () => {
+		// `AgentConfigSchema` forbids a pattern in both lists at once, so the realistic patch this
+		// covers moves the pattern across — out of tools_allow, into tools_require_human_approval —
+		// in the same commit, rather than merely adding it to the second list.
+		const before = agent({
+			permissions: {
+				tools_allow: ["deploy.rollback"],
+				tools_require_human_approval: [],
+				tools_deny: [],
+			},
+		});
+		const after = agent({
+			permissions: {
+				tools_allow: [],
+				tools_require_human_approval: ["deploy.rollback"],
+				tools_deny: [],
+			},
+		});
+		expect(agentPatchImpact(before, after)).toEqual([
+			"removes tool grant 'deploy.rollback'",
+			"now requires human approval for 'deploy.rollback'",
+		]);
+	});
+
+	describe("every permissions list, added and removed", () => {
+		it("tools_allow: add", () => {
+			const before = agent({
+				permissions: { tools_allow: [], tools_require_human_approval: [], tools_deny: [] },
+			});
+			const after = agent({
+				permissions: {
+					tools_allow: ["mattermost.post"],
+					tools_require_human_approval: [],
+					tools_deny: [],
+				},
+			});
+			expect(agentPatchImpact(before, after)).toEqual(["grants tool 'mattermost.post'"]);
+		});
+
+		it("tools_allow: remove", () => {
+			const before = agent({
+				permissions: {
+					tools_allow: ["mattermost.post"],
+					tools_require_human_approval: [],
+					tools_deny: [],
+				},
+			});
+			const after = agent({
+				permissions: { tools_allow: [], tools_require_human_approval: [], tools_deny: [] },
+			});
+			expect(agentPatchImpact(before, after)).toEqual(["removes tool grant 'mattermost.post'"]);
+		});
+
+		it("tools_deny: add is not flagged (narrowing access needs no owner confirmation)", () => {
+			const before = agent({
+				permissions: { tools_allow: [], tools_require_human_approval: [], tools_deny: [] },
+			});
+			const after = agent({
+				permissions: {
+					tools_allow: [],
+					tools_require_human_approval: [],
+					tools_deny: ["deploy.*"],
+				},
+			});
+			expect(agentPatchImpact(before, after)).toEqual([]);
+		});
+
+		it("tools_deny: remove", () => {
+			const before = agent({
+				permissions: {
+					tools_allow: [],
+					tools_require_human_approval: [],
+					tools_deny: ["deploy.*"],
+				},
+			});
+			const after = agent({
+				permissions: { tools_allow: [], tools_require_human_approval: [], tools_deny: [] },
+			});
+			expect(agentPatchImpact(before, after)).toEqual(["removes the deny rule for 'deploy.*'"]);
+		});
+
+		it("tools_require_human_approval: add, not previously allowed — an increase", () => {
+			const before = agent({
+				permissions: { tools_allow: [], tools_require_human_approval: [], tools_deny: [] },
+			});
+			const after = agent({
+				permissions: {
+					tools_allow: [],
+					tools_require_human_approval: ["finance.payment.create"],
+					tools_deny: [],
+				},
+			});
+			expect(agentPatchImpact(before, after)).toEqual([
+				"allows 'finance.payment.create' with human approval",
+			]);
+		});
+
+		it("tools_require_human_approval: add (moved from tools_allow) — a reduction, still flagged", () => {
+			const before = agent({
+				permissions: {
+					tools_allow: ["finance.payment.create"],
+					tools_require_human_approval: [],
+					tools_deny: [],
+				},
+			});
+			const after = agent({
+				permissions: {
+					tools_allow: [],
+					tools_require_human_approval: ["finance.payment.create"],
+					tools_deny: [],
+				},
+			});
+			expect(agentPatchImpact(before, after)).toEqual([
+				"removes tool grant 'finance.payment.create'",
+				"now requires human approval for 'finance.payment.create'",
+			]);
+		});
+
+		it("tools_require_human_approval: remove", () => {
+			const before = agent({
+				permissions: {
+					tools_allow: [],
+					tools_require_human_approval: ["finance.payment.create"],
+					tools_deny: [],
+				},
+			});
+			const after = agent({
+				permissions: { tools_allow: [], tools_require_human_approval: [], tools_deny: [] },
+			});
+			expect(agentPatchImpact(before, after)).toEqual([
+				"removes the human-approval requirement for 'finance.payment.create'",
+			]);
+		});
+	});
+
 	it("flags observe_system granted and removed symmetrically", () => {
 		const before = agent({
 			permissions: { tools_allow: [], tools_require_human_approval: [], tools_deny: [] },

@@ -9,6 +9,20 @@ import { Label } from "@/components/ui/label";
 import { ApiError, type SignInOutcome } from "@/lib/api-client";
 import { useSession } from "@/lib/session-context";
 
+/**
+ * `location.state.from` (`ProtectedLayout`'s own redirect here), narrowed to a same-app relative
+ * path — the only kind of value it ever sets, but `location.state` is caller-supplied, so anything
+ * else (an absolute URL, a protocol-relative `//host/...` that the browser would follow as one,
+ * or simply not a string) falls back to the console's own root rather than being handed to
+ * `Navigate` unexamined.
+ */
+function safeRedirectTarget(from: unknown): string {
+	if (typeof from !== "string" || !from.startsWith("/") || from.startsWith("//")) {
+		return "/";
+	}
+	return from;
+}
+
 function errorMessage(outcome: Exclude<SignInOutcome, { kind: "ok" }>): string {
 	switch (outcome.kind) {
 		case "invalid":
@@ -32,7 +46,7 @@ export function SignInPage(): React.ReactElement {
 	const [submitting, setSubmitting] = React.useState(false);
 
 	if (state.status === "signed-in") {
-		const from = (location.state as { from?: string } | null)?.from ?? "/";
+		const from = safeRedirectTarget((location.state as { from?: unknown } | null)?.from);
 		return <Navigate to={from} replace />;
 	}
 

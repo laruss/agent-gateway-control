@@ -294,6 +294,69 @@ describe("the Agents hub's management API (ADR-024/ADR-025)", () => {
 		expect(count.rows[0]?.count).toBe("1");
 	});
 
+	it(
+		"replays a retried commit whose agent a later CLI change removed entirely, rather than " +
+			"revalidating the stale-base plan against live state and reporting it invalid",
+		async () => {
+			const { base } = await withServer();
+			const session = await signIn(base);
+			const removedAgentId = "developer";
+			const baseRevisionId = await activeRevisionId(base, session.cookie);
+			const key = randomUUID();
+			const body = {
+				baseRevisionId,
+				changes: { rolePrompt: "The developer's freshly committed role prompt." },
+				idempotencyKey: key,
+			};
+			const first = await postJson(base, `/api/agents/${removedAgentId}/commit`, session, body);
+			expect(first.status).toBe(200);
+
+			// A CLI apply removes the agent entirely, through `commitChange` directly — the same path
+			// `gateway config apply` uses, never the console's own HTTP surface.
+			const cliRemoval = await commitChange(gateway.deps(), {
+				changeSet: [{ type: "remove_agent", agentId: removedAgentId }],
+				baseRevisionId: first.body.revisionId as number,
+				actor: "test-cli",
+				source: "cli_apply",
+			});
+			expect(cliRemoval.revisionId).toBeGreaterThan(first.body.revisionId as number);
+
+			// The exact same request again (as if the first response had been lost in transit):
+			// replayed from the recorded idempotency key, never recomputed against live state (where
+			// the agent is now gone) and reported as an invalid patch.
+			const retry = await postJson(base, `/api/agents/${removedAgentId}/commit`, session, body);
+			expect(retry.status).toBe(200);
+			expect(retry.body.replayed).toBe(true);
+			expect(retry.body.revisionId).toBe(first.body.revisionId);
+		},
+	);
+
+	it(
+		"refuses a stale base with 409 rather than 422 when the intervening change removed the " +
+			"agent entirely (the plan is not actually invalid — the base is simply stale)",
+		async () => {
+			const { base } = await withServer();
+			const session = await signIn(base);
+			const removedAgentId = "operator";
+			const staleBase = await activeRevisionId(base, session.cookie);
+
+			const cliRemoval = await commitChange(gateway.deps(), {
+				changeSet: [{ type: "remove_agent", agentId: removedAgentId }],
+				baseRevisionId: staleBase,
+				actor: "test-cli",
+				source: "cli_apply",
+			});
+
+			const commit = await postJson(base, `/api/agents/${removedAgentId}/commit`, session, {
+				baseRevisionId: staleBase,
+				changes: { rolePrompt: "Computed against a base that is no longer live." },
+				idempotencyKey: randomUUID(),
+			});
+			expect(commit.status).toBe(409);
+			expect(commit.body.currentRevisionId).toBe(cliRemoval.revisionId);
+		},
+	);
+
 	it("rejects an unknown field in the patch with 400", async () => {
 		const { base } = await withServer();
 		const session = await signIn(base);
@@ -577,11 +640,18 @@ describe("the Agents hub's management API (ADR-024/ADR-025)", () => {
 					expect.arrayContaining(["removes the agent from the configuration"]),
 				);
 
-				const commit = await postJson(base, `/api/agents/${RETAINED_AGENT_ID}/commit`, session, {
+				const commitKey = randomUUID();
+				const commitBody = {
 					baseRevisionId,
 					changes: { enabled: false },
-					idempotencyKey: randomUUID(),
-				});
+					idempotencyKey: commitKey,
+				};
+				const commit = await postJson(
+					base,
+					`/api/agents/${RETAINED_AGENT_ID}/commit`,
+					session,
+					commitBody,
+				);
 				expect(commit.status).toBe(200);
 
 				const detail = await getJson(base, `/api/agents/${RETAINED_AGENT_ID}`, session.cookie);
@@ -593,6 +663,20 @@ describe("the Agents hub's management API (ADR-024/ADR-025)", () => {
 					)
 				).rows;
 				expect(row?.enabled).toBe(false);
+
+				// An identical retry (the same stale base, the same idempotency key) must replay the
+				// first commit's result, never recompute the disable-with-fallback resolution against
+				// live state (where the agent is now gone entirely) and refuse it as "a different
+				// change set" under the same key.
+				const retry = await postJson(
+					base,
+					`/api/agents/${RETAINED_AGENT_ID}/commit`,
+					session,
+					commitBody,
+				);
+				expect(retry.status).toBe(200);
+				expect(retry.body.replayed).toBe(true);
+				expect(retry.body.revisionId).toBe(commit.body.revisionId);
 			},
 		);
 
