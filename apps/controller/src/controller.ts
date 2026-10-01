@@ -12,6 +12,7 @@ import {
 } from "@agent-gateway/contracts";
 import {
 	type ControlPlaneDeps,
+	ensureConfigHistory,
 	handleRunReport,
 	handleRunTimeout,
 	handleToolReport,
@@ -115,6 +116,10 @@ export async function startController(options: ControllerOptions): Promise<Runni
 		random: options.random ?? Math.random,
 		log,
 	};
+	// A no-op once a revision is recorded; backfills one for a database upgraded from a release
+	// before configuration history existed, so it is never left permanently unbackfilled on a
+	// controller that is restarted without an intervening `config apply`.
+	await ensureConfigHistory(deps, "system");
 	const metrics = options.metrics ?? new MetricsRegistry();
 	registerControllerMetrics(metrics, pool, clock);
 	const reportsApplied = metrics.counter(

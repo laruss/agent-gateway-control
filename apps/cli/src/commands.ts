@@ -19,6 +19,7 @@ import {
 	toolReportQueue,
 } from "@agent-gateway/contracts";
 import {
+	ackConfigRevision,
 	applyConfig,
 	budgetReport,
 	type CancelledJob,
@@ -26,7 +27,9 @@ import {
 	type ControlPlaneDeps,
 	cancelRun,
 	configBundleProblems,
+	configHistoryNeedsBackfill,
 	decideMemory,
+	ensureConfigHistory,
 	ingestEvent,
 	killAll,
 	listAgents,
@@ -86,6 +89,13 @@ import {
 import { createRuntimeAdapter, workspaceRoot } from "@agent-gateway/worker";
 import type { PgBoss } from "pg-boss";
 import { type BackupCheckReport, checkBackup, localPgTools } from "./backup.ts";
+import {
+	configDiffCommand,
+	configExport,
+	configHistory,
+	configImport,
+	configRollback,
+} from "./config-commands.ts";
 import { loadConfigDirectory } from "./config-files.ts";
 import { consolePasswordSet, nodeHiddenReader } from "./console-commands.ts";
 import { gmailAuthorize } from "./gmail-commands.ts";
@@ -124,8 +134,32 @@ export const USAGE = `gateway <command>
                                       namespaces (e.g. finance) and their begin check
   config validate <dir> [--root .]    validate organization.yaml and agents/*.yaml
   config apply <dir> [--root .] [--mock-runtimes]
-                                      store the configuration as the active version;
-                                      --mock-runtimes runs every agent on the mock runtime
+                                      deprecated: 'config import' against the current revision,
+                                      without --expected-revision (existing scripts keep working;
+                                      --mock-runtimes runs every agent on the mock runtime)
+  config export <dir> [--revision <id>]
+                                      write the active (or given) revision's snapshot as a config
+                                      directory: organization.yaml, agents/<id>.yaml, their prompt
+                                      files under prompts/, and a manifest.json; import it with
+                                      --root set to this same <dir>. <dir> must not exist yet, or
+                                      must already be empty; remove an old export yourself first
+  config diff <dir> [--root .] [--json]
+                                      preview <dir> as a change against the active configuration
+                                      (read-only); --json prints the raw preview
+  config import <dir> [--root .] [--expected-revision <id>] [--reason <text>]
+                                      replace the active configuration with <dir>'s content;
+                                      --expected-revision is required unless the database has no
+                                      active configuration yet (run 'config diff' first to see
+                                      what would change)
+  config history [--limit N]          recent revisions: id, created, actor, source, a shortened
+                                      snapshot hash, parent and reason (default 20, max 500)
+  config rollback <revision-id> --expected-revision <id> [--reason <text>]
+                                      commit a new revision whose content is <revision-id>'s own
+                                      snapshot (never a pointer reset); prints the diff first
+  config ack <revision-id>            acknowledge a 'backfill' revision (configuration changed
+                                      outside revision history); clears the 'config:backfill'
+                                      alert and doctor's 'config_history' check for it, since
+                                      recommitting its own content alone is a no-op
   directory set <channel|user|team> <name> <mattermost-id>
   agents list | show <id> | enable <id> | disable <id> | pause <id> | resume <id>
   runtimes list                       worker availability and runtime versions per adapter
@@ -373,6 +407,60 @@ async function doctor(session: Session, out: Output): Promise<boolean> {
 				held.length === 0
 					? `no hold on ${budgets.day}`
 					: `held on ${budgets.day}: ${held.map((agent) => `@${agent.agentId}`).join(", ")}`,
+		});
+		// `doctor` never runs `ensureConfigHistory` itself (it is read-only), so right after a
+		// forward upgrade the journal's latest entry can still look exactly as it did before the
+		// upgrade even though the live projections have already drifted (see
+		// `configHistoryNeedsBackfill`): checked first, since the second check below (the latest
+		// entry already recorded as a drifted backfill) can only ever be true once that backfill
+		// has actually run.
+		const needsBackfill = await configHistoryNeedsBackfill(session.deps);
+		// Checked directly, not only through the alert sweep (which may not have run since a
+		// drift just got backfilled): the most recently recorded revision is a `backfill` with a
+		// parent, meaning a release before this one changed `config_versions`/`agents` outside the
+		// revision journal (most likely during a rollback interval; see `ensureConfigHistoryIn`). A
+		// parentless `backfill` is the ordinary first entry a database upgraded from before
+		// configuration history existed gets, not a sign of drift.
+		const [latestRevision] = (
+			await pool.query<{
+				id: number;
+				source: string;
+				generation: number;
+				parent_revision_id: number | null;
+			}>(
+				`select id::int as id, source, generation::int as generation,
+				        parent_revision_id::int as parent_revision_id
+				   from config_revisions order by id desc limit 1`,
+			)
+		).rows;
+		const recordedDrift =
+			latestRevision?.source === "backfill" && latestRevision.parent_revision_id !== null;
+		// A faithful recommit of the drifted content is a no-op (`commitChange`), so reviewing it
+		// alone never clears this check; an explicit `gateway config ack` does.
+		const acked =
+			!recordedDrift || latestRevision === undefined
+				? false
+				: ((
+						await pool.query<{ n: number }>(
+							"select count(*)::int as n from config_revision_acks where revision_id = $1",
+							[latestRevision.id],
+						)
+					).rows[0]?.n ?? 0) > 0;
+		const configDrift = needsBackfill || (recordedDrift && !acked);
+		checks.push({
+			name: "config_history",
+			ok: !configDrift,
+			detail: needsBackfill
+				? "configuration changed outside revision history; it will be recorded as a backfill " +
+					"revision on the next controller start or config command"
+				: !recordedDrift
+					? "no drift since the last recorded revision"
+					: acked
+						? `configuration changed outside revision history at generation ${latestRevision?.generation}; ` +
+							`recorded as revision ${latestRevision?.id} (backfill); acknowledged`
+						: `configuration changed outside revision history at generation ${latestRevision?.generation}; ` +
+							`recorded as revision ${latestRevision?.id} (backfill); review with 'gateway config diff'/'history', ` +
+							`then 'gateway config ack ${latestRevision?.id}'`,
 		});
 		const firing = await pool.query<{ key: string }>(
 			"select key from alert_states where state = 'firing' order by key",
@@ -692,6 +780,10 @@ async function runSessionCommand(
 			if (!schema.ok) {
 				throw new Error(`this CLI cannot run against this database: ${schema.detail}`);
 			}
+			// Backfills configuration history once the schema is confirmed compatible, so every
+			// command past this point — not just `config apply` — sees an up-to-date base revision
+			// (a console or `gateway agents enable|disable` reads it through `prepareChange`).
+			await ensureConfigHistory(session.deps, actor());
 		}
 		return await dispatchSessionCommand(session, command, args, out);
 	} finally {
@@ -713,9 +805,94 @@ async function dispatchSessionCommand(
 		case "doctor":
 			return (await doctor(session, out)) ? 0 : 1;
 		case "config apply": {
+			process.stderr.write(
+				"gateway: 'config apply' is deprecated; use 'config import --expected-revision <id>' " +
+					"(see 'gateway config history' for the current id)\n",
+			);
 			const loaded = loadConfigDirectory(arg(args, 2, "dir"), resolve(flag(args, "root") ?? "."));
 			const input = args.includes("--mock-runtimes") ? withMockRuntimes(loaded) : loaded;
 			out.print(json(await applyConfig(deps, input, who)));
+			return 0;
+		}
+		case "config export": {
+			const dir = arg(args, 2, "dir");
+			const revisionFlag = flag(args, "revision");
+			let revisionId: number | null = null;
+			if (revisionFlag !== null) {
+				revisionId = Number(revisionFlag);
+				if (!Number.isInteger(revisionId) || revisionId < 1) {
+					throw new UsageError("--revision must be a positive integer");
+				}
+			}
+			await configExport(deps, { dir, revisionId }, out.print);
+			return 0;
+		}
+		case "config diff": {
+			const dir = arg(args, 2, "dir");
+			const root = resolve(flag(args, "root") ?? ".");
+			const ok = await configDiffCommand(
+				deps,
+				{ dir, root, json: args.includes("--json") },
+				out.print,
+			);
+			return ok ? 0 : 1;
+		}
+		case "config import": {
+			const dir = arg(args, 2, "dir");
+			const root = resolve(flag(args, "root") ?? ".");
+			const expectedFlag = flag(args, "expected-revision");
+			let expectedRevision: number | null = null;
+			if (expectedFlag !== null) {
+				expectedRevision = Number(expectedFlag);
+				if (!Number.isInteger(expectedRevision) || expectedRevision < 1) {
+					throw new UsageError("--expected-revision must be a positive integer");
+				}
+			}
+			await configImport(
+				deps,
+				{ dir, root, expectedRevision, reason: flag(args, "reason"), actor: who },
+				out.print,
+			);
+			return 0;
+		}
+		case "config history": {
+			const limitFlag = flag(args, "limit");
+			const limit = limitFlag === null ? 20 : Number(limitFlag);
+			if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
+				throw new UsageError("--limit must be an integer from 1 to 500");
+			}
+			await configHistory(deps, limit, out.print);
+			return 0;
+		}
+		case "config rollback": {
+			const revisionId = Number(arg(args, 2, "revision-id"));
+			if (!Number.isInteger(revisionId) || revisionId < 1) {
+				throw new UsageError("<revision-id> must be a positive integer");
+			}
+			const expectedFlag = flag(args, "expected-revision");
+			if (expectedFlag === null) {
+				throw new UsageError(
+					"missing --expected-revision <id>: run 'gateway config history' first",
+				);
+			}
+			const expectedRevision = Number(expectedFlag);
+			if (!Number.isInteger(expectedRevision) || expectedRevision < 1) {
+				throw new UsageError("--expected-revision must be a positive integer");
+			}
+			await configRollback(
+				deps,
+				{ revisionId, expectedRevision, reason: flag(args, "reason"), actor: who },
+				out.print,
+			);
+			return 0;
+		}
+		case "config ack": {
+			const revisionId = Number(arg(args, 2, "revision-id"));
+			if (!Number.isInteger(revisionId) || revisionId < 1) {
+				throw new UsageError("<revision-id> must be a positive integer");
+			}
+			await ackConfigRevision(deps, revisionId, who);
+			out.print(`revision ${revisionId} acknowledged`);
 			return 0;
 		}
 		case "directory set": {
@@ -738,9 +915,19 @@ async function dispatchSessionCommand(
 			out.print(json(await showAgent(deps, arg(args, 2, "id"))));
 			return 0;
 		case "agents enable":
-		case "agents disable":
-			out.print(await setAgentEnabled(deps, arg(args, 2, "id"), action === "enable", who));
+		case "agents disable": {
+			const agentId = arg(args, 2, "id");
+			const { result, removed } = await setAgentEnabled(deps, agentId, action === "enable", who);
+			if (removed) {
+				out.print(
+					`note: '${agentId}' could not be disabled without leaving the configuration invalid ` +
+						"(its own retained configuration no longer validates); removed from it instead, " +
+						"still disabled rather than deleted, visible in 'gateway config history'",
+				);
+			}
+			out.print(json(result));
 			return 0;
+		}
 		case "agents pause":
 			await cancelJobs(boss, await pauseAgent(deps, arg(args, 2, "id"), who));
 			out.print("paused");

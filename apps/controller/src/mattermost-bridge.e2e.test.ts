@@ -14,7 +14,6 @@ import {
 	mattermostReconcileStore,
 	pauseAgent,
 	resumeAgent,
-	setAgentEnabled,
 } from "@agent-gateway/core";
 import {
 	bootstrapMattermost,
@@ -32,7 +31,13 @@ import {
 } from "@agent-gateway/service";
 import { startTestMattermost, type TestMattermost } from "@agent-gateway/testkit";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { eventually, exampleConfig, startTestGateway, type TestGateway } from "./test-gateway.ts";
+import {
+	eventually,
+	exampleConfig,
+	setAgentEnabledThroughConfig,
+	startTestGateway,
+	type TestGateway,
+} from "./test-gateway.ts";
 
 type Row = Record<string, JsonValue>;
 
@@ -607,8 +612,8 @@ describe("Mattermost bridge against a real server", () => {
 			await query("select 1 from events where subject like $1", [`channel/%/post/${forged}`]),
 		).toEqual([]);
 		// Leave developer and finance as the other tests expect them.
-		await setAgentEnabled(deps, "developer", false, "e2e");
-		await setAgentEnabled(deps, "developer", true, "e2e");
+		await setAgentEnabledThroughConfig(deps, "developer", false, "e2e");
+		await setAgentEnabledThroughConfig(deps, "developer", true, "e2e");
 		await resumeAgent(deps, "finance", "e2e");
 	});
 
@@ -1111,9 +1116,19 @@ describe("Mattermost bridge against a real server", () => {
 		const deps = gateway.deps();
 		const mailBot = await botUserId("mail-follower");
 		const config = exampleConfig();
+		// `configBundleProblems` now refuses a `rolePrompts` entry for an agent the bundle does not
+		// configure (the same shape a real config directory without `mail-follower`'s YAML file
+		// would have, since `loadConfigDirectory` never has a role prompt for an agent it did not
+		// read): dropped here along with the agent itself.
+		const rolePrompts = { ...config.rolePrompts };
+		delete rolePrompts["mail-follower"];
 		await applyConfig(
 			deps,
-			{ ...config, agents: config.agents.filter((agent) => agent.id !== "mail-follower") },
+			{
+				...config,
+				agents: config.agents.filter((agent) => agent.id !== "mail-follower"),
+				rolePrompts,
+			},
 			"e2e",
 		);
 		bootstrapReport.length = 0;

@@ -10,6 +10,7 @@ import {
 	exampleConfig,
 	humanPost,
 	IDS,
+	setAgentEnabledThroughConfig,
 	startTestGateway,
 	type TestGateway,
 } from "@agent-gateway/controller/testing";
@@ -22,7 +23,6 @@ import {
 	killAll,
 	releaseKillSwitch,
 	resumeAgent,
-	setAgentEnabled,
 	sweepApprovals,
 	TOOL_BEGIN_WINDOW_MS,
 	TOOL_RUN_GRACE_MS,
@@ -680,8 +680,8 @@ describe("approvals and the tool broker", () => {
 		await idle("finance");
 
 		const pending = await requestPayment();
-		await setAgentEnabled(gateway.deps(), "finance", false, "test");
-		await setAgentEnabled(gateway.deps(), "finance", true, "test");
+		await setAgentEnabledThroughConfig(gateway.deps(), "finance", false, "test");
+		await setAgentEnabledThroughConfig(gateway.deps(), "finance", true, "test");
 		expect(await status(pending.id)).toEqual({ status: "cancelled", action: null });
 		await sweepApprovals(gateway.deps());
 		const withdrawn = await query("select 1 from outbox where idempotency_key = $1", [

@@ -34,7 +34,6 @@ import {
 	redriveRun,
 	releaseKillSwitch,
 	resumeAgent,
-	setAgentEnabled,
 	setDirectoryEntry,
 	startManagedChannel,
 	type UnitOfWork,
@@ -62,6 +61,7 @@ import {
 	flakyDeliverer,
 	humanPost,
 	IDS,
+	setAgentEnabledThroughConfig,
 	startTestGateway,
 	type TestGateway,
 } from "./test-gateway.ts";
@@ -635,8 +635,10 @@ describe("durable core with the mock runtime", () => {
 		expect(parent?.parent_run_id).toBe(run.id);
 
 		// Neither disable/enable nor kill-all clears a failure; only a redrive does.
-		expect(await setAgentEnabled(gateway.deps(), "research", false, "test")).toBe("disabled");
-		expect(await setAgentEnabled(gateway.deps(), "research", true, "test")).toBe("failed");
+		await setAgentEnabledThroughConfig(gateway.deps(), "research", false, "test");
+		expect(await agentState("research")).toBe("disabled");
+		await setAgentEnabledThroughConfig(gateway.deps(), "research", true, "test");
+		expect(await agentState("research")).toBe("failed");
 		expect(await pauseAgent(gateway.deps(), "research", "test")).toEqual([]);
 		expect(await agentState("research")).toBe("failed");
 	});
@@ -761,6 +763,29 @@ describe("durable core with the mock runtime", () => {
 			/append-only/,
 		);
 		await expect(gateway.pool.query("delete from audit_log")).rejects.toThrow(/append-only/);
+	});
+
+	it("keeps configuration snapshots and revisions append-only", async () => {
+		const [snapshot] = await query<{ hash: string }>(
+			"select hash from config_snapshots order by created_at desc limit 1",
+		);
+		const [revision] = await query<{ id: string }>(
+			"select id from config_revisions order by id desc limit 1",
+		);
+		await expect(
+			gateway.pool.query("update config_snapshots set origin = 'backfill' where hash = $1", [
+				snapshot?.hash,
+			]),
+		).rejects.toThrow(/append-only/);
+		await expect(
+			gateway.pool.query("delete from config_snapshots where hash = $1", [snapshot?.hash]),
+		).rejects.toThrow(/append-only/);
+		await expect(
+			gateway.pool.query("update config_revisions set actor = 'x' where id = $1", [revision?.id]),
+		).rejects.toThrow(/append-only/);
+		await expect(
+			gateway.pool.query("delete from config_revisions where id = $1", [revision?.id]),
+		).rejects.toThrow(/append-only/);
 	});
 
 	it("refuses reserved event types from outside the Gateway", async () => {

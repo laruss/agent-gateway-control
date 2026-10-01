@@ -3,9 +3,15 @@ import {
 	type RuntimeAdapterId,
 	RuntimeAdapterIdSchema,
 } from "@agent-gateway/contracts";
-import { type AlertState, alertStates, withTransaction } from "@agent-gateway/db";
+import {
+	type AlertState,
+	alertStates,
+	configRevisionAcks,
+	configRevisions,
+	withTransaction,
+} from "@agent-gateway/db";
 import { budgetPressure, type UsageTotals, utcDay } from "@agent-gateway/policy";
-import { eq } from "drizzle-orm";
+import { desc, eq } from "drizzle-orm";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
 import { loadActiveConfig, postAlert } from "./store.ts";
 
@@ -119,6 +125,7 @@ export async function currentAlertConditions(
 	const conditions: AlertCondition[] = [];
 
 	conditions.push(...(await mattermostCondition(uow, inputs.mattermost)));
+	conditions.push(...(await configHistoryConditions(uow)));
 
 	const deadLetters = await client.query<CountRow>(
 		`select name as key, count(*)::text as count from pgboss.job
@@ -228,6 +235,50 @@ async function mattermostCondition(
 		];
 	}
 	return [];
+}
+
+/**
+ * The most recently recorded configuration revision was a `backfill` with a parent: something
+ * changed `config_versions`/`agents` outside the revision journal — most likely a release before
+ * this one, which does not know the journal exists, running during a rollback interval (see
+ * `ensureConfigHistoryIn`). A `backfill` with no parent is excluded: that one is the ordinary,
+ * expected first entry a database upgraded from before configuration history existed gets, not a
+ * sign anything drifted. Resolves once a later, actually different revision supersedes it, or once
+ * a human acknowledges it with `gateway config ack <revision-id>` (`ackConfigRevision`) — not on
+ * its own from merely reviewing it: `commitChange` treats identical content as a no-op, so
+ * recommitting the reviewed configuration (or `config rollback` to this same revision) writes no
+ * new revision and never clears this on its own.
+ */
+async function configHistoryConditions(uow: UnitOfWork): Promise<AlertCondition[]> {
+	const [latest] = await uow.tx.db
+		.select({
+			id: configRevisions.id,
+			source: configRevisions.source,
+			generation: configRevisions.generation,
+			parentRevisionId: configRevisions.parentRevisionId,
+		})
+		.from(configRevisions)
+		.orderBy(desc(configRevisions.id))
+		.limit(1);
+	if (latest === undefined || latest.source !== "backfill" || latest.parentRevisionId === null) {
+		return [];
+	}
+	const [ack] = await uow.tx.db
+		.select({ revisionId: configRevisionAcks.revisionId })
+		.from(configRevisionAcks)
+		.where(eq(configRevisionAcks.revisionId, latest.id));
+	if (ack !== undefined) {
+		return [];
+	}
+	return [
+		{
+			key: "config:backfill",
+			message:
+				`Configuration changed outside revision history at generation ${latest.generation}; ` +
+				`recorded as revision ${latest.id} (backfill): review with \`gateway config diff\`/\`history\`, ` +
+				`then \`gateway config ack ${latest.id}\`.`,
+		},
+	];
 }
 
 async function budgetConditions(uow: UnitOfWork): Promise<AlertCondition[]> {

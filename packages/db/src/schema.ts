@@ -2,6 +2,8 @@ import type {
 	ActionParams,
 	AgentConfig,
 	AgentTurnInput,
+	ConfigRevisionSource,
+	ConfigSnapshotBundle,
 	GatewayEventType,
 	GmailMode,
 	JsonObject,
@@ -21,6 +23,7 @@ import type {
 } from "@agent-gateway/contracts";
 import {
 	APPROVAL_STATUSES,
+	CONFIG_REVISION_SOURCES,
 	GMAIL_MODES,
 	TOOL_ACTION_STATUSES,
 	TOOL_NAMESPACES,
@@ -28,6 +31,7 @@ import {
 } from "@agent-gateway/contracts";
 import { sql } from "drizzle-orm";
 import {
+	type AnyPgColumn,
 	bigint,
 	bigserial,
 	boolean,
@@ -95,6 +99,15 @@ export const POLICY_DECISIONS = ["allow", "deny", "require_approval"] as const;
 export const DIRECTORY_KINDS = ["channel", "user", "team"] as const;
 export type DirectoryKind = (typeof DIRECTORY_KINDS)[number];
 
+/**
+ * How a `config_snapshots` row came to exist: `applied` is every snapshot a configuration apply
+ * stored; `backfill` is one `ensureConfigHistory` synthesized for a database upgraded from a
+ * release before this history existed, from whatever the active `config_versions` and `agents`
+ * rows still held (older, since-replaced agent definitions are not reconstructed).
+ */
+export const CONFIG_SNAPSHOT_ORIGINS = ["applied", "backfill"] as const;
+export type ConfigSnapshotOrigin = (typeof CONFIG_SNAPSHOT_ORIGINS)[number];
+
 /** Global switches; exactly one row with id 1. */
 export const gatewayControls = pgTable(
 	"gateway_controls",
@@ -105,6 +118,12 @@ export const gatewayControls = pgTable(
 		activeConfigVersion: text("active_config_version"),
 		/** Incremented by every config apply: tells whether anything was applied in between. */
 		configGeneration: bigint("config_generation", { mode: "number" }).notNull().default(0),
+		/**
+		 * The revision that produced the active configuration; null until the first apply or
+		 * backfill records one. No foreign key (like `active_config_version`): the row this points
+		 * to is written in the same transaction that sets it, never before.
+		 */
+		activeConfigRevision: bigint("active_config_revision", { mode: "number" }),
 		updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 	},
 	(t) => [check("gateway_controls_single_row", sql`${t.id} = 1`)],
@@ -117,6 +136,83 @@ export const configVersions = pgTable("config_versions", {
 	organization: jsonb("organization").$type<OrganizationConfig>().notNull(),
 	constitution: text("constitution").notNull(),
 	appliedAt: timestamp("applied_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+/**
+ * An immutable, content-addressed complete configuration bundle: organization, every agent
+ * definition and its resolved role prompt, and the constitution text, exactly as
+ * `ConfigSnapshotBundleSchema` describes. `hash` is the same canonical sha256 as
+ * `config_versions.version` of the same content, so the two agree without a foreign key between
+ * them (not every `config_versions` row has a snapshot; see `origin`). A trigger (migration
+ * 0019) rejects UPDATE and DELETE.
+ */
+export const configSnapshots = pgTable(
+	"config_snapshots",
+	{
+		hash: text("hash").primaryKey(),
+		bundle: jsonb("bundle").$type<ConfigSnapshotBundle>().notNull(),
+		format: integer("format").notNull(),
+		origin: text("origin").$type<ConfigSnapshotOrigin>().notNull(),
+		createdAt: createdAt(),
+	},
+	() => [check("config_snapshots_origin", oneOf("origin", CONFIG_SNAPSHOT_ORIGINS))],
+);
+
+/**
+ * The configuration's chronological journal: one row per applied change, even one that repeats
+ * an earlier snapshot's content verbatim (a rollback gets its own revision id, pointing at the
+ * same `snapshot_hash`). A trigger (migration 0019) rejects UPDATE and DELETE.
+ */
+export const configRevisions = pgTable(
+	"config_revisions",
+	{
+		id: bigserial("id", { mode: "number" }).primaryKey(),
+		snapshotHash: text("snapshot_hash")
+			.notNull()
+			.references(() => configSnapshots.hash),
+		/** The revision this one replaced; null for the first revision ever recorded. */
+		parentRevisionId: bigint("parent_revision_id", { mode: "number" }).references(
+			(): AnyPgColumn => configRevisions.id,
+		),
+		/** Equal to the `gateway_controls.config_generation` this revision produced. */
+		generation: bigint("generation", { mode: "number" }).notNull(),
+		actor: text("actor").notNull(),
+		source: text("source").$type<ConfigRevisionSource>().notNull(),
+		reason: text("reason"),
+		/**
+		 * A caller-supplied token that makes a `commitChange` retry safe: a second commit with the
+		 * same key returns this row instead of writing another one. Set at insert only (the
+		 * append-only trigger forbids any later UPDATE).
+		 */
+		idempotencyKey: text("idempotency_key"),
+		/** sha256 of the change set that produced this revision; catches a key reused for a different change. */
+		changeHash: text("change_hash"),
+		createdAt: createdAt(),
+	},
+	(t) => [
+		index("config_revisions_snapshot").on(t.snapshotHash),
+		uniqueIndex("config_revisions_idempotency_key")
+			.on(t.idempotencyKey)
+			.where(sql`${t.idempotencyKey} is not null`),
+		check("config_revisions_source", oneOf("source", CONFIG_REVISION_SOURCES)),
+	],
+);
+
+/**
+ * A human's acknowledgement of one configuration revision — typically a `backfill` with a
+ * parent, which the `config:backfill` alert and `gateway doctor`'s `config_history` check name as
+ * drift (see `configHistoryConditions`): `commitChange` treats identical content as a no-op, so
+ * recommitting the reviewed configuration (or `config rollback` to it) writes no new revision to
+ * supersede it, and an explicit acknowledgement is the only way to clear the alert/check for it
+ * short of a later, actually different change. One row per revision; acknowledging it again (the
+ * same actor or another) replaces the row rather than failing.
+ */
+export const configRevisionAcks = pgTable("config_revision_acks", {
+	revisionId: bigint("revision_id", { mode: "number" })
+		.primaryKey()
+		.references(() => configRevisions.id),
+	actor: text("actor").notNull(),
+	ackedAt: timestamp("acked_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
 export const agents = pgTable(

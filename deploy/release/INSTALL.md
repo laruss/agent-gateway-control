@@ -85,6 +85,13 @@ bin/agw run --rm gateway-cli gateway config validate /config --root /config
 bin/agw run --rm gateway-cli gateway config apply /config --root /config
 ```
 
+This first apply is also the first entry of the configuration's revision history
+(`gateway config history`). `config apply` keeps working (a documented, deprecated alias); from
+here on `config diff` then `config import --expected-revision <id>` is the safer way to change
+configuration, since it refuses to commit over a change made since you last looked. See
+[docs/operations/backups.md](../../docs/operations/backups.md#a-database-backup-is-not-a-configuration-export)
+for how a `config export` relates to a database backup.
+
 The tool runner gets a role the same way (`db create-role`, then
 `db grant-tool-runner gateway_tool_runner finance`). The Gmail connector writes the events it
 ingests and uses the owner's connection: copy `secrets/controller/database_url` into

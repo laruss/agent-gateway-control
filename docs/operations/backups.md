@@ -14,6 +14,20 @@ What a complete backup of a Gateway deployment covers (the database is only one 
 A database backup holds message content, mail bodies, approval parameters and audit history.
 Encrypt it at rest and keep an off-host copy.
 
+## A database backup is not a configuration export
+
+The database already keeps its own history of configuration changes — immutable snapshots and an
+append-only revision journal, `config_snapshots`/`config_revisions` (ADR-024) — and this page's
+dump and restore cover them like any other table. `gateway config export <dir>` is a different,
+narrower thing: it writes one revision's snapshot back out as a config directory
+(`organization.yaml`, `agents/*.yaml`, their prompt files, a `manifest.json`), portable and free of
+secrets or operational history, meant to hand to `config diff`/`config import` or to keep as a
+bootstrap artifact after an upgrade (see UPGRADE.md). It is not a substitute for a database backup:
+it carries none of the runs, events, approvals, audit log or the rest of the revision journal, and
+restoring from one does not recreate any of that — only a database restore (this page) does. Take
+both: the usual database backup for disaster recovery, and a `config export` whenever you want a
+portable copy of exactly what is configured right now.
+
 ## Making a backup
 
 ```bash
@@ -82,8 +96,12 @@ ignored) and prints its checks as JSON; the exit code is 1 when one fails.
   parameters, so the probe and `pg_restore` connect to the same database;
 - the restore runs `pg_restore --no-owner --no-privileges --exit-on-error`;
 - afterwards it checks the restored database: the migrations match the manifest, the controls
-  row exists, and `events`, `agent_runs`, `approval_requests`, `tool_actions` and `audit_log`
-  exist and can be counted.
+  row exists, `events`, `agent_runs`, `approval_requests`, `tool_actions`, `audit_log`,
+  `config_snapshots` and `config_revisions` exist and can be counted, `gateway_controls`' active
+  configuration revision (when one is set) names a `config_revisions` row whose snapshot exists,
+  and every stored snapshot's content still hashes to its own `hash` (`restored:active_revision`,
+  `restored:snapshot_hashes`) — a dropped or corrupted snapshot is caught here, in the restore
+  test, rather than only the next time someone reads configuration history.
 
 Run the restore test regularly (weekly), not only before an upgrade.
 

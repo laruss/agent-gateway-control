@@ -1,0 +1,625 @@
+import {
+	cpSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+	AdminError,
+	activeConfigRevisionId,
+	applyConfig,
+	type ControlPlaneDeps,
+	commitChange,
+	configBundleProblems,
+	configSnapshotBundle,
+	ManagementConflictError,
+	prepareChange,
+} from "@agent-gateway/core";
+import { createPool, migrateSchema } from "@agent-gateway/db";
+import { canonicalHash } from "@agent-gateway/events";
+import { DEVELOPMENT_VERSION, silentLogger } from "@agent-gateway/logging";
+import { createBoss, migrateQueues, transactionalJobSink } from "@agent-gateway/queue";
+import { startTestPostgres, type TestPostgres } from "@agent-gateway/testkit";
+import type pg from "pg";
+import type { PgBoss } from "pg-boss";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import {
+	configDiffCommand,
+	configExport,
+	configHistory,
+	configImport,
+	configRollback,
+} from "./config-commands.ts";
+import { ConfigFileError, loadConfigDirectory } from "./config-files.ts";
+
+const repoRoot = fileURLToPath(new URL("../../..", import.meta.url));
+const EXAMPLES_DIR = join(repoRoot, "config/examples");
+
+function exampleInput() {
+	return loadConfigDirectory(EXAMPLES_DIR, repoRoot);
+}
+
+function exportDir(): string {
+	return mkdtempSync(join(tmpdir(), "gateway-export-"));
+}
+
+/** Every file under `dir`, keyed by its path relative to `dir`, read as UTF-8 text. */
+function readTree(dir: string, prefix = ""): Readonly<Record<string, string>> {
+	const result: Record<string, string> = {};
+	for (const name of readdirSync(dir).sort()) {
+		const full = join(dir, name);
+		const rel = prefix === "" ? name : `${prefix}/${name}`;
+		if (statSync(full).isDirectory()) {
+			Object.assign(result, readTree(full, rel));
+		} else {
+			result[rel] = readFileSync(full, "utf8");
+		}
+	}
+	return result;
+}
+
+const noopPrint = (_line: string) => undefined;
+
+/** A control plane with a real database but no controller or worker: exactly what `openSession`
+ * (the real CLI) builds, minus the deployment lock session commands hold around it. */
+async function startHarness(): Promise<
+	Readonly<{
+		postgres: TestPostgres;
+		pool: pg.Pool;
+		boss: PgBoss;
+		deps: ControlPlaneDeps;
+		stop: () => Promise<void>;
+	}>
+> {
+	const postgres = await startTestPostgres();
+	const pool = createPool(postgres.connectionString, 4);
+	await migrateSchema({
+		pool,
+		connectionString: postgres.connectionString,
+		release: DEVELOPMENT_VERSION,
+		migrateQueues: () => migrateQueues(postgres.connectionString),
+	});
+	const boss = createBoss(postgres.connectionString, "client");
+	await boss.start();
+	const deps: ControlPlaneDeps = {
+		pool,
+		jobs: (tx) => transactionalJobSink(boss, tx.client),
+		clock: () => new Date(),
+		random: Math.random,
+		log: silentLogger,
+	};
+	return {
+		postgres,
+		pool,
+		boss,
+		deps,
+		stop: async () => {
+			await boss.stop({ graceful: false });
+			await pool.end();
+			await postgres.stop();
+		},
+	};
+}
+
+async function revisionCount(pool: pg.Pool): Promise<number> {
+	const result = await pool.query<{ n: number }>("select count(*)::int as n from config_revisions");
+	return result.rows[0]?.n ?? 0;
+}
+
+describe("config export, diff, import, rollback and history", () => {
+	let harness: Awaited<ReturnType<typeof startHarness>>;
+	let firstRevisionId: number;
+	let dirA: string;
+
+	beforeAll(async () => {
+		harness = await startHarness();
+	});
+
+	afterAll(async () => {
+		await harness.stop();
+	});
+
+	it("imports into a fresh database without --expected-revision", async () => {
+		const result = await configImport(
+			harness.deps,
+			{ dir: EXAMPLES_DIR, root: repoRoot, expectedRevision: null, reason: null, actor: "test" },
+			noopPrint,
+		);
+		expect(result.noop).toBe(false);
+		firstRevisionId = result.revisionId;
+		expect(await revisionCount(harness.pool)).toBe(1);
+	});
+
+	it("exports the active revision as a directory that round-trips to the same hash as a no-op import", async () => {
+		dirA = exportDir();
+		await configExport(harness.deps, { dir: dirA, revisionId: null }, noopPrint);
+
+		const reloaded = loadConfigDirectory(dirA, dirA);
+		expect(reloaded.agents.map((a) => a.id).sort()).toEqual(
+			exampleInput()
+				.agents.map((a) => a.id)
+				.sort(),
+		);
+
+		const before = await revisionCount(harness.pool);
+		const result = await configImport(
+			harness.deps,
+			{ dir: dirA, root: dirA, expectedRevision: firstRevisionId, reason: null, actor: "test" },
+			noopPrint,
+		);
+		expect(result.noop).toBe(true);
+		expect(result.revisionId).toBe(firstRevisionId);
+		expect(await revisionCount(harness.pool)).toBe(before);
+	});
+
+	it("is deterministic: exporting the same revision twice is byte-for-byte identical", async () => {
+		const dirB = exportDir();
+		await configExport(harness.deps, { dir: dirB, revisionId: firstRevisionId }, noopPrint);
+		expect(readTree(dirB)).toEqual(readTree(dirA));
+	});
+
+	it("refuses to export into a non-empty directory, leaving it untouched", async () => {
+		const before = readTree(dirA);
+		await expect(
+			configExport(harness.deps, { dir: dirA, revisionId: null }, noopPrint),
+		).rejects.toThrow(ConfigFileError);
+		expect(readTree(dirA)).toEqual(before);
+	});
+
+	it("diff reports no problems and a noop for the directory it just exported", async () => {
+		const printed: string[] = [];
+		const ok = await configDiffCommand(
+			harness.deps,
+			{ dir: dirA, root: dirA, json: false },
+			(line) => printed.push(line),
+		);
+		expect(ok).toBe(true);
+		expect(printed[0]).toContain("no changes");
+	});
+
+	it("import without --expected-revision replays an already-committed identical import instead of refusing", async () => {
+		// dirA's content is byte-for-byte the same as the fresh-DB import that created
+		// firstRevisionId: its own earlier response may have been lost before the caller saw it,
+		// so this is a legitimate retry, not a missing-flag mistake.
+		const before = await revisionCount(harness.pool);
+		const result = await configImport(
+			harness.deps,
+			{ dir: dirA, root: dirA, expectedRevision: null, reason: null, actor: "test" },
+			noopPrint,
+		);
+		expect(result.revisionId).toBe(firstRevisionId);
+		expect(await revisionCount(harness.pool)).toBe(before);
+	});
+
+	it("import without --expected-revision refuses when there is no matching commit to replay", async () => {
+		const modified = exportDir();
+		cpSync(dirA, modified, { recursive: true });
+		// A manifest copied alongside modified content would fail its own hash check first; this
+		// directory's import is refused for the missing flag, not a tampered manifest.
+		rmSync(join(modified, "manifest.json"));
+		writeFileSync(
+			join(modified, "prompts/examples/organization-constitution.md"),
+			"A constitution this directory never committed with 'import:none'.",
+		);
+		await expect(
+			configImport(
+				harness.deps,
+				{ dir: modified, root: modified, expectedRevision: null, reason: null, actor: "test" },
+				noopPrint,
+			),
+		).rejects.toThrow(AdminError);
+		await expect(
+			configImport(
+				harness.deps,
+				{ dir: modified, root: modified, expectedRevision: null, reason: null, actor: "test" },
+				noopPrint,
+			),
+		).rejects.toThrow(/--expected-revision is required/);
+	});
+
+	let revisionAfterChange: number;
+
+	it("a later change moves the active revision; diff against the stale export now shows it, and a stale import conflicts", async () => {
+		const changeSet = [
+			{ type: "set_constitution" as const, constitution: "Changed directly, after the export." },
+		];
+		const preview = await prepareChange(harness.deps, changeSet);
+		const committed = await commitChange(harness.deps, {
+			changeSet,
+			baseRevisionId: preview.baseRevisionId,
+			actor: "test",
+			source: "cli_apply",
+		});
+		revisionAfterChange = committed.revisionId;
+		expect(revisionAfterChange).not.toBe(firstRevisionId);
+
+		const printed: string[] = [];
+		const ok = await configDiffCommand(
+			harness.deps,
+			{ dir: dirA, root: dirA, json: false },
+			(line) => printed.push(line),
+		);
+		expect(ok).toBe(true);
+		expect(printed[0]).toContain("constitution:");
+
+		await expect(
+			configImport(
+				harness.deps,
+				{ dir: dirA, root: dirA, expectedRevision: firstRevisionId, reason: null, actor: "test" },
+				noopPrint,
+			),
+		).rejects.toThrow(ManagementConflictError);
+	});
+
+	it("rolls back to the first revision's content as a new revision, source 'rollback'", async () => {
+		const active = await activeConfigRevisionId(harness.deps);
+		expect(active).toBe(revisionAfterChange);
+
+		const result = await configRollback(
+			harness.deps,
+			{
+				revisionId: firstRevisionId,
+				expectedRevision: revisionAfterChange,
+				reason: "rollback test",
+				actor: "test",
+			},
+			noopPrint,
+		);
+		expect(result.noop).toBe(false);
+
+		const rows = await harness.pool.query<{
+			snapshot_hash: string;
+			parent_revision_id: number;
+			source: string;
+			reason: string | null;
+		}>(
+			"select snapshot_hash, parent_revision_id::int as parent_revision_id, source, reason from config_revisions where id = $1",
+			[result.revisionId],
+		);
+		const target = await harness.pool.query<{ snapshot_hash: string }>(
+			"select snapshot_hash from config_revisions where id = $1",
+			[firstRevisionId],
+		);
+		expect(rows.rows[0]?.snapshot_hash).toBe(target.rows[0]?.snapshot_hash);
+		expect(rows.rows[0]?.parent_revision_id).toBe(revisionAfterChange);
+		expect(rows.rows[0]?.source).toBe("rollback");
+		expect(rows.rows[0]?.reason).toBe("rollback test");
+	});
+
+	it("refuses a rollback target whose revision does not exist", async () => {
+		const active = await activeConfigRevisionId(harness.deps);
+		await expect(
+			configRollback(
+				harness.deps,
+				{ revisionId: 999_999, expectedRevision: active ?? 0, reason: null, actor: "test" },
+				noopPrint,
+			),
+		).rejects.toThrow(AdminError);
+	});
+
+	it("lists revision history newest first, with the fields an operator needs", async () => {
+		const printed: string[] = [];
+		await configHistory(harness.deps, 10, (line) => printed.push(line));
+		const rows = JSON.parse(printed[0] ?? "[]") as Readonly<
+			{
+				id: number;
+				createdAt: string;
+				actor: string;
+				source: string;
+				reason: string | null;
+				snapshotHash: string;
+				parentRevisionId: number | null;
+			}[]
+		>;
+		expect(rows.length).toBeGreaterThanOrEqual(3);
+		for (let i = 1; i < rows.length; i += 1) {
+			expect(rows[i - 1]?.id).toBeGreaterThan(rows[i]?.id ?? 0);
+		}
+		expect(rows[0]?.source).toBe("rollback");
+		expect(rows[0]?.snapshotHash).toHaveLength(12);
+	});
+});
+
+describe("config apply", () => {
+	it("remains a working, source-'cli_apply' alias of a whole-bundle replace (existing callers are unaffected)", async () => {
+		const harness = await startHarness();
+		try {
+			const result = await applyConfig(harness.deps, exampleInput(), "test");
+			expect(result.created.length).toBeGreaterThan(0);
+			expect(await revisionCount(harness.pool)).toBe(1);
+		} finally {
+			await harness.stop();
+		}
+	});
+});
+
+describe("config import: idempotency key reuse survives a renamed agent file", () => {
+	/** A writable copy of `EXAMPLES_DIR`, so a file inside it can be renamed or edited. */
+	function copyExamplesDir(): string {
+		const dir = mkdtempSync(join(tmpdir(), "gateway-config-copy-"));
+		cpSync(EXAMPLES_DIR, dir, { recursive: true });
+		return dir;
+	}
+
+	it("the same content under a renamed YAML file replays instead of refusing as key reuse", async () => {
+		const harness = await startHarness();
+		try {
+			const base = await configImport(
+				harness.deps,
+				{ dir: EXAMPLES_DIR, root: repoRoot, expectedRevision: null, reason: null, actor: "test" },
+				noopPrint,
+			);
+
+			// A real change against the base revision: `director`'s display name, edited in a copy of
+			// the example directory (never the repository's own files).
+			const dirC = copyExamplesDir();
+			const directorPathC = join(dirC, "agents/director.yaml");
+			writeFileSync(
+				directorPathC,
+				readFileSync(directorPathC, "utf8").replace(
+					"display_name: Director",
+					"display_name: Director (renamed test)",
+				),
+			);
+			const changed = await configImport(
+				harness.deps,
+				{
+					dir: dirC,
+					root: repoRoot,
+					expectedRevision: base.revisionId,
+					reason: null,
+					actor: "test",
+				},
+				noopPrint,
+			);
+			expect(changed.noop).toBe(false);
+			expect(changed.revisionId).not.toBe(base.revisionId);
+			const afterChange = await revisionCount(harness.pool);
+
+			// The same content, but `director.yaml` is now the last file `readdirSync` returns
+			// instead of the second: a retry (the same directory content, same --expected-revision)
+			// that only looks different because of file order, not configuration meaning.
+			const dirD = copyExamplesDir();
+			cpSync(join(dirC, "agents/director.yaml"), join(dirD, "agents/director.yaml"), {
+				force: true,
+			});
+			cpSync(join(dirD, "agents/director.yaml"), join(dirD, "agents/zzz-director.yaml"));
+			rmSync(join(dirD, "agents/director.yaml"));
+
+			const replayed = await configImport(
+				harness.deps,
+				{
+					dir: dirD,
+					root: repoRoot,
+					expectedRevision: base.revisionId,
+					reason: null,
+					actor: "test",
+				},
+				noopPrint,
+			);
+			expect(replayed.revisionId).toBe(changed.revisionId);
+			expect(await revisionCount(harness.pool)).toBe(afterChange);
+		} finally {
+			await harness.stop();
+		}
+	});
+});
+
+describe("config import: a replayed commit reports when it is no longer the active revision", () => {
+	it("prints that the import already committed, and warns which revision is now active", async () => {
+		const harness = await startHarness();
+		try {
+			const base = await configImport(
+				harness.deps,
+				{ dir: EXAMPLES_DIR, root: repoRoot, expectedRevision: null, reason: null, actor: "test" },
+				noopPrint,
+			);
+
+			// A real change against `base`: `director`'s display name, in a writable copy of the
+			// example directory (never the repository's own files).
+			const dirC = mkdtempSync(join(tmpdir(), "gateway-config-copy-"));
+			cpSync(EXAMPLES_DIR, dirC, { recursive: true });
+			const directorPath = join(dirC, "agents/director.yaml");
+			writeFileSync(
+				directorPath,
+				readFileSync(directorPath, "utf8").replace(
+					"display_name: Director",
+					"display_name: Director (replay test)",
+				),
+			);
+			const changed = await configImport(
+				harness.deps,
+				{
+					dir: dirC,
+					root: repoRoot,
+					expectedRevision: base.revisionId,
+					reason: null,
+					actor: "test",
+				},
+				noopPrint,
+			);
+			expect(changed.noop).toBe(false);
+
+			// A later, unrelated change moves the active revision past `changed` (a different
+			// operator, or the same one in another terminal).
+			const superseding = await commitChange(harness.deps, {
+				changeSet: [{ type: "set_constitution", constitution: "A later, unrelated change." }],
+				baseRevisionId: changed.revisionId,
+				actor: "test",
+				source: "cli_apply",
+			});
+
+			// A retry of the `changed` import (the same directory, the same --expected-revision, as
+			// if its own response was lost before the caller saw it) replays that commit rather than
+			// conflicting — but the active configuration has since moved on, so the operator is told.
+			const printed: string[] = [];
+			const replay = await configImport(
+				harness.deps,
+				{
+					dir: dirC,
+					root: repoRoot,
+					expectedRevision: base.revisionId,
+					reason: null,
+					actor: "test",
+				},
+				(line) => printed.push(line),
+			);
+			expect(replay.replayed).toBe(true);
+			expect(replay.revisionId).toBe(changed.revisionId);
+			expect(replay.activeRevisionId).toBe(superseding.revisionId);
+			expect(printed[0]).toContain(`already committed as revision ${changed.revisionId}`);
+			expect(printed[1]).toContain(`revision ${superseding.revisionId} is now active`);
+			expect(printed[1]).toContain("config diff");
+		} finally {
+			await harness.stop();
+		}
+	});
+});
+
+describe("config export: target directory rules", () => {
+	let harness: Awaited<ReturnType<typeof startHarness>>;
+
+	beforeAll(async () => {
+		harness = await startHarness();
+		await applyConfig(harness.deps, exampleInput(), "test");
+	});
+
+	afterAll(async () => {
+		await harness.stop();
+	});
+
+	it("refuses a non-empty target directory, leaving it completely untouched", async () => {
+		const dir = exportDir();
+		writeFileSync(join(dir, "stray.txt"), "not an export");
+		const before = readTree(dir);
+
+		await expect(configExport(harness.deps, { dir, revisionId: null }, noopPrint)).rejects.toThrow(
+			ConfigFileError,
+		);
+
+		expect(readTree(dir)).toEqual(before);
+	});
+
+	it("publishes a freshly created target directory with mode 0755", async () => {
+		const parent = mkdtempSync(join(tmpdir(), "gateway-export-parent-"));
+		const dir = join(parent, "export");
+		await configExport(harness.deps, { dir, revisionId: null }, noopPrint);
+
+		// `mkdtemp` itself creates the build directory mode 0700; the published one must be the
+		// ordinary 0755 a directory `mkdir` would get, not leak the temp directory's own mode.
+		expect(statSync(dir).mode & 0o777).toBe(0o755);
+		expect(configBundleProblems(loadConfigDirectory(dir, dir))).toEqual([]);
+		// Nothing but the export itself sits beside it: no leftover temp directory.
+		expect(readdirSync(parent).sort()).toEqual(["export"]);
+	});
+
+	it("writes directly into an existing, empty target directory", async () => {
+		const dir = exportDir();
+		await configExport(harness.deps, { dir, revisionId: null }, noopPrint);
+		expect(configBundleProblems(loadConfigDirectory(dir, dir))).toEqual([]);
+	});
+});
+
+describe("config export: a stored snapshot predating the shared-path validation", () => {
+	it("refuses rather than silently dropping one agent's text when two agents share a role_file but disagree on it", async () => {
+		const harness = await startHarness();
+		try {
+			const applied = await applyConfig(harness.deps, exampleInput(), "test");
+			const base = exampleInput();
+			// `commitChange`/`applyConfig` would now refuse this bundle outright
+			// (`configBundleProblems`); this writes it directly, as a snapshot that predates that
+			// rule, to check `config export`'s own defensive check against it.
+			const sharedPath = "prompts/examples/agents/developer.md";
+			const conflicting = {
+				organization: base.organization,
+				agents: base.agents.map((a) =>
+					a.id === "director" ? { ...a, prompts: { role_file: sharedPath } } : a,
+				),
+				constitution: base.constitution,
+				rolePrompts: base.rolePrompts,
+			};
+			const bundle = configSnapshotBundle(conflicting);
+			const hash = canonicalHash(bundle);
+			const [controls] = (
+				await harness.pool.query<{ generation: number }>(
+					"select config_generation::int as generation from gateway_controls where id = 1",
+				)
+			).rows;
+			await harness.pool.query(
+				"insert into config_snapshots (hash, bundle, format, origin, created_at) values ($1, $2::jsonb, 1, 'applied', now())",
+				[hash, JSON.stringify(bundle)],
+			);
+			// Same generation as `gateway_controls.config_generation` already holds (left untouched
+			// below): `ensureConfigHistoryIn` treats a revision whose generation disagrees with the
+			// live column as stale and silently replaces it with a fresh backfill from the `agents`
+			// table before `configExport` ever reads it — which has no conflict, since this insert
+			// never touches `agents`, defeating the point of the test.
+			const inserted = await harness.pool.query<{ id: number }>(
+				`insert into config_revisions (snapshot_hash, parent_revision_id, generation, actor, source, created_at)
+				 values ($1, $2, $3, 'test', 'backfill', now()) returning id::int as id`,
+				[hash, applied.revisionId, controls?.generation ?? 0],
+			);
+			await harness.pool.query(
+				"update gateway_controls set active_config_revision = $1 where id = 1",
+				[inserted.rows[0]?.id],
+			);
+
+			// The conflict is caught building the export in memory, before the target directory is
+			// ever looked at.
+			await expect(
+				configExport(harness.deps, { dir: exportDir(), revisionId: null }, noopPrint),
+			).rejects.toThrow(ConfigFileError);
+		} finally {
+			await harness.stop();
+		}
+	});
+
+	it("refuses to export a snapshot with a role prompt for an agent it does not configure", async () => {
+		const harness = await startHarness();
+		try {
+			const applied = await applyConfig(harness.deps, exampleInput(), "test");
+			const base = exampleInput();
+			// `commitChange`/`applyConfig` would now refuse this bundle outright
+			// (`configBundleProblems`); this writes it directly, as a snapshot that predates that
+			// rule, to check `config export`'s own defensive check against it.
+			const orphaned = {
+				organization: base.organization,
+				agents: base.agents,
+				constitution: base.constitution,
+				rolePrompts: { ...base.rolePrompts, ghost: "A role prompt for an agent that is gone." },
+			};
+			const bundle = configSnapshotBundle(orphaned);
+			const hash = canonicalHash(bundle);
+			const [controls] = (
+				await harness.pool.query<{ generation: number }>(
+					"select config_generation::int as generation from gateway_controls where id = 1",
+				)
+			).rows;
+			await harness.pool.query(
+				"insert into config_snapshots (hash, bundle, format, origin, created_at) values ($1, $2::jsonb, 1, 'applied', now())",
+				[hash, JSON.stringify(bundle)],
+			);
+			const inserted = await harness.pool.query<{ id: number }>(
+				`insert into config_revisions (snapshot_hash, parent_revision_id, generation, actor, source, created_at)
+				 values ($1, $2, $3, 'test', 'backfill', now()) returning id::int as id`,
+				[hash, applied.revisionId, controls?.generation ?? 0],
+			);
+			await harness.pool.query(
+				"update gateway_controls set active_config_revision = $1 where id = 1",
+				[inserted.rows[0]?.id],
+			);
+
+			await expect(
+				configExport(harness.deps, { dir: exportDir(), revisionId: null }, noopPrint),
+			).rejects.toThrow(ConfigFileError);
+		} finally {
+			await harness.stop();
+		}
+	});
+});

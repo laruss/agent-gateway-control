@@ -1,5 +1,6 @@
 import { type JsonValue, MattermostPostDataSchema } from "@agent-gateway/contracts";
 import {
+	ackConfigRevision,
 	applyRetention,
 	type ControlPlaneDeps,
 	enqueueOutbox,
@@ -256,6 +257,71 @@ describe("operations: traces, alerts, retention and metrics", () => {
 				)["maintenance:probe"],
 			).toBe("fired");
 			await gateway.pool.query("delete from maintenance_status where task = 'probe'");
+		});
+
+		it("a drifted backfill fires the alert and the doctor-equivalent check; acknowledging clears both", async () => {
+			const now = new Date("2030-01-03T00:00:00Z");
+			const [active] = await query<{ id: number; snapshot_hash: string; generation: number }>(
+				`select active_config_revision::int as id,
+				        (select snapshot_hash from config_revisions where id = active_config_revision) as snapshot_hash,
+				        config_generation::int as generation
+				   from gateway_controls where id = 1`,
+			);
+			if (active?.id === undefined) {
+				throw new Error("expected an active configuration revision");
+			}
+			// Simulates a release before configuration history existed changing the projections
+			// directly, the same way `ensureConfigHistoryIn` backfills a revision for it, except this
+			// one has a parent (the previously active revision): a drift, not an initial bootstrap.
+			const inserted = await gateway.pool.query<{ id: number }>(
+				`insert into config_revisions (snapshot_hash, parent_revision_id, generation, actor, source, created_at)
+				 values ($1, $2, $3, 'test', 'backfill', now()) returning id::int as id`,
+				[active.snapshot_hash, active.id, active.generation],
+			);
+			const backfillId = inserted.rows[0]?.id;
+			if (backfillId === undefined) {
+				throw new Error("expected a config_revisions row to be inserted");
+			}
+			await gateway.pool.query(
+				"update gateway_controls set active_config_revision = $1 where id = 1",
+				[backfillId],
+			);
+
+			// The same two-query read `gateway doctor`'s `config_history` check performs.
+			const doctorOk = async () => {
+				const [latest] = await query<{
+					id: number;
+					source: string;
+					parent_revision_id: number | null;
+				}>(
+					`select id::int as id, source, parent_revision_id::int as parent_revision_id
+					   from config_revisions order by id desc limit 1`,
+				);
+				const drift = latest?.source === "backfill" && latest.parent_revision_id !== null;
+				if (!drift || latest === undefined) {
+					return true;
+				}
+				const ack = await query<{ n: number }>(
+					"select count(*)::int as n from config_revision_acks where revision_id = $1",
+					[String(latest.id)],
+				);
+				return (ack[0]?.n ?? 0) > 0;
+			};
+
+			expect(await doctorOk()).toBe(false);
+			expect(await sweepAlertConditions(at(now), { mattermost: null })).toMatchObject({
+				"config:backfill": "fired",
+			});
+			// Faithfully recommitting the same content is a no-op (`commitChange`): reviewing it
+			// alone, without acknowledging, must not have cleared either signal already.
+			expect(await doctorOk()).toBe(false);
+
+			await ackConfigRevision(at(now), backfillId, "test");
+
+			expect(await doctorOk()).toBe(true);
+			expect(await sweepAlertConditions(at(now), { mattermost: null })).toMatchObject({
+				"config:backfill": "resolved",
+			});
 		});
 
 		it("removes old content but keeps dedupe, pending work and a failed agent's work", async () => {

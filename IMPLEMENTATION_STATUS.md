@@ -1867,3 +1867,37 @@ Known gaps, deferred:
   payload that must not be redriven under an older release).
 
 Released as 0.3.0 (no migration: head `0017_channel_grant_checks`, pg-boss schema 42).
+
+## Phase 12 - Managed configuration
+
+Status: **done**
+
+| Item | State | Evidence |
+|------|-------|----------|
+| Immutable, content-addressed `config_snapshots` and an append-only `config_revisions` journal (append-only triggers), `gateway_controls.active_config_revision`; `config_versions`/`agents` kept as compatible projections | done | `packages/db/migrations/0018_config_history.sql`, `0019_config_history_guards.sql`, `packages/core/src/services/admin.ts` |
+| History backfill for a database upgraded from a release without it, and after an older release changed configuration (generation drift, enabled-flag drift, enabled agents retained outside the active configuration) | done | `ensureConfigHistory` in `packages/core/src/services/admin.ts` |
+| A shared prepare/commit service: typed change operations, deterministic structural diff, base-revision conflicts, idempotency keys (`0020_config_revision_idempotency.sql`), validation at the service boundary | done | `packages/core/src/services/management.ts`, `packages/contracts/src/management.ts` |
+| `gateway config export\|diff\|import\|history\|rollback\|ack`; `agents enable\|disable` through the shared path; `config apply` kept as a deprecated alias | done | `apps/cli/src/config-commands.ts`, `apps/cli/src/config-files.ts` |
+| Drift reporting: a structured warning, the `config:backfill` alert and a `doctor` check, cleared by acknowledgement (`0021_config_revision_acks.sql`) or a newer revision | done | `packages/core/src/services/alerts.ts`, `apps/cli/src/commands.ts` |
+| Restore verification of configuration history, gated on the backup's own schema | done | `apps/cli/src/backup.ts` |
+
+Acceptance:
+
+- [x] Applying configuration records a snapshot and a revision in the same transaction as the
+  projections; identical content reuses its snapshot under a new revision.
+- [x] An export re-imports to the same snapshot hash as a no-op; two exports of one revision are
+  byte-for-byte identical.
+- [x] Import paths are confined: symlinks, `..`, special files and oversized files are refused
+  before they are read, and an export's manifest must match its file set exactly.
+- [x] Rolling back to 0.3.0 needs no database step: it reads the projections unchanged, and its
+  changes are recorded and reported on re-upgrade (`deploy/release/ROLLBACK.md`).
+
+Deliberate choices in this phase ([ADR-024](docs/adr/024-managed-configuration.md)):
+
+- Snapshots are content-addressed and revisions are separate rows, so returning to earlier
+  content is a new revision, never a pointer reset.
+- The projections are what runs: a backfill records them as they are rather than preferring a
+  stale snapshot.
+- `config export` writes only into a new or empty directory; replacing an earlier export is left
+  to the operator.
+
