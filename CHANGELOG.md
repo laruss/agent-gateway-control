@@ -4,6 +4,14 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## [Unreleased]
 
+### Fixed
+
+- Channel grants (ADR-022): a grant is recorded before the listener joins the channel, so
+  `gateway mattermost reconcile` never reports the listener as an unauthorized member of a
+  channel whose grant was already decided; the listener's membership of every granted channel is
+  re-checked on each pass, after the grant is re-validated, so a transient failure or a restart
+  between granting and joining heals itself.
+
 ## [0.4.0] - 2026-10-01
 
 ### Added
