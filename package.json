@@ -12,11 +12,13 @@
     "packages/*"
   ],
   "scripts": {
-    "fix": "biome check --write . && tsc -p tsconfig.json",
-    "check": "biome check . && tsc -p tsconfig.json",
+    "fix": "biome check --write . && tsc -p tsconfig.json && tsc -b apps/console",
+    "check": "biome check . && tsc -p tsconfig.json && tsc -b apps/console",
     "lint": "biome lint .",
     "format": "biome format --write .",
-    "typecheck": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json && tsc -b apps/console",
+    "console:dev": "bun run --cwd apps/console dev",
+    "console:build": "bun run --cwd apps/console build",
     "test": "bun --bun vitest run --project unit",
     "test:integration": "bun --bun vitest run --project integration",
     "test:e2e": "bun --bun vitest run --project e2e",

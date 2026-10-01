@@ -97,15 +97,17 @@ one, a plain login form — is already behind the session and CSRF model the res
   referrer policy for exactly the requests this ADR depends on: a non-GET/HEAD, non-CORS-mode
   request (a plain HTML form `POST`, in particular) sends `Origin: null` whenever the referrer
   policy in effect is `no-referrer`, or is `same-origin` and the request is cross-origin. The
-  stand-in login page posts to its own origin, so under `no-referrer` the browser's own real
-  login would have been rejected by the very check meant to protect it. `same-origin` keeps the
-  real `Origin` header on a same-origin request while still sending no referrer, and no Origin,
-  to anything cross-site — the same off-site leakage `no-referrer` was chosen to prevent.
+  console's own sign-in form posts JSON to its own origin via `fetch` (a CORS-mode request, so it
+  always carries a real `Origin` regardless of referrer policy) rather than a plain HTML form
+  `POST`, but the distinction still matters: `same-origin` keeps the real `Origin` header on any
+  same-origin request while still sending no referrer, and no Origin, to anything cross-site — the
+  same off-site leakage `no-referrer` was chosen to prevent — without depending on every request
+  happening to be CORS-mode to get that.
 - **Never `X-Forwarded-*`.** Those headers name the edge proxy's own view of the request; the
   console's listener sees the connection Caddy actually made to it and nothing upstream of that
   is treated as an authenticated claim about where a request came from.
 
-### Routes, until the SPA replaces this page
+### Routes
 
 - **`POST /api/session`** (JSON `{password}`): verifies the password the same Argon2id way as
   before, then mints a new session unconditionally — a client-supplied cookie on the request is
@@ -120,32 +122,70 @@ one, a plain login form — is already behind the session and CSRF model the res
   it requires the exact Origin and a matching CSRF header.
 - **Every other `/api/*` route requires a valid session**; `/api/status` is unchanged in shape,
   now returning `401` instead of challenging for Basic credentials.
-- **`GET /` and `POST /` carry the dashboard and its own login, until the SPA lands.** The SPA
-  shell will need to be reachable without a session to show a login screen at all, so this
-  decision resolves that the same way now: `GET /` renders the existing dashboard when the
-  request carries a valid session, and a plain login form otherwise — never a mix of the two,
-  never any dashboard data before authentication. `POST /` accepts the form's
-  `application/x-www-form-urlencoded` body (a password field), because a script-free HTML form
-  cannot post JSON and the CSP (`default-src 'none'`) forbids an inline script that would encode
-  one; on success it sets the cookie and replies with a `303` redirect back to `/`, the same
-  flow the SPA will eventually replace wholesale rather than extend.
+- **`GET`/`HEAD` on every non-`/api/*` path serves the React SPA**, built by the frontend step
+  below: `/assets/*` is the build's own content-hashed files (`Cache-Control: public,
+  max-age=31536000, immutable`), and every other path — `/`, a deep link like `/agents`, anything
+  the SPA's own router recognizes — gets the same `index.html` (`Cache-Control: no-store`), which
+  then renders the sign-in screen or the dashboard once it loads, from its own session check. No
+  route gates `/` on a session any more; the SPA itself refuses to show anything but the sign-in
+  screen until `GET /api/session` says who, if anyone, is signed in. A missing or incomplete
+  build (`console-static.ts`) logs once and serves a plain `503` for the UI only — `/api/*` keeps
+  working.
 - **HTTP Basic is removed outright.** `gateway` (the CLI) never authenticated against the
   console; nothing else depended on it continuing to exist alongside sessions, and one
   authentication mechanism is simpler to reason about than two.
 
-### The frontend, decided here and built next
+### The frontend
 
-- **React, TypeScript, Vite, Tailwind and shadcn/ui**, in a new frontend workspace, built to
-  static assets the controller serves from this same listener — no separate frontend service,
-  no additional deploy artifact or published port. This is the shape the next step of this phase
-  builds; this decision states it now because every route already being added (login, session
-  check, status) is written to be the API surface that SPA calls, not a page of its own that a
-  later rewrite discards.
-- **`.claude/rules/basic-rules.md`'s shadcn exception, written for ADR-023's plain HTML page,
-  ends once that SPA replaces the server-rendered dashboard and login form.** Until it does, the
-  pages this decision adds (the login form in particular) are held to the same plain-HTML,
-  no-build-step rule as the dashboard they sit beside, for the same reason ADR-023 gave: a
-  one-owner page does not earn a component library before it has a framework to put one in.
+- **React 19, TypeScript, Vite 8, Tailwind CSS v4 and shadcn/ui** (`apps/console`, a bun
+  workspace), built to static assets the controller serves from this same listener
+  (`console-static.ts`) — no separate frontend service, no additional deploy artifact or
+  published port. `deploy/images/Dockerfile` builds it in its own stage (`console-build`, dev
+  dependencies included) and copies only the built `dist/` into the `gateway` image; the
+  production `bun install --production` stage never installs Vite, React or Tailwind.
+- **Routing: React Router**, not TanStack Router. Four top-level pages (Overview, Agents, Skills,
+  Instruments & utils) and a sign-in screen do not need file-based route generation or its own
+  Vite plugin; `createBrowserRouter`'s JSX form is the smaller, more direct fit, and the
+  controller's own SPA fallback (above) is what makes every deep link work regardless of which
+  router renders it.
+- **Data fetching: TanStack Query for the status poll, a small typed fetch wrapper
+  (`lib/api-client.ts`) underneath it for everything.** The wrapper owns the transport concerns
+  shared by every call — same-origin credentials, the `X-CSRF-Token` header on mutations, parsing
+  every response against the shared Zod contracts below, and turning a `401` into the one
+  `ApiError` kind the session layer reacts to. Query earns its place only for the status poll
+  specifically: `refetchInterval` plus its own stale/error/pending state already is the 15 s
+  polling and stale-snapshot handling this page needs, instead of this app reimplementing that
+  state machine by hand for one endpoint. Sign-in and sign-out stay plain `async` calls through
+  the same wrapper; they are one-shot actions, not cached data.
+- **Shared response types, not duplicated ones.** `ConsoleStatus` and everything under it
+  (`ConsoleTask`, `ConsoleContext`, `ConsoleAgent`, `ConsoleRun`, `ConsoleAlert`) and the
+  `ConsoleSnapshot` envelope `/api/status` actually returns are now Zod schemas in
+  `@agent-gateway/contracts` (`console-status.ts`), re-exported from `@agent-gateway/core` for
+  its existing callers. The console parses every `/api/status` and `/api/session` response
+  against these schemas at the fetch boundary; a response that does not match is a parse error,
+  never silently trusted shaped JSON.
+- **CSP: `script-src 'self'; style-src 'self'`, no `'unsafe-inline'` or `'unsafe-eval'`
+  anywhere.** Vite's production build emits no inline `<script>` (confirmed by inspecting the
+  built `index.html`) and `build.modulePreload.polyfill: false` removes the one inline snippet
+  Vite would otherwise add. shadcn/ui's components are built on Radix primitives, which do set
+  `element.style` directly in JavaScript (visibility, positioning) — but that is CSSOM
+  manipulation, which `style-src` governs only for a `style="..."` HTML attribute or a `<style>`
+  element, never for script setting `element.style.foo` — so it needed no loosening at all,
+  confirmed by loading the signed-in dashboard in a real browser with zero CSP violations
+  reported. `img-src 'self' data:` and `font-src 'self'` are the only other additions beyond
+  ADR-023's original policy, for the small inlined icons a component library tends to carry and
+  for the SPA's own fonts, should it ever ship any (today it ships none; the system font stack is
+  used throughout). One thing did need an explicit change, not a CSP exception: Zod builds each
+  object schema's fast parser at construction time by probing whether `new Function(...)` works,
+  catching the resulting error itself when it doesn't — but the browser still reports that caught
+  throw as a `script-src` violation before the catch runs. `z.config({ jitless: true })`
+  (`apps/console/src/lib/zod-config.ts`, imported first, before anything that constructs a
+  schema) skips the probe entirely; this is Zod's own documented fix for exactly this CSP
+  interaction, not a workaround of ours.
+- **`.claude/rules/basic-rules.md`'s shadcn exception, written for ADR-023's plain HTML page, is
+  removed.** The SPA this section describes has fully replaced the server-rendered dashboard and
+  its stand-in login form; every page in this repository now follows the shadcn-first rule the
+  same way.
 
 ## Alternatives
 
@@ -159,9 +199,10 @@ one, a plain login form — is already behind the session and CSRF model the res
   hashed, without exception, is a simpler invariant to keep than "hash this one, but not that
   one, because of how it is used." Rotating it on every `GET /api/session` instead keeps that
   invariant and still lets the client recover a working token after a reload.
-- **A separate `/login` route.** Rejected: the SPA shell will serve exactly one page at `/`
-  regardless of authentication state; building the stand-in login page at that same path now
-  means the eventual SPA replaces one route's behavior, not two.
+- **A separate server-side `/login` route.** Rejected: the controller serves the same
+  `index.html` for every non-`/api/*` path regardless of authentication state (above); the SPA's
+  own router, not the server, decides whether that renders the sign-in screen or the dashboard,
+  so a second server-side route for login would duplicate a decision the client already makes.
 - **Keeping HTTP Basic and adding CSRF on top.** Rejected: Basic has no server-side session to
   revoke, no logout a page can trigger, and no way to expire on its own; CSRF protection without
   a revocable session underneath it does not address why Basic was insufficient in the first
@@ -182,5 +223,10 @@ one, a plain login form — is already behind the session and CSRF model the res
   password hash file resumes working exactly as ADR-023 left it, and the session rows left
   behind are simply inert until a later upgrade re-reads them under their own expiry rules.
 - A reloaded browser tab's in-memory CSRF token can go stale if another tab (or an earlier load
-  of the same one) has since called `GET /api/session`; the fix is the same call, not a page
-  reload, and the SPA is expected to make it automatically before retrying a failed mutation.
+  of the same one) has since called `GET /api/session`; the fix is the same call, which the SPA
+  already makes once on every load (`SessionProvider`) and whenever a 401 sends it back to the
+  sign-in screen. It does not yet retry a single failed mutation automatically after refreshing
+  the token — a stale-tab 403 surfaces as a clear, typed error (`ApiError.kind === "forbidden"`)
+  rather than being silently retried; this is a candidate for a later pass, not a correctness
+  gap, since the 12-hour/30-minute session itself is what makes a tab's token stale in the first
+  place, and whatever triggered that has already made the mutation it was attempting stale too.

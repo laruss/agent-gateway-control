@@ -21,7 +21,11 @@ import { loopbackApprovalCardDeliverer, loopbackPostDeliverer } from "./loopback
 import { bridgeDeliverers, type MattermostBridgeOptions } from "./mattermost-bridge.ts";
 
 const environment = readSetting("GATEWAY_ENV") ?? "unset";
-const log = createLogger({ service: "controller", version: serviceVersion(), environment });
+const log = createLogger({
+	service: "controller",
+	version: serviceVersion(),
+	environment,
+});
 
 /**
  * Outbox delivery mode, required explicitly:
@@ -86,7 +90,10 @@ const deliverers: ControllerOptions["deliverers"] = (deps) => {
 };
 
 const metrics = new MetricsRegistry();
-registerProcessMetrics(metrics, { service: "controller", version: serviceVersion() });
+registerProcessMetrics(metrics, {
+	service: "controller",
+	version: serviceVersion(),
+});
 const databaseUrl = requireSetting("DATABASE_URL");
 const deployment = await claimDeployment(log, databaseUrl);
 const controller = await startController({
@@ -109,6 +116,10 @@ log.info("health endpoints listening", { port: health.port });
 const consoleAddress = consoleEnabled
 	? (await lookup(readSetting("CONSOLE_HOST") ?? "127.0.0.1", { family: 4 })).address
 	: null;
+/** The built console SPA's directory; defaults (inside `startConsoleServer`) to the path the
+ * release image bakes it into. Overridden in development and tests to point at a local build or
+ * a fixture. */
+const consoleStaticDir = readSetting("CONSOLE_STATIC_DIR");
 const ownerConsole =
 	consoleAddress !== null && consolePasswordHash !== null && consoleOrigin !== null
 		? startConsoleServer({
@@ -119,10 +130,14 @@ const ownerConsole =
 				pool: controller.deps.pool,
 				cache: createConsoleStatusCache((now) => collectConsoleStatus(controller.deps.pool, now)),
 				log,
+				...(consoleStaticDir === undefined ? {} : { staticDir: consoleStaticDir }),
 			})
 		: null;
 if (ownerConsole !== null) {
-	log.info("console listening", { address: consoleAddress, port: ownerConsole.port });
+	log.info("console listening", {
+		address: consoleAddress,
+		port: ownerConsole.port,
+	});
 }
 
 onShutdown(log, async () => {

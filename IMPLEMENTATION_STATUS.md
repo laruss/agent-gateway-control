@@ -1910,7 +1910,7 @@ Status: **done**
 | Item | State | Evidence |
 |------|-------|----------|
 | `console_sessions`: hashed token, rotating hashed CSRF token, `password_hash_fingerprint`, sliding 30-minute idle timeout (touched at most once a minute), 12-hour absolute expiry, a 20-session active cap evicting the oldest | done | `packages/db/migrations/0022_console_sessions.sql`, `packages/core/src/services/console-sessions.ts` |
-| `POST/GET/DELETE /api/session`, `GET`/`POST /` (dashboard or a plain sign-in form, and its submission); every other `/api/*` route needs a valid session, every mutation needs the exact `CONSOLE_ORIGIN` and a matching CSRF header; HTTP Basic removed | done | `apps/controller/src/console-server.ts`, `console-auth.ts`, `console-render.ts` |
+| `POST/GET/DELETE /api/session`; every other `/api/*` route needs a valid session, every mutation needs the exact `CONSOLE_ORIGIN` and a matching CSRF header; HTTP Basic removed | done | `apps/controller/src/console-server.ts`, `console-auth.ts` |
 | `CONSOLE_ORIGIN` setting, validated at start alongside the password hash | done | `apps/controller/src/main.ts`, `deploy/release/compose.yaml`, `deploy/release/gateway.env.example` |
 | `gateway console password set` revokes every active session directly when it can reach the database, on top of the fingerprint check that invalidates them on the next controller restart regardless | done | `apps/cli/src/commands.ts`, `packages/service/src/console-auth.ts` |
 | Expired/revoked session cleanup hooked into the existing retention pass | done | `packages/core/src/services/retention.ts` |
@@ -1930,8 +1930,57 @@ Deliberate choices here ([ADR-025](docs/adr/025-management-console.md)):
 
 - The CSRF token is stored only as a hash, like the session token; `GET /api/session` rotates it
   so a reloaded page can recover a usable one without the server ever holding the raw value.
-- `GET /` and `POST /` carry the sign-in form at the same path the SPA will later serve from,
-  rather than a separate `/login` route it would otherwise have to deprecate.
 - Session validation and `Origin`/CSRF checks never consult `X-Forwarded-*`: only the connection
   Caddy actually made to the listener counts.
+
+### The React console (SPA), replacing the server-rendered page
+
+Status: **done**
+
+| Item | State | Evidence |
+|------|-------|----------|
+| `apps/console` (bun workspace): React 19, TypeScript, Vite, Tailwind CSS v4, shadcn/ui (`style: radix-nova`); `components.json` checked in | done | `apps/console/package.json`, `apps/console/components.json` |
+| Shared response types: `ConsoleStatus`/`ConsoleSnapshot` and everything under them are now Zod schemas in `@agent-gateway/contracts`, re-exported from `@agent-gateway/core`; the console parses every response against them at the fetch boundary | done | `packages/contracts/src/console-status.ts`, `apps/console/src/lib/api-client.ts` |
+| Pages: sign-in (JSON `POST /api/session`, CSRF token held in memory, recovered via `GET /api/session` on reload), overview (every section the old page showed, polling `/api/status` every 15 s via TanStack Query), placeholders for Agents/Skills/Instruments & utils, sign-out | done | `apps/console/src/routes/` |
+| A typed API client adding `X-CSRF-Token` on mutations, same-origin credentials, and turning a `401` into the one error kind the session layer reacts to; `403`/`409` surfaced as their own distinct, typed outcomes | done | `apps/console/src/lib/api-client.ts`, `apps/console/src/lib/session-context.tsx` |
+| `bun run console:build` (`vite build`, hashed assets, no source maps, no inline script); `bun run console:dev` (Vite dev server, proxying `/api/*` to a running controller) | done | `apps/console/vite.config.ts`, root `package.json` |
+| The console's own `tsc` project (`apps/console/tsconfig.app.json`/`tsconfig.node.json`, DOM lib + JSX + the `@/*` alias), checked separately from the backend's (`tsc -b apps/console`, since a browser program and `@types/bun`'s globals do not mix in one `tsc` invocation); Biome lints and formats it, with Tailwind v4's CSS syntax enabled in the CSS parser | done | `tsconfig.json`, `package.json`'s `fix`/`check`/`typecheck` scripts, `biome.json` |
+| Vitest unit tests for the console (React Testing Library + happy-dom) in the existing `unit` project | done | `apps/console/src/**/*.test.tsx` |
+| The controller serves the built assets (`/assets/*` immutable-cached, any other non-`/api/*` path as the SPA fallback), path-traversal- and symlink-safe, missing-build-tolerant (plain 503 for the UI, `/api/*` unaffected); the server-rendered dashboard, its stand-in sign-in form, and `console-render.ts` are removed | done | `apps/controller/src/console-static.ts`, `console-server.ts` |
+| A strict CSP with no `unsafe-inline`/`unsafe-eval` anywhere, verified against the real built app in a browser | done | `apps/controller/src/console-server.ts`, ADR-025 |
+| The release image builds the console in its own Docker stage (dev dependencies included) and copies only the built static output into the runtime image; the production install stays dependency-free of it | done | `deploy/images/Dockerfile` |
+
+Acceptance:
+
+- [x] `bun run console:build` produces hashed, source-map-free assets with no inline script in
+  `index.html`.
+- [x] The overview page renders every section (agent states, tasks, waits, context measurements,
+  recent runs, queues, alerts, budgets, footer) from a fixture status payload, including the
+  stale and unavailable snapshot states.
+- [x] Sign-in (success, wrong password, rate-limited) and the CSRF header on mutations are
+  covered by component tests against a mocked `fetch`; a `401` on the status poll flips the
+  session to signed-out.
+- [x] The controller refuses path traversal and a symlink escaping the static root, serves
+  `/assets/*` immutably cached and every other non-`/api/*` path as the SPA fallback, never
+  falls back to HTML for an unknown `/api/*` path, and serves a plain 503 for the UI (API
+  intact) when the build is missing.
+- [x] Loaded in a real browser: signs in, shows the overview, signs out, with zero CSP
+  violations reported.
+- [x] `osv-scanner` reports no license outside the allowlist and no unexempted vulnerability
+  across every new dependency.
+
+Deliberate choices here ([ADR-025](docs/adr/025-management-console.md)):
+
+- React Router over TanStack Router: four top-level pages do not need file-based route
+  generation; the controller's own SPA fallback is what makes every deep link work regardless.
+- TanStack Query for the status poll specifically (its stale/error/pending state and
+  `refetchInterval` are exactly what that one endpoint needs), a small typed fetch wrapper
+  underneath it for everything else (same-origin credentials, the CSRF header, shared-schema
+  parsing) — not Query for every call.
+- The console's own `tsc` program is checked separately from the backend's rather than widening
+  the backend's `lib`/`types` to include the DOM and Vite's ambient types, which would risk
+  colliding with `@types/bun`'s own globals across the entire rest of the monorepo.
+- Radix UI's inline `element.style` calls are CSSOM manipulation, not an HTML `style` attribute
+  or a `<style>` element, so the CSP needed no `style-src 'unsafe-inline'`; confirmed in a real
+  browser rather than assumed.
 

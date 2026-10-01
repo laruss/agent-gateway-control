@@ -4,6 +4,13 @@ import {
 	MAX_SUMMARY_CHARS,
 } from "@agent-gateway/context";
 import {
+	type ConsoleAgent,
+	type ConsoleAlert,
+	type ConsoleContext,
+	type ConsoleRun,
+	type ConsoleStatus,
+	type ConsoleTask,
+	type ConsoleWait,
 	type DailyBudget,
 	type GatewayEventType,
 	GatewayEventTypeSchema,
@@ -238,7 +245,12 @@ async function load(client: Client, now: Date): Promise<Loaded> {
 	});
 
 	const runtimes = await rows<
-		Readonly<{ adapter: RuntimeAdapterId; available: boolean; versions: string[]; changed: Date }>
+		Readonly<{
+			adapter: RuntimeAdapterId;
+			available: boolean;
+			versions: string[];
+			changed: Date;
+		}>
 	>(
 		client,
 		`select adapter, available, runtime_versions as versions, changed_at as changed
@@ -249,7 +261,12 @@ async function load(client: Client, now: Date): Promise<Loaded> {
 	// injected clock, never the database's own: a caller measuring against a fixed moment (a
 	// test, a replay) gets that moment's answer, not the wall clock's.
 	const queues = await rows<
-		Readonly<{ queue: string; waiting: number; active: number; oldest: number | null }>
+		Readonly<{
+			queue: string;
+			waiting: number;
+			active: number;
+			oldest: number | null;
+		}>
 	>(
 		client,
 		`select name as queue,
@@ -316,7 +333,10 @@ async function load(client: Client, now: Date): Promise<Loaded> {
 			outbox,
 			approvalsPending: counts.approvals,
 			toolActionsUnknown: counts.unknown,
-			alerts: alerts.map((row) => ({ key: row.key, firedAt: iso(row.fired_at) })),
+			alerts: alerts.map((row) => ({
+				key: row.key,
+				firedAt: iso(row.fired_at),
+			})),
 			maintenance: maintenance.map((row) => ({
 				task: row.task,
 				lastSuccessAt: isoOrNull(row.last_success_at),
@@ -356,108 +376,30 @@ export async function loadSystemStatus(tx: Transaction, now: Date): Promise<Syst
 // The owner's console
 // ---------------------------------------------------------------------------
 
-/** What a run was started by, as the owner reads it. Never the triggering post's own text: a
- * message body is exactly what ADR-023 keeps off the console, so only ids, refs and codes are
- * shown here, the same boundary `SystemStatus` itself keeps. */
-export type ConsoleTask = Readonly<{
-	runId: string;
-	status: string;
-	attempt: number;
-	maxAttempts: number;
-	queuedAt: string;
-	startedAt: string | null;
-	deadlineAt: string;
-	triggerType: GatewayEventType;
-	/** The channel's configured or granted name; null outside Mattermost or when unresolved. */
-	channel: string | null;
-	/** The thread's root post, from the run's own snapshot (`context_snapshots.thread_ref`): this
-	 * covers a timeout or wait-resumption turn, whose triggering event carries no post of its
-	 * own, as well as an ordinary one. Null for a run outside any thread. */
-	threadRootId: string | null;
-}>;
-
 /**
- * What the Gateway handed the runtime in a run, measured separately (ADR-023): the Gateway's
- * own budgets in characters and bytes, and the tokens the runtime reported. The model's context
- * window is not known to the Gateway, so no fill percentage is derived from them.
- *
- * Character counts are computed in JavaScript (`String.prototype.length`, UTF-16 code units) on
- * the already-budget-bounded text a snapshot holds, then discarded: only the counts leave this
- * module, never the text. PostgreSQL's own `length()` counts Unicode code points, which
- * undercounts anything outside the Basic Multilingual Plane (most emoji) relative to the
- * budgets themselves (`@agent-gateway/context`), so it is never used for this measurement.
+ * `ConsoleTask`, `ConsoleContext`, `ConsoleWait`, `ConsoleAgent`, `ConsoleRun`, `ConsoleAlert`
+ * and `ConsoleStatus` are `@agent-gateway/contracts`' own schemas (`console-status.ts`), shared
+ * with the console frontend so both sides parse and build the same shape rather than each
+ * duplicating it. Re-exported here so this module's existing callers (the controller's own
+ * `console-status.ts`) keep importing them from `@agent-gateway/core`. Never the triggering
+ * post's own text or a run's content: only ids, refs, counts and codes, the same boundary
+ * `SystemStatus` itself keeps. The model's context window is not known to the Gateway, so
+ * `ConsoleContext` never derives a fill percentage from it; its character counts are computed in
+ * JavaScript (`String.prototype.length`, UTF-16 code units) on the already-budget-bounded text a
+ * snapshot holds, then discarded — only the counts leave this module, never the text.
+ * `ConsoleAgent.maxInputTokens7d` is the largest input tokens a single run's *last stored
+ * attempt* reported in the last 7 days, read from `agent_runs.usage` (which keeps only the most
+ * recent attempt of each run, not a sum over `run_usage`'s full per-attempt ledger).
  */
-export type ConsoleContext = Readonly<{
-	runId: string;
-	inputBytes: number;
-	inputLimitBytes: number;
-	/** The thread's root post (or the trigger, when it is the root), within its own per-post cap. */
-	rootChars: number;
-	rootLimitChars: number;
-	threadPosts: number;
-	omittedPosts: number;
-	/** The newest replies within the thread's own recent-replies budget, distinct from the root's
-	 * and the summary's own limits below. */
-	recentRepliesChars: number;
-	recentRepliesLimitChars: number;
-	summaryChars: number;
-	summaryLimitChars: number;
-	memoryItems: number;
-	memoryChars: number;
-	memoryLimitChars: number;
-	pendingEvents: number;
-	/** Reported by the runtime for the run's last attempt; null when it reported none. */
-	inputTokens: number | null;
-	cachedInputTokens: number | null;
-	outputTokens: number | null;
-	model: string | null;
-}>;
-
-export type ConsoleWait = Readonly<{ eventType: string; timeoutAt: string }>;
-
-export type ConsoleAgent = Readonly<{
-	status: SystemStatusAgent;
-	displayName: string;
-	/** The queued or running run's task; null while the agent has none. */
-	current: ConsoleTask | null;
-	waits: Readonly<ConsoleWait[]>;
-	/** Of the current run, else of the latest one; null once its snapshot has expired under
-	 * retention (`context_snapshots` keeps a finished run's content for a bounded time only). */
-	context: ConsoleContext | null;
-	/**
-	 * The largest input tokens a single run's *last stored attempt* reported in the last 7 days,
-	 * read from `agent_runs.usage` (which keeps only the most recent attempt of each run, not a
-	 * sum over `run_usage`'s full per-attempt ledger).
-	 */
-	maxInputTokens7d: number | null;
-	session: Readonly<{ lastUsedAt: string; expiresAt: string | null }> | null;
-	budget: DailyBudget | null;
-}>;
-
-export type ConsoleRun = Readonly<{
-	runId: string;
-	agentId: string;
-	status: string;
-	outcome: string | null;
-	errorCode: string | null;
-	triggerType: GatewayEventType;
-	queuedAt: string;
-	startedAt: string | null;
-	finishedAt: string | null;
-	inputTokens: number | null;
-	outputTokens: number | null;
-}>;
-
-/** The alert's own message: already sent to the owner's alerts channel (ADR-023 shows alerts on
- * the console too), never a run's or a channel's content. */
-export type ConsoleAlert = Readonly<{ key: string; message: string; firedAt: string }>;
-
-export type ConsoleStatus = Readonly<{
-	system: SystemStatus;
-	agents: Readonly<ConsoleAgent[]>;
-	recentRuns: Readonly<ConsoleRun[]>;
-	alerts: Readonly<ConsoleAlert[]>;
-}>;
+export type {
+	ConsoleAgent,
+	ConsoleAlert,
+	ConsoleContext,
+	ConsoleRun,
+	ConsoleStatus,
+	ConsoleTask,
+	ConsoleWait,
+};
 
 const RECENT_RUNS = 25;
 const WAITS_SHOWN = 5;
@@ -698,7 +640,12 @@ export async function loadConsoleStatus(
 	);
 	const sessions = byAgent(
 		await rows<
-			Readonly<{ agent_id: string; last_used_at: Date; expires_at: Date | null; adapter: string }>
+			Readonly<{
+				agent_id: string;
+				last_used_at: Date;
+				expires_at: Date | null;
+				adapter: string;
+			}>
 		>(
 			client,
 			`select s.agent_id, s.last_used_at, s.expires_at, s.adapter from runtime_sessions s
@@ -752,7 +699,10 @@ export async function loadConsoleStatus(
 			session:
 				session === undefined
 					? null
-					: { lastUsedAt: iso(session.last_used_at), expiresAt: isoOrNull(session.expires_at) },
+					: {
+							lastUsedAt: iso(session.last_used_at),
+							expiresAt: isoOrNull(session.expires_at),
+						},
 			budget: budgets.perAgent,
 		};
 	});

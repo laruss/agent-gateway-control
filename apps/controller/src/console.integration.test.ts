@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { silentLogger } from "@agent-gateway/logging";
@@ -13,6 +13,11 @@ import { collectConsoleStatus, createConsoleStatusCache } from "./console-status
 import { startTestGateway, type TestGateway } from "./test-gateway.ts";
 
 const PASSWORD = "integration test console password";
+const CONSOLE_CSP =
+	"default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+/** A marker unique to the fixture's `index.html`, so a test can tell the SPA fallback actually
+ * served the fixture's own content rather than merely returning 200. */
+const INDEX_MARKER = "console-static-fixture-index";
 const ORIGIN = "https://gateway.local";
 const FOREIGN_ORIGIN = "https://attacker.example";
 
@@ -45,21 +50,47 @@ function cookiePair(setCookie: string | null): string {
 	return (setCookie ?? "").split(";")[0] ?? "";
 }
 
+/** A minimal fixture standing in for `vite build`'s own `dist/` (an `index.html` and a hashed
+ * `assets/` directory), plus a symlink inside `assets/` that resolves to a file *outside* the
+ * fixture root — proving the static server refuses to follow it, not only to walk `..` segments
+ * to the same place. */
+function buildStaticFixture(): Readonly<{ dir: string; secretDir: string }> {
+	const dir = mkdtempSync(join(tmpdir(), "console-static-"));
+	mkdirSync(join(dir, "assets"));
+	writeFileSync(
+		join(dir, "index.html"),
+		`<!doctype html><html><head><title>fixture</title></head><body><div id="root">${INDEX_MARKER}</div></body></html>`,
+	);
+	writeFileSync(join(dir, "assets", "app-abc123.js"), "console.log('console fixture');\n");
+	writeFileSync(join(dir, "assets", "app-abc123.css"), "body { color: red; }\n");
+	const secretDir = mkdtempSync(join(tmpdir(), "console-static-secret-"));
+	writeFileSync(join(secretDir, "secret.txt"), "do not serve me");
+	symlinkSync(join(secretDir, "secret.txt"), join(dir, "assets", "escape.js"));
+	return { dir, secretDir };
+}
+
 describe("the owner's console, wired against a real gateway (ADR-025)", () => {
 	let gateway: TestGateway;
 	let secretsDir: string;
 	let passwordHash: string;
+	let staticDir: string;
+	let staticSecretDir: string;
 
 	beforeAll(async () => {
 		gateway = await startTestGateway();
 		secretsDir = mkdtempSync(join(tmpdir(), "console-integration-"));
 		passwordHash = await hashConsolePassword(PASSWORD);
 		writeSecretFile(join(secretsDir, "console_password_hash"), passwordHash);
+		const fixture = buildStaticFixture();
+		staticDir = fixture.dir;
+		staticSecretDir = fixture.secretDir;
 	});
 
 	afterAll(async () => {
 		await gateway?.stop();
 		rmSync(secretsDir, { recursive: true, force: true });
+		rmSync(staticDir, { recursive: true, force: true });
+		rmSync(staticSecretDir, { recursive: true, force: true });
 	});
 
 	// Sessions are a single, global table (ADR-025: one owner); every test starts from an empty
@@ -85,6 +116,7 @@ describe("the owner's console, wired against a real gateway (ADR-025)", () => {
 			pool: gateway.pool,
 			cache: createConsoleStatusCache((now) => collectConsoleStatus(gateway.pool, now)),
 			log: silentLogger,
+			staticDir,
 			...overrides,
 		});
 		servers.push(server);
@@ -100,12 +132,15 @@ describe("the owner's console, wired against a real gateway (ADR-025)", () => {
 		}
 	});
 
-	it("logs in, authenticates the dashboard and the JSON status, and logs out", async () => {
+	it("logs in, authenticates the JSON status, and logs out", async () => {
 		const { base } = await withServer();
 
+		// `/` is the SPA itself, served unconditionally (ADR-025's frontend section): it decides
+		// for itself, once loaded, whether to show the sign-in screen or the dashboard, so the
+		// controller no longer gates it on a session the way the server-rendered page once did.
 		const unauthenticatedPage = await fetch(`${base}/`);
 		expect(unauthenticatedPage.status).toBe(200);
-		expect(await unauthenticatedPage.text()).toContain("Sign in");
+		expect(await unauthenticatedPage.text()).toContain(INDEX_MARKER);
 
 		const unauthenticatedApi = await fetch(`${base}/api/status`);
 		expect(unauthenticatedApi.status).toBe(401);
@@ -116,13 +151,6 @@ describe("the owner's console, wired against a real gateway (ADR-025)", () => {
 		expect(typeof login.body.expiresAt).toBe("string");
 		const cookie = cookiePair(login.setCookie);
 
-		const page = await fetch(`${base}/`, { headers: { cookie } });
-		expect(page.status).toBe(200);
-		const html = await page.text();
-		expect(html).toContain("Agent Gateway Console");
-		// One of the example agents, seeded by `startTestGateway`, shows up on the real page.
-		expect(html).toContain("director");
-
 		const api = await fetch(`${base}/api/status`, { headers: { cookie } });
 		expect(api.status).toBe(200);
 		const body = (await api.json()) as {
@@ -132,7 +160,9 @@ describe("the owner's console, wired against a real gateway (ADR-025)", () => {
 		expect(body.state).toBe("ok");
 		expect(body.status?.agents.some((a) => a.status.agentId === "director")).toBe(true);
 
-		const sessionCheck = await fetch(`${base}/api/session`, { headers: { cookie } });
+		const sessionCheck = await fetch(`${base}/api/session`, {
+			headers: { cookie },
+		});
 		expect(sessionCheck.status).toBe(200);
 		const sessionBody = (await sessionCheck.json()) as {
 			authenticated: boolean;
@@ -142,7 +172,11 @@ describe("the owner's console, wired against a real gateway (ADR-025)", () => {
 
 		const logout = await fetch(`${base}/api/session`, {
 			method: "DELETE",
-			headers: { cookie, origin: ORIGIN, "x-csrf-token": sessionBody.csrfToken },
+			headers: {
+				cookie,
+				origin: ORIGIN,
+				"x-csrf-token": sessionBody.csrfToken,
+			},
 		});
 		expect(logout.status).toBe(204);
 		expect(logout.headers.get("set-cookie")).toContain("Max-Age=0");
@@ -306,7 +340,11 @@ describe("the owner's console, wired against a real gateway (ADR-025)", () => {
 
 		const wrong = await fetch(`${base}/api/session`, {
 			method: "DELETE",
-			headers: { cookie, origin: ORIGIN, "x-csrf-token": "not-the-right-token" },
+			headers: {
+				cookie,
+				origin: ORIGIN,
+				"x-csrf-token": "not-the-right-token",
+			},
 		});
 		expect(wrong.status).toBe(403);
 
@@ -333,7 +371,10 @@ describe("the owner's console, wired against a real gateway (ADR-025)", () => {
 		// An injected, strictly increasing clock avoids ties in `created_at` between logins that a
 		// real clock could produce within the same millisecond.
 		let now = new Date("2031-03-04T00:00:00.000Z");
-		const { base } = await withServer({ maxActiveSessions: 2, clock: () => now });
+		const { base } = await withServer({
+			maxActiveSessions: 2,
+			clock: () => now,
+		});
 		const first = cookiePair((await loginJson(base, PASSWORD)).setCookie);
 		now = new Date(now.getTime() + 1_000);
 		await loginJson(base, PASSWORD);
@@ -344,14 +385,14 @@ describe("the owner's console, wired against a real gateway (ADR-025)", () => {
 		expect((await fetch(`${base}/api/status`, { headers: { cookie: third } })).status).toBe(200);
 	});
 
-	it("returns 404 for an unknown path and 405 for an unsupported method", async () => {
+	it("returns 404 for an unknown /api/* path and 405 for an unsupported method on a static path", async () => {
 		const { base } = await withServer();
-		const missing = await fetch(`${base}/nope`);
+		const missing = await fetch(`${base}/api/nope`);
 		expect(missing.status).toBe(404);
 
 		const wrongMethod = await fetch(`${base}/`, { method: "PUT" });
 		expect(wrongMethod.status).toBe(405);
-		expect(wrongMethod.headers.get("allow")).toBe("GET, POST");
+		expect(wrongMethod.headers.get("allow")).toBe("GET, HEAD");
 	});
 
 	it("carries the security headers on every response, including error and login responses", async () => {
@@ -375,10 +416,10 @@ describe("the owner's console, wired against a real gateway (ADR-025)", () => {
 		const page = await fetch(`${base}/`);
 		// `no-referrer` and `same-origin` both withhold the `Referer` header from a cross-site
 		// request; the difference that matters here is what a *same-origin* request sends. Per the
-		// Fetch spec, a non-GET/HEAD, non-CORS-mode request (a plain HTML form POST, in particular)
-		// carries `Origin: null` under `no-referrer`, which would make the console's own login form
-		// fail its own exact-Origin check. `same-origin` does not null it for a same-origin request,
-		// only for a cross-origin one.
+		// Fetch spec, a non-GET/HEAD, non-CORS-mode request (a plain HTML form POST, in particular,
+		// though the SPA itself only ever sends `fetch` requests, which are CORS-mode and so always
+		// carry a real `Origin`) carries `Origin: null` under `no-referrer`. `same-origin` does not
+		// null it for a same-origin request, only for a cross-origin one.
 		expect(page.headers.get("referrer-policy")).toBe("same-origin");
 
 		// A request that actually carries the literal string "null" as its Origin — what a
@@ -455,5 +496,84 @@ describe("the owner's console, wired against a real gateway (ADR-025)", () => {
 		const server = servers.pop();
 		await server?.stop();
 		await expect(fetch(`${base}/`)).rejects.toThrow();
+	});
+
+	describe("serving the built console SPA", () => {
+		it("serves the fixture's index.html for the root and for any other non-API path (SPA fallback), no-store", async () => {
+			const { base } = await withServer();
+			for (const path of ["/", "/agents", "/skills", "/some/deep/link"]) {
+				const res = await fetch(`${base}${path}`);
+				expect(res.status).toBe(200);
+				expect(res.headers.get("content-type")).toContain("text/html");
+				expect(res.headers.get("cache-control")).toBe("no-store");
+				expect(await res.text()).toContain(INDEX_MARKER);
+			}
+		});
+
+		it("serves assets with their content type and immutable, long-lived caching", async () => {
+			const { base } = await withServer();
+			const script = await fetch(`${base}/assets/app-abc123.js`);
+			expect(script.status).toBe(200);
+			expect(script.headers.get("content-type")).toContain("javascript");
+			expect(script.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+			expect(await script.text()).toContain("console fixture");
+
+			const style = await fetch(`${base}/assets/app-abc123.css`);
+			expect(style.status).toBe(200);
+			expect(style.headers.get("content-type")).toContain("text/css");
+			expect(style.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+		});
+
+		it("supports HEAD the same as GET, without a body", async () => {
+			const { base } = await withServer();
+			const res = await fetch(`${base}/assets/app-abc123.js`, {
+				method: "HEAD",
+			});
+			expect(res.status).toBe(200);
+			expect(res.headers.get("content-type")).toContain("javascript");
+			expect(res.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+			expect(await res.text()).toBe("");
+		});
+
+		it("refuses a path that tries to escape the static root, even through a symlink", async () => {
+			const { base } = await withServer();
+			// `%2f`-encoded, not a literal `/`: a literal `..` segment would already be collapsed by
+			// URL parsing before the request ever leaves the client, which would not exercise the
+			// server's own defense at all.
+			const traversal = await fetch(`${base}/assets/..%2f..%2fsecret.txt`);
+			expect(traversal.status).toBe(404);
+
+			// `assets/escape.js` resolves (via a symlink) to a real file, but one outside the static
+			// root: refused for that reason alone, never served just because it resolves somewhere.
+			const symlinkEscape = await fetch(`${base}/assets/escape.js`);
+			expect(symlinkEscape.status).toBe(404);
+		});
+
+		it("never falls back to HTML for an unknown /api/* path", async () => {
+			const { base } = await withServer();
+			const res = await fetch(`${base}/api/does-not-exist`);
+			expect(res.status).toBe(404);
+			expect(res.headers.get("content-type")).toContain("text/plain");
+		});
+
+		it("serves a plain-text 503 for the UI when the build is missing, while the API keeps working", async () => {
+			const missingDir = join(tmpdir(), `console-static-missing-${crypto.randomUUID()}`);
+			const { base } = await withServer({ staticDir: missingDir });
+
+			const page = await fetch(`${base}/`);
+			expect(page.status).toBe(503);
+			expect(page.headers.get("content-type")).toContain("text/plain");
+
+			const login = await loginJson(base, PASSWORD);
+			expect(login.status).toBe(200);
+			const cookie = cookiePair(login.setCookie);
+			expect((await fetch(`${base}/api/status`, { headers: { cookie } })).status).toBe(200);
+		});
+
+		it("carries the SPA's exact CSP on its own pages", async () => {
+			const { base } = await withServer();
+			const res = await fetch(`${base}/`);
+			expect(res.headers.get("content-security-policy")).toBe(CONSOLE_CSP);
+		});
 	});
 });

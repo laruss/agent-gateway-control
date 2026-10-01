@@ -34,6 +34,16 @@ All notable changes are documented here. The project follows Semantic Versioning
   `CONSOLE_ORIGIN` setting every login and mutation must match exactly. A plain sign-in form
   replaces the browser's HTTP Basic dialog at `/`; `gateway console password set` now also
   revokes every active session when it can reach the database.
+- The owner's console is now a React single-page app (`apps/console`: React 19, Vite, Tailwind
+  CSS v4, shadcn/ui, TanStack Query, React Router; ADR-025's frontend section), replacing the
+  server-rendered dashboard and its stand-in sign-in form. It covers everything the old page
+  showed (agent states, tasks, recent runs, queues, alerts, budgets, context measurements,
+  stale/unavailable states) and adds navigation for the Agents, Skills and Instruments & utils
+  hubs, each an honest "not available yet" placeholder until later phases fill them in. Served
+  under a strict CSP with no `unsafe-inline`/`unsafe-eval` anywhere (`script-src 'self'; style-src
+  'self'`); built in its own Docker stage with only the static output copied into the release
+  image. `bun run console:build` builds it, `bun run console:dev` runs it against a local
+  controller.
 
 ### Changed
 

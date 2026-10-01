@@ -10,3 +10,6 @@
 !LICENSE
 **/node_modules
 **/*.test.ts
+**/*.test.tsx
+**/dist
+apps/console/.tsbuild

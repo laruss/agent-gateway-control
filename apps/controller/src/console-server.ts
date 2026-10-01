@@ -27,16 +27,24 @@ import {
 	SESSION_COOKIE_NAME,
 	sessionCookieHeader,
 } from "./console-auth.ts";
-import { renderConsolePage, renderLoginPage } from "./console-render.ts";
+import {
+	DEFAULT_CONSOLE_STATIC_DIR,
+	resolveConsoleStaticRoot,
+	resolveStaticFile,
+	staticContentType,
+} from "./console-static.ts";
 import type { ConsoleSnapshot, ConsoleStatusCache } from "./console-status.ts";
 
 // ---------------------------------------------------------------------------
 // The owner's console listener (ADR-025): a separate Bun.serve, authenticated with a server-side
 // session cookie and CSRF-protected mutations instead of HTTP Basic (superseding that part of
-// ADR-023). `GET /` and `POST /` carry the server-rendered dashboard and its stand-in login page
-// for now; `/api/session` and `/api/status` are the console's
-// JSON surface. Every response — success, error, even the login page itself — carries the same
-// fixed set of security headers.
+// ADR-023). `/api/session` and `/api/status` are the console's JSON surface; every other `GET`/
+// `HEAD` request is the React SPA's own static assets or its SPA-fallback `index.html`
+// (`console-static.ts`) — the SPA itself renders the sign-in screen or the dashboard once it
+// loads, so this listener no longer distinguishes an authenticated page from an unauthenticated
+// one the way the server-rendered dashboard and its stand-in login form once did. Every response
+// — success, error, even a 503 for a missing build — carries the same fixed set of security
+// headers.
 // ---------------------------------------------------------------------------
 
 /** Failed logins share one bounded, global counter (ADR-023), never partitioned by a
@@ -61,8 +69,15 @@ const MAX_REQUEST_BODY_BYTES = 1024 * 1024;
 
 const SECURITY_HEADERS: Readonly<Record<string, string>> = {
 	"cache-control": "no-store",
+	// The React SPA (ADR-025's frontend section): no inline script or style, no eval, nothing
+	// cross-origin. `style-src 'self'` covers the SPA's own built stylesheet; Radix's inline
+	// `element.style.setProperty(...)` calls are CSSOM manipulation, which `style-src` does not
+	// govern (only a `style="..."` attribute or a `<style>` element would be), so they are
+	// unaffected by not having `'unsafe-inline'` here. `img-src` adds `data:` for the few small
+	// inlined icons a component library like this tends to carry; everything else is `'self'` or
+	// `'none'`.
 	"content-security-policy":
-		"default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+		"default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
 	"x-content-type-options": "nosniff",
 	// `same-origin`, not `no-referrer`: per the Fetch spec, a non-GET/HEAD, non-CORS-mode request
 	// (a plain HTML form POST, in particular) sends `Origin: null` whenever the referrer policy in
@@ -91,15 +106,11 @@ const textResponse = (
 	status: number,
 	headers: Readonly<Record<string, string>> = {},
 ) => respond(body, status, "text/plain; charset=utf-8", headers);
-const htmlResponse = (body: string, status: number) =>
-	respond(body, status, "text/html; charset=utf-8");
 const jsonResponse = (
 	value: unknown,
 	status: number,
 	headers: Readonly<Record<string, string>> = {},
 ) => respond(JSON.stringify(value), status, "application/json; charset=utf-8", headers);
-const redirectToRoot = (headers: Readonly<Record<string, string>>) =>
-	respond("", 303, "text/plain; charset=utf-8", { ...headers, location: "/" });
 
 const unauthenticated = () => textResponse("unauthorized", 401);
 const forbidden = (message: string) => textResponse(message, 403);
@@ -107,7 +118,9 @@ const badRequest = (message: string) => textResponse(message, 400);
 
 function tooManyRequests(waitMs: number): Response {
 	const seconds = Math.max(1, Math.ceil(waitMs / 1000));
-	return textResponse("too many attempts", 429, { "retry-after": String(seconds) });
+	return textResponse("too many attempts", 429, {
+		"retry-after": String(seconds),
+	});
 }
 
 function payloadTooLarge(): Response {
@@ -192,12 +205,6 @@ function passwordFromJson(text: string): string | null {
 	return typeof password === "string" ? password : null;
 }
 
-/** `password=...`, `application/x-www-form-urlencoded`, for the no-JavaScript login form. */
-function passwordFromForm(text: string): string | null {
-	const params = new URLSearchParams(text);
-	return params.has("password") ? (params.get("password") ?? "") : null;
-}
-
 /** A bounded gate on concurrent Argon2id verifications: over the limit, `run` returns `"busy"`
  * immediately rather than queueing (queueing would just move the same memory pressure into a
  * backlog instead of bounding it). */
@@ -252,6 +259,10 @@ export type ConsoleServerOptions = Readonly<{
 	pool: pg.Pool;
 	cache: ConsoleStatusCache;
 	log: Logger;
+	/** The built console SPA's own directory (`vite build`'s `dist`); defaults to the path the
+	 * release image bakes it into. A missing or incomplete build is logged once and served as a
+	 * plain 503 for the UI only — `/api/*` is unaffected. */
+	staticDir?: string;
 	clock?: () => Date;
 	maxConcurrentVerifications?: number;
 	/** Active sessions kept at once; the oldest beyond this are revoked on the next login. */
@@ -260,7 +271,10 @@ export type ConsoleServerOptions = Readonly<{
 	verifyPassword?: (password: string, hash: string) => Promise<boolean>;
 }>;
 
-export type RunningConsoleServer = Readonly<{ port: number; stop: () => Promise<void> }>;
+export type RunningConsoleServer = Readonly<{
+	port: number;
+	stop: () => Promise<void>;
+}>;
 
 type LoginOutcome =
 	| Readonly<{ kind: "ok"; token: string; csrfToken: string; expiresAt: Date }>
@@ -268,14 +282,19 @@ type LoginOutcome =
 	| Readonly<{ kind: "rate-limited"; waitMs: number }>
 	| Readonly<{ kind: "busy" }>;
 
-type AuthenticatedSession = Readonly<{ id: string; csrfTokenHash: string; expiresAt: Date }>;
+type AuthenticatedSession = Readonly<{
+	id: string;
+	csrfTokenHash: string;
+	expiresAt: Date;
+}>;
 
 /**
- * Starts the owner's console listener. `GET /` and `POST /` carry the dashboard and its
- * stand-in login page, `/api/status` the same projection as JSON, and `/api/session` the
- * session lifecycle; every route but login and the session check requires an authenticated
+ * Starts the owner's console listener. `/api/status` serves the projection as JSON, `/api/session`
+ * the session lifecycle; every route but login and the session check requires an authenticated
  * session, and every mutation additionally requires the exact configured Origin and a matching
- * CSRF header.
+ * CSRF header. Every other `GET`/`HEAD` request serves the built SPA (`console-static.ts`): its
+ * own `assets/*`, or `index.html` as the fallback for any other path — the SPA decides for
+ * itself, once loaded, whether to show the sign-in screen or the dashboard.
  */
 export function startConsoleServer(options: ConsoleServerOptions): RunningConsoleServer {
 	const clock = options.clock ?? (() => new Date());
@@ -286,6 +305,12 @@ export function startConsoleServer(options: ConsoleServerOptions): RunningConsol
 	const limiter = createLoginLimiter(clock);
 	const fingerprint = consolePasswordHashFingerprint(options.passwordHash);
 	const maxActiveSessions = options.maxActiveSessions ?? CONSOLE_SESSION_MAX_ACTIVE;
+	const staticRoot = resolveConsoleStaticRoot(options.staticDir ?? DEFAULT_CONSOLE_STATIC_DIR);
+	if (staticRoot.kind === "missing") {
+		options.log.error("console UI assets are missing; serving a plain 503 for the UI only", {
+			configuredDir: staticRoot.configuredDir,
+		});
+	}
 
 	async function attemptLogin(password: string): Promise<LoginOutcome> {
 		const blockedMs = limiter.blockedFor();
@@ -329,48 +354,52 @@ export function startConsoleServer(options: ConsoleServerOptions): RunningConsol
 		return Math.max(0, Math.round((expiresAt.getTime() - clock().getTime()) / 1000));
 	}
 
-	async function handleRoot(request: Request): Promise<Response> {
-		if (request.method === "GET") {
-			const session = await authenticate(request);
-			if (session === null) {
-				return htmlResponse(renderLoginPage(null), 200);
-			}
-			const snapshot: ConsoleSnapshot = await options.cache.get();
-			const status = snapshot.state === "unavailable" ? 503 : 200;
-			return htmlResponse(renderConsolePage(snapshot), status);
+	/** `public, max-age=31536000, immutable`: every file under `assets/` is named for its own
+	 * content hash (`vite build`), so a given URL's bytes never change — the browser never needs
+	 * to revalidate it, only ever to fetch a new URL when the content actually changes. */
+	const STATIC_ASSET_CACHE = "public, max-age=31536000, immutable";
+
+	function staticFileResponse(
+		path: string,
+		cacheControl: string,
+		method: "GET" | "HEAD",
+	): Response {
+		const file = Bun.file(path);
+		const headers: Record<string, string> = {
+			...SECURITY_HEADERS,
+			"content-type": staticContentType(path),
+			"cache-control": cacheControl,
+		};
+		if (method === "HEAD") {
+			headers["content-length"] = String(file.size);
+			return new Response(null, { status: 200, headers });
 		}
-		if (request.method === "POST") {
-			if (!originAllowed(request, options.origin)) {
-				return forbidden("origin not allowed");
-			}
-			if (
-				!(request.headers.get("content-type") ?? "").startsWith("application/x-www-form-urlencoded")
-			) {
-				return badRequest("expected application/x-www-form-urlencoded");
-			}
-			const bounded = await readBoundedText(request, MAX_LOGIN_BODY_BYTES);
-			if (!bounded.ok) {
-				return payloadTooLarge();
-			}
-			const password = passwordFromForm(bounded.text);
-			if (password === null) {
-				return badRequest("missing password");
-			}
-			const outcome = await attemptLogin(password);
-			if (outcome.kind === "rate-limited") {
-				return tooManyRequests(outcome.waitMs);
-			}
-			if (outcome.kind === "busy") {
-				return serviceBusy();
-			}
-			if (outcome.kind === "invalid") {
-				return htmlResponse(renderLoginPage("wrong password"), 401);
-			}
-			return redirectToRoot({
-				"set-cookie": sessionCookieHeader(outcome.token, sessionMaxAgeSeconds(outcome.expiresAt)),
-			});
+		return new Response(file, { status: 200, headers });
+	}
+
+	/**
+	 * Every `GET`/`HEAD` request that is not `/api/*`: the SPA's own built assets
+	 * (`/assets/*`, long-cached and immutable, content-hashed by `vite build`) or `index.html` as
+	 * the fallback for every other path, `no-store` — deep links work because any path the SPA's
+	 * own router recognizes gets the same `index.html`, which then renders the right page
+	 * client-side. A missing build serves a plain 503 here only; `/api/*` is never affected.
+	 */
+	function handleStatic(request: Request, pathname: string): Response {
+		if (request.method !== "GET" && request.method !== "HEAD") {
+			return textResponse("method not allowed", 405, { allow: "GET, HEAD" });
 		}
-		return textResponse("method not allowed", 405, { allow: "GET, POST" });
+		const method = request.method;
+		if (staticRoot.kind === "missing") {
+			return textResponse("console UI assets are not installed", 503);
+		}
+		if (pathname.startsWith("/assets/")) {
+			const file = resolveStaticFile(staticRoot.root, pathname);
+			if (file === null) {
+				return textResponse("not found", 404);
+			}
+			return staticFileResponse(file, STATIC_ASSET_CACHE, method);
+		}
+		return staticFileResponse(staticRoot.indexHtml, "no-store", method);
 	}
 
 	async function handleStatus(request: Request): Promise<Response> {
@@ -398,7 +427,11 @@ export function startConsoleServer(options: ConsoleServerOptions): RunningConsol
 			const csrfToken = randomSessionToken();
 			await rotateConsoleSessionCsrf(options.pool, session.id, hashSessionToken(csrfToken));
 			return jsonResponse(
-				{ authenticated: true, csrfToken, expiresAt: session.expiresAt.toISOString() },
+				{
+					authenticated: true,
+					csrfToken,
+					expiresAt: session.expiresAt.toISOString(),
+				},
 				200,
 			);
 		}
@@ -428,7 +461,10 @@ export function startConsoleServer(options: ConsoleServerOptions): RunningConsol
 				return jsonResponse({ error: "invalid credentials" }, 401);
 			}
 			return jsonResponse(
-				{ csrfToken: outcome.csrfToken, expiresAt: outcome.expiresAt.toISOString() },
+				{
+					csrfToken: outcome.csrfToken,
+					expiresAt: outcome.expiresAt.toISOString(),
+				},
 				200,
 				{
 					"set-cookie": sessionCookieHeader(outcome.token, sessionMaxAgeSeconds(outcome.expiresAt)),
@@ -451,21 +487,23 @@ export function startConsoleServer(options: ConsoleServerOptions): RunningConsol
 				"set-cookie": clearedSessionCookieHeader(),
 			});
 		}
-		return textResponse("method not allowed", 405, { allow: "GET, POST, DELETE" });
+		return textResponse("method not allowed", 405, {
+			allow: "GET, POST, DELETE",
+		});
 	}
 
 	async function handle(request: Request): Promise<Response> {
 		const { pathname } = new URL(request.url);
-		if (pathname === "/") {
-			return handleRoot(request);
-		}
 		if (pathname === "/api/status") {
 			return handleStatus(request);
 		}
 		if (pathname === "/api/session") {
 			return handleSession(request);
 		}
-		return textResponse("not found", 404);
+		if (pathname.startsWith("/api/")) {
+			return textResponse("not found", 404);
+		}
+		return handleStatic(request, pathname);
 	}
 
 	const server = Bun.serve({

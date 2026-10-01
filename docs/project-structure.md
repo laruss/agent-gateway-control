@@ -10,7 +10,11 @@ Packages are created in the phase where they get code. Progress is tracked in
 agent-gateway-control/
 ├── apps/
 │   ├── controller/          # report/timeout/outbox consumers, health endpoints,    (done)
-│   │                        #   the owner's console (console-server/-status/-render.ts)
+│   │                        #   the owner's console API and static serving
+│   │                        #   (console-server/-status/-static/-auth.ts)
+│   ├── console/             # the owner's console SPA: React, Vite, Tailwind v4,    (done)
+│   │                        #   shadcn/ui; built to static assets the controller
+│   │                        #   serves (ADR-025)
 │   ├── worker/              # generic worker host for one runtime adapter           (done)
 │   ├── connector-gmail/     # Gmail connector process for one mailbox               (done)
 │   ├── tool-runner/         # executes approved tool actions of its namespaces      (done)
@@ -18,7 +22,8 @@ agent-gateway-control/
 │                            #   (console password set)
 ├── packages/
 │   ├── contracts/           # Zod schemas: config, events, turn, queue payloads,     (done)
-│   │                        #   system-status.ts (ADR-023)
+│   │                        #   system-status.ts (ADR-023), console-status.ts
+│   │                        #   (ADR-025, shared with apps/console)
 │   ├── testkit/             # Testcontainers PostgreSQL, test helpers                (done)
 │   ├── core/                # state machine, routing, wait matching, use cases,      (done)
 │   │                        #   system-status.ts and console read models (ADR-023)

@@ -50,6 +50,25 @@ RUN bun install --frozen-lockfile --production --ignore-scripts \
 	&& test -n "${SOURCE_DATE_EPOCH}" \
 	&& find /opt/agent-gateway /out -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
+# The owner's console SPA (ADR-025's frontend section), built to static assets: Vite, Tailwind
+# and React are dev dependencies of `apps/console` alone, installed only in this stage, never in
+# `deps` above, whose `--production` install is what actually reaches the runtime image below.
+# Only `apps/console/dist` — the built output `console-server.ts` serves — is copied out of this
+# stage; this stage's own `node_modules` goes nowhere.
+FROM base AS console-build
+ARG SOURCE_DATE_EPOCH
+WORKDIR /opt/agent-gateway
+COPY package.json bun.lock tsconfig.base.json ./
+COPY apps apps
+COPY packages packages
+# Every workspace's dependencies, dev included: `bun.lock` already pins the exact versions, the
+# same as every other install in this file.
+RUN bun install --frozen-lockfile --ignore-scripts \
+	&& bun run --cwd apps/console build \
+	&& rm -rf /root/.bun \
+	&& test -n "${SOURCE_DATE_EPOCH}" \
+	&& find apps/console/dist -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
+
 FROM base AS gateway
 # The PostgreSQL client tools serve `gateway backup check` (pg_restore) and the backup script.
 # A snapshot's Release file has expired by design; its signature is still verified.
@@ -65,6 +84,10 @@ RUN groupadd --gid 10001 gateway \
 		--shell /usr/sbin/nologin gateway
 COPY --from=deps /opt/agent-gateway /opt/agent-gateway
 COPY --from=deps /out/bin/ /usr/local/bin/
+# The console's built static assets only (ADR-025's frontend section): `console-build`'s
+# `node_modules` — the only place Vite, Tailwind and React ever existed in this build — is never
+# copied anywhere.
+COPY --from=console-build /opt/agent-gateway/apps/console/dist /opt/agent-gateway/apps/console/dist
 ARG GATEWAY_VERSION
 ARG GATEWAY_COMMIT
 # A release image always knows its version: an image reporting 0.0.0 is a build error.

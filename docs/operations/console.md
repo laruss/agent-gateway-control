@@ -56,11 +56,11 @@ account; it is never a Mattermost username or any other identity the rest of the
 
 `https://gateway.local`, from any device on the home network that already trusts the home
 server's Caddy root certificate (the same one trusted for `mattermost.local`; see
-[home-server.md](home-server.md#mattermost)). Visiting it shows a plain sign-in form (just a
-password field — there is no username any more); signing in sets a session cookie good for 12
-hours, or 30 minutes of inactivity, whichever comes first. **Sign out** by calling `DELETE
-/api/session` (the SPA, once it lands, will give this a button; today it's one `curl` call away
-— see below).
+[home-server.md](home-server.md#mattermost)). It is a single-page app (React, ADR-025's frontend
+section): visiting it loads the same page regardless of path, which checks its own session and
+shows a sign-in screen (just a password field — there is no username any more) or the dashboard.
+Signing in sets a session cookie good for 12 hours, or 30 minutes of inactivity, whichever comes
+first. **Sign out** from the sidebar, or by calling `DELETE /api/session` directly (see below).
 
 There is no host port: the controller's listener binds only its own alias on the `agent-mm`
 network (`gateway-console`, port 8084), the same network Caddy and Mattermost share. Nothing on
@@ -71,15 +71,18 @@ Routes:
 
 | Route | Method | Needs | What it does |
 |---|---|---|---|
-| `/` | `GET` | — | The dashboard if a valid session cookie is present, otherwise the sign-in form. |
-| `/` | `POST` | exact Origin | The sign-in form's own submission (`application/x-www-form-urlencoded`); sets the cookie and redirects back to `/`. |
+| `/assets/*` | `GET`/`HEAD` | — | The SPA's own built, content-hashed files; `Cache-Control: public, max-age=31536000, immutable`. |
+| any other non-`/api/*` path | `GET`/`HEAD` | — | The SPA's `index.html` (`Cache-Control: no-store`) — `/`, `/agents`, any deep link the SPA's own router recognizes. A missing build logs once and serves a plain `503` here only; `/api/*` is unaffected. |
 | `/api/session` | `GET` | — | `{authenticated, csrfToken?, expiresAt?}` for the current cookie; also mints a fresh CSRF token when authenticated. |
 | `/api/session` | `POST` | exact Origin | JSON `{password}`; returns `{csrfToken, expiresAt}` and sets the cookie. |
 | `/api/session` | `DELETE` | session, exact Origin, CSRF header | Logs out: revokes the session and clears the cookie. |
 | `/api/status` | `GET` | session | The same projection as JSON, for scripting or a quick `curl` once signed in. |
 
-Every response — success, a failure, even the sign-in page itself — carries
-`Cache-Control: no-store`, a restrictive CSP, `X-Content-Type-Options: nosniff`,
+Every response — success, a failure, even a `503` for a missing build — carries
+`Cache-Control: no-store` (except the SPA's own immutable assets above), a restrictive CSP
+(`default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self';
+connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'` — no
+`unsafe-inline`/`unsafe-eval` anywhere), `X-Content-Type-Options: nosniff`,
 `Referrer-Policy: same-origin` and `X-Frame-Options: DENY`. There is no permissive CORS. A
 mutation (`POST`/`DELETE`) additionally requires the request's `Origin` header to equal
 `CONSOLE_ORIGIN` exactly, and, when the browser sends it, `Sec-Fetch-Site: same-origin`; a
@@ -93,6 +96,25 @@ curl -s -c cookies.txt -H 'content-type: application/json' -H 'origin: https://g
   -d '{"password":"..."}' https://gateway.local/api/session
 curl -s -b cookies.txt https://gateway.local/api/status
 ```
+
+## Building and running it in development
+
+`apps/console` is its own bun workspace (React, Vite, Tailwind CSS v4, shadcn/ui):
+
+- **`bun run console:build`** — `vite build` into `apps/console/dist` (gitignored); this is the
+  only thing the release image actually uses (`deploy/images/Dockerfile`'s `console-build`
+  stage). No source maps, hashed asset filenames, no inline script in the built `index.html`.
+- **`bun run console:dev`** — a Vite dev server with hot reload, proxying `/api/*` to a running
+  controller's console listener (default `http://127.0.0.1:8084`; override with
+  `CONSOLE_DEV_PROXY_TARGET`) so the same relative API calls the built app makes work unchanged.
+  Start a controller with the console enabled first (`CONSOLE_ENABLED=true`,
+  `CONSOLE_ORIGIN=http://localhost:5173` to match Vite's own dev origin, a password set the same
+  way as any other environment) and point this at it.
+- Unit tests for the console live alongside its source (`*.test.tsx`, React Testing Library +
+  happy-dom) and run as part of `bun run test` like everything else; `bun run fix`/`check`
+  typecheck it too (`tsc -b apps/console`, its own project — a browser app needs the DOM lib and
+  Vite's own `types`, which do not belong in the same `tsc` program as the backend's `@types/bun`
+  globals, so it is checked as a second, separate program).
 
 ## What each section shows
 
@@ -148,10 +170,11 @@ for one.
 
 ## Limits and troubleshooting
 
-- **`401 unauthorized`:** no session cookie, or an expired/revoked/wrong-password one. `/` shows
-  the sign-in form instead of a browser dialog; signing in again is all that's needed. Check the
-  password was actually set (`console_password_hash` exists) and the controller picked it up:
-  `bin/agw up -d gateway-controller` after first turning `CONSOLE_ENABLED` on, `bin/agw restart
+- **`401 unauthorized`:** no session cookie, or an expired/revoked/wrong-password one. The SPA
+  itself shows the sign-in screen once its own session check comes back this way, instead of a
+  browser dialog; signing in again is all that's needed. Check the password was actually set
+  (`console_password_hash` exists) and the controller picked it up: `bin/agw up -d
+  gateway-controller` after first turning `CONSOLE_ENABLED` on, `bin/agw restart
   gateway-controller` after only rotating the password.
 - **`403` on sign-in or a mutation:** the request's `Origin` header did not exactly equal
   `CONSOLE_ORIGIN`, carried `Sec-Fetch-Site: cross-site`, or (for `DELETE /api/session`) its
@@ -173,6 +196,11 @@ for one.
   started. This is different from stale: there is no last-known snapshot to fall back to yet.
 - **`503 busy`:** too many concurrent login attempts are already verifying their password hash
   (Argon2id is deliberately expensive); retry shortly.
+- **A plain-text `503` on the page itself (not on `/api/*`):** the built SPA is missing or
+  incomplete at the directory `CONSOLE_STATIC_DIR` names (default the path the release image
+  bakes it into). The controller logs this once at start and keeps serving `/api/*` normally —
+  only the UI is affected. In the release image this should never happen
+  (`deploy/images/Dockerfile` builds it in); in development, run `bun run console:build` first.
 - A login body larger than expected (well past the longest password `gateway console password
   set` accepts, plus field overhead) is refused with `400` before anything is parsed.
 - **Signed out sooner than expected:** sessions are capped at 20 active at once (creating one
