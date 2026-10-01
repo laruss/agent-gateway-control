@@ -100,7 +100,10 @@ export const ConsoleAgentDetailSchema = z.strictObject({
 	enabled: z.boolean(),
 	mattermost: ConsoleAgentMattermostSchema,
 	runtime: AgentRuntimeConfigSchema,
-	rolePrompt: z.string().min(1).max(50_000),
+	/** Not `RolePromptSchema` (which requires non-blank text, for the patch an edit submits): an
+	 * agent that has never had one set has an empty string here (`consoleShowAgent`'s own `?? ""`),
+	 * and the view must still be able to open to let the owner set one. */
+	rolePrompt: z.string().max(50_000),
 	wakeRules: z.array(WakeRuleSchema).max(32),
 	permissions: AgentPermissionsSchema,
 	memory: ConsoleAgentMemorySchema,
@@ -126,7 +129,11 @@ export const AgentRuntimePatchSchema = z
 	.strictObject({
 		adapter: RuntimeAdapterIdSchema.optional(),
 		profile: z.string().min(1).optional(),
-		model: z.string().min(1).optional(),
+		/** `null` removes the override (the agent falls back to the runtime adapter's own default
+		 * model); `undefined`/absent leaves it unchanged. A JSON body cannot tell "absent" and
+		 * "explicitly `undefined`" apart, which is exactly why clearing the field needs its own
+		 * value instead of reusing `undefined` for it. */
+		model: z.string().min(1).nullable().optional(),
 		session_policy: SessionPolicySchema.optional(),
 		timeout_seconds: z.int().min(10).max(86_400).optional(),
 	})

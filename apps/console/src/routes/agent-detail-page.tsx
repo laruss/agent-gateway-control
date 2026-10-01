@@ -2,6 +2,7 @@ import type { AgentPatch, ConsoleAgentDetailResponse } from "@agent-gateway/cont
 import { AlertCircle } from "lucide-react";
 import * as React from "react";
 import { useNavigate, useParams } from "react-router";
+import { toast } from "sonner";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
 	AlertDialog,
@@ -23,6 +24,7 @@ import { HistoryTab } from "./agent-detail/history-tab.tsx";
 import { InstructionsTab } from "./agent-detail/instructions-tab.tsx";
 import { OverviewTab } from "./agent-detail/overview-tab.tsx";
 import { PermissionsTab } from "./agent-detail/permissions-tab.tsx";
+import { rebaseDraft } from "./agent-detail/rebase-draft.ts";
 import { ReviewChangesDialog } from "./agent-detail/review-dialog.tsx";
 import { RuntimeTab } from "./agent-detail/runtime-tab.tsx";
 import type { AgentDetailTabProps } from "./agent-detail/types.ts";
@@ -76,6 +78,34 @@ export function AgentDetailPage(): React.ReactElement {
 	React.useEffect(() => {
 		void load();
 	}, [load]);
+
+	/** "Reload and try again" after a 409 (`review-dialog.tsx`): re-fetches the agent and rebases
+	 * the draft onto it (`rebaseDraft`), rather than merely re-running `load()` and leaving the
+	 * draft exactly as it was. A dirty field whose own live value changed upstream in the meantime
+	 * is dropped, with a visible notice, instead of silently re-applied over someone else's change
+	 * to that same field; if nothing is left to preview, the dialog closes itself. */
+	async function handleReload(): Promise<void> {
+		if (agentId === undefined || state.status !== "ok") {
+			return;
+		}
+		const previousAgent = state.detail.agent;
+		try {
+			const [detail, agents] = await Promise.all([fetchAgentDetail(agentId), fetchAgentsList()]);
+			const { rebased, discardedFields } = rebaseDraft(previousAgent, detail.agent, draft);
+			setState({ status: "ok", detail, knownAgentIds: agents.agents.map((a) => a.id) });
+			setDraft(rebased);
+			if (discardedFields.length > 0) {
+				toast.warning(
+					`Discarded your edit to ${discardedFields.join(", ")}: changed elsewhere since you started editing.`,
+				);
+			}
+			if (Object.keys(rebased).length === 0) {
+				setReviewOpen(false);
+			}
+		} catch (error) {
+			toast.error(error instanceof ApiError ? error.message : "Could not reload this agent.");
+		}
+	}
 
 	const hasUnsavedChanges = Object.keys(draft).length > 0;
 
@@ -181,7 +211,11 @@ export function AgentDetailPage(): React.ReactElement {
 					<RuntimeTab {...tabProps} />
 				</TabsContent>
 				<TabsContent value="assignments">
-					<AssignmentsTab {...tabProps} />
+					{/* Keyed by the loaded revision: a reload (`handleReload`) remounts this tab, resetting
+					the wake rules editor's own locally held, stable row ids (`assignments-tab.tsx`) to
+					match the freshly reloaded data instead of leaving them paired with rules that may no
+					longer be at the same index. */}
+					<AssignmentsTab key={agent.activeRevisionId} {...tabProps} />
 				</TabsContent>
 				<TabsContent value="permissions">
 					<PermissionsTab {...tabProps} />
@@ -197,7 +231,7 @@ export function AgentDetailPage(): React.ReactElement {
 				agentId={agent.id}
 				baseRevisionId={agent.activeRevisionId}
 				draft={draft}
-				onReload={() => void load()}
+				onReload={() => void handleReload()}
 				onApplied={() => {
 					setDraft({});
 					void load();

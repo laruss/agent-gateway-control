@@ -1,17 +1,31 @@
 import { randomUUID } from "node:crypto";
+import type { ConfigApplyInput } from "@agent-gateway/core";
+import { applyConfig, commitChange, ensureConfigHistory } from "@agent-gateway/core";
 import { withTransaction } from "@agent-gateway/db";
 import { silentLogger } from "@agent-gateway/logging";
 import { hashConsolePassword } from "@agent-gateway/service";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { type ConsoleServerOptions, startConsoleServer } from "./console-server.ts";
 import { collectConsoleStatus, createConsoleStatusCache } from "./console-status.ts";
-import { startTestGateway, type TestGateway } from "./test-gateway.ts";
+import { exampleConfig, startTestGateway, type TestGateway } from "./test-gateway.ts";
 
 const PASSWORD = "console management integration test password";
 const ORIGIN = "https://gateway.local";
 const FOREIGN_ORIGIN = "https://attacker.example";
 const CSRF_KEY = "a-test-only-csrf-derivation-key-at-least-32-chars";
 const AGENT_ID = "director";
+/** Dropped from the active configuration and re-enabled directly, outside it, by some of the
+ * tests below (the same recipe `config-history.integration.test.ts` uses) — never touched by any
+ * other test in this file, so mutating it is safe this late. */
+const RETAINED_AGENT_ID = "research";
+
+/** `input` with `id` removed from `agents` and its `rolePrompts` entry along with it — the same
+ * shape a real config directory without that agent's YAML file would produce. */
+function withoutAgent(input: ConfigApplyInput, id: string): ConfigApplyInput {
+	const rolePrompts = { ...input.rolePrompts };
+	delete rolePrompts[id];
+	return { ...input, agents: input.agents.filter((agent) => agent.id !== id), rolePrompts };
+}
 
 type JsonBody = Record<string, unknown>;
 
@@ -391,5 +405,204 @@ describe("the Agents hub's management API (ADR-024/ADR-025)", () => {
 		expect(diff.status).toBe(200);
 		expect(diff.body.revisionId).toBe(latest.id);
 		expect(diff.body.diff).toBeDefined();
+	});
+
+	it("a preview computed against a stale base is refused with 409, never silently computed against the live state instead", async () => {
+		const { base } = await withServer();
+		const session = await signIn(base);
+		const staleBase = await activeRevisionId(base, session.cookie);
+		const moveOn = await postJson(base, `/api/agents/${AGENT_ID}/commit`, session, {
+			baseRevisionId: staleBase,
+			changes: { rolePrompt: "Moves the revision on, so the base below is stale." },
+			idempotencyKey: randomUUID(),
+		});
+		expect(moveOn.status).toBe(200);
+
+		const preview = await postJson(base, `/api/agents/${AGENT_ID}/preview`, session, {
+			baseRevisionId: staleBase,
+			changes: { rolePrompt: "Computed against a base that is no longer live." },
+		});
+		expect(preview.status).toBe(409);
+		expect(preview.body.currentRevisionId).toBe(moveOn.body.revisionId);
+	});
+
+	it(
+		"the full optimistic-concurrency scenario: load, a CLI commit to the same agent, then the " +
+			"console's own preview and commit both refuse the stale base with 409 — nothing it carried is overwritten",
+		async () => {
+			const { base } = await withServer();
+			const session = await signIn(base);
+			// "Load": the editor reads the agent at its currently active revision.
+			const loadedRevisionId = await activeRevisionId(base, session.cookie);
+			const loadedDetail = await getJson(base, `/api/agents/${AGENT_ID}`, session.cookie);
+			const originalDisplayName = (loadedDetail.body.agent as JsonBody).displayName as string;
+
+			// A CLI apply changes the very same agent while the console's draft is still open —
+			// through `commitChange` directly (`source: "cli_apply"`, never the console's own HTTP
+			// surface), the same path `gateway config apply`/`import` use.
+			const cliResult = await commitChange(gateway.deps(), {
+				changeSet: [
+					{ type: "set_role_prompt", agentId: AGENT_ID, rolePrompt: "Changed by the CLI." },
+				],
+				baseRevisionId: loadedRevisionId,
+				actor: "test-cli",
+				source: "cli_apply",
+			});
+			expect(cliResult.revisionId).toBeGreaterThan(loadedRevisionId ?? 0);
+
+			// The console's own preview, still built against the stale loaded revision, refuses
+			// instead of quietly previewing the live (already-moved-on) state as if it were current.
+			const preview = await postJson(base, `/api/agents/${AGENT_ID}/preview`, session, {
+				baseRevisionId: loadedRevisionId,
+				changes: { displayName: "Renamed by the console, from a stale view" },
+			});
+			expect(preview.status).toBe(409);
+			expect(preview.body.currentRevisionId).toBe(cliResult.revisionId);
+
+			// Even a direct commit attempt against that same stale base is refused the same way —
+			// the editor's own loaded revision, carried through unchanged, is what makes this safe
+			// regardless of whether the preview step above ran first.
+			const commit = await postJson(base, `/api/agents/${AGENT_ID}/commit`, session, {
+				baseRevisionId: loadedRevisionId,
+				changes: { displayName: "Renamed by the console, from a stale view" },
+				idempotencyKey: randomUUID(),
+			});
+			expect(commit.status).toBe(409);
+			expect(commit.body.currentRevisionId).toBe(cliResult.revisionId);
+
+			// Nothing was overwritten: the CLI's role prompt change survived, and the display name
+			// the stale console attempt tried to write never landed.
+			const after = await getJson(base, `/api/agents/${AGENT_ID}`, session.cookie);
+			const afterAgent = after.body.agent as JsonBody;
+			expect(afterAgent.rolePrompt).toBe("Changed by the CLI.");
+			expect(afterAgent.displayName).toBe(originalDisplayName);
+		},
+	);
+
+	it("replays a commit retried after an intervening, unrelated change under the same idempotency key, instead of refusing it as 'a different change set'", async () => {
+		const { base } = await withServer();
+		const session = await signIn(base);
+		const baseRevisionId = await activeRevisionId(base, session.cookie);
+		const key = randomUUID();
+		const body = {
+			baseRevisionId,
+			changes: { displayName: "Renamed, retried later" },
+			idempotencyKey: key,
+		};
+
+		const first = await postJson(base, `/api/agents/${AGENT_ID}/commit`, session, body);
+		expect(first.status).toBe(200);
+
+		// An unrelated change to the same agent, through a fresh request with its own idempotency
+		// key — moving the revision on and changing a field the retried patch below never
+		// mentions (so recomputing that patch's plan against this new live state, rather than
+		// replaying the first attempt's own recorded result, would resolve to a different `after`
+		// and so a different change hash).
+		const unrelated = await postJson(base, `/api/agents/${AGENT_ID}/commit`, session, {
+			baseRevisionId: first.body.revisionId,
+			changes: { runtime: { timeout_seconds: 999 } },
+			idempotencyKey: randomUUID(),
+		});
+		expect(unrelated.status).toBe(200);
+
+		// The retry: the exact same request as the first commit (same stale `baseRevisionId`, same
+		// patch, same idempotency key) — as if the first response had been lost and the client
+		// resubmitted it.
+		const retry = await postJson(base, `/api/agents/${AGENT_ID}/commit`, session, body);
+		expect(retry.status).toBe(200);
+		expect(retry.body.replayed).toBe(true);
+		expect(retry.body.revisionId).toBe(first.body.revisionId);
+		expect(retry.body.activeRevisionId).toBe(unrelated.body.revisionId);
+
+		// Nothing was overwritten by the replay: the unrelated, intervening change is still there.
+		const after = await getJson(base, `/api/agents/${AGENT_ID}`, session.cookie);
+		expect((after.body.agent as JsonBody).displayName).toBe("Renamed, retried later");
+		expect(((after.body.agent as JsonBody).runtime as JsonBody).timeout_seconds).toBe(999);
+	});
+
+	it("clears the runtime model override when the patch sets it to null", async () => {
+		const { base } = await withServer();
+		const session = await signIn(base);
+		const setBaseRevisionId = await activeRevisionId(base, session.cookie);
+		const setModel = await postJson(base, `/api/agents/${AGENT_ID}/commit`, session, {
+			baseRevisionId: setBaseRevisionId,
+			changes: { runtime: { model: "gpt-5" } },
+			idempotencyKey: randomUUID(),
+		});
+		expect(setModel.status).toBe(200);
+		const withModel = await getJson(base, `/api/agents/${AGENT_ID}`, session.cookie);
+		expect(((withModel.body.agent as JsonBody).runtime as JsonBody).model).toBe("gpt-5");
+
+		const clearBaseRevisionId = await activeRevisionId(base, session.cookie);
+		const clearModel = await postJson(base, `/api/agents/${AGENT_ID}/commit`, session, {
+			baseRevisionId: clearBaseRevisionId,
+			changes: { runtime: { model: null } },
+			idempotencyKey: randomUUID(),
+		});
+		expect(clearModel.status).toBe(200);
+		const withoutModel = await getJson(base, `/api/agents/${AGENT_ID}`, session.cookie);
+		expect(((withoutModel.body.agent as JsonBody).runtime as JsonBody).model).toBeUndefined();
+	});
+
+	describe("an agent retained outside the active configuration", () => {
+		it(
+			"falls back to remove_agent — reflected in preview's impact and executed by commit — " +
+				"for a disable that a plain set_agent_enabled cannot satisfy on its own",
+			async () => {
+				const { base } = await withServer();
+				const session = await signIn(base);
+
+				await applyConfig(gateway.deps(), withoutAgent(exampleConfig(), RETAINED_AGENT_ID), "test");
+				await gateway.pool.query(
+					"update agents set enabled = true, state = 'idle', state_changed_at = now() where id = $1",
+					[RETAINED_AGENT_ID],
+				);
+				// Its own retained configuration no longer validates on its own (`max_active_runs`
+				// stands in for any whole-bundle rule that has moved on since this row was last
+				// written; see `config-history.integration.test.ts`'s own version of this recipe).
+				await gateway.pool.query(
+					"update agents set config = jsonb_set(config, '{concurrency,max_active_runs}', '2') where id = $1",
+					[RETAINED_AGENT_ID],
+				);
+				await ensureConfigHistory(gateway.deps(), "upgrade");
+
+				const baseRevisionId = await activeRevisionId(base, session.cookie);
+				const preview = await postJson(base, `/api/agents/${RETAINED_AGENT_ID}/preview`, session, {
+					baseRevisionId,
+					changes: { enabled: false },
+				});
+				expect(preview.status).toBe(200);
+				expect(preview.body.problems).toEqual([]);
+				expect(preview.body.impact).toEqual(
+					expect.arrayContaining(["removes the agent from the configuration"]),
+				);
+
+				const commit = await postJson(base, `/api/agents/${RETAINED_AGENT_ID}/commit`, session, {
+					baseRevisionId,
+					changes: { enabled: false },
+					idempotencyKey: randomUUID(),
+				});
+				expect(commit.status).toBe(200);
+
+				const detail = await getJson(base, `/api/agents/${RETAINED_AGENT_ID}`, session.cookie);
+				expect(detail.status).toBe(404);
+				const [row] = (
+					await gateway.pool.query<{ enabled: boolean }>(
+						"select enabled from agents where id = $1",
+						[RETAINED_AGENT_ID],
+					)
+				).rows;
+				expect(row?.enabled).toBe(false);
+			},
+		);
+
+		it("is excluded from the agents list, consistent with its own 404 on detail", async () => {
+			const { base } = await withServer();
+			const session = await signIn(base);
+			const list = await getJson(base, "/api/agents", session.cookie);
+			expect(list.status).toBe(200);
+			const agents = list.body.agents as JsonBody[];
+			expect(agents.some((a) => a.id === RETAINED_AGENT_ID)).toBe(false);
+		});
 	});
 });

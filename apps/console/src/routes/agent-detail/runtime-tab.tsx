@@ -1,4 +1,4 @@
-import type { RuntimeAdapterId, SessionPolicy } from "@agent-gateway/contracts";
+import type { AgentRuntimePatch, RuntimeAdapterId, SessionPolicy } from "@agent-gateway/contracts";
 import type * as React from "react";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -21,10 +21,18 @@ export function RuntimeTab({
 }: AgentDetailTabProps): React.ReactElement {
 	const runtime = { ...original.runtime, ...draft.runtime };
 
-	function setRuntimeField<K extends keyof typeof runtime>(key: K, value: (typeof runtime)[K]) {
-		const next = { ...draft.runtime, [key]: value };
-		for (const field of Object.keys(next) as (keyof typeof next)[]) {
-			if (next[field] === original.runtime[field]) {
+	function setRuntimeField<K extends keyof AgentRuntimePatch>(key: K, value: AgentRuntimePatch[K]) {
+		const next: AgentRuntimePatch = { ...draft.runtime, [key]: value };
+		for (const field of Object.keys(next) as (keyof AgentRuntimePatch)[]) {
+			const draftValue = next[field];
+			const originalValue = original.runtime[field];
+			// `model: null` ("clear the override") reads as unchanged exactly when the agent had no
+			// override to begin with (`original.runtime.model === undefined`) — the patch contract's
+			// only field with a distinct "remove" representation (`console-management.ts`).
+			const unchanged =
+				draftValue === originalValue ||
+				(field === "model" && draftValue === null && originalValue === undefined);
+			if (unchanged) {
 				delete next[field];
 			}
 		}
@@ -57,7 +65,13 @@ export function RuntimeTab({
 					id="runtime-model"
 					value={runtime.model ?? ""}
 					placeholder="(provider default)"
-					onChange={(event) => setRuntimeField("model", event.target.value || undefined)}
+					onChange={(event) => {
+						const value = event.target.value;
+						// `null`, never `undefined`: `undefined` is dropped by `JSON.stringify` (nothing
+						// is sent at all), which the server can only read as "this field is unchanged" —
+						// `null` is this patch's own explicit "remove the override" value.
+						setRuntimeField("model", value === "" ? null : value);
+					}}
 				/>
 			</div>
 			<div className="grid gap-2">

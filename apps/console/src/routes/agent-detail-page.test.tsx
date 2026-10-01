@@ -118,7 +118,14 @@ function stubFetch(commitOutcome: CommitOutcome): {
 			if (path === `/api/agents/${AGENT_ID}/preview` && method === "POST") {
 				const body = JSON.parse(String(init?.body)) as { changes: { rolePrompt?: string } };
 				return jsonResponse({
-					baseRevisionId: 7,
+					// Deliberately not 7 (the agent's own loaded `activeRevisionId`): a real server
+					// only ever reports its own live revision here, which always equals what the
+					// request's own `baseRevisionId` already was by the time a preview succeeds (a
+					// mismatch is a 409 instead, see `console-management.integration.test.ts`'s own
+					// coverage of that). This value is deliberately different purely so this fixture
+					// can tell apart "the editor's own loaded revision" from "whatever the preview
+					// response happened to carry" at the commit call below.
+					baseRevisionId: 42,
 					baseHash: "a".repeat(64),
 					newHash: "b".repeat(64),
 					noop: false,
@@ -203,7 +210,7 @@ describe("AgentDetailPage", () => {
 		vi.unstubAllGlobals();
 	});
 
-	it("edits the role prompt, previews a diff, and applies it with the preview's base revision and a fresh idempotency key", async () => {
+	it("edits the role prompt, previews a diff, and applies it with the editor's own loaded base revision (never the preview response's) and a fresh idempotency key", async () => {
 		const { commitCalls } = stubFetch("ok");
 		renderDetail();
 		const user = userEvent.setup();
@@ -223,6 +230,9 @@ describe("AgentDetailPage", () => {
 		await user.click(screen.getByRole("button", { name: /^apply$/i }));
 
 		await waitFor(() => expect(commitCalls).toHaveLength(1));
+		// 7 is `detailFixture()`'s own `activeRevisionId` — the revision the editor actually loaded.
+		// The preview fixture above deliberately reports 42: committing with that value instead (as
+		// `state.preview.baseRevisionId`) is exactly the optimistic-concurrency defeat this covers.
 		expect(commitCalls[0]?.baseRevisionId).toBe(7);
 		expect(commitCalls[0]?.idempotencyKey).toEqual(expect.stringMatching(/^[0-9a-f-]{36}$/));
 

@@ -43,7 +43,9 @@ an upgrade from an older home server kit needs an extra step first, in
 The controller reads the password hash once, at start; it refuses to start at all if
 `CONSOLE_ENABLED=true` and the hash file is missing, empty, or not private (mode `0600`, no
 symlink, not group- or world-readable), or if `CONSOLE_ORIGIN` is not a plain origin (scheme and
-host, no path). This is deliberate: a half-configured console must never end up serving
+host, no path) or is `http://` pointed at anything other than `localhost`/`127.0.0.1` (the session
+cookie is `__Host-`/`Secure`; only a loopback origin — `console:dev`'s own Vite dev server — is
+exempt from needing TLS). This is deliberate: a half-configured console must never end up serving
 unauthenticated, or silently skip only the console and start everything else.
 
 **Rotating the password** writes a new hash file and, when the CLI can also reach the database,
@@ -106,16 +108,19 @@ curl -s -b cookies.txt https://gateway.local/api/status
 
 ## Managing agents
 
-The Agents hub (`/agents`) lists every configured agent and lets the owner edit an existing one;
-creating or deleting an agent is not available from the console yet (`gateway config apply`/
-`import` still does that). Open an agent from the list to its editor, which has one tab per group
-of fields:
+The Agents hub (`/agents`) lists every agent in the active configuration and lets the owner edit
+an existing one; creating or deleting an agent is not available from the console yet (`gateway
+config apply`/`import` still does that). An agent disabled and retained outside the active
+configuration (`gateway agent disable` falling back to `remove_agent` for a stale, no-longer-valid
+row — see the Overview tab's note below) is left out of this list entirely, consistent with its
+own detail route, which 404s for it the same way. Open an agent from the list to its editor, which
+has one tab per group of fields:
 
 | Tab | Editable fields |
 |---|---|
-| Overview | Display name, enabled, plus the agent's current state and recent runs (from the same `/api/status` data the overview page shows — not a separate query). |
+| Overview | Display name, enabled, plus the agent's current state and recent runs (from the same `/api/status` data the overview page shows — not a separate query). Disabling a *retained* agent whose own stored configuration no longer validates falls back to removing it from the configuration outright (the same fallback `gateway agent disable` already has); the preview's "impact" list says so before applying. |
 | Instructions | The role prompt (monospace, bounded at 50,000 characters, the same limit `set_role_prompt` enforces everywhere else). |
-| Runtime | Runtime adapter, model, session policy, timeout. |
+| Runtime | Runtime adapter, model (clearing the field back to blank removes the override, falling back to the runtime adapter's own default — not merely leaving the stored value untouched), session policy, timeout. |
 | Assignments | Allowed Mattermost channels (from the organization's own configured list), wake rules (event type and an optional target agent). |
 | Permissions | The three tool-pattern lists (`tools_allow`, `tools_require_human_approval`, `tools_deny`) and `observe_system`. |
 | History | Revisions that touched this agent, each with its own diff. |
@@ -123,22 +128,36 @@ of fields:
 The Mattermost identity (bot username, token secret path), memory namespaces, concurrency and any
 configured budget are shown but not editable here — there is no tab for them yet.
 
-Edits accumulate in a local draft; nothing is sent until **Review changes** is clicked, which
-shows a preview (the exact diff `prepareChange` computes, ADR-024) before anything is written.
-Disabling the agent, removing a channel, removing a tool grant or removing `observe_system` each
-appear in the preview's own "impact" list and must be acknowledged before **Apply** is enabled.
-Applying commits through the same `prepareChange`/`commitChange` service every other configuration
-surface uses:
+Edits accumulate in a local draft (only the fields actually touched, never a whole snapshot);
+nothing is sent until **Review changes** is clicked, which shows a preview (the exact diff
+`prepareChange` computes, ADR-024) before anything is written. Destructive or authority-reducing
+consequences (disabling the agent, removing a channel, removing a tool grant, removing
+`observe_system` or a deny rule, removing a tool's human-approval requirement) *and*
+authority-increasing ones (enabling the agent, adding a channel, granting a tool or
+`observe_system`) alike appear in the preview's own "impact" list and must be acknowledged before
+**Apply** is enabled. Applying commits through the same `prepareChange`/`commitChange` service
+every other configuration surface uses:
 
-- **A conflict** (someone else committed a change to the same agent since this edit's preview was
-  computed) is refused with the revision that is now active; **Reload and try again** re-reads the
-  agent's current configuration and re-previews the same draft on top of it — the draft itself
-  (a patch of only the changed fields) does not need to change, only what it is compared against.
+- **A conflict** — the editor's own loaded revision is no longer the one actually active, because
+  someone else (another tab, `gateway config apply`/`import`, an agent's own commit) committed a
+  change to the same agent since this edit began — is refused with `409` and the revision that is
+  now active, at preview time already (never silently previewed against that newer state in the
+  stale view's place) and, redundantly, at commit time too. **Reload and try again** re-reads the
+  agent's current configuration and rebases the draft onto it: a field the owner did not touch is
+  unaffected either way, a touched field whose own value did *not* change upstream survives
+  unchanged (to be re-previewed against the fresh state), and a touched field that *also* changed
+  upstream is dropped from the draft with a visible notice — the owner's own edit to that one
+  field is never silently applied over someone else's conflicting change to the very same field.
 - **An invalid change** (a business-rule problem — a configuration-breaking change, or a
   protection like "pause a running agent before disabling it") is reported inline, with the
   server's own message; nothing is written.
 - Applying twice with the same idempotency key (a retried request after a dropped response, say)
-  replays the first commit's result rather than writing a second revision.
+  replays the first commit's own recorded result rather than writing a second revision: the change
+  being applied is always recomputed from the configuration as it stood at the draft's own base
+  revision, never from whatever is live at the moment of the request, so a retry recomputes the
+  identical change every time and replays correctly even if something else has changed the agent
+  again in the meantime, rather than risking a spurious "the same key, a different change set"
+  refusal.
 
 Every commit the console makes is a normal, auditable configuration revision: `gateway config
 history` shows it with `source: console` and `actor: console:owner`, the same way a `cli_apply`
@@ -230,10 +249,14 @@ for one.
   gateway-controller` after first turning `CONSOLE_ENABLED` on, `bin/agw restart
   gateway-controller` after only rotating the password.
 - **`403` on sign-in or a mutation:** the request's `Origin` header did not exactly equal
-  `CONSOLE_ORIGIN`, carried `Sec-Fetch-Site: cross-site`, or (for `DELETE /api/session`) its
-  `X-CSRF-Token` header was missing or did not match. A browser pointed at anything other than
-  `CONSOLE_ORIGIN` itself (a different hostname, `http://` instead of `https://`, a port) always
-  gets this; a plain `curl` needs the matching `-H 'origin: ...'` shown above.
+  `CONSOLE_ORIGIN`, carried `Sec-Fetch-Site: cross-site`, or its `X-CSRF-Token` header was missing
+  or did not match. A browser pointed at anything other than `CONSOLE_ORIGIN` itself (a different
+  hostname, `http://` instead of `https://`, a port) always gets this; a plain `curl` needs the
+  matching `-H 'origin: ...'` shown above. The SPA itself recovers on its own from a stale CSRF
+  token specifically (another tab signed in again after this one's own copy was captured, or the
+  controller's routing key — which the token derives from — rotated): it refreshes the token from
+  one session check and retries the request once before showing anything; only a `403` that
+  persists past that retry, or one naming the Origin instead, reaches the owner as an error.
 - **`429 too many attempts` (with `Retry-After`):** failed logins share one bounded, global
   counter — ten failures per minute, across every client, not partitioned by address. A
   password-guessing attempt from anywhere blocks the owner too, along with the attacker;

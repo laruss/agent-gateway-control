@@ -4,7 +4,10 @@ import {
 	signIn as apiSignIn,
 	signOut as apiSignOut,
 	checkSession,
+	getCsrfToken,
 	type SignInOutcome,
+	setCsrfToken,
+	setUnauthorizedHandler,
 } from "@/lib/api-client";
 
 // ---------------------------------------------------------------------------
@@ -38,12 +41,21 @@ export function SessionProvider({ children }: { children: React.ReactNode }): Re
 	// now-stale "signed-out" (or an error) a no-op instead of overwriting the fresh "signed-in"
 	// state once it finally resolves.
 	const settledByLogin = React.useRef(false);
+	// `checkSession()` itself updates the module-level CSRF token as a side effect, unconditionally
+	// — it has no way to know its own result is about to be stale. When it is (`settledByLogin`),
+	// that update has already clobbered the token a login captured in the meantime; this is what
+	// the login captured, to restore right after.
+	const signedInCsrfToken = React.useRef<string | null>(null);
 
 	React.useEffect(() => {
 		let cancelled = false;
 		checkSession()
 			.then((check) => {
-				if (cancelled || settledByLogin.current) {
+				if (cancelled) {
+					return;
+				}
+				if (settledByLogin.current) {
+					setCsrfToken(signedInCsrfToken.current);
 					return;
 				}
 				setState(
@@ -53,9 +65,15 @@ export function SessionProvider({ children }: { children: React.ReactNode }): Re
 				);
 			})
 			.catch(() => {
-				if (!cancelled && !settledByLogin.current) {
-					setState({ status: "signed-out" });
+				if (cancelled) {
+					return;
 				}
+				if (settledByLogin.current) {
+					// `checkSession` throws before ever touching the token on this path (a non-OK
+					// response, or a response that fails its own shape check) — nothing to restore.
+					return;
+				}
+				setState({ status: "signed-out" });
 			});
 		return () => {
 			cancelled = true;
@@ -66,6 +84,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }): Re
 		const outcome = await apiSignIn(password);
 		if (outcome.kind === "ok") {
 			settledByLogin.current = true;
+			signedInCsrfToken.current = getCsrfToken();
 			setState({ status: "signed-in", expiresAt: outcome.expiresAt });
 		}
 		return outcome;
@@ -87,6 +106,14 @@ export function SessionProvider({ children }: { children: React.ReactNode }): Re
 	const reportUnauthorized = React.useCallback(() => {
 		setState((current) => (current.status === "signed-in" ? { status: "signed-out" } : current));
 	}, []);
+
+	// Every request the API client makes (not only the status poll, which wires this itself through
+	// `useConsoleStatus`) reports its own 401 here, so the Agents hub's list, its editor and its
+	// preview/commit calls fall back to the sign-in screen the same way a stale status poll does.
+	React.useEffect(() => {
+		setUnauthorizedHandler(reportUnauthorized);
+		return () => setUnauthorizedHandler(null);
+	}, [reportUnauthorized]);
 
 	const value = React.useMemo<SessionContextValue>(
 		() => ({ state, signIn, signOut, reportUnauthorized }),

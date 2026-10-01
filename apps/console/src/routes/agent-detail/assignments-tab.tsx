@@ -1,6 +1,6 @@
 import type { WakeRule } from "@agent-gateway/contracts";
 import { Plus, X } from "lucide-react";
-import type * as React from "react";
+import * as React from "react";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import {
@@ -56,31 +56,65 @@ function ChannelsEditor({
 	);
 }
 
+/** A wake rule paired with a client-only id, stable across edits of the list it belongs to —
+ * `crypto.randomUUID()`, never the array index (`WakeRulesEditor` below), since the rule itself
+ * carries nothing unique enough to key a React list on (two rules can share the same event type
+ * and target). This is local state `WakeRulesEditor` owns directly (every mutation updates it in
+ * the same call that notifies `patchDraft`), not something re-derived from `draft.wakeRules` on
+ * every render: re-deriving it there would hand every rule a fresh id on every edit, exactly the
+ * instability stable keys exist to avoid. A reload that changes the underlying agent out from
+ * under this tab (`agent-detail-page.tsx`'s "Reload and try again" path) remounts it instead,
+ * keyed by the agent's own `activeRevisionId`. */
+type KeyedWakeRule = Readonly<{ key: string; rule: WakeRule }>;
+
+function keyRules(rules: Readonly<WakeRule[]>): KeyedWakeRule[] {
+	return rules.map((rule) => ({ key: crypto.randomUUID(), rule }));
+}
+
+/** The sentinel the target-agent `Select` below uses for "no specific target" (a `WakeRule` has
+ * no empty-string representation of its own `target_agent_id`, which is `string | undefined`). */
+export const NO_SPECIFIC_TARGET = "__none__";
+
+/** `rule` with its target set to `value`, or with `target_agent_id` removed entirely when `value`
+ * is {@link NO_SPECIFIC_TARGET} — built fresh from `event_type` alone, never `{...rule, ...}`,
+ * which would carry the old `target_agent_id` through untouched (there is no field to overwrite
+ * it with: `undefined` is dropped by JSON the same way it is everywhere else in this patch
+ * contract, so only omitting the key entirely actually clears it). */
+export function ruleWithTarget(rule: WakeRule, value: string): WakeRule {
+	return value === NO_SPECIFIC_TARGET
+		? { event_type: rule.event_type }
+		: { event_type: rule.event_type, target_agent_id: value };
+}
+
 function WakeRulesEditor({
 	original,
 	draft,
 	patchDraft,
 	knownAgentIds,
 }: AgentDetailTabProps): React.ReactElement {
-	const rules = draft.wakeRules ?? original.wakeRules;
+	const [keyed, setKeyed] = React.useState<KeyedWakeRule[]>(() =>
+		keyRules(draft.wakeRules ?? original.wakeRules),
+	);
 
-	function setRules(next: Readonly<WakeRule[]>) {
+	function setRules(next: Readonly<KeyedWakeRule[]>) {
+		const rules = next.map((entry) => entry.rule);
 		const unchanged =
-			next.length === original.wakeRules.length &&
-			next.every(
+			rules.length === original.wakeRules.length &&
+			rules.every(
 				(rule, index) =>
 					rule.event_type === original.wakeRules[index]?.event_type &&
 					rule.target_agent_id === original.wakeRules[index]?.target_agent_id,
 			);
-		patchDraft("wakeRules", unchanged ? undefined : [...next]);
+		patchDraft("wakeRules", unchanged ? undefined : rules);
+		setKeyed([...next]);
 	}
 
 	function updateRule(index: number, next: WakeRule) {
-		setRules(rules.map((rule, i) => (i === index ? next : rule)));
+		setRules(keyed.map((entry, i) => (i === index ? { ...entry, rule: next } : entry)));
 	}
 
 	function removeRule(index: number) {
-		setRules(rules.filter((_, i) => i !== index));
+		setRules(keyed.filter((_, i) => i !== index));
 	}
 
 	function addRule() {
@@ -89,10 +123,13 @@ function WakeRulesEditor({
 			return;
 		}
 		setRules([
-			...rules,
+			...keyed,
 			{
-				event_type: eventType as WakeRule["event_type"],
-				...(eventType.startsWith("mattermost.") ? { target_agent_id: original.id } : {}),
+				key: crypto.randomUUID(),
+				rule: {
+					event_type: eventType as WakeRule["event_type"],
+					...(eventType.startsWith("mattermost.") ? { target_agent_id: original.id } : {}),
+				},
 			},
 		]);
 	}
@@ -106,11 +143,8 @@ function WakeRulesEditor({
 				</Button>
 			</div>
 			<div className="flex flex-col gap-2">
-				{rules.map((rule, index) => (
-					// Rules are an ordered list the agent itself does not reorder by content; the index
-					// is a stable enough key for this bounded (max 32), purely client-side editor list.
-					// biome-ignore lint/suspicious/noArrayIndexKey: see above
-					<div key={index} className="flex items-center gap-2 rounded-lg border border-input p-2">
+				{keyed.map(({ key, rule }, index) => (
+					<div key={key} className="flex items-center gap-2 rounded-lg border border-input p-2">
 						<Select
 							value={rule.event_type}
 							onValueChange={(value) =>
@@ -129,19 +163,14 @@ function WakeRulesEditor({
 							</SelectContent>
 						</Select>
 						<Select
-							value={rule.target_agent_id ?? "__none__"}
-							onValueChange={(value) =>
-								updateRule(index, {
-									...rule,
-									...(value === "__none__" ? {} : { target_agent_id: value }),
-								})
-							}
+							value={rule.target_agent_id ?? NO_SPECIFIC_TARGET}
+							onValueChange={(value) => updateRule(index, ruleWithTarget(rule, value))}
 						>
 							<SelectTrigger className="w-48">
 								<SelectValue placeholder="any target" />
 							</SelectTrigger>
 							<SelectContent>
-								<SelectItem value="__none__">(no specific target)</SelectItem>
+								<SelectItem value={NO_SPECIFIC_TARGET}>(no specific target)</SelectItem>
 								{knownAgentIds.map((id) => (
 									<SelectItem key={id} value={id}>
 										{id}
@@ -160,7 +189,7 @@ function WakeRulesEditor({
 						</Button>
 					</div>
 				))}
-				{rules.length === 0 && <p className="text-sm text-muted-foreground">No wake rules.</p>}
+				{keyed.length === 0 && <p className="text-sm text-muted-foreground">No wake rules.</p>}
 			</div>
 		</div>
 	);

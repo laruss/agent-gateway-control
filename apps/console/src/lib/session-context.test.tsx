@@ -2,6 +2,7 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import type * as React from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { getCsrfToken } from "./api-client.ts";
 import { SessionProvider, useSession } from "./session-context.tsx";
 
 // ---------------------------------------------------------------------------
@@ -103,7 +104,10 @@ describe("SessionProvider", () => {
 					return startupCheck;
 				}
 				if (method === "POST" && input.endsWith("/api/session")) {
-					return jsonResponse({ csrfToken: "t", expiresAt: "2031-01-01T00:00:00.000Z" });
+					return jsonResponse({
+						csrfToken: "fresh-from-login",
+						expiresAt: "2031-01-01T00:00:00.000Z",
+					});
 				}
 				throw new Error(`unexpected request: ${method} ${input}`);
 			}),
@@ -115,11 +119,16 @@ describe("SessionProvider", () => {
 		// Sign-in happens, and wins, while the startup check is still pending.
 		screen.getByRole("button", { name: "sign in" }).click();
 		await waitFor(() => expect(screen.getByTestId("status").textContent).toBe("signed-in"));
+		expect(getCsrfToken()).toBe("fresh-from-login");
 
 		// The startup check finally resolves, unauthenticated (as it genuinely was, at the moment
-		// it was sent, before the sign-in above ever happened) — it must not undo the sign-in.
+		// it was sent, before the sign-in above ever happened). It must not undo the sign-in state,
+		// and its own `setCsrfToken(null)` side effect (`checkSession`, `api-client.ts`) must not
+		// clobber the token the sign-in above already captured either: a mutation right after this
+		// must still carry the token login got, not a stale `null` from the now-irrelevant check.
 		resolveStartupCheck?.(jsonResponse({ authenticated: false }));
 		await new Promise((resolve) => setTimeout(resolve, 20));
 		expect(screen.getByTestId("status").textContent).toBe("signed-in");
+		expect(getCsrfToken()).toBe("fresh-from-login");
 	});
 });

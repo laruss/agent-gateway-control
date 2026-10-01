@@ -53,8 +53,12 @@ export function ReviewChangesDialog({
 		setState({ status: "loading" });
 		setConfirmedImpact(false);
 		try {
-			const preview = await previewAgentChange(agentId, { baseRevisionId, changes: draft });
-			setState({ status: "ready", preview, idempotencyKey: crypto.randomUUID() });
+			const outcome = await previewAgentChange(agentId, { baseRevisionId, changes: draft });
+			if (outcome.kind === "conflict") {
+				setState({ status: "conflict", currentRevisionId: outcome.currentRevisionId });
+				return;
+			}
+			setState({ status: "ready", preview: outcome.preview, idempotencyKey: crypto.randomUUID() });
 		} catch (error) {
 			setState({
 				status: "error",
@@ -74,8 +78,15 @@ export function ReviewChangesDialog({
 			return;
 		}
 		setState({ status: "applying", preview: state.preview, idempotencyKey: state.idempotencyKey });
+		// `baseRevisionId` here is the prop — the revision the editor actually loaded this draft
+		// against — never `state.preview.baseRevisionId`: the preview always reports the revision it
+		// was computed against (which, once a mismatched preview is refused as a `conflict` instead
+		// of silently computed, is always this same value on a `"ready"` state anyway), but committing
+		// with whatever the *preview response* happened to carry back, rather than with the editor's
+		// own loaded view, is what let a stale base silently re-derive itself as "current" and defeat
+		// optimistic concurrency entirely.
 		const outcome = await commitAgentChange(agentId, {
-			baseRevisionId: state.preview.baseRevisionId,
+			baseRevisionId,
 			changes: draft,
 			idempotencyKey: state.idempotencyKey,
 		}).catch((error: unknown) => {
@@ -189,7 +200,7 @@ export function ReviewChangesDialog({
 							{impact.length > 0 && (
 								<Alert variant="destructive">
 									<AlertTriangle />
-									<AlertTitle>This reduces the agent's authority</AlertTitle>
+									<AlertTitle>This changes what the agent can do</AlertTitle>
 									<AlertDescription>
 										<ul className="list-inside list-disc">
 											{impact.map((item) => (
@@ -238,14 +249,13 @@ export function ReviewChangesDialog({
 
 				<DialogFooter>
 					{state.status === "conflict" ? (
-						<Button
-							onClick={() => {
-								onReload();
-								void loadPreview();
-							}}
-						>
-							Reload and try again
-						</Button>
+						// `onReload` reloads the agent and rebases the draft onto it (dropping and
+						// announcing any field that itself changed upstream, `agent-detail-page.tsx`'s
+						// `rebaseDraft`); it does not call `loadPreview` itself — once the parent's own
+						// `baseRevisionId`/`draft` props change, the effect above re-runs `loadPreview`
+						// against the fresh ones on its own (or, if the rebase discarded the entire draft,
+						// the parent closes this dialog instead, since there is nothing left to preview).
+						<Button onClick={onReload}>Reload and try again</Button>
 					) : (
 						<Button onClick={() => void apply()} disabled={!canApply}>
 							{state.status === "applying" ? "Applying…" : "Apply"}

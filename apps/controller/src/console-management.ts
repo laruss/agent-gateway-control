@@ -104,9 +104,23 @@ async function previewRoute(
 	if (!parsed.ok) {
 		return parsed.result;
 	}
-	const result = await previewAgentPatch(deps, agentId, parsed.data.changes);
+	const result = await previewAgentPatch(
+		deps,
+		agentId,
+		parsed.data.baseRevisionId,
+		parsed.data.changes,
+	);
 	if (result.kind === "not-found") {
 		return notFound(`agent '${agentId}' not found`);
+	}
+	if (result.kind === "conflict") {
+		return {
+			status: 409,
+			body: {
+				error: "the active configuration changed since this change was prepared",
+				currentRevisionId: result.currentRevisionId,
+			},
+		};
 	}
 	const response: ConsolePreviewResponse = {
 		baseRevisionId: result.preview.baseRevisionId,

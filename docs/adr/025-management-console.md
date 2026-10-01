@@ -99,7 +99,10 @@ one, a plain login form — is already behind the session and CSRF model the res
 - **`CONSOLE_ORIGIN`** is a new controller setting, e.g. `https://gateway.local` — the home
   server's default (`deploy/release/compose.yaml`, `gateway.env.example`). It is read and
   validated at start, alongside the password hash, so a malformed value fails the controller
-  closed rather than starting a listener that would reject every login.
+  closed rather than starting a listener that would reject every login. `assertConsoleOrigin`
+  also refuses an `http:` origin outright unless its host is `localhost`/`127.0.0.1` (`console:dev`'s
+  own Vite dev server, the only legitimate case): the session cookie is `__Host-`/`Secure`
+  (above), so an `http://` value pointed at a real host would otherwise carry it in the clear.
 - **Login and every mutation require the request's `Origin` header to equal `CONSOLE_ORIGIN`
   exactly**, and, when the browser sends it, `Sec-Fetch-Site: same-origin`. Requiring it on login
   itself — not only on mutations after login — is what blocks cross-site login CSRF: a page on
@@ -166,20 +169,34 @@ one of those checks.
   the prompt changed, or — when the patch is `{enabled}` alone — `set_agent_enabled` through the
   same disable-with-fallback-to-`remove_agent` path `gateway agent disable` uses (a retained
   agent whose own stored configuration no longer validates cannot be fixed by flipping its
-  `enabled` flag alone). Both routes always build this plan against the agent's *current* live
-  definition, exactly as `prepareChange` itself always previews against the live active revision
-  (never a client's possibly-stale view); a stale `baseRevisionId` is still caught correctly,
-  because `commitChange`'s own conflict check compares the caller's claimed base against the
-  actual current revision regardless of what content the plan computed. `preview` returns `200`
-  with the diff, any validation `problems`, and `impact` — a short list of destructive or
-  authority-reducing consequences (disables the agent, removes a channel, removes a tool grant,
-  removes `observe_system`) the console must show for explicit confirmation before letting a
-  commit proceed, derived from the before/after agent definitions directly rather than the
-  structural diff's `fieldPaths` (which names only that a list changed, never what left it).
-  `commit` returns `200` on success (including a replayed idempotency key), `409` with the
-  current revision id on a stale base, and `422` with `problems` for anything invalid — whether
-  caught by `prepareChange` before committing or only at commit time (a run-in-progress
-  protection, `AdminError`s `commitChange`/`writeConfigRevisionIn` can still raise).
+  `enabled` flag alone; the fallback is resolved once, by `resolveEnabledChangeSet`, and shared by
+  `preview` and `commit` alike, so the console sees it — "removes the agent from the
+  configuration" in `impact` — before ever committing it). **Both routes require the request's
+  `baseRevisionId` to equal the revision actually active right now**, the editor's own loaded
+  view: `preview` refuses a mismatch with `409` and the current revision id instead of silently
+  computing a diff against the live state in its place, building its own plan from the agent's
+  current live definition once that equality is confirmed (the same definition `baseRevisionId`
+  was just confirmed to name). `commit` instead builds its plan from the snapshot `baseRevisionId`
+  itself names directly — immutable and content-addressed, so the *same* `(baseRevisionId, changes)`
+  pair always recomputes the identical change set no matter what the live configuration has become
+  since; `commitChange`'s own conflict check (inside its transaction lock) is what still refuses a
+  genuinely stale, non-retried base the same way preview does. `preview` returns `200` with the
+  diff, any validation `problems`, and `impact` — a short list of consequences needing explicit
+  confirmation before a commit proceeds: destructive or authority-reducing ones (disables the
+  agent, removes a channel, removes a tool grant, removes `observe_system`, removes a tool's deny
+  rule or its human-approval requirement) and authority-*increasing* ones just as much (enables
+  the agent, adds a channel, grants a tool, grants `observe_system`) — derived from the
+  before/after agent definitions directly rather than the structural diff's `fieldPaths` (which
+  names only that a list changed, never what left or joined it). `commit` returns `200` on success
+  (including a replayed idempotency key: a retry after a lost response carries the same
+  `baseRevisionId` and the same `changes`, so it recomputes the identical change set and
+  `commitChange`'s own idempotency check replays the original commit's own recorded result exactly
+  — a live-state-dependent plan could instead disagree with its own first attempt purely because
+  an unrelated, intervening change had moved live state on, and risk "the same key, a different
+  change set"), `409` with the current revision id on a stale base, and `422` with `problems` for
+  anything invalid — whether caught by `prepareChange` before committing or only at commit time (a
+  run-in-progress protection, `AdminError`s `commitChange`/`writeConfigRevisionIn` can still
+  raise).
 - **`GET /api/config/revisions`** / **`GET /api/config/revisions/:id/diff`** — the journal's own
   history (`listConfigRevisions`, unchanged) and a structural diff of one revision against its
   parent (`consoleRevisionDiff`, reusing `configDiff`) for any recorded revision, not only the
@@ -223,9 +240,14 @@ one of those checks.
 - **Data fetching: TanStack Query for the status poll, a small typed fetch wrapper
   (`lib/api-client.ts`) underneath it for everything.** The wrapper owns the transport concerns
   shared by every call — same-origin credentials, the `X-CSRF-Token` header on mutations, parsing
-  every response against the shared Zod contracts below, and turning a `401` into the one
-  `ApiError` kind the session layer reacts to. Query earns its place only for the status poll
-  specifically: `refetchInterval` plus its own stale/error/pending state already is the 15 s
+  every response against the shared Zod contracts below, and reporting every `401` to a single
+  handler the session layer registers (`setUnauthorizedHandler`), the same fallback-to-sign-in
+  behavior the status poll's own query already had, now shared by the Agents hub's list, its
+  editor and its preview/commit calls too, instead of each needing its own wiring. A mutation
+  refused with a `403` naming the CSRF token (another tab signed in anew since this one captured
+  its copy, or the routing key it derives from rotated) refreshes the token from one session check
+  and retries the same request once before giving up. Query earns its place only for the status
+  poll specifically: `refetchInterval` plus its own stale/error/pending state already is the 15 s
   polling and stale-snapshot handling this page needs, instead of this app reimplementing that
   state machine by hand for one endpoint. Sign-in and sign-out stay plain `async` calls through
   the same wrapper; they are one-shot actions, not cached data.

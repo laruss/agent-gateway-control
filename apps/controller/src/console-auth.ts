@@ -102,15 +102,33 @@ export function originAllowed(request: Request, configuredOrigin: string): boole
 	return secFetchSite === null || secFetchSite === "same-origin";
 }
 
-const ORIGIN_SHAPE = /^https?:\/\/[^/]+$/;
+const ORIGIN_SHAPE = /^(https?):\/\/([^/]+)$/;
+
+/** The only hosts an `http:` `CONSOLE_ORIGIN` may name: the session cookie is `__Host-`/`Secure`
+ * (ADR-025) and so needs TLS in every other case, but a loopback origin is never carried over the
+ * network regardless of scheme, which is what a local `console:dev` setup (Vite's own dev server,
+ * `http://localhost:5173`) relies on. */
+const HTTP_ORIGIN_ALLOWED_HOSTS = new Set(["localhost", "127.0.0.1"]);
 
 /** Validates `CONSOLE_ORIGIN` at startup: a value that could never equal a browser's `Origin`
  * header (no scheme, a path, a trailing slash) is a configuration error, not a setting the
- * listener silently starts with anyway and then rejects every login and mutation against. */
+ * listener silently starts with anyway and then rejects every login and mutation against. An
+ * `http:` origin is refused unless its host is a loopback address — the session cookie needs TLS
+ * everywhere else, and a misconfigured `http://` pointed at a real host would otherwise carry it
+ * in the clear. */
 export function assertConsoleOrigin(value: string): string {
-	if (!ORIGIN_SHAPE.test(value)) {
+	const match = ORIGIN_SHAPE.exec(value);
+	const scheme = match?.[1];
+	const hostAndPort = match?.[2];
+	if (scheme === undefined || hostAndPort === undefined) {
 		throw new Error(
 			`CONSOLE_ORIGIN '${value}' must be an origin like 'https://gateway.local' (scheme and host, no path)`,
+		);
+	}
+	if (scheme === "http" && !HTTP_ORIGIN_ALLOWED_HOSTS.has(hostAndPort.split(":")[0] ?? "")) {
+		throw new Error(
+			`CONSOLE_ORIGIN '${value}' must use 'https:' (the session cookie is '__Host-'/Secure); ` +
+				"'http:' is only allowed for 'http://localhost' or 'http://127.0.0.1'",
 		);
 	}
 	return value;

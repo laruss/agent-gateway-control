@@ -3,7 +3,10 @@ import {
 	ApiError,
 	checkSession,
 	fetchConsoleStatus,
+	getCsrfToken,
+	previewAgentChange,
 	setCsrfToken,
+	setUnauthorizedHandler,
 	signIn,
 	signOut,
 } from "./api-client.ts";
@@ -29,6 +32,7 @@ describe("api-client", () => {
 
 	afterEach(() => {
 		vi.unstubAllGlobals();
+		setUnauthorizedHandler(null);
 	});
 
 	describe("signIn", () => {
@@ -166,6 +170,135 @@ describe("api-client", () => {
 			);
 			await expect(fetchConsoleStatus()).rejects.toBeInstanceOf(Error);
 			await expect(fetchConsoleStatus()).rejects.not.toBeInstanceOf(ApiError);
+		});
+
+		it("reports a 401 to the registered unauthorized handler", async () => {
+			const handler = vi.fn();
+			setUnauthorizedHandler(handler);
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async () => new Response("unauthorized", { status: 401 })),
+			);
+			await expect(fetchConsoleStatus()).rejects.toBeInstanceOf(ApiError);
+			expect(handler).toHaveBeenCalledTimes(1);
+		});
+	});
+
+	describe("signOut", () => {
+		it("clears the CSRF token on 204", async () => {
+			setCsrfToken("held-token");
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async () => new Response(null, { status: 204 })),
+			);
+			await signOut();
+			expect(getCsrfToken()).toBeNull();
+		});
+
+		it("clears the CSRF token on 401 (already signed out)", async () => {
+			setCsrfToken("held-token");
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async () => new Response("unauthorized", { status: 401 })),
+			);
+			await signOut();
+			expect(getCsrfToken()).toBeNull();
+		});
+
+		it("leaves the CSRF token held on a 403 (the session is still valid server-side)", async () => {
+			setCsrfToken("held-token");
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async () => new Response("missing or invalid CSRF token", { status: 403 })),
+			);
+			await expect(signOut()).rejects.toBeInstanceOf(ApiError);
+			expect(getCsrfToken()).toBe("held-token");
+		});
+	});
+
+	describe("a stale CSRF token on a mutation", () => {
+		it("refreshes the token from a session check and retries once on a 403 naming CSRF, then succeeds", async () => {
+			setCsrfToken("stale-token");
+			let call = 0;
+			const fetchMock = vi.fn(async (_input: string, init?: RequestInit) => {
+				call += 1;
+				const method = init?.method ?? "GET";
+				if (call === 1) {
+					expect(method).toBe("DELETE");
+					expect(new Headers(init?.headers).get("X-CSRF-Token")).toBe("stale-token");
+					return new Response("missing or invalid CSRF token", { status: 403 });
+				}
+				if (call === 2) {
+					// The session check this retry performs.
+					expect(method).toBe("GET");
+					return jsonResponse({
+						authenticated: true,
+						csrfToken: "fresh-token",
+						expiresAt: "2031-01-01T00:00:00.000Z",
+					});
+				}
+				expect(method).toBe("DELETE");
+				expect(new Headers(init?.headers).get("X-CSRF-Token")).toBe("fresh-token");
+				return new Response(null, { status: 204 });
+			});
+			vi.stubGlobal("fetch", fetchMock);
+
+			await signOut();
+			expect(fetchMock).toHaveBeenCalledTimes(3);
+			expect(getCsrfToken()).toBeNull();
+		});
+
+		it("gives up after one retry if the 403 persists", async () => {
+			setCsrfToken("stale-token");
+			let call = 0;
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async (_input: string, init?: RequestInit) => {
+					call += 1;
+					const method = init?.method ?? "GET";
+					if (method === "GET") {
+						return jsonResponse({
+							authenticated: true,
+							csrfToken: "still-stale",
+							expiresAt: "2031-01-01T00:00:00.000Z",
+						});
+					}
+					return new Response("missing or invalid CSRF token", { status: 403 });
+				}),
+			);
+			await expect(signOut()).rejects.toMatchObject({ status: 403 });
+			// One original attempt, one session check, one retry — never a second retry.
+			expect(call).toBe(3);
+		});
+
+		it("does not retry a 403 that does not name CSRF (a foreign Origin, say)", async () => {
+			setCsrfToken("held-token");
+			const fetchMock = vi.fn(async () => new Response("origin not allowed", { status: 403 }));
+			vi.stubGlobal("fetch", fetchMock);
+			await expect(signOut()).rejects.toBeInstanceOf(ApiError);
+			expect(fetchMock).toHaveBeenCalledTimes(1);
+		});
+	});
+
+	describe("previewAgentChange", () => {
+		it("reports a 409 as a 'conflict' outcome, not a thrown ApiError", async () => {
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async () =>
+					jsonResponse(
+						{
+							error: "the active configuration changed since this change was prepared",
+							currentRevisionId: 9,
+						},
+						409,
+					),
+				),
+			);
+			const outcome = await previewAgentChange("director", {
+				baseRevisionId: 7,
+				changes: { displayName: "New name" },
+			});
+			expect(outcome).toEqual({ kind: "conflict", currentRevisionId: 9 });
 		});
 	});
 });

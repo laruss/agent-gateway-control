@@ -944,9 +944,10 @@ export const schemaCertifications = pgTable(
 
 /**
  * The owner's console session cookies (ADR-025): `token_hash` is the sha256 of the random token
- * the cookie carries, and `csrf_token_hash` is the sha256 of the token returned to the client for
- * the `X-CSRF-Token` header — the raw value of neither is ever stored. `password_hash_fingerprint`
- * is a sha256 of the Argon2id hash file's own content at session creation; a password rotation
+ * the cookie carries — the raw value is never stored. `csrf_token_hash` is unused: the CSRF token
+ * is derived from the session's own raw token on every check instead, never stored at all (see
+ * the column's own comment below). `password_hash_fingerprint` is a sha256 of the Argon2id hash
+ * file's own content at session creation; a password rotation
  * changes that content, so every session bound to the old hash stops matching it on its next
  * request even without a database write (`gateway console password set` also revokes rows
  * directly when it has database access). A session is valid only while `revoked_at` is null,

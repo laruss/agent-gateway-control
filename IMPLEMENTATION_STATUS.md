@@ -2000,25 +2000,30 @@ Status: **done** (creating and deleting an agent, and the Skills/Instruments & u
 | `commit`'s outcomes: `200` (including an idempotency-key replay), `409` with the current revision id on a stale base, `422` with problems for anything invalid (caught at preview time or only at commit time, e.g. a run-in-progress disable protection) | done | `packages/core/src/services/console-management.ts` |
 | Every console commit carries `source: "console"`, `actor: "console:owner"` — distinguishable in `gateway config history` with no change to that command | done | `apps/cli/src/config-commands.ts` (unchanged), `packages/core/src/services/console-management.ts` |
 | The Agents list page (table: state, runtime/model, channel count, last run) and the agent editor (`/agents/:id`: Overview, Instructions, Runtime, Assignments, Permissions, History tabs) | done | `apps/console/src/routes/agents-list-page.tsx`, `agent-detail-page.tsx`, `agent-detail/*.tsx` |
-| Save flow: a local draft, a "Review changes" dialog showing the server's diff and an "impact" list requiring explicit confirmation before applying, a fresh idempotency key per apply, 409/422 handled with a reload-and-retry or inline problems respectively | done | `apps/console/src/routes/agent-detail/review-dialog.tsx` |
+| Save flow: a local draft (dirty fields only), a "Review changes" dialog showing the server's diff and an "impact" list requiring explicit confirmation before applying, a fresh idempotency key per apply, 409/422 handled with a reload-and-rebase or inline problems respectively | done | `apps/console/src/routes/agent-detail/review-dialog.tsx`, `rebase-draft.ts` |
 | New shadcn/ui components (table, tabs, select, switch, dialog, alert-dialog, sonner, scroll-area, textarea already or newly present) and a small app-level tag-list input for tool patterns and channels | done | `apps/console/src/components/ui/*.tsx`, `apps/console/src/components/tag-list-input.tsx` |
 | The Agents hub's two page components are code-split (`React.lazy`), loaded only once opened | done | `apps/console/src/App.tsx` |
 
 Acceptance:
 
 - [x] Listing, showing, previewing and committing an agent change are covered by a controller
-  integration test against a real PostgreSQL, including a stale base (`409`), two concurrent
-  edits (the second gets `409`), an idempotency-key replay, invalid bodies (an unknown field, an
+  integration test against a real PostgreSQL, including a stale base refused at preview time and
+  at commit time alike (`409`), the full scenario of a load followed by a `commitChange` (as a
+  CLI apply would make it) to the same agent leaving nothing overwritten, two concurrent edits
+  (the second gets `409`), an idempotency-key replay (including one retried after an unrelated,
+  intervening change to the same agent), clearing `runtime.model` back to its default, a retained
+  agent whose own configuration no longer validates falling back to `remove_agent` in both preview
+  and commit, that same agent excluded from the list, invalid bodies (an unknown field, an
   oversized role prompt, a protected field) at `400`, unauthenticated/missing-CSRF/foreign-Origin
   at `401`/`403`, and a disable of a running agent surfacing its protection error at `422`.
 - [x] A committed role-prompt change is visible in the `agents` projection immediately (the same
   column the scheduler's turn context reads from).
 - [x] Console component tests cover the save flow end to end against a mocked `fetch`: editing
-  the role prompt, the preview dialog showing its diff, applying with the preview's own base
-  revision and a fresh idempotency key, the 409 and 422 paths, and the unsaved-changes guard
-  (a confirm dialog on the page's own "back to Agents" action; `beforeunload` for the tab itself
-  — this app's router is a plain declarative one, not a data router, so a blanket `useBlocker`
-  is not available).
+  the role prompt, the preview dialog showing its diff, applying with the editor's own loaded base
+  revision (never one read back from the preview response) and a fresh idempotency key, the 409
+  and 422 paths, and the unsaved-changes guard (a confirm dialog on the page's own "back to
+  Agents" action; `beforeunload` for the tab itself — this app's router is a plain declarative
+  one, not a data router, so a blanket `useBlocker` is not available).
 - [x] Loaded in a real browser: sign in, open an agent, edit the role prompt, review and apply
   the change, see the new revision in its History tab, zero CSP violations.
 
@@ -2028,14 +2033,25 @@ Deliberate choices here ([ADR-025](docs/adr/025-management-console.md)):
   prompt, runtime, wake rules, allowed channels, the three tool lists, `observe_system`) — never
   the whole `AgentConfig` shape, and never the Mattermost identity, memory or concurrency, which
   have no tab yet.
-- Both preview and commit always build their change set from the agent's current live
-  definition, never a client-cached one, matching `prepareChange`'s own always-against-the-live-
-  revision contract; a stale client view is still caught correctly, because `commitChange`'s
-  conflict check compares the claimed base revision id against the current one independent of
-  what content was computed.
+- Preview and commit both require the request's `baseRevisionId` to equal the revision actually
+  active right now — the editor's own loaded view — refusing a mismatch with `409` and the
+  current revision id rather than computing a plan or a diff against the live state as if the
+  stale view were still current. Preview builds its plan from the agent's current live definition
+  once that equality is confirmed (matching `prepareChange`'s own always-against-the-live-revision
+  contract); commit instead builds it from the snapshot `baseRevisionId` itself names — immutable
+  and content-addressed, so a retry under the same idempotency key (the same `baseRevisionId`, the
+  same patch) always recomputes the identical change set regardless of what the live configuration
+  has become since, which is what lets `commitChange`'s own idempotency check replay it correctly
+  instead of seeing "the same key, a different change set" purely because an unrelated field had
+  moved on.
 - An agent's History tab scans the most recent 20 revisions for ones that touched it (one diff
   fetch per revision) rather than adding a per-agent history endpoint; older history stays
   reachable through `gateway config history`/`diff`.
+- The Agents hub's list reads the active configuration snapshot, the same source
+  `consoleShowAgent` reads a single agent's detail from, rather than the `agents` projection table
+  directly: a row retained, disabled, outside the active snapshot (the disable-with-fallback-to-
+  `remove_agent` path below) is consistently absent from both, instead of listed but 404ing when
+  opened.
 - `react-hook-form`/shadcn's `form` component was not added: every tab is a handful of plain
   controlled inputs, not a multi-field validated form, so the lighter existing pattern (plain
   `useState`, the same the sign-in page already uses) fit better than a new dependency.
