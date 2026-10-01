@@ -26,7 +26,10 @@ const FIELD_LABELS: Readonly<Record<FieldKey, string>> = {
 	permissions: "permissions",
 };
 
-function deepEqual(a: unknown, b: unknown): boolean {
+/** Structural equality, recursing into plain objects and arrays alike. Exported for
+ * `review-dialog.tsx`'s own staleness check (comparing a captured draft snapshot against the
+ * live draft prop), not only for this module's own field-by-field rebase. */
+export function deepEqual(a: unknown, b: unknown): boolean {
 	if (a === b) {
 		return true;
 	}
@@ -99,4 +102,18 @@ export function rebaseDraft(
 		}
 	}
 	return { rebased, discardedFields };
+}
+
+/** `draft`, minus every field `applied` touched — `agent-detail-page.tsx`'s own `onApplied`
+ * handler uses this instead of discarding the whole draft once a commit succeeds: `applied` is
+ * the snapshot `review-dialog.tsx` actually reviewed and committed, which by the time the commit
+ * resolves may no longer be the whole of `draft` (dismissal is blocked while applying, but this
+ * does not assume that holds forever) — a field edited after that snapshot was taken stays in the
+ * draft, rather than being discarded along with everything that really did get committed. */
+export function clearAppliedFields(draft: AgentPatch, applied: AgentPatch): AgentPatch {
+	const next = { ...draft };
+	for (const key of Object.keys(applied) as FieldKey[]) {
+		delete next[key];
+	}
+	return next;
 }

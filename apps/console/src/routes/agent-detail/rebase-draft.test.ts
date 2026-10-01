@@ -1,6 +1,6 @@
 import type { ConsoleAgentDetail } from "@agent-gateway/contracts";
 import { describe, expect, it } from "vitest";
-import { rebaseDraft } from "./rebase-draft.ts";
+import { clearAppliedFields, rebaseDraft } from "./rebase-draft.ts";
 
 function detail(overrides: Partial<ConsoleAgentDetail> = {}): ConsoleAgentDetail {
 	return {
@@ -78,5 +78,26 @@ describe("rebaseDraft", () => {
 		const { rebased, discardedFields } = rebaseDraft(previous, next, {});
 		expect(rebased).toEqual({});
 		expect(discardedFields).toEqual([]);
+	});
+});
+
+describe("clearAppliedFields", () => {
+	it("removes every field the applied patch touched", () => {
+		const draft = { rolePrompt: "New prompt.", displayName: "New name" };
+		expect(clearAppliedFields(draft, { rolePrompt: "New prompt." })).toEqual({
+			displayName: "New name",
+		});
+	});
+
+	it("leaves a field untouched that the applied patch never mentioned — e.g. edited after the reviewed snapshot was taken", () => {
+		const draft = { rolePrompt: "New prompt.", displayName: "Edited after the snapshot" };
+		expect(clearAppliedFields(draft, { rolePrompt: "New prompt." })).toEqual({
+			displayName: "Edited after the snapshot",
+		});
+	});
+
+	it("clears the whole draft when the applied patch is everything that was in it", () => {
+		const draft = { rolePrompt: "New prompt.", displayName: "New name" };
+		expect(clearAppliedFields(draft, draft)).toEqual({});
 	});
 });

@@ -607,6 +607,95 @@ describe("the Agents hub's management API (ADR-024/ADR-025)", () => {
 		expect(((withoutModel.body.agent as JsonBody).runtime as JsonBody).model).toBeUndefined();
 	});
 
+	it("a reused idempotency key with a different patch on the same agent is rejected, never replayed", async () => {
+		const { base } = await withServer();
+		const session = await signIn(base);
+		const baseRevisionId = await activeRevisionId(base, session.cookie);
+		const key = randomUUID();
+		const first = await postJson(base, `/api/agents/${AGENT_ID}/commit`, session, {
+			baseRevisionId,
+			changes: { rolePrompt: "The first patch committed under this key." },
+			idempotencyKey: key,
+		});
+		expect(first.status).toBe(200);
+
+		// Same key, same agent, but a different patch — as if a client bug (or a key collision)
+		// reused an idempotency key across two unrelated edits. The second must be rejected, not
+		// silently replayed with the first edit's result as if it had succeeded.
+		const reused = await postJson(base, `/api/agents/${AGENT_ID}/commit`, session, {
+			baseRevisionId,
+			changes: { displayName: "Reused key, unrelated patch" },
+			idempotencyKey: key,
+		});
+		expect(reused.status).toBe(422);
+		expect(reused.body.problems).toEqual(
+			expect.arrayContaining([expect.stringContaining("different change set")]),
+		);
+
+		const after = await getJson(base, `/api/agents/${AGENT_ID}`, session.cookie);
+		expect((after.body.agent as JsonBody).displayName).not.toBe("Reused key, unrelated patch");
+	});
+
+	it("a reused idempotency key for a different agent is rejected, never replayed", async () => {
+		const { base } = await withServer();
+		const session = await signIn(base);
+		const baseRevisionId = await activeRevisionId(base, session.cookie);
+		const key = randomUUID();
+		const otherAgentId = "finance";
+		const first = await postJson(base, `/api/agents/${AGENT_ID}/commit`, session, {
+			baseRevisionId,
+			changes: { rolePrompt: "The director's patch under this key." },
+			idempotencyKey: key,
+		});
+		expect(first.status).toBe(200);
+
+		const reused = await postJson(base, `/api/agents/${otherAgentId}/commit`, session, {
+			baseRevisionId,
+			changes: { rolePrompt: "A different agent, reusing the director's key." },
+			idempotencyKey: key,
+		});
+		expect(reused.status).toBe(422);
+		expect(reused.body.problems).toEqual(
+			expect.arrayContaining([expect.stringContaining("different change set")]),
+		);
+
+		const after = await getJson(base, `/api/agents/${otherAgentId}`, session.cookie);
+		expect((after.body.agent as JsonBody).rolePrompt).not.toBe(
+			"A different agent, reusing the director's key.",
+		);
+	});
+
+	it("N concurrent, identical commits write exactly once; every other one replays, none sees a false conflict", async () => {
+		const { base } = await withServer();
+		const session = await signIn(base);
+		const baseRevisionId = await activeRevisionId(base, session.cookie);
+		const body = {
+			baseRevisionId,
+			changes: { rolePrompt: "Submitted by several concurrent, identical requests." },
+			idempotencyKey: randomUUID(),
+		};
+		const concurrency = 10;
+		const results = await Promise.all(
+			Array.from({ length: concurrency }, () =>
+				postJson(base, `/api/agents/${AGENT_ID}/commit`, session, body),
+			),
+		);
+
+		for (const result of results) {
+			expect(result.status).toBe(200);
+		}
+		const revisionIds = new Set(results.map((result) => result.body.revisionId));
+		expect(revisionIds.size).toBe(1);
+		const replayedCount = results.filter((result) => result.body.replayed === true).length;
+		expect(replayedCount).toBe(concurrency - 1);
+
+		const count = await gateway.pool.query<{ count: string }>(
+			"select count(*)::text as count from config_revisions where idempotency_key = $1",
+			[body.idempotencyKey],
+		);
+		expect(count.rows[0]?.count).toBe("1");
+	});
+
 	describe("an agent retained outside the active configuration", () => {
 		it(
 			"falls back to remove_agent — reflected in preview's impact and executed by commit — " +

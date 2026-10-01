@@ -277,11 +277,13 @@ export type PreviewAgentOutcome =
 export async function previewAgentChange(
 	agentId: string,
 	body: ConsolePreviewRequest,
+	signal?: AbortSignal,
 ): Promise<PreviewAgentOutcome> {
 	const response = await request(`/api/agents/${encodeURIComponent(agentId)}/preview`, {
 		method: "POST",
 		headers: { "content-type": "application/json" },
 		body: JSON.stringify(body),
+		...(signal === undefined ? {} : { signal }),
 	});
 	if (response.status === 409) {
 		const parsed = ConflictBodySchema.parse(await response.json());

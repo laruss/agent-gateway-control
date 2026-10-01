@@ -24,7 +24,7 @@ import { HistoryTab } from "./agent-detail/history-tab.tsx";
 import { InstructionsTab } from "./agent-detail/instructions-tab.tsx";
 import { OverviewTab } from "./agent-detail/overview-tab.tsx";
 import { PermissionsTab } from "./agent-detail/permissions-tab.tsx";
-import { rebaseDraft } from "./agent-detail/rebase-draft.ts";
+import { clearAppliedFields, rebaseDraft } from "./agent-detail/rebase-draft.ts";
 import { ReviewChangesDialog } from "./agent-detail/review-dialog.tsx";
 import { RuntimeTab } from "./agent-detail/runtime-tab.tsx";
 import type { AgentDetailTabProps } from "./agent-detail/types.ts";
@@ -232,8 +232,8 @@ export function AgentDetailPage(): React.ReactElement {
 				baseRevisionId={agent.activeRevisionId}
 				draft={draft}
 				onReload={() => void handleReload()}
-				onApplied={() => {
-					setDraft({});
+				onApplied={(_revisionId, appliedPatch) => {
+					setDraft((current) => clearAppliedFields(current, appliedPatch));
 					void load();
 				}}
 			/>
