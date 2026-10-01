@@ -103,6 +103,27 @@ describe("console session store (ADR-025)", () => {
 		expect(await touchConsoleSession(pool, "token-hash-idle", pastIdle, FINGERPRINT)).toBeNull();
 	});
 
+	it("refuses a due touch whose session was revoked while the touch waited for its row", async () => {
+		const start = new Date("2031-01-05T00:00:00.000Z");
+		await createConsoleSession(pool, newSession("race"), start);
+		const due = new Date(start.getTime() + CONSOLE_SESSION_TOUCH_INTERVAL_MS + 1_000);
+		// A logout holding the row: the touch reads the still-unrevoked row, then waits on its write.
+		const revoker = await pool.connect();
+		try {
+			await revoker.query("begin");
+			await revoker.query(
+				"update console_sessions set revoked_at = $2, revoked_reason = 'logout' where token_hash = $1",
+				["token-hash-race", due],
+			);
+			const touch = touchConsoleSession(pool, "token-hash-race", due, FINGERPRINT);
+			await new Promise((resolve) => setTimeout(resolve, 200));
+			await revoker.query("commit");
+			expect(await touch).toBeNull();
+		} finally {
+			revoker.release();
+		}
+	});
+
 	it("expires absolutely even with continuous activity inside the idle window", async () => {
 		const start = new Date("2031-01-04T00:00:00.000Z");
 		await createConsoleSession(pool, newSession("abs"), start);

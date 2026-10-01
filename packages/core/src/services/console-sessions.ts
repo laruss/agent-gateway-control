@@ -82,6 +82,13 @@ export async function createConsoleSession(
 
 export type ConsoleSessionValid = Readonly<{ id: string; csrfTokenHash: string; expiresAt: Date }>;
 
+type SessionRow = Readonly<{
+	id: string;
+	csrf_token_hash: string;
+	expires_at: Date;
+	last_seen_at: Date;
+}>;
+
 /**
  * Validates a session by its token hash and slides its idle timeout. A request past
  * `expires_at`, more than `CONSOLE_SESSION_IDLE_MS` after the last one, already revoked, or
@@ -100,32 +107,37 @@ export async function touchConsoleSession(
 ): Promise<ConsoleSessionValid | null> {
 	const idleCutoff = new Date(now.getTime() - CONSOLE_SESSION_IDLE_MS);
 	const touchThreshold = new Date(now.getTime() - CONSOLE_SESSION_TOUCH_INTERVAL_MS);
-	const result = await pool.query<{
-		id: string;
-		csrf_token_hash: string;
-		expires_at: Date;
-		last_seen_at: Date;
-	}>(
-		`select id, csrf_token_hash, expires_at, last_seen_at
-		   from console_sessions
-		  where token_hash = $1
-		    and revoked_at is null
-		    and expires_at > $2
-		    and last_seen_at > $3
-		    and password_hash_fingerprint = $4`,
-		[tokenHash, now, idleCutoff, passwordHashFingerprint],
-	);
-	const row = result.rows[0];
+	const select = () =>
+		pool.query<SessionRow>(
+			`select id, csrf_token_hash, expires_at, last_seen_at
+			   from console_sessions
+			  where token_hash = $1
+			    and revoked_at is null
+			    and expires_at > $2
+			    and last_seen_at > $3
+			    and password_hash_fingerprint = $4`,
+			[tokenHash, now, idleCutoff, passwordHashFingerprint],
+		);
+	const row = (await select()).rows[0];
 	if (row === undefined) {
 		return null;
 	}
 	if (new Date(row.last_seen_at).getTime() < touchThreshold.getTime()) {
-		// Guarded by the same staleness check it was just read under: a concurrent touch that
-		// already slid this past the threshold makes this a no-op instead of a second write.
-		await pool.query(
-			"update console_sessions set last_seen_at = $2 where id = $1 and last_seen_at < $3",
-			[row.id, now, touchThreshold],
+		// The write re-checks validity under the row lock: a logout, password rotation or cap
+		// eviction committed while it waited leaves nothing to update. A concurrent touch that
+		// already slid this past the threshold does too; the re-read below tells the two apart.
+		const touched = await pool.query(
+			`update console_sessions set last_seen_at = $2
+			  where id = $1
+			    and last_seen_at < $3
+			    and revoked_at is null
+			    and expires_at > $2
+			    and password_hash_fingerprint = $4`,
+			[row.id, now, touchThreshold, passwordHashFingerprint],
 		);
+		if (touched.rowCount === 0 && (await select()).rows[0] === undefined) {
+			return null;
+		}
 	}
 	return { id: row.id, csrfTokenHash: row.csrf_token_hash, expiresAt: new Date(row.expires_at) };
 }
