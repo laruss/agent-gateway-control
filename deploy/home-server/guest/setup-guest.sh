@@ -87,5 +87,27 @@ WantedBy=multi-user.target docker.service
 UNIT
 systemctl daemon-reload
 systemctl enable --now avahi-daemon agw-mdns-alias agw-mdns-alias-gateway agw-egress-firewall
-systemctl restart agw-mdns-alias agw-mdns-alias-gateway agw-egress-firewall
+systemctl restart agw-egress-firewall
+# `netplan apply` above makes avahi-daemon restart on its own, a moment later: an avahi-publish
+# started in that moment attaches to the daemon on its way out and then stays running without
+# a record. Restart the daemon here, wait for it, then (re)start the aliases, and check each name
+# resolves before reporting success.
+systemctl restart avahi-daemon
+for _ in $(seq 1 20); do
+	avahi-daemon --check 2>/dev/null && break
+	sleep 0.5
+done
+systemctl restart agw-mdns-alias agw-mdns-alias-gateway
+for name in "$MDNS_NAME" "$GATEWAY_MDNS_NAME"; do
+	resolved=
+	for _ in $(seq 1 15); do
+		resolved=$(timeout 3 avahi-resolve -4 -n "$name" 2>/dev/null | awk '{print $2}') || true
+		[ "$resolved" = "$address" ] && break
+		sleep 1
+	done
+	[ "$resolved" = "$address" ] || {
+		echo "$name does not resolve to $address over mDNS; check: journalctl -u avahi-daemon" >&2
+		exit 1
+	}
+done
 echo "LAN address $LAN_ADDRESS, mDNS $MDNS_NAME and $GATEWAY_MDNS_NAME, egress firewall loaded"
