@@ -1,7 +1,7 @@
 import type { ConsoleSnapshot } from "@agent-gateway/contracts";
 import { useQuery } from "@tanstack/react-query";
 import { fetchConsoleStatus } from "@/lib/api-client";
-import { isUnauthorized, useSession } from "@/lib/session-context";
+import { useSession } from "@/lib/session-context";
 
 /** The console's own status refresh cycle (ADR-023/025): the same 15 s the controller's cache
  * and the old server-rendered page both used. TanStack Query is the right tool here over a bare
@@ -12,19 +12,12 @@ import { isUnauthorized, useSession } from "@/lib/session-context";
 const STATUS_POLL_MS = 15_000;
 
 export function useConsoleStatus() {
-	const { state, reportUnauthorized } = useSession();
+	const { state } = useSession();
 	return useQuery<ConsoleSnapshot>({
 		queryKey: ["console-status"],
-		queryFn: async () => {
-			try {
-				return await fetchConsoleStatus();
-			} catch (error) {
-				if (isUnauthorized(error)) {
-					reportUnauthorized();
-				}
-				throw error;
-			}
-		},
+		// A 401 reaches the session through the API client, which ignores one from a request that
+		// started under an earlier session.
+		queryFn: fetchConsoleStatus,
 		// Never polls before the session is actually confirmed signed-in: there is nothing to show
 		// yet (the overview page only ever renders behind `ProtectedLayout`), and polling anyway
 		// would spend a request per interval that could only ever come back 401.

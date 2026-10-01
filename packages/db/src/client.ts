@@ -25,6 +25,9 @@ export type PoolTimeouts = Readonly<{
 	connectionTimeoutMs?: number;
 	/** Bounds each statement server-side (`SET statement_timeout`). */
 	statementTimeoutMs?: number;
+	/** Bounds each query client-side: a server that stops answering mid-query fails within this,
+	 * which a server-side timeout cannot guarantee. */
+	queryTimeoutMs?: number;
 }>;
 
 export function createPool(connectionString: string, max = 10, timeouts?: PoolTimeouts): pg.Pool {
@@ -37,6 +40,7 @@ export function createPool(connectionString: string, max = 10, timeouts?: PoolTi
 		...(timeouts?.statementTimeoutMs === undefined
 			? {}
 			: { statement_timeout: timeouts.statementTimeoutMs }),
+		...(timeouts?.queryTimeoutMs === undefined ? {} : { query_timeout: timeouts.queryTimeoutMs }),
 	});
 }
 

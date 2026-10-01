@@ -195,7 +195,7 @@ export function ReviewChangesDialog({
 
 	return (
 		<Dialog open={open} onOpenChange={handleOpenChange}>
-			<DialogContent className="max-w-2xl">
+			<DialogContent className="flex max-h-[90dvh] max-w-2xl flex-col">
 				<DialogHeader>
 					<DialogTitle>Review changes</DialogTitle>
 					<DialogDescription>
@@ -254,7 +254,7 @@ export function ReviewChangesDialog({
 				)}
 
 				{preview !== null && (
-					<ScrollArea className="max-h-96">
+					<ScrollArea className="min-h-0 flex-1">
 						<div className="flex flex-col gap-3 pr-4">
 							{preview.noop && (
 								<Alert>

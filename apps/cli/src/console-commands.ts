@@ -198,6 +198,7 @@ export async function revokeConsoleSessionsAfterRotation(
 	const pool = createPool(databaseUrl, 1, {
 		connectionTimeoutMs: SESSION_REVOCATION_TIMEOUT_MS,
 		statementTimeoutMs: SESSION_REVOCATION_TIMEOUT_MS,
+		queryTimeoutMs: SESSION_REVOCATION_TIMEOUT_MS,
 	});
 	try {
 		const revoked = await revokeAllConsoleSessions(pool, "password_rotated", new Date());
