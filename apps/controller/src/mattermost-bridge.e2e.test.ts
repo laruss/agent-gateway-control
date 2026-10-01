@@ -255,6 +255,25 @@ describe("Mattermost bridge against a real server", () => {
 		});
 	};
 
+	/**
+	 * Holds the row lock a channel grant takes (`gateway_controls`, ADR-022) for `work`: the live
+	 * membership synchronizer cannot turn a membership `work` adds into a grant before `work` is
+	 * done examining it, since granting takes this same row for update and waits behind it. Reads
+	 * (reconcile among them) are not blocked by it.
+	 */
+	const withGrantsBlocked = async <T>(work: () => Promise<T>): Promise<T> => {
+		const client = await gateway.pool.connect();
+		try {
+			await client.query("begin");
+			await client.query("insert into gateway_controls (id) values (1) on conflict do nothing");
+			await client.query("select id from gateway_controls where id = 1 for update");
+			return await work();
+		} finally {
+			await client.query("rollback");
+			client.release();
+		}
+	};
+
 	/** Give routing a moment, then prove nothing ran. */
 	const settle = () => Bun.sleep(3000);
 
@@ -338,14 +357,20 @@ describe("Mattermost bridge against a real server", () => {
 			display_name: "unmanaged-room",
 			type: "P",
 		});
-		await mmApi("POST", `channels/${String(random.id)}/members`, mm.adminToken, {
-			user_id: developerId,
+		// Blocked against the live membership synchronizer (it polls every second here): the admin
+		// who added this bot is also an owner-equivalent add under ADR-022, and without the block
+		// the synchronizer could grant the channel, and bring the listener into it, before this
+		// checks it is still an unmanaged, unauthorized membership.
+		await withGrantsBlocked(async () => {
+			await mmApi("POST", `channels/${String(random.id)}/members`, mm.adminToken, {
+				user_id: developerId,
+			});
+			expect([...(await reconcile())].sort()).toEqual([
+				"developer: has admin rights in channel 'hq'",
+				"developer: has admin rights in channel 'town-square'",
+				"developer: member of channel 'unmanaged-room' it is not allowed in",
+			]);
 		});
-		expect([...(await reconcile())].sort()).toEqual([
-			"developer: has admin rights in channel 'hq'",
-			"developer: has admin rights in channel 'town-square'",
-			"developer: member of channel 'unmanaged-room' it is not allowed in",
-		]);
 		await bootstrap(deps);
 		expect(await reconcile()).toEqual([]);
 

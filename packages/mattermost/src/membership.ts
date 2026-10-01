@@ -236,6 +236,22 @@ async function judgeAdd(pass: BotPass, channel: ApiChannel, add: ApiPost): Promi
 		});
 		return;
 	}
+	// Recorded before the listener joins: no one reading the grants can ever see the listener a
+	// member of a channel its own grant does not cover yet (reconcile included).
+	pending.delete(key);
+	const granted = await options.store.grant({
+		agentId: bot.agentId,
+		botUserId: bot.userId,
+		teamId: state.teamId,
+		channelId: channel.id,
+		channelName: channel.name,
+		grantorUserId: add.user_id,
+		evidencePostId: add.id,
+		sinceMs: add.create_at,
+	});
+	if (!granted) {
+		return;
+	}
 	// The agent's own bot brings the listener in: a plain member may add members by default, so
 	// no admin credential is needed.
 	if (!(await client.isChannelMember(channel.id, state.listener.userId))) {
@@ -256,22 +272,30 @@ async function judgeAdd(pass: BotPass, channel: ApiChannel, add: ApiPost): Promi
 			return;
 		}
 	}
-	pending.delete(key);
-	const granted = await options.store.grant({
-		agentId: bot.agentId,
-		botUserId: bot.userId,
-		teamId: state.teamId,
-		channelId: channel.id,
-		channelName: channel.name,
-		grantorUserId: add.user_id,
-		evidencePostId: add.id,
-		sinceMs: add.create_at,
-	});
-	if (!granted) {
-		return;
-	}
 	options.log.info("channel granted", { agent_id: bot.agentId, channel_id: channel.id });
 	await routeMentions(pass, channel.id, add.create_at);
+}
+
+/**
+ * Self-heals a granted channel the listener fell out of: a transient failure right after the
+ * grant was recorded, or a restart between recording it and the join. Checked on every pass for
+ * every active grant, so a failure here is only logged (the next pass tries again), never fatal
+ * to the rest of the bot's channels.
+ */
+async function ensureListenerIn(pass: BotPass, channel: ApiChannel): Promise<void> {
+	const { options, state, client } = pass;
+	// Never throws: a failure here is retried on the next pass and must not stop the rest of it.
+	try {
+		if (await client.isChannelMember(channel.id, state.listener.userId)) {
+			return;
+		}
+		await client.addChannelMember(channel.id, state.listener.userId);
+	} catch (error) {
+		options.log.warn("the listener could not be added to a granted channel", {
+			channel_id: channel.id,
+			...errorFields(error),
+		});
+	}
 }
 
 /**
@@ -374,6 +398,10 @@ async function syncBot(pass: BotPass): Promise<void> {
 					return;
 				}
 			}
+			// Every pass, not only the one that recorded the grant, and only once the grant has held
+			// up: a transient failure right after granting, or a restart in between, left the
+			// listener out with no other chance to bring it back in.
+			await ensureListenerIn(pass, channel);
 			await routeMentions(pass, grant.channelId, Math.max(grant.sinceMs, after - SCAN_OVERLAP_MS));
 			// By Mattermost's own clock: the newest post read, a little back. The controller's clock
 			// may run ahead of the server's, and posts are dated by the server.
