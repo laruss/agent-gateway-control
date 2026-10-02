@@ -8,7 +8,13 @@ import type pg from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { applyConfig, configSnapshotBundle, inTransaction } from "./admin.ts";
 import type { ControlPlaneDeps } from "./deps.ts";
-import { commitChange, loadActiveBundle } from "./management.ts";
+import {
+	activeConfigRevisionId,
+	commitChange,
+	dropAttachmentsToUnknownEntriesIn,
+	loadActiveBundle,
+	prepareChange,
+} from "./management.ts";
 import {
 	attachTool,
 	deleteCatalogEntry,
@@ -351,8 +357,11 @@ describe("tool catalog service (ADR-027)", () => {
 					agents: attachBundle.agents,
 					constitution: attachBundle.constitution,
 					rolePrompts: attachBundle.rolePrompts,
-					toolAttachments: attachBundle.toolAttachments,
 				}),
+				// The attachments document is a sibling field of the operation, not part of `bundle`
+				// itself (ADR-027): omitting it would carry the *current* (detached) state
+				// forward instead of restoring what this rollback actually means to restore.
+				toolAttachments: attachBundle.toolAttachments,
 			},
 		];
 		const rolledBack = await commitChange(deps, {
@@ -395,6 +404,61 @@ describe("tool catalog service (ADR-027)", () => {
 		).resolves.toMatchObject({ noop: false });
 	});
 
+	/** Whether `error`, or anything in its `cause` chain, is Postgres's own "deadlock detected" —
+	 * the same helper `agent-lifecycle.integration.test.ts` uses for its own lock-order races. */
+	function isDeadlock(error: unknown): boolean {
+		for (let current: unknown = error; current instanceof Error; current = current.cause) {
+			if (/deadlock detected/i.test(current.message)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	it("deleteCatalogEntry racing a concurrent attach never deadlocks (lock order: gateway_controls, then catalog_entries)", async () => {
+		// `deleteCatalogEntry` now locks `gateway_controls` before `catalog_entries`, the same order
+		// every configuration writer keeps (`commitChangeIn`'s own first lock) — taking
+		// `catalog_entries` first, as an earlier version did, risked a deadlock (40P01) against a
+		// concurrent `attach_tool`/`update_attachment` commit, which always reaches for
+		// `gateway_controls` first through `commitChangeIn`. A deleted built-in is tombstoned
+		// forever (never reseeded), so each iteration below deletes a distinct one — never one an
+		// earlier or later test in this file still needs fresh — racing the attach against a fixed
+		// entry ("native-repository-read") none of them ever is.
+		const toDelete = [
+			"native-tests-run",
+			"native-web-fetch",
+			"native-web-search",
+			"native-workspace-write",
+		];
+		for (const entryId of toDelete) {
+			const deleting = deleteCatalogEntry(deps, entryId, "test");
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			const results = await Promise.allSettled([
+				deleting,
+				attachTool(deps, {
+					agentId: "alpha",
+					entryId: "native-repository-read",
+					pinnedVersion: null,
+					mode: "allow",
+					settings: {},
+					actor: "test",
+					source: "console",
+				}),
+			]);
+			for (const result of results) {
+				if (result.status === "rejected") {
+					expect(isDeadlock(result.reason)).toBe(false);
+				}
+			}
+			await detachTool(deps, {
+				agentId: "alpha",
+				entryId: "native-repository-read",
+				actor: "test",
+				source: "console",
+			});
+		}
+	});
+
 	it("refuses attaching an entry that does not exist, and a pinned version that does not exist", async () => {
 		await expect(
 			attachTool(deps, {
@@ -418,5 +482,98 @@ describe("tool catalog service (ADR-027)", () => {
 				source: "console",
 			}),
 		).rejects.toThrow(/has no version 9/);
+	});
+
+	it("a direct commitChange naming a nonexistent catalog entry is refused, not only attachTool's own checkAttachable", async () => {
+		// `config import`/a direct `commitChange` (a console patch, say) never calls `checkAttachable`
+		// at all; the shared commit boundary (`attachmentCatalogProblems`) must refuse it on its own.
+		const revisionId = await activeConfigRevisionId(deps);
+		const { bundle } = await inTransaction(deps, ({ tx }) => loadActiveBundle(tx.db, revisionId));
+		if (bundle.organization === null) {
+			throw new Error("expected an organization");
+		}
+		const changeSet = [
+			{
+				type: "replace_bundle" as const,
+				bundle: configSnapshotBundle({
+					organization: bundle.organization,
+					agents: bundle.agents,
+					constitution: bundle.constitution,
+					rolePrompts: bundle.rolePrompts,
+				}),
+				toolAttachments: {
+					alpha: [
+						{ entryId: "ghost-entry", pinnedVersion: null, mode: "allow" as const, settings: {} },
+					],
+				},
+			},
+		];
+		await expect(
+			commitChange(deps, {
+				changeSet,
+				baseRevisionId: revisionId,
+				actor: "test",
+				source: "import",
+			}),
+		).rejects.toThrow(/ghost-entry.*does not exist/);
+		// `prepareChange` (`config diff`) reports the exact same problem, read-only.
+		const preview = await prepareChange(deps, changeSet);
+		expect(preview.problems.some((p) => /ghost-entry.*does not exist/.test(p))).toBe(true);
+	});
+
+	it("rolling back to a revision that attached a since-deleted entry drops it instead of FK-failing or resurrecting it", async () => {
+		const attach = await attachTool(deps, {
+			agentId: "alpha",
+			entryId: "gateway-memory-write",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "console",
+		});
+		await deleteCatalogEntry(deps, "gateway-memory-write", "test");
+
+		// The entry's own row still exists (soft-deleted), so inserting a `catalog_attachments` row
+		// for it on rollback no longer fails on a foreign key — but the rollback must still not
+		// silently bring the deleted capability back.
+		const { bundle: attachBundle } = await inTransaction(deps, ({ tx }) =>
+			loadActiveBundle(tx.db, attach.revisionId),
+		);
+		if (attachBundle.organization === null) {
+			throw new Error("expected an organization");
+		}
+		const { toolAttachments: filtered, dropped } = await inTransaction(deps, ({ tx }) =>
+			dropAttachmentsToUnknownEntriesIn(tx.db, attachBundle.toolAttachments),
+		);
+		expect(dropped).toEqual([{ agentId: "alpha", entryId: "gateway-memory-write" }]);
+		const revisionId = await activeConfigRevisionId(deps);
+		const changeSet = [
+			{
+				type: "replace_bundle" as const,
+				bundle: configSnapshotBundle({
+					organization: attachBundle.organization,
+					agents: attachBundle.agents,
+					constitution: attachBundle.constitution,
+					rolePrompts: attachBundle.rolePrompts,
+				}),
+				toolAttachments: filtered,
+			},
+		];
+		const rolledBack = await commitChange(deps, {
+			changeSet,
+			baseRevisionId: revisionId,
+			actor: "test",
+			source: "rollback",
+		});
+		const { bundle: rolledBackBundle } = await inTransaction(deps, ({ tx }) =>
+			loadActiveBundle(tx.db, rolledBack.revisionId),
+		);
+		expect(rolledBackBundle.toolAttachments.alpha).toEqual([]);
+		const row = (
+			await pool.query("select deleted_at from catalog_entries where id = $1", [
+				"gateway-memory-write",
+			])
+		).rows[0];
+		expect(row.deleted_at).not.toBeNull();
 	});
 });

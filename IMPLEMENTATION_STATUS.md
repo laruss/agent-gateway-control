@@ -2206,14 +2206,17 @@ and `custom_https` definitions are later work)
 
 | Item | State | Evidence |
 |------|-------|----------|
-| Catalog entry/version/attachment contracts: `kind` (`native`/`gateway`/`executor`, `custom_https` reserved), immutable `implementationKey`, bounded `configSchema`/`settings`, `riskFloor`, `supportedAdapters`, `ToolAttachment` (`entryId`/`pinnedVersion`/`mode`/`settings`) | done | `packages/contracts/src/tool-catalog.ts` |
-| `ConfigSnapshotBundle.toolAttachments` (defaults to `{}`), four new change operations (`attach_tool`/`detach_tool`/`update_attachment`/`clear_tool_attachments`), a `toolAttachmentsChangedAgentIds` diff field | done | `packages/contracts/src/management.ts` |
-| Schema: `catalog_entries`, `catalog_entry_versions` (append-only — migration `0029` guards it), `catalog_attachments` (the bundle's current-state projection), `catalog_entry_tombstones` | done | `packages/db/src/schema.ts`, migrations `0028_tool_catalog`/`0029_tool_catalog_guards` |
+| Catalog entry/version/attachment contracts: `kind` (`native`/`gateway`/`executor`, `custom_https` reserved), immutable `implementationKey`, bounded `configSchema`/`settings`, `riskFloor`, `supportedAdapters`, `ToolAttachment` (`entryId`/`pinnedVersion`/`mode`/`settings`), `riskFloorAllows` | done | `packages/contracts/src/tool-catalog.ts` |
+| Attachments are their own content-addressed document (`ConfigAttachmentsSnapshotSchema`), named by a revision alongside its bundle (`attachmentsSnapshotHash`), never a `ConfigSnapshotBundle` field — an older release's own `strictObject` schema still parses every snapshot this release writes. `replace_bundle`/`add_agent` carry an optional sibling `toolAttachments` (omitted: carry forward unchanged; given, even `{}`/`[]`: replaces in full). A richer `ConfigDiff.toolAttachments` (added/removed/changed, per agent per entry, naming which fields changed) | done | `packages/contracts/src/management.ts` |
+| Schema: `catalog_entries` (`deleted_at`/`deleted_by`: deleting marks, never removes, the row), `catalog_entry_versions` (append-only — migration `0029` guards it), `catalog_attachments` (the active revision's current-state projection), `catalog_entry_tombstones`, `config_attachment_snapshots` (append-only — migration `0031` guards it) | done | `packages/db/src/schema.ts`, migrations `0028_tool_catalog`/`0029_tool_catalog_guards`/`0030_config_attachment_snapshots`/`0031_config_attachment_snapshots_guards` |
 | `ensureToolCatalogSeeded`: idempotent, seeds every built-in this release ships, never re-adds a tombstoned one; run at controller startup and every CLI session | done | `packages/core/src/services/tool-catalog.ts`, `apps/controller/src/controller.ts`, `apps/cli/src/commands.ts` |
-| `legacyAttachmentsFromPermissions` (pure) and `loadAllAgentToolAttachments`/`loadAgentToolAttachments`: a hub-managed agent's recorded attachments, or a legacy agent's `permissions` converted on the fly against entries known right now, with unresolved patterns kept visible | done | `packages/core/src/services/tool-catalog.ts` |
-| `listCatalogEntries`/`getCatalogEntry` (availability computed from a caller-supplied context, never stored), `listCatalogEntryVersions`, `editCatalogEntry` (a new version; a built-in's `configSchema`/`riskFloor`/`supportedAdapters` refused), `deleteCatalogEntry` (every attachment cleared atomically, a tombstone for a built-in), `attachTool`/`detachTool`/`updateAttachment` (through `commitChange`, a risk-floor check before attaching `allow`) | done | `packages/core/src/services/tool-catalog.ts` |
-| `writeConfigRevisionIn` reconciles `catalog_attachments` to the committed bundle on every write, the same way it reconciles `agents` | done | `packages/core/src/services/admin.ts` (`reconcileCatalogAttachmentsIn`) |
-| `gateway config export`/`import` round-trip `tool-attachments.json`, optional (an export from before this phase, or a hand-written directory, has none and converts to `{}`); `config rollback` carries the target revision's own attachments forward | done | `apps/cli/src/config-files.ts`, `apps/cli/src/config-commands.ts` |
+| `legacyAttachmentsFromPermissions` (pure) and `loadAllAgentToolAttachments`/`loadAgentToolAttachments`: a hub-managed agent's recorded attachments, or a legacy agent's `permissions` converted on the fly against entries known right now (deleted entries excluded), with unresolved patterns kept visible | done | `packages/core/src/services/tool-catalog.ts` |
+| `listCatalogEntries`/`getCatalogEntry` (deleted entries excluded; availability computed from a caller-supplied context, never stored), `listCatalogEntryVersions` (unfiltered — history stays readable), `editCatalogEntry` (every supplied field validated against its own contract schema before insert; a built-in's `configSchema`/`riskFloor`/`supportedAdapters` refused), `deleteCatalogEntry` (every attachment cleared atomically, the entry's own row marked deleted — never removed, so a historical rollback that once attached it never FK-fails — a tombstone for a built-in; `gateway_controls` locked before `catalog_entries`, matching every other writer's lock order), `attachTool`/`detachTool`/`updateAttachment` (through `commitChange`, a risk-floor check before attaching `allow`) | done | `packages/core/src/services/tool-catalog.ts` |
+| `attachmentCatalogProblems`: every attachment any write path commits (not only `attachTool`'s own `checkAttachable`) is checked — entry exists and is not deleted, pinned version exists, mode respects risk floor — at the shared `prepareChange`/`commitChangeIn` boundary | done | `packages/core/src/services/management.ts` |
+| `canonicalizeAttachments`: every agent's attachment list sorted by `entryId` once, right after a change set applies, before anything hashes or stores it — an untouched export/import round-trips to a no-op regardless of attach order | done | `packages/core/src/services/management.ts` |
+| `writeConfigRevisionIn` resolves and stores this revision's own attachments snapshot (carried forward or replaced — never derived from `bundle`) and reconciles `catalog_attachments` to it on every write, the same way it reconciles `agents`; `applyConfig`'s own `resolveApplyToolAttachments` carries attachments forward when no document was supplied | done | `packages/core/src/services/admin.ts` |
+| `dropAttachmentsToUnknownEntriesIn`: `config rollback` and `requestAgentRestore` each drop an attachment naming a catalog entry deleted since, reporting it (the rollback's own printed note; `RequestAgentRestoreResult.droppedAttachments`), rather than failing or resurrecting the capability | done | `packages/core/src/services/management.ts`, `apps/cli/src/config-commands.ts`, `packages/core/src/services/agent-lifecycle.ts` |
+| `gateway config export`/`import` round-trip `tool-attachments.json`, optional (an export from before this phase, or a hand-written directory, has none and carries existing attachments forward rather than clearing them); `config rollback` carries the target revision's own attachments forward, minus any dropped; `formatConfigDiff` renders every attachment change | done | `apps/cli/src/config-files.ts`, `apps/cli/src/config-commands.ts` |
 
 Not yet done: no console route or CLI command surfaces the catalog to an owner; no compilation of
 attachments into `permissions`/policy enforcement (deliberately deferred — ADR-027); `custom_https`
@@ -2224,15 +2227,24 @@ Acceptance:
 
 - [x] Unit: legacy conversion (exact match, wildcard expansion only against known entries,
   unresolved patterns kept, `tools_deny` to `disabled`, finance rules honoured), a built-in's
-  immutable fields refused on edit, availability computation (an unregistered executor action is
-  unavailable; a native capability needs an installed adapter; a gateway capability is always
-  available; `custom_https` never is).
+  immutable fields refused on edit, `editCatalogEntryInputProblems`'s own bounds, availability
+  computation (an unregistered executor action is unavailable; a native capability needs an
+  installed adapter; a gateway capability is always available; `custom_https` never is),
+  `replace_bundle`/`add_agent`'s attachments carry-forward-or-replace semantics, canonicalization
+  by `entryId`, a richer `configDiff` attachments list, a snapshot this release writes still parses
+  with 0.6.0's own pinned `ConfigSnapshotBundleSchema`.
 - [x] Integration: seeding is idempotent; a tombstoned built-in never returns across reseeding
   while the rest still do; editing publishes a new, immutable version with readable history (the
   guard trigger refuses a direct UPDATE/DELETE of a version row); deleting an entry removes every
-  agent's attachment of it in the same transaction as its tombstone; attach/detach/update each
-  commit a revision carrying their given source and are covered by rollback; an attachment
-  round-trips through `config export`/`import` losslessly at the same hash; a directory from
-  before this phase still imports, converting to no attachments rather than refusing.
+  agent's attachment of it in the same transaction as its tombstone, without deadlocking a
+  concurrent attach (lock order); a direct `commitChange`/`config import` is refused for an
+  attachment naming a nonexistent or deleted entry, not only through `attachTool`'s own check;
+  rolling back to a revision that attached a since-deleted entry drops it rather than FK-failing or
+  resurrecting it; attach/detach/update each commit a revision carrying their given source and are
+  covered by rollback; an attachment round-trips through `config export`/`import` losslessly at the
+  same hash, including when attached in a different order than export's own sort; a directory from
+  before this phase still imports, carrying existing attachments forward; retiring then restoring
+  an agent carries its last hub-managed attachments forward (including an explicitly empty list),
+  minus any naming a catalog entry deleted since.
 
 Not yet released; see the Changelog's `[Unreleased]` section.

@@ -33,6 +33,7 @@ import {
 import { listMemory } from "./memory.ts";
 import { handleRunReport } from "./runs.ts";
 import { recordWorkerStatus } from "./runtime-health.ts";
+import { attachTool, deleteCatalogEntry, ensureToolCatalogSeeded } from "./tool-catalog.ts";
 
 function organization(): OrganizationConfig {
 	return OrganizationConfigSchema.parse({
@@ -604,6 +605,107 @@ describe("agent lifecycle service (ADR-026)", () => {
 		const [row] = (await pool.query("select enabled from agents where id = 'kappa'")).rows;
 		expect(row.enabled).toBe(true);
 		expect(await activeConfigRevisionId(deps)).toBe(restored.revisionId);
+	});
+
+	it("restore carries the agent's last hub-managed attachments forward, including an explicitly empty list (ADR-027)", async () => {
+		await ensureToolCatalogSeeded(deps, "test");
+		const created = await requestAgentCreate(deps, createInput("mu"));
+		await markProvisioning(deps, created.operationId, "test");
+		await completeOperation(deps, created.operationId, "test");
+		await attachTool(deps, {
+			agentId: "mu",
+			entryId: "gateway-mattermost-post",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+		const retired = await requestAgentRetire(deps, { agentId: "mu", actor: "test", source: "cli" });
+		await markProvisioning(deps, retired.operationId, "test");
+		await completeOperation(deps, retired.operationId, "test");
+
+		const restored = await requestAgentRestore(deps, {
+			agentId: "mu",
+			actor: "test",
+			source: "cli",
+		});
+		expect(restored.droppedAttachments).toEqual([]);
+		const { bundle } = await inTransaction(deps, ({ tx }) =>
+			loadActiveBundle(tx.db, restored.revisionId),
+		);
+		expect(bundle.toolAttachments.mu).toEqual([
+			{ entryId: "gateway-mattermost-post", pinnedVersion: null, mode: "allow", settings: {} },
+		]);
+
+		// A second agent, explicitly cleared (hub-managed but empty) before it retires, is restored
+		// the same way: still hub-managed (a key of its own), just with nothing in it — never
+		// reverted to legacy (converted from `permissions`) on restore.
+		const createdNu = await requestAgentCreate(deps, createInput("nu"));
+		await markProvisioning(deps, createdNu.operationId, "test");
+		await completeOperation(deps, createdNu.operationId, "test");
+		const attach = await attachTool(deps, {
+			agentId: "nu",
+			entryId: "gateway-mattermost-post",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+		await commitChange(deps, {
+			changeSet: [{ type: "detach_tool", agentId: "nu", entryId: "gateway-mattermost-post" }],
+			baseRevisionId: attach.revisionId,
+			actor: "test",
+			source: "cli_apply",
+		});
+		const retiredNu = await requestAgentRetire(deps, {
+			agentId: "nu",
+			actor: "test",
+			source: "cli",
+		});
+		await markProvisioning(deps, retiredNu.operationId, "test");
+		await completeOperation(deps, retiredNu.operationId, "test");
+		const restoredNu = await requestAgentRestore(deps, {
+			agentId: "nu",
+			actor: "test",
+			source: "cli",
+		});
+		const { bundle: bundleNu } = await inTransaction(deps, ({ tx }) =>
+			loadActiveBundle(tx.db, restoredNu.revisionId),
+		);
+		expect(bundleNu.toolAttachments.nu).toEqual([]);
+	});
+
+	it("restore drops an attachment to a catalog entry deleted since retirement, reporting it rather than failing or resurrecting it (ADR-027)", async () => {
+		await ensureToolCatalogSeeded(deps, "test");
+		const created = await requestAgentCreate(deps, createInput("xi"));
+		await markProvisioning(deps, created.operationId, "test");
+		await completeOperation(deps, created.operationId, "test");
+		await attachTool(deps, {
+			agentId: "xi",
+			entryId: "gateway-memory-write",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+		const retired = await requestAgentRetire(deps, { agentId: "xi", actor: "test", source: "cli" });
+		await markProvisioning(deps, retired.operationId, "test");
+		await completeOperation(deps, retired.operationId, "test");
+		await deleteCatalogEntry(deps, "gateway-memory-write", "test");
+
+		const restored = await requestAgentRestore(deps, {
+			agentId: "xi",
+			actor: "test",
+			source: "cli",
+		});
+		expect(restored.droppedAttachments).toEqual([{ entryId: "gateway-memory-write" }]);
+		const { bundle } = await inTransaction(deps, ({ tx }) =>
+			loadActiveBundle(tx.db, restored.revisionId),
+		);
+		expect(bundle.toolAttachments.xi).toEqual([]);
 	});
 
 	it("restore migrates an adopted (bootstrap-managed) agent's token reference to the lifecycle provisioner's own path", async () => {

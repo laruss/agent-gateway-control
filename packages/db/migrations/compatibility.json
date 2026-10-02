@@ -31,7 +31,9 @@
     "0026_outbox_cancelled_status": "expand",
     "0027_lifecycle_retry_of": "expand",
     "0028_tool_catalog": "expand",
-    "0029_tool_catalog_guards": "expand"
+    "0029_tool_catalog_guards": "expand",
+    "0030_config_attachment_snapshots": "expand",
+    "0031_config_attachment_snapshots_guards": "expand"
   },
   "releases": [
     {

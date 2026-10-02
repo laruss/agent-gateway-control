@@ -23,6 +23,8 @@ import {
 	RequestOperationRetryInputSchema,
 	type RuntimeAdapterId,
 	type SecretFile,
+	type ToolAttachment,
+	ToolAttachmentsBundleSchema,
 	toolPatternsOverlap,
 } from "@agent-gateway/contracts";
 import {
@@ -49,6 +51,7 @@ import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
 import {
 	type CommitOutcome,
 	commitChangeIn,
+	dropAttachmentsToUnknownEntriesIn,
 	loadActiveBundle,
 	ManagementConflictError,
 } from "./management.ts";
@@ -639,6 +642,11 @@ export type RequestAgentRestoreResult = Readonly<{
 	operationId: string;
 	agentId: AgentId;
 	revisionId: number;
+	/** Entry ids the agent's last recorded attachments named that no longer exist (deleted since):
+	 * dropped from what was actually restored, rather than failing the restore or resurrecting a
+	 * retired capability (ADR-027). Empty when the agent was never hub-managed, or every
+	 * attachment it had still names a live entry. */
+	droppedAttachments: Readonly<{ entryId: string }[]>;
 }>;
 
 /**
@@ -649,15 +657,26 @@ export type RequestAgentRestoreResult = Readonly<{
  * ever `retiring`, whose own `remove_agent` commit is itself such a snapshot's parent — but an
  * upgrade from a release before configuration history existed may have lost it; see ADR-024), or
  * a found snapshot no longer parses (`ConfigSnapshotBundleSchema`).
+ *
+ * `toolAttachments` is that same revision's own attachments document (ADR-027), read from
+ * `config_attachment_snapshots` through the revision's `attachments_snapshot_hash` — `undefined`
+ * when the agent never had a key of its own there (legacy, never touched through the hub, the
+ * same distinction `loadAllAgentToolAttachments` makes), as opposed to `[]` (hub-managed, but
+ * explicitly cleared): `requestAgentRestore` carries this forward unchanged.
  */
 async function findLastConfiguredAgent(
 	uow: UnitOfWork,
 	agentId: string,
-): Promise<Readonly<{ agent: AgentConfig; rolePrompt: string }> | null> {
-	const result = await uow.tx.client.query<{ bundle: unknown }>(
-		`select s.bundle
+): Promise<Readonly<{
+	agent: AgentConfig;
+	rolePrompt: string;
+	toolAttachments: Readonly<ToolAttachment[]> | undefined;
+}> | null> {
+	const result = await uow.tx.client.query<{ bundle: unknown; attachments_bundle: unknown }>(
+		`select s.bundle, a.bundle as attachments_bundle
 		   from config_revisions r
 		   join config_snapshots s on s.hash = r.snapshot_hash
+		   left join config_attachment_snapshots a on a.hash = r.attachments_snapshot_hash
 		  where s.bundle -> 'agents' @> $1::jsonb
 		  order by r.id desc
 		  limit 1`,
@@ -673,7 +692,17 @@ async function findLastConfiguredAgent(
 	}
 	const agent = parsed.data.agents.find((candidate) => candidate.id === agentId);
 	const rolePrompt = parsed.data.rolePrompts[agentId];
-	return agent === undefined || rolePrompt === undefined ? null : { agent, rolePrompt };
+	if (agent === undefined || rolePrompt === undefined) {
+		return null;
+	}
+	let toolAttachments: Readonly<ToolAttachment[]> | undefined;
+	if (row.attachments_bundle !== null && row.attachments_bundle !== undefined) {
+		const parsedAttachments = ToolAttachmentsBundleSchema.safeParse(row.attachments_bundle);
+		if (parsedAttachments.success && Object.hasOwn(parsedAttachments.data, agentId)) {
+			toolAttachments = parsedAttachments.data[agentId];
+		}
+	}
+	return { agent, rolePrompt, toolAttachments };
 }
 
 const FINANCE_TOOLS = "finance.*";
@@ -758,6 +787,9 @@ export async function requestAgentRestore(
 					operationId: existing.id,
 					agentId: existing.agentId,
 					revisionId: existing.configRevisionId,
+					// Not recomputed for a replay: this exact restore already ran and already reported
+					// whatever it dropped the first time.
+					droppedAttachments: [],
 				};
 			}
 		}
@@ -811,7 +843,27 @@ export async function requestAgentRestore(
 			},
 			permissions,
 		};
-		const changeSet: ChangeSet = [{ type: "add_agent", agent, rolePrompt: historical.rolePrompt }];
+		// The agent's own last recorded attachments carry forward (ADR-027): present (even
+		// `[]`, hub-managed but cleared), minus any that named a catalog entry since deleted —
+		// dropped and reported rather than failing the restore or resurrecting a retired capability;
+		// absent (never hub-managed), the restored agent stays legacy, exactly as it was.
+		let droppedAttachments: { entryId: string }[] = [];
+		let toolAttachmentsForAdd: ToolAttachment[] | undefined;
+		if (historical.toolAttachments !== undefined) {
+			const { toolAttachments: filtered, dropped } = await dropAttachmentsToUnknownEntriesIn(db, {
+				[parsed.agentId]: [...historical.toolAttachments],
+			});
+			toolAttachmentsForAdd = filtered[parsed.agentId] ?? [];
+			droppedAttachments = dropped.map((entry) => ({ entryId: entry.entryId }));
+		}
+		const changeSet: ChangeSet = [
+			{
+				type: "add_agent",
+				agent,
+				rolePrompt: historical.rolePrompt,
+				...(toolAttachmentsForAdd === undefined ? {} : { toolAttachments: toolAttachmentsForAdd }),
+			},
+		];
 		if (makeFinanceAgent) {
 			// The role moves to the restored agent atomically; the agent it moves *from* must give up
 			// finance tools in the very same change set, or `validateConfigBundle`'s own finance rule
@@ -890,8 +942,14 @@ export async function requestAgentRestore(
 		await audit(uow, parsed.actor, "agent_lifecycle.restore", "agent", parsed.agentId, {
 			operation_id: operationId,
 			revision_id: commit.result.revisionId,
+			...(droppedAttachments.length === 0 ? {} : { dropped_attachments: droppedAttachments }),
 		});
-		return { operationId, agentId: parsed.agentId, revisionId: commit.result.revisionId };
+		return {
+			operationId,
+			agentId: parsed.agentId,
+			revisionId: commit.result.revisionId,
+			droppedAttachments,
+		};
 	});
 }
 

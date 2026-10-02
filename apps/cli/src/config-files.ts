@@ -21,8 +21,9 @@ export class ConfigFileError extends Error {
 
 /** Where `config export`/`config import` round-trip every agent's catalog attachments (ADR-027).
  * Optional: a directory from before this file existed (an older export, or hand-written YAML)
- * simply has none, and `loadConfigDirectory` reads that as `{}` — every agent legacy-converted
- * from its `permissions` instead, never silently dropped. */
+ * simply has none, and `loadConfigDirectory` leaves `toolAttachments` unresolved (`undefined`) —
+ * `config apply`'s own carry-forward semantics then apply (ADR-027): every agent's existing
+ * attachments stay exactly as they are, never silently cleared. */
 export const TOOL_ATTACHMENTS_FILE = "tool-attachments.json";
 
 /**
@@ -85,12 +86,15 @@ export function readPromptFile(root: string, promptPath: string): string {
 	return readFileSync(current, "utf8");
 }
 
-/** Reads `<dir>/tool-attachments.json`, or `{}` when the file does not exist (an export from
- * before ADR-027, or a hand-written directory that never had one). */
-function loadToolAttachments(dir: string): ToolAttachmentsBundle {
+/** Reads `<dir>/tool-attachments.json`, or `undefined` when the file does not exist (an export
+ * from before ADR-027, or a hand-written directory that never had one) — distinct from `{}` (the
+ * file exists and explicitly names no attachments for anyone), so `applyConfig`/`commitChange` can
+ * tell "no document supplied, carry forward" from "this document, which happens to be empty"
+ * (ADR-027). */
+function loadToolAttachments(dir: string): ToolAttachmentsBundle | undefined {
 	const path = join(dir, TOOL_ATTACHMENTS_FILE);
 	if (!existsSync(path)) {
-		return {};
+		return undefined;
 	}
 	let parsed: unknown;
 	try {

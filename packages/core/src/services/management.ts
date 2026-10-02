@@ -10,8 +10,10 @@ import {
 	type ChangeSet,
 	type ChangeSetInput,
 	ChangeSetSchema,
+	ConfigAttachmentsSnapshotSchema,
 	type ConfigDiff,
 	type ConfigDiffAgent,
+	type ConfigDiffAttachment,
 	ConfigRevisionReasonSchema,
 	type ConfigRevisionSource,
 	ConfigRevisionSourceSchema,
@@ -19,14 +21,19 @@ import {
 	IdempotencyKeySchema,
 	MAX_ATTACHMENTS_PER_AGENT,
 	type OrganizationConfig,
+	riskFloorAllows,
 	type TextChange,
 	type ToolAttachment,
 	type ToolAttachmentsBundle,
+	type ToolCatalogRiskFloor,
 } from "@agent-gateway/contracts";
 import {
 	agentLifecycle,
 	agentLifecycleOperations,
 	agents,
+	catalogEntries,
+	catalogEntryVersions,
+	configAttachmentSnapshots,
 	configRevisions,
 	configSnapshots,
 	gatewayControls,
@@ -84,10 +91,14 @@ function byAgentId(a: AgentConfig, b: AgentConfig): number {
 }
 
 /**
- * The canonical hash of a draft bundle, whether or not it is valid (an organization-less draft
- * hashes too, so `prepareChange` stays deterministic even for a change set that does not
- * validate). A valid draft's hash is identical to `canonicalHash(configSnapshotBundle(...))` of
- * the same content: the same field order and the same agent sort.
+ * The canonical hash of a draft bundle's configuration content alone, whether or not it is valid
+ * (an organization-less draft hashes too, so `prepareChange` stays deterministic even for a
+ * change set that does not validate). A valid draft's hash is identical to
+ * `canonicalHash(configSnapshotBundle(...))` of the same content: the same field order and the
+ * same agent sort. Deliberately excludes `toolAttachments`, which ADR-027 hashes and stores as its
+ * own, separate attachments snapshot — see `canonicalizeAttachments` and
+ * `commitChangeIn`'s own noop check, which compares that content directly rather than through a
+ * combined hash.
  */
 export function previewHash(draft: ConfigDraftBundle): string {
 	return canonicalHash({
@@ -95,8 +106,26 @@ export function previewHash(draft: ConfigDraftBundle): string {
 		agents: [...draft.agents].sort(byAgentId),
 		constitution: draft.constitution,
 		rolePrompts: { ...draft.rolePrompts },
-		toolAttachments: { ...draft.toolAttachments },
 	});
+}
+
+/**
+ * `toolAttachments`, with every agent's own attachment list sorted by `entryId` (ADR-027):
+ * applied once, right after a change set is applied (`applyChangeSet`), so every reader downstream
+ * — the diff, the noop comparison, the attachments snapshot actually hashed and stored — sees the
+ * same, order-independent content regardless of the order attachments happened to be attached in.
+ * Without this, an unrelated export/import round-trip (which writes `tool-attachments.json` with
+ * each agent's attachments already sorted) would hash to different content than what was actually
+ * stored, manufacturing a spurious new revision for a no-op import.
+ */
+export function canonicalizeAttachments(bundle: ToolAttachmentsBundle): ToolAttachmentsBundle {
+	const result: Record<string, ToolAttachment[]> = {};
+	for (const [agentId, attachments] of Object.entries(bundle)) {
+		result[agentId] = [...attachments].sort((a, b) =>
+			a.entryId < b.entryId ? -1 : a.entryId > b.entryId ? 1 : 0,
+		);
+	}
+	return result;
 }
 
 /**
@@ -151,20 +180,28 @@ type LoadedBundle = Readonly<{ bundle: ConfigDraftBundle; hash: string | null }>
  * The bundle behind `revisionId` (null: no revision has ever been recorded, the empty bundle a
  * fresh database starts from), read at the validated boundary: a stored snapshot that does not
  * parse as `ConfigSnapshotBundleSchema` fails clearly here rather than corrupting a change set
- * applied on top of it.
+ * applied on top of it. `toolAttachments` is read from this same revision's own, separate
+ * attachments snapshot (ADR-027) — `{}` when it names none (a revision recorded before that
+ * column existed, or one whose configuration has no agent ever touched through the hub) — and
+ * merged in, so every caller still gets one `ConfigDraftBundle` with both halves of this
+ * revision's actual content, exactly as before the two were split into separate tables.
  */
 export async function loadActiveBundle(db: Db, revisionId: number | null): Promise<LoadedBundle> {
 	if (revisionId === null) {
 		return { bundle: EMPTY_DRAFT_BUNDLE, hash: null };
 	}
 	const [revision] = await db
-		.select({ snapshotHash: configRevisions.snapshotHash })
+		.select({
+			snapshotHash: configRevisions.snapshotHash,
+			attachmentsSnapshotHash: configRevisions.attachmentsSnapshotHash,
+		})
 		.from(configRevisions)
 		.where(eq(configRevisions.id, revisionId));
 	if (revision === undefined) {
 		throw new AdminError(`config revision ${revisionId} does not exist`);
 	}
-	const cached = cachedSnapshot(revision.snapshotHash);
+	const cacheKey = `${revision.snapshotHash}\u0000${revision.attachmentsSnapshotHash ?? ""}`;
+	const cached = cachedSnapshot(cacheKey);
 	if (cached !== undefined) {
 		return { bundle: cached, hash: revision.snapshotHash };
 	}
@@ -185,8 +222,29 @@ export async function loadActiveBundle(db: Db, revisionId: number | null): Promi
 				.join("; ")}`,
 		);
 	}
-	const bundle = deepFreeze(parsed.data);
-	cacheSnapshot(revision.snapshotHash, bundle);
+	let toolAttachments: ToolAttachmentsBundle = {};
+	if (revision.attachmentsSnapshotHash !== null) {
+		const [attachmentsSnapshot] = await db
+			.select({ bundle: configAttachmentSnapshots.bundle })
+			.from(configAttachmentSnapshots)
+			.where(eq(configAttachmentSnapshots.hash, revision.attachmentsSnapshotHash));
+		if (attachmentsSnapshot === undefined) {
+			throw new AdminError(
+				`attachments snapshot '${revision.attachmentsSnapshotHash}' referenced by revision ${revisionId} does not exist`,
+			);
+		}
+		const parsedAttachments = ConfigAttachmentsSnapshotSchema.safeParse(attachmentsSnapshot.bundle);
+		if (!parsedAttachments.success) {
+			throw new AdminError(
+				`attachments snapshot '${revision.attachmentsSnapshotHash}' is malformed: ${parsedAttachments.error.issues
+					.map((issue) => `${issue.path.join(".")}: ${issue.message}`)
+					.join("; ")}`,
+			);
+		}
+		toolAttachments = parsedAttachments.data;
+	}
+	const bundle = deepFreeze({ ...parsed.data, toolAttachments });
+	cacheSnapshot(cacheKey, bundle);
 	return { bundle, hash: revision.snapshotHash };
 }
 
@@ -247,17 +305,33 @@ export type OperationResult = Readonly<{ draft: ConfigDraftBundle; problems: Rea
  */
 function applyOperation(draft: ConfigDraftBundle, op: ChangeOperation): OperationResult {
 	switch (op.type) {
-		case "replace_bundle":
+		case "replace_bundle": {
+			// `op.toolAttachments` omitted: no attachments document was supplied (a plain YAML
+			// directory, any caller that never resolved one) — every agent's existing attachments
+			// carry forward unchanged, filtered down to the agents this replace still configures
+			// (ADR-027: whole-bundle-replace semantics apply to the bundle, never silently to
+			// attachments, which change only when a document is actually given). Present (even `{}`):
+			// this *is* the new document, replacing whatever was there before in full.
+			const configuredAgentIds = new Set(op.bundle.agents.map((agent) => agent.id));
+			const toolAttachments =
+				op.toolAttachments === undefined
+					? Object.fromEntries(
+							Object.entries(draft.toolAttachments).filter(([agentId]) =>
+								configuredAgentIds.has(agentId),
+							),
+						)
+					: op.toolAttachments;
 			return {
 				draft: {
 					organization: op.bundle.organization,
 					agents: op.bundle.agents,
 					constitution: op.bundle.constitution,
 					rolePrompts: op.bundle.rolePrompts,
-					toolAttachments: op.bundle.toolAttachments,
+					toolAttachments,
 				},
 				problems: [],
 			};
+		}
 		case "set_constitution":
 			return { draft: { ...draft, constitution: op.constitution }, problems: [] };
 		case "update_agent": {
@@ -273,11 +347,20 @@ function applyOperation(draft: ConfigDraftBundle, op: ChangeOperation): Operatio
 			if (draft.agents.some((agent) => agent.id === op.agent.id)) {
 				return { draft, problems: [`add_agent: agent '${op.agent.id}' already exists`] };
 			}
+			// `op.toolAttachments` omitted: the agent starts legacy, with no attachments key of its
+			// own — a brand-new agent's long-standing behavior (`requestAgentCreate`). Present (even
+			// `[]`): it starts hub-managed with exactly this list — `requestAgentRestore`'s own
+			// carried-forward last attachments (ADR-027).
+			const toolAttachments =
+				op.toolAttachments === undefined
+					? draft.toolAttachments
+					: { ...draft.toolAttachments, [op.agent.id]: op.toolAttachments };
 			return {
 				draft: {
 					...draft,
 					agents: [...draft.agents, op.agent],
 					rolePrompts: { ...draft.rolePrompts, [op.agent.id]: op.rolePrompt },
+					toolAttachments,
 				},
 				problems: [],
 			};
@@ -424,7 +507,13 @@ export function applyChangeSet(base: ConfigDraftBundle, changeSet: ChangeSet): O
 		draft = result.draft;
 		problems.push(...result.problems);
 	}
-	return { draft, problems };
+	// Canonicalized once, here, so every reader of the result — the diff, the noop comparison, the
+	// attachments snapshot actually hashed and stored — agrees regardless of the order individual
+	// operations happened to attach things in (ADR-027; see `canonicalizeAttachments`).
+	return {
+		draft: { ...draft, toolAttachments: canonicalizeAttachments(draft.toolAttachments) },
+		problems,
+	};
 }
 
 /** Whole-bundle validation of a draft, the same `configBundleProblems` `applyConfig` uses. */
@@ -452,6 +541,163 @@ export function draftBundleProblems(draft: ConfigDraftBundle): string[] {
 		}
 	}
 	return problems;
+}
+
+// ---------------------------------------------------------------------------
+// Catalog constraints (ADR-027): checked against the database, so pure `draftBundleProblems`
+// cannot cover it. Called from every write path that commits a bundle (`prepareChange`,
+// `commitChangeIn`), closing the gap `attachTool`/`updateAttachment`'s own, earlier
+// `checkAttachable` left open for `config import`'s `replace_bundle` and a direct `commitChange` —
+// deliberately not from `previewChangeSetAgainst`, whose own doc comment requires it stay a pure
+// function of (base, patch) for an idempotent retry to replay safely; the console's own change
+// sets never touch `toolAttachments` in the first place, so nothing is lost by excluding it there.
+// ---------------------------------------------------------------------------
+
+type AttachableCatalogEntry = Readonly<{ deletedAt: Date | null; riskFloor: ToolCatalogRiskFloor }>;
+
+async function loadAttachableEntries(
+	db: Db,
+	entryIds: ReadonlySet<string>,
+): Promise<ReadonlyMap<string, AttachableCatalogEntry>> {
+	if (entryIds.size === 0) {
+		return new Map();
+	}
+	const rows = await db
+		.select({
+			id: catalogEntries.id,
+			deletedAt: catalogEntries.deletedAt,
+			riskFloor: catalogEntryVersions.riskFloor,
+		})
+		.from(catalogEntries)
+		.innerJoin(catalogEntryVersions, eq(catalogEntries.currentVersionId, catalogEntryVersions.id))
+		.where(inArray(catalogEntries.id, [...entryIds]));
+	return new Map(
+		rows.map((row) => [row.id, { deletedAt: row.deletedAt, riskFloor: row.riskFloor }]),
+	);
+}
+
+async function loadKnownEntryVersions(
+	db: Db,
+	entryIds: ReadonlySet<string>,
+): Promise<ReadonlyMap<string, ReadonlySet<number>>> {
+	if (entryIds.size === 0) {
+		return new Map();
+	}
+	const rows = await db
+		.select({ entryId: catalogEntryVersions.entryId, version: catalogEntryVersions.version })
+		.from(catalogEntryVersions)
+		.where(inArray(catalogEntryVersions.entryId, [...entryIds]));
+	const result = new Map<string, Set<number>>();
+	for (const row of rows) {
+		const versions = result.get(row.entryId) ?? new Set<number>();
+		versions.add(row.version);
+		result.set(row.entryId, versions);
+	}
+	return result;
+}
+
+/**
+ * Every catalog constraint an attachment must satisfy, checked against the database: its entry
+ * exists and is not deleted, its `pinnedVersion` (when set) names a real version of that entry,
+ * and its `mode` respects the entry's own `riskFloor`. An attachment's `settings` bound is already
+ * enforced structurally wherever one is parsed (`ToolAttachmentSettingsSchema`); nothing here
+ * compiles `configSchema` into a validator (ADR-027 leaves that for later work).
+ */
+export async function attachmentCatalogProblems(
+	db: Db,
+	toolAttachments: ToolAttachmentsBundle,
+): Promise<Readonly<string[]>> {
+	const entryIds = new Set<string>();
+	for (const attachments of Object.values(toolAttachments)) {
+		for (const attachment of attachments) {
+			entryIds.add(attachment.entryId);
+		}
+	}
+	if (entryIds.size === 0) {
+		return [];
+	}
+	const [entries, versions] = await Promise.all([
+		loadAttachableEntries(db, entryIds),
+		loadKnownEntryVersions(db, entryIds),
+	]);
+	const problems: string[] = [];
+	for (const [agentId, attachments] of Object.entries(toolAttachments)) {
+		for (const attachment of attachments) {
+			const entry = entries.get(attachment.entryId);
+			if (entry === undefined || entry.deletedAt !== null) {
+				problems.push(
+					`toolAttachments: agent '${agentId}': catalog entry '${attachment.entryId}' does not exist`,
+				);
+				continue;
+			}
+			if (!riskFloorAllows(attachment.mode, entry.riskFloor)) {
+				problems.push(
+					`toolAttachments: agent '${agentId}': catalog entry '${attachment.entryId}' requires at ` +
+						"least 'require_approval' (its risk floor)",
+				);
+			}
+			if (
+				attachment.pinnedVersion !== null &&
+				!(versions.get(attachment.entryId)?.has(attachment.pinnedVersion) ?? false)
+			) {
+				problems.push(
+					`toolAttachments: agent '${agentId}': catalog entry '${attachment.entryId}' has no ` +
+						`version ${attachment.pinnedVersion}`,
+				);
+			}
+		}
+	}
+	return problems;
+}
+
+// ---------------------------------------------------------------------------
+// Dropping attachments to a retired catalog entry: `config rollback` and `requestAgentRestore`
+// reintroduce historical content they themselves resolved, not something an operator hand-typed,
+// so (unlike `attachmentCatalogProblems` above) a reference to a since-deleted entry is dropped
+// and reported rather than refused outright — never silently, and never resurrecting the
+// capability (ADR-027).
+// ---------------------------------------------------------------------------
+
+export type DroppedAttachment = Readonly<{ agentId: AgentId; entryId: string }>;
+
+/** `toolAttachments`, with every attachment naming an entry outside `knownEntryIds` removed; the
+ * ones removed, for the caller to report. Pure — `dropAttachmentsToUnknownEntriesIn` resolves
+ * `knownEntryIds` from the database. */
+export function dropAttachmentsToUnknownEntries(
+	toolAttachments: ToolAttachmentsBundle,
+	knownEntryIds: ReadonlySet<string>,
+): Readonly<{ toolAttachments: ToolAttachmentsBundle; dropped: Readonly<DroppedAttachment[]> }> {
+	const dropped: DroppedAttachment[] = [];
+	const result: Record<string, ToolAttachment[]> = {};
+	for (const [agentId, attachments] of Object.entries(toolAttachments)) {
+		result[agentId] = attachments.filter((attachment) => {
+			if (knownEntryIds.has(attachment.entryId)) {
+				return true;
+			}
+			dropped.push({ agentId, entryId: attachment.entryId });
+			return false;
+		});
+	}
+	return { toolAttachments: result, dropped };
+}
+
+/** Every catalog entry that still exists and is not deleted — attachable, right now. */
+export async function loadAttachableEntryIds(db: Db): Promise<ReadonlySet<string>> {
+	const rows = await db
+		.select({ id: catalogEntries.id, deletedAt: catalogEntries.deletedAt })
+		.from(catalogEntries);
+	return new Set(rows.filter((row) => row.deletedAt === null).map((row) => row.id));
+}
+
+/** {@link dropAttachmentsToUnknownEntries}, resolving `knownEntryIds` from the database itself. */
+export async function dropAttachmentsToUnknownEntriesIn(
+	db: Db,
+	toolAttachments: ToolAttachmentsBundle,
+): Promise<
+	Readonly<{ toolAttachments: ToolAttachmentsBundle; dropped: Readonly<DroppedAttachment[]> }>
+> {
+	const known = await loadAttachableEntryIds(db);
+	return dropAttachmentsToUnknownEntries(toolAttachments, known);
 }
 
 // ---------------------------------------------------------------------------
@@ -519,9 +765,57 @@ function textChange(before: string, after: string): TextChange {
 }
 
 /**
+ * Every agent's own catalog-entry attachment added, removed or changed between `before` and
+ * `after`, sorted by `agentId` then `entryId` (ADR-027): `config diff`/`config rollback` now
+ * show exactly what changed, not merely which agents' attachments differ.
+ */
+function attachmentsDiff(
+	before: ToolAttachmentsBundle,
+	after: ToolAttachmentsBundle,
+): ConfigDiffAttachment[] {
+	const agentIds = [...new Set([...Object.keys(before), ...Object.keys(after)])].sort();
+	const result: ConfigDiffAttachment[] = [];
+	for (const agentId of agentIds) {
+		const beforeByEntry = new Map((before[agentId] ?? []).map((a) => [a.entryId, a]));
+		const afterByEntry = new Map((after[agentId] ?? []).map((a) => [a.entryId, a]));
+		const entryIds = [...new Set([...beforeByEntry.keys(), ...afterByEntry.keys()])].sort();
+		for (const entryId of entryIds) {
+			const beforeAttachment = beforeByEntry.get(entryId);
+			const afterAttachment = afterByEntry.get(entryId);
+			if (beforeAttachment === undefined && afterAttachment !== undefined) {
+				result.push({ kind: "added", agentId, entryId });
+				continue;
+			}
+			if (beforeAttachment !== undefined && afterAttachment === undefined) {
+				result.push({ kind: "removed", agentId, entryId });
+				continue;
+			}
+			if (beforeAttachment === undefined || afterAttachment === undefined) {
+				continue;
+			}
+			const fields: Array<"mode" | "pinnedVersion" | "settings"> = [];
+			if (beforeAttachment.mode !== afterAttachment.mode) {
+				fields.push("mode");
+			}
+			if (beforeAttachment.pinnedVersion !== afterAttachment.pinnedVersion) {
+				fields.push("pinnedVersion");
+			}
+			if (!deepEqual(beforeAttachment.settings, afterAttachment.settings)) {
+				fields.push("settings");
+			}
+			if (fields.length > 0) {
+				result.push({ kind: "changed", agentId, entryId, fields });
+			}
+		}
+	}
+	return result;
+}
+
+/**
  * A deterministic structural diff between two draft bundles: every agent added, removed or
  * changed (an unchanged agent — same fields, same role prompt — is left out entirely), the
- * organization's changed field paths, and the constitution's change. An agent's own fields are
+ * organization's changed field paths, the constitution's change, and every agent's own
+ * catalog-entry attachment added, removed or changed (ADR-027). An agent's own fields are
  * compared one level deep (`fieldPaths` names top-level `AgentConfig` keys, e.g. `"runtime"`);
  * the organization is compared all the way down, since its fields are the operator-facing detail
  * a console or reviewing agent needs.
@@ -549,9 +843,6 @@ export function configDiff(before: ConfigDraftBundle, after: ConfigDraftBundle):
 		}
 		agents.push({ kind: "changed", agentId: id, fieldPaths, rolePrompt });
 	}
-	const toolAttachmentsChangedAgentIds = ids.filter(
-		(id) => !deepEqual(before.toolAttachments[id] ?? [], after.toolAttachments[id] ?? []),
-	);
 	return {
 		agents,
 		organizationFieldPaths: structuralFieldPaths(
@@ -560,7 +851,7 @@ export function configDiff(before: ConfigDraftBundle, after: ConfigDraftBundle):
 			Number.POSITIVE_INFINITY,
 		),
 		constitution: textChange(before.constitution, after.constitution),
-		toolAttachmentsChangedAgentIds,
+		toolAttachments: attachmentsDiff(before.toolAttachments, after.toolAttachments),
 	};
 }
 
@@ -662,12 +953,14 @@ export async function prepareChange(
 			};
 		}
 		const { draft, problems: opProblems } = applyChangeSet(base, shape.data);
-		const problems = [...opProblems, ...draftBundleProblems(draft)];
+		const attachmentProblems = await attachmentCatalogProblems(db, draft.toolAttachments);
+		const problems = [...opProblems, ...draftBundleProblems(draft), ...attachmentProblems];
 		const newHash = previewHash(draft);
 		const noop =
 			problems.length === 0 &&
 			baseHash !== null &&
 			baseHash === newHash &&
+			deepEqual(canonicalizeAttachments(base.toolAttachments), draft.toolAttachments) &&
 			!(await liveEnabledDiverges(db, enabledById(draft.agents)));
 		return {
 			baseRevisionId,
@@ -722,6 +1015,7 @@ export async function previewChangeSetAgainst(
 		problems.length === 0 &&
 		baseHash !== null &&
 		baseHash === newHash &&
+		deepEqual(canonicalizeAttachments(base.toolAttachments), draft.toolAttachments) &&
 		!(await inTransaction(deps, ({ tx }) => liveEnabledDiverges(tx.db, enabledById(draft.agents))));
 	return { baseRevisionId, baseHash, newHash, noop, diff: configDiff(base, draft), problems };
 }
@@ -1118,7 +1412,8 @@ export async function commitChangeIn(
 
 	const { bundle: base, hash: baseHash } = await loadActiveBundle(db, currentRevisionId);
 	const { draft, problems: opProblems } = applyChangeSet(base, changeSet);
-	const problems = [...opProblems, ...draftBundleProblems(draft)];
+	const attachmentProblems = await attachmentCatalogProblems(db, draft.toolAttachments);
+	const problems = [...opProblems, ...draftBundleProblems(draft), ...attachmentProblems];
 	if (problems.length > 0) {
 		throw new AdminError(`configuration is invalid:\n- ${problems.join("\n- ")}`);
 	}
@@ -1165,7 +1460,6 @@ export async function commitChangeIn(
 		agents: draft.agents,
 		constitution: draft.constitution,
 		rolePrompts: draft.rolePrompts,
-		toolAttachments: draft.toolAttachments,
 	};
 	const bundle = configSnapshotBundle(resolvedInput);
 	const version = canonicalHash(bundle);
@@ -1173,6 +1467,7 @@ export async function commitChangeIn(
 	if (
 		currentRevisionId !== null &&
 		baseHash === version &&
+		deepEqual(canonicalizeAttachments(base.toolAttachments), draft.toolAttachments) &&
 		!(await liveEnabledDiverges(db, enabledById(draft.agents)))
 	) {
 		return {
@@ -1207,6 +1502,7 @@ export async function commitChangeIn(
 		input: resolvedInput,
 		bundle,
 		version,
+		toolAttachments: draft.toolAttachments,
 		generation,
 		parentRevisionId: currentRevisionId,
 		actor: input.actor,

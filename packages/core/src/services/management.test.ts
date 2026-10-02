@@ -394,6 +394,94 @@ describe("applyChangeSet", () => {
 		expect(draft.toolAttachments.alpha).toBeUndefined();
 	});
 
+	it("replace_bundle with no attachments document carries every existing attachment forward, filtered to the new agents (ADR-027)", () => {
+		const attached = apply(bundleOf([agent("alpha"), agent("beta")]), {
+			type: "attach_tool",
+			agentId: "alpha",
+			entryId: "gateway-mattermost-post",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+		}).draft;
+		const replacement = bundleOf([agent("alpha"), agent("gamma")]);
+		const { draft, problems } = apply(attached, { type: "replace_bundle", bundle: replacement });
+		expect(problems).toEqual([]);
+		// Carried forward: alpha keeps its attachment even though nothing in `replacement` ever
+		// mentioned one.
+		expect(draft.toolAttachments.alpha).toEqual([
+			{ entryId: "gateway-mattermost-post", pinnedVersion: null, mode: "allow", settings: {} },
+		]);
+		// `beta` left the configuration: its own attachments (it had none here, but the principle is
+		// the same) never survive a replace that drops it.
+		expect(draft.toolAttachments.beta).toBeUndefined();
+	});
+
+	it("replace_bundle with an explicit attachments document (even {}) replaces the whole document", () => {
+		const attached = apply(bundleOf([agent("alpha")]), {
+			type: "attach_tool",
+			agentId: "alpha",
+			entryId: "gateway-mattermost-post",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+		}).draft;
+		const replacement = bundleOf([agent("alpha")]);
+		const { draft, problems } = apply(attached, {
+			type: "replace_bundle",
+			bundle: replacement,
+			toolAttachments: {},
+		});
+		expect(problems).toEqual([]);
+		expect(draft.toolAttachments).toEqual({});
+	});
+
+	it("add_agent with no attachments document starts the agent legacy (no key of its own)", () => {
+		const { draft, problems } = apply(bundleOf([agent("alpha")]), {
+			type: "add_agent",
+			agent: agent("beta"),
+			rolePrompt: "Role prompt for beta.",
+		});
+		expect(problems).toEqual([]);
+		expect(Object.hasOwn(draft.toolAttachments, "beta")).toBe(false);
+	});
+
+	it("add_agent with an explicit, even empty, attachments list starts the agent hub-managed (restore's own carry-forward)", () => {
+		const { draft, problems } = apply(bundleOf([agent("alpha")]), {
+			type: "add_agent",
+			agent: agent("beta"),
+			rolePrompt: "Role prompt for beta.",
+			toolAttachments: [],
+		});
+		expect(problems).toEqual([]);
+		expect(draft.toolAttachments.beta).toEqual([]);
+	});
+
+	it("canonicalizes every agent's attachments by entryId, regardless of the order they were attached in", () => {
+		const { draft } = apply(
+			bundleOf([agent("alpha")]),
+			{
+				type: "attach_tool",
+				agentId: "alpha",
+				entryId: "native-web-search",
+				pinnedVersion: null,
+				mode: "allow",
+				settings: {},
+			},
+			{
+				type: "attach_tool",
+				agentId: "alpha",
+				entryId: "gateway-mattermost-post",
+				pinnedVersion: null,
+				mode: "allow",
+				settings: {},
+			},
+		);
+		expect(draft.toolAttachments.alpha?.map((a) => a.entryId)).toEqual([
+			"gateway-mattermost-post",
+			"native-web-search",
+		]);
+	});
+
 	it("applies an ordered list of operations in order, collecting every problem", () => {
 		const base = bundleOf([agent("alpha")]);
 		const { draft, problems } = apply(
@@ -558,6 +646,86 @@ describe("configDiff", () => {
 			beforeSize: 0,
 			afterSize: "Be helpful.".length,
 		});
+	});
+
+	it("reports every attachment added, removed or changed, per agent per entry (ADR-027)", () => {
+		const before: ConfigDraftBundle = {
+			...bundleOf([agent("alpha")]),
+			toolAttachments: {
+				alpha: [
+					{
+						entryId: "gateway-mattermost-post",
+						pinnedVersion: null,
+						mode: "allow",
+						settings: {},
+					},
+					{ entryId: "native-web-search", pinnedVersion: null, mode: "allow", settings: {} },
+				],
+			},
+		};
+		const after: ConfigDraftBundle = {
+			...before,
+			toolAttachments: {
+				alpha: [
+					// Unchanged: left out of the diff entirely.
+					{
+						entryId: "gateway-mattermost-post",
+						pinnedVersion: null,
+						mode: "allow",
+						settings: {},
+					},
+					// native-web-search removed; native-web-fetch added; gateway-memory-write is new too,
+					// with a mode change relative to nothing (so "added", not "changed").
+					{
+						entryId: "native-web-fetch",
+						pinnedVersion: null,
+						mode: "require_approval",
+						settings: {},
+					},
+				],
+			},
+		};
+		expect(configDiff(before, after).toolAttachments).toEqual([
+			{ kind: "added", agentId: "alpha", entryId: "native-web-fetch" },
+			{ kind: "removed", agentId: "alpha", entryId: "native-web-search" },
+		]);
+	});
+
+	it("reports a changed attachment's own fields (mode, pinnedVersion, settings) by name", () => {
+		const before: ConfigDraftBundle = {
+			...bundleOf([agent("alpha")]),
+			toolAttachments: {
+				alpha: [
+					{
+						entryId: "gateway-mattermost-post",
+						pinnedVersion: null,
+						mode: "allow",
+						settings: { a: 1 },
+					},
+				],
+			},
+		};
+		const after: ConfigDraftBundle = {
+			...before,
+			toolAttachments: {
+				alpha: [
+					{
+						entryId: "gateway-mattermost-post",
+						pinnedVersion: 2,
+						mode: "require_approval",
+						settings: { a: 2 },
+					},
+				],
+			},
+		};
+		expect(configDiff(before, after).toolAttachments).toEqual([
+			{
+				kind: "changed",
+				agentId: "alpha",
+				entryId: "gateway-mattermost-post",
+				fields: ["mode", "pinnedVersion", "settings"],
+			},
+		]);
 	});
 });
 

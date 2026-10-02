@@ -14,6 +14,7 @@ import type {
 	AgentConfig,
 	ChangeSetInput,
 	ConfigDiffAgent,
+	ConfigDiffAttachment,
 	OrganizationConfig,
 	ToolAttachmentsBundle,
 } from "@agent-gateway/contracts";
@@ -23,8 +24,10 @@ import {
 	type ChangePreview,
 	type CommitChangeResult,
 	type ControlPlaneDeps,
+	canonicalizeAttachments,
 	commitChange,
 	configSnapshotBundle,
+	dropAttachmentsToUnknownEntriesIn,
 	findConfigRevisionByIdempotencyKey,
 	inTransaction,
 	listConfigRevisions,
@@ -44,8 +47,9 @@ const AGENTS_DIR = "agents";
 const MANIFEST_FORMAT = 1;
 
 /** A bundle in plain, writable-array shape, as every `replace_bundle` change set needs it.
- * `toolAttachments` defaults to `{}` in `configSnapshotBundle`, so a caller with nothing to carry
- * forward (a fresh directory with no hub-managed agent) may still omit it. */
+ * `toolAttachments` omitted means no attachments document was resolved at all (a plain YAML
+ * directory with no `tool-attachments.json`): every agent's existing attachments carry forward
+ * unchanged rather than being cleared (ADR-027) — see `replaceBundleChangeSet`. */
 type ReplaceableBundle = Readonly<{
 	organization: OrganizationConfig;
 	agents: Readonly<AgentConfig[]>;
@@ -63,7 +67,13 @@ type ReplaceableBundle = Readonly<{
  * change set.
  */
 function replaceBundleChangeSet(bundle: ReplaceableBundle): ChangeSetInput {
-	return [{ type: "replace_bundle", bundle: configSnapshotBundle(bundle) }];
+	return [
+		{
+			type: "replace_bundle",
+			bundle: configSnapshotBundle(bundle),
+			...(bundle.toolAttachments === undefined ? {} : { toolAttachments: bundle.toolAttachments }),
+		},
+	];
 }
 
 // ---------------------------------------------------------------------------
@@ -349,6 +359,18 @@ function formatDiffAgent(agent: ConfigDiffAgent): string {
 	return `  ~ ${agent.agentId}: ${parts.length > 0 ? parts.join("; ") : "(unchanged)"}`;
 }
 
+/** One line per added/removed/changed attachment (ADR-027): `agentId: entryId`, a changed one
+ * naming which of its own fields moved. */
+function formatDiffAttachment(attachment: ConfigDiffAttachment): string {
+	if (attachment.kind === "added") {
+		return `  + ${attachment.agentId}: ${attachment.entryId} (added)`;
+	}
+	if (attachment.kind === "removed") {
+		return `  - ${attachment.agentId}: ${attachment.entryId} (removed)`;
+	}
+	return `  ~ ${attachment.agentId}: ${attachment.entryId} (${attachment.fields.join(", ")})`;
+}
+
 /** The structural diff `config diff`/`config rollback` print by default (not `--json`). */
 export function formatConfigDiff(preview: ChangePreview): string {
 	const lines: string[] = [
@@ -366,6 +388,9 @@ export function formatConfigDiff(preview: ChangePreview): string {
 		lines.push(
 			`constitution: ${preview.diff.constitution.beforeSize} -> ${preview.diff.constitution.afterSize} chars`,
 		);
+	}
+	if (preview.diff.toolAttachments.length > 0) {
+		lines.push("attachments:", ...preview.diff.toolAttachments.map(formatDiffAttachment));
 	}
 	if (preview.problems.length > 0) {
 		lines.push("problems:", ...preview.problems.map((problem) => `  - ${problem}`));
@@ -422,7 +447,15 @@ export async function configImport(
 	print: (line: string) => void,
 ): Promise<CommitChangeResult> {
 	const input = loadConfigDirectoryForImport(options.dir, options.root);
-	const contentHash = canonicalHash(configSnapshotBundle(input));
+	// Includes the attachments document too (ADR-027): `configSnapshotBundle` alone no longer
+	// does — it is hashed and stored separately from the bundle now — so a key derived from it
+	// alone would collide for two imports whose `tool-attachments.json` differs but whose bundle
+	// does not, tripping `commitChangeIn`'s "idempotency key reused for a different change set"
+	// refusal instead of importing the new attachments.
+	const contentHash = canonicalHash({
+		bundle: configSnapshotBundle(input),
+		toolAttachments: canonicalizeAttachments(input.toolAttachments ?? {}),
+	});
 	let baseRevisionId: number | null;
 	let idempotencyKey: string;
 	if (options.expectedRevision !== null) {
@@ -512,6 +545,12 @@ export type ConfigRollbackOptions = Readonly<{
  * pointer reset. Prints the diff against the current active configuration before committing (the
  * CLI is non-interactive; `expectedRevision` already guards against committing over a change made
  * since the operator last looked). Refuses a target revision whose snapshot is unavailable.
+ *
+ * The target's own attachments carry forward, minus any naming a catalog entry deleted since
+ * (ADR-027): dropped and reported here, rather than failing the rollback outright or
+ * resurrecting a retired capability (a hard FK constraint no longer forces the choice either way —
+ * the entry's own row stays, retired — but reintroducing a deleted capability's attachment would
+ * still be the wrong outcome for a rollback to choose silently).
  */
 export async function configRollback(
 	deps: ControlPlaneDeps,
@@ -525,15 +564,24 @@ export async function configRollback(
 	if (organization === null || hash === null) {
 		throw new AdminError(`internal: revision ${options.revisionId} resolved to an empty bundle`);
 	}
+	const { toolAttachments, dropped } = await inTransaction(deps, ({ tx }) =>
+		dropAttachmentsToUnknownEntriesIn(tx.db, bundle.toolAttachments),
+	);
 	const changeSet = replaceBundleChangeSet({
 		organization,
 		agents: bundle.agents,
 		constitution: bundle.constitution,
 		rolePrompts: bundle.rolePrompts,
-		toolAttachments: bundle.toolAttachments,
+		toolAttachments,
 	});
 	const preview = await prepareChange(deps, changeSet);
 	print(formatConfigDiff(preview));
+	if (dropped.length > 0) {
+		print(
+			`note: dropped ${dropped.length} attachment(s) to since-deleted catalog ` +
+				`entries: ${dropped.map((d) => `${d.agentId}:${d.entryId}`).join(", ")}`,
+		);
+	}
 	const result = await commitChange(deps, {
 		changeSet,
 		baseRevisionId: options.expectedRevision,

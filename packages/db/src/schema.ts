@@ -7,6 +7,7 @@ import type {
 	AgentLifecycleSource,
 	AgentLifecycleStatus,
 	AgentTurnInput,
+	ConfigAttachmentsSnapshot,
 	ConfigRevisionSource,
 	ConfigSnapshotBundle,
 	GatewayEventType,
@@ -159,7 +160,8 @@ export const configVersions = pgTable("config_versions", {
 /**
  * An immutable, content-addressed complete configuration bundle: organization, every agent
  * definition and its resolved role prompt, and the constitution text, exactly as
- * `ConfigSnapshotBundleSchema` describes. `hash` is the same canonical sha256 as
+ * `ConfigSnapshotBundleSchema` describes — deliberately never a tool attachment (see
+ * `configAttachmentSnapshots` below; ADR-027). `hash` is the same canonical sha256 as
  * `config_versions.version` of the same content, so the two agree without a foreign key between
  * them (not every `config_versions` row has a snapshot; see `origin`). A trigger (migration
  * 0019) rejects UPDATE and DELETE.
@@ -177,6 +179,23 @@ export const configSnapshots = pgTable(
 );
 
 /**
+ * An immutable, content-addressed attachments document: every agent's tool-catalog attachments,
+ * keyed by agent id (`ConfigAttachmentsSnapshotSchema`, ADR-027) — stored apart from
+ * `config_snapshots` precisely so that table stays exactly the shape a release before this table
+ * existed already reads. No `origin` column: unlike a configuration bundle, nothing ever backfills an
+ * attachments document (a database upgraded from before attachments existed has none to
+ * reconstruct — `config_revisions.attachments_snapshot_hash` is simply null for it), so every row
+ * this table ever holds was written by an actual commit. A trigger (migration after this one)
+ * rejects UPDATE and DELETE, the same guard `config_snapshots` already has.
+ */
+export const configAttachmentSnapshots = pgTable("config_attachment_snapshots", {
+	hash: text("hash").primaryKey(),
+	bundle: jsonb("bundle").$type<ConfigAttachmentsSnapshot>().notNull(),
+	format: integer("format").notNull(),
+	createdAt: createdAt(),
+});
+
+/**
  * The configuration's chronological journal: one row per applied change, even one that repeats
  * an earlier snapshot's content verbatim (a rollback gets its own revision id, pointing at the
  * same `snapshot_hash`). A trigger (migration 0019) rejects UPDATE and DELETE.
@@ -188,6 +207,13 @@ export const configRevisions = pgTable(
 		snapshotHash: text("snapshot_hash")
 			.notNull()
 			.references(() => configSnapshots.hash),
+		/** This same revision's own attachments document (ADR-027); null when it carries none —
+		 * a revision recorded before this column existed, or one whose resulting configuration has no
+		 * agent ever touched through the tool-catalog hub (`{}`, never given its own stored row — see
+		 * `configAttachmentSnapshots`). A release before this column existed does not know it exists. */
+		attachmentsSnapshotHash: text("attachments_snapshot_hash").references(
+			() => configAttachmentSnapshots.hash,
+		),
 		/** The revision this one replaced; null for the first revision ever recorded. */
 		parentRevisionId: bigint("parent_revision_id", { mode: "number" }).references(
 			(): AnyPgColumn => configRevisions.id,
@@ -373,6 +399,15 @@ export const agentLifecycleOperations = pgTable(
  * versions, and `isBuiltin` decides whether deleting it (`deleteCatalogEntry`) also writes a
  * tombstone. `currentVersionId` has no foreign key: it is set right after the first version row is
  * inserted, in the same transaction (the same reason `agent_lifecycle.operation_id` has none).
+ *
+ * Deleting an entry never removes this row — `deletedAt`/`deletedBy` mark it retired instead
+ * (`deleteCatalogEntry`'s own fix): the row, and so `currentVersionId` and every past version,
+ * stay referenceable, which is what lets a historical `config_revisions` snapshot that once
+ * attached this entry still be rolled back to without a foreign-key failure inserting
+ * `catalog_attachments`. A deleted entry is simply excluded from every active listing/attach
+ * check (`listCatalogEntries`/`getCatalogEntry`/`checkAttachable`'s own `loadEntry`) and can never
+ * be attached again; it is never un-deleted, and `ensureToolCatalogSeeded` never revives a
+ * deleted built-in (its own `catalog_entry_tombstones` row is unaffected by this).
  */
 export const catalogEntries = pgTable(
 	"catalog_entries",
@@ -382,6 +417,8 @@ export const catalogEntries = pgTable(
 		implementationKey: text("implementation_key").notNull(),
 		isBuiltin: boolean("is_builtin").notNull().default(false),
 		currentVersionId: bigint("current_version_id", { mode: "number" }),
+		deletedAt: timestamp("deleted_at", { withTimezone: true }),
+		deletedBy: text("deleted_by"),
 		createdAt: createdAt(),
 	},
 	() => [check("catalog_entries_kind", oneOf("kind", TOOL_CATALOG_ENTRY_KINDS))],

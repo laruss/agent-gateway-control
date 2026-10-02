@@ -10,21 +10,33 @@ All notable changes are documented here. The project follows Semantic Versioning
   `native`/`gateway`/`executor`, `custom_https` reserved — and implementation key), append-only
   immutable versions (name, description, a bounded config schema, a risk floor, supported runtime
   adapters), and per-agent attachments (a pinned version or "current", an `allow`/
-  `require_approval`/`disabled` mode, bounded settings) living in the configuration bundle
-  alongside `agents`/`rolePrompts` — versioned, rolled back and exported/imported exactly like the
-  rest of it. `ensureToolCatalogSeeded` (controller startup, every CLI session) idempotently seeds
-  every built-in this release actually has — five native runtime capabilities, `mattermost.post`
-  and `memory.write`, and the two sandbox tool-broker executor actions — skipping one the owner
-  already deleted (a tombstone survives reseeding, forever). Editing a built-in entry may only
-  change its name/description (a new immutable version); deleting one removes every agent's
-  attachment of it atomically, in the same transaction as (for a built-in) its tombstone.
-  `attachTool`/`detachTool`/`updateAttachment` commit through the same managed-configuration writer
-  every other configuration change does, so a revision records them and rollback covers them.
+  `require_approval`/`disabled` mode, bounded settings). A revision's attachments are their own
+  content-addressed document, named alongside its configuration bundle — never a field of the
+  bundle itself, so an older release's own schema still parses every snapshot this release writes,
+  rollback included — versioned, rolled back and exported/imported as one unit with it.
+  `ensureToolCatalogSeeded` (controller startup, every CLI session) idempotently seeds every
+  built-in this release actually has — five native runtime capabilities, `mattermost.post` and
+  `memory.write`, and the two sandbox tool-broker executor actions — skipping one the owner already
+  deleted (a tombstone survives reseeding, forever). Editing a built-in entry may only change its
+  name/description (a new immutable version, every field validated against its own bound before
+  insert); deleting one removes every agent's attachment of it atomically, in the same transaction
+  as (for a built-in) its tombstone, and marks the entry's own row deleted rather than removing it —
+  its past versions, and any historical revision that once attached it, stay inspectable and
+  rollback-safe. `attachTool`/`detachTool`/`updateAttachment` commit through the same
+  managed-configuration writer every other configuration change does, so a revision records them and
+  rollback covers them; every attachment any write path commits is checked against the live catalog
+  (entry exists and is not deleted, pinned version exists, mode respects risk floor) at that same
+  shared boundary, not only through `attachTool`'s own earlier check. A plain YAML `config apply`
+  carries every agent's existing attachments forward unchanged rather than clearing them; `config
+  rollback` and restoring a retired agent each carry their own target's attachments forward too,
+  minus any naming a catalog entry deleted since (dropped and reported, never resurrected).
   `legacyAttachmentsFromPermissions` converts an agent's existing `permissions` lists to what its
   attachments would look like, read-only, against catalog entries known right now — a pattern
-  matching none of them is reported unresolved, never dropped. Tool enforcement itself is
-  unchanged: `packages/policy` still reads only `permissions`; nothing here compiles an attachment
-  into a grant yet, and no console or CLI surface reads the catalog yet either.
+  matching none of them is reported unresolved, never dropped. `config diff`/`config rollback` show
+  every attachment added, removed or changed (mode, pinned version, settings) per agent per entry.
+  Tool enforcement itself is unchanged: `packages/policy` still reads only `permissions`; nothing
+  here compiles an attachment into a grant yet, and no console or CLI surface reads the catalog yet
+  either.
 
 ## [0.6.0] - 2026-10-02
 

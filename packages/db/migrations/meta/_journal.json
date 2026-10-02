@@ -211,6 +211,20 @@
       "when": 1790971112142,
       "tag": "0029_tool_catalog_guards",
       "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1790975121850,
+      "tag": "0030_config_attachment_snapshots",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1790975138398,
+      "tag": "0031_config_attachment_snapshots_guards",
+      "breakpoints": true
     }
   ]
 }

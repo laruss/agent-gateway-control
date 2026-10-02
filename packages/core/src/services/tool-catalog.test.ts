@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
 	builtInEditProblems,
 	computeCatalogEntryAvailability,
+	editCatalogEntryInputProblems,
 	type KnownCatalogEntry,
 	legacyAttachmentsFromPermissions,
 	riskFloorAllows,
@@ -125,6 +126,69 @@ describe("builtInEditProblems", () => {
 		expect(problems.join(" ")).toMatch(/configSchema/);
 		expect(problems.join(" ")).toMatch(/riskFloor/);
 		expect(problems.join(" ")).toMatch(/supportedAdapters/);
+	});
+});
+
+describe("editCatalogEntryInputProblems", () => {
+	const base = { entryId: "custom-thing", actor: "test" };
+
+	it("accepts a fully unset edit (nothing to change)", () => {
+		expect(editCatalogEntryInputProblems(base)).toEqual([]);
+	});
+
+	it("accepts every field within its own bound", () => {
+		expect(
+			editCatalogEntryInputProblems({
+				...base,
+				name: "Name",
+				description: "Description.",
+				configSchema: { type: "object" },
+				riskFloor: "require_approval",
+				supportedAdapters: ["mock", "codex"],
+			}),
+		).toEqual([]);
+	});
+
+	it("rejects an empty name and an empty description", () => {
+		const problems = editCatalogEntryInputProblems({ ...base, name: "", description: "" });
+		expect(problems.some((p) => p.startsWith("name:"))).toBe(true);
+		expect(problems.some((p) => p.startsWith("description:"))).toBe(true);
+	});
+
+	it("rejects a name over its bound", () => {
+		expect(
+			editCatalogEntryInputProblems({ ...base, name: "x".repeat(101) }).some((p) =>
+				p.startsWith("name:"),
+			),
+		).toBe(true);
+	});
+
+	it("rejects an unknown riskFloor", () => {
+		// A caller's `EditCatalogEntryInput` is a plain TypeScript type, never itself runtime-checked
+		// (this function's whole point) — parsed here from an untyped source, exactly as a console or
+		// CLI request body would arrive, so this exercises the runtime check the type system itself
+		// cannot.
+		const untyped: unknown = JSON.parse(JSON.stringify({ ...base, riskFloor: "sometimes" }));
+		const problems = editCatalogEntryInputProblems(
+			untyped as Parameters<typeof editCatalogEntryInputProblems>[0],
+		);
+		expect(problems.some((p) => p.startsWith("riskFloor:"))).toBe(true);
+	});
+
+	it("rejects more supportedAdapters than the bound allows", () => {
+		const problems = editCatalogEntryInputProblems({
+			...base,
+			supportedAdapters: Array.from({ length: 17 }, () => "mock" as const),
+		});
+		expect(problems.some((p) => p.startsWith("supportedAdapters:"))).toBe(true);
+	});
+
+	it("rejects a configSchema over its serialized-size bound", () => {
+		const problems = editCatalogEntryInputProblems({
+			...base,
+			configSchema: { huge: "x".repeat(20_001) },
+		});
+		expect(problems.some((p) => p.startsWith("configSchema:"))).toBe(true);
 	});
 });
 

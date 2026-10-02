@@ -42,6 +42,21 @@ export const TOOL_ATTACHMENT_MODES = ["allow", "require_approval", "disabled"] a
 export const ToolAttachmentModeSchema = z.enum(TOOL_ATTACHMENT_MODES);
 export type ToolAttachmentMode = z.infer<typeof ToolAttachmentModeSchema>;
 
+/**
+ * Whether `mode` clears `riskFloor`: `mode: "allow"` is refused once `riskFloor` is
+ * `require_approval` (only `require_approval` or `disabled` are accepted then); `disabled` is
+ * never refused regardless of floor — an attachment can always be turned off. Pure, shared by
+ * every write path that can set or change an attachment's mode (`tool-catalog.ts`'s
+ * `attachTool`/`updateAttachment`, and `management.ts`'s shared commit-boundary check), so neither
+ * copy of the rule can drift from the other.
+ */
+export function riskFloorAllows(
+	mode: ToolAttachmentMode,
+	riskFloor: ToolCatalogRiskFloor,
+): boolean {
+	return mode !== "allow" || riskFloor === "allow";
+}
+
 function boundedJson(maxChars: number, what: string) {
 	return JsonObjectSchema.refine(
 		(value) => JSON.stringify(value).length <= maxChars,
@@ -59,6 +74,11 @@ export const ToolAttachmentSettingsSchema = boundedJson(4_000, "settings");
 /** `name`/`description`, the only fields a built-in entry's edit may ever change. */
 export const ToolCatalogEntryNameSchema = z.string().min(1).max(100);
 export const ToolCatalogEntryDescriptionSchema = z.string().min(1).max(2_000);
+
+/** Adapters a (non-built-in) entry declares it works under; the same bound
+ * `ToolCatalogEntryVersionSchema.supportedAdapters` carries, reused by `editCatalogEntry`'s own
+ * input validation so the two never disagree. */
+export const ToolCatalogSupportedAdaptersSchema = z.array(RuntimeAdapterIdSchema).max(16);
 
 /**
  * One immutable version of a catalog entry's content. `kind`/`implementationKey` never change
@@ -78,7 +98,7 @@ export const ToolCatalogEntryVersionSchema = z.strictObject({
 	riskFloor: ToolCatalogRiskFloorSchema,
 	/** Adapters this capability works under; empty for `gateway`/`executor` (not adapter-scoped —
 	 * every agent regardless of its runtime may hold it). */
-	supportedAdapters: z.array(RuntimeAdapterIdSchema).max(16),
+	supportedAdapters: ToolCatalogSupportedAdaptersSchema,
 	createdBy: z.string().min(1).max(200),
 	createdAt: z.iso.datetime({ offset: true }),
 });

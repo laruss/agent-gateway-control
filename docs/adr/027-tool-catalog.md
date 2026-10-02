@@ -57,7 +57,12 @@ version (`builtInEditProblems`, unit-tested without a database): those fields de
 real integration actually does, not something an edit should be able to silently redefine for a
 capability the owner did not build. A `kind`/`implementationKey` pairing that is not built in has
 no creation path yet — `custom_https` is reserved, not defined — so this rule has no non-built-in
-case to exercise this release.
+case to exercise this release. Every field an edit does supply (`name`, `description`,
+`configSchema`, `riskFloor`, `supportedAdapters`) is validated against its own contract schema
+before a new version is ever inserted (`editCatalogEntryInputProblems`): `EditCatalogEntryInput` is
+a plain TypeScript type, never itself runtime-checked, so a caller handing this service data
+parsed from JSON (a future console route, say) is held to the same bounds `ToolCatalogEntryVersionSchema`
+already enforces for a seeded or freshly inserted version.
 
 `catalog_entry_versions.entry_id` carries no foreign key: deleting an entry (below) never touches
 its past versions, which stay exactly as recorded, entry gone or not — the same reasoning
@@ -89,22 +94,39 @@ only ever affects what the catalog *displays* as supported — never what policy
 this decision does not touch — and is reconciled by hand if a runtime's own confinable tools ever
 change.
 
-### Attachments: part of the bundle, independent of `permissions`
+### Attachments: a document of their own, alongside the bundle, independent of `permissions`
 
 An attachment (`ToolAttachmentSchema`: `entryId`, `pinnedVersion` — null tracks the entry's current
 version, a positive integer pins it even as the entry is edited further — `mode`
 (`allow`/`require_approval`/`disabled`) and bounded, opaque `settings`) binds one agent to one
-catalog entry. **Attachments live in `ConfigSnapshotBundle.toolAttachments`, a new field keyed by
-agent id, alongside `agents`/`rolePrompts`** — not in `AgentConfig` itself, which stays untouched
-(no YAML schema change, no migration of every existing agent definition or test fixture) — the
-same way `rolePrompts` is bundle-level, hub-managed state rather than something `AgentConfigSchema`
-carries. This is this decision's source-of-truth choice: attachments are part of the snapshot, so
-every write that changes one goes through the same `commitChange`/`commitChangeIn` path (four new
-change operations: `attach_tool`, `detach_tool`, `update_attachment`, `clear_tool_attachments` —
-the last removes one entry's attachment from every agent that has it in a single operation,
-regardless of how many agents that is, since `MAX_CHANGE_SET_OPERATIONS` could not bound one
-`detach_tool` per agent for a widely-attached entry) and is covered by config history, rollback and
-`config export`/`import` for free, exactly like every other field of the bundle.
+catalog entry — not in `AgentConfig` itself, which stays untouched (no YAML schema change, no
+migration of every existing agent definition or test fixture).
+
+**Every agent's attachments, keyed by agent id, are their own content-addressed snapshot
+(`config_attachment_snapshots`), named by a revision alongside its configuration bundle
+(`config_revisions.attachments_snapshot_hash`, nullable) — never a field inside
+`ConfigSnapshotBundle` itself.** A revision's full state is the pair (bundle snapshot, attachments
+snapshot); hashing, idempotent no-op detection, diff, history, rollback and export/import all treat
+the pair as one unit, through the same `commitChange`/`commitChangeIn` path every other
+configuration change already uses (four change operations: `attach_tool`, `detach_tool`,
+`update_attachment`, `clear_tool_attachments` — the last removes one entry's attachment from every
+agent that has it in a single operation, regardless of how many agents that is, since
+`MAX_CHANGE_SET_OPERATIONS` could not bound one `detach_tool` per agent for a widely-attached
+entry). `attachmentsSnapshotHash` is null for a revision whose resulting configuration has no agent
+ever touched through the hub (`{}` is never given its own stored row) or one recorded before this
+column existed.
+
+This separation exists because `ConfigSnapshotBundleSchema` is a `strictObject`: a release before
+attachments existed parses it with the exact same schema it always has, which refuses any key it
+does not know. Putting attachments inside the bundle would mean that release's own copy of the
+schema fails to parse the very first snapshot a hub-managed attachment ever touches — and so fails
+to start at all — the moment an operator rolls back to it. Keeping the bundle exactly the shape
+every release has always read, and the attachments document in a table of its own that an older
+release simply does not know exists (and does not need: `config_snapshots`/`config_revisions` stay
+fully readable, ADR-020's expand-migration guarantee), avoids that regression by construction. The
+bundle's own agent `permissions` lists stay present and valid regardless — later work may derive
+them from attachments, so an older release still enforces the same effective permissions after a
+binary rollback; this decision does not change what `permissions` means or how it is validated.
 
 **`permissions` is not derived from attachments, and attachments are not derived from
 `permissions`, in this release.** `packages/policy` keeps reading only `permissions`, completely
@@ -116,21 +138,61 @@ belongs to a later phase building on this one, not to introducing the data model
 the two independent this release is also what keeps this decision small enough to review and
 revert on its own: nothing about tool enforcement changes merely because this migration ran.
 
-`catalog_attachments` is a database table, but it is the **current-state projection** of
-`ConfigSnapshotBundle.toolAttachments`, exactly the way the existing `agents` table projects
+Every attachment named anywhere in a committed configuration is checked, at the same shared commit
+boundary every write path commits a bundle through (`prepareChange`/`commitChangeIn`): its entry
+exists and is not deleted, any `pinnedVersion` it names is a real version of that entry, and its
+`mode` respects the entry's own `riskFloor`. `attachTool`/`updateAttachment` already give a caller a
+friendlier, earlier refusal for the same problems (`checkAttachable`); this boundary is what closes
+the gap for every other path that can commit a bundle — `config import`'s `replace_bundle`, a
+direct `commitChange` — which never called `checkAttachable` at all.
+
+Each agent's own attachment list is canonicalized (sorted by `entryId`) once, right after a change
+set is applied and before anything hashes or stores the result: an attachment's position in its
+list carries no meaning, but a canonical hash is sensitive to array order regardless, and
+`config export` already writes `tool-attachments.json` with each agent's list sorted. Without this,
+an untouched export of a revision whose attachments were attached in a different order than their
+sorted one, re-imported unchanged, would hash to different content than what is actually stored —
+manufacturing a new revision for what is, in truth, a no-op.
+
+`catalog_attachments` is a database table, but it is the **current-state projection** of the active
+revision's own attachments document, exactly the way the existing `agents` table projects
 `ConfigSnapshotBundle.agents` — reconciled by `writeConfigRevisionIn` on every committed change
 (`replace_bundle` included, so a plain YAML `config apply` reconciles it too), never written to
-directly by the catalog service. The bundle inside `config_snapshots` is the actual historical
-record rollback restores; the table exists only so "every attachment of this agent" or "every
-agent attached to this entry" is a cheap, indexed read instead of a snapshot deserialization.
+directly by the catalog service. The snapshot is the actual historical record rollback restores;
+the table exists only so "every attachment of this agent" or "every agent attached to this entry"
+is a cheap, indexed read instead of a snapshot deserialization.
 
-One consequence of attachments being bundle content: `gateway config apply`'s long-standing
-whole-bundle-replace semantics now also apply to them. A plain YAML directory with no
-`tool-attachments.json` resets every agent's attachments to none — exactly as it already resets any
-agent dropped from the directory to disabled, or a changed field to whatever the YAML now says. An
-operator who wants attachments to survive an edit round-trips through `config export`/`import`
-(which does carry `tool-attachments.json` forward), rather than hand-editing YAML once the hub is
-in use.
+**A bundle committed without an attachments document never clears anything.** `replace_bundle`'s
+own whole-bundle-replace semantics apply to the *bundle* — organization, agents, constitution,
+role prompts — never silently to attachments, which are a separate document that changes only when
+one is actually supplied as part of the same operation. A plain YAML directory (`gateway config
+apply`, with no `tool-attachments.json`) carries every agent's existing attachments forward
+unchanged, filtered down to whichever agents the apply still configures; an export/import directory
+that does carry `tool-attachments.json` (even an empty one) replaces the document in full, exactly
+as it always has. `config diff`/`config rollback` show every attachment added, removed or changed
+(mode, pinned version or settings) per agent per entry, the same way they already show an agent's
+own changed fields.
+
+### Deleting an entry never removes its row: a retired, referenceable identity
+
+Deleting a catalog entry (`deleteCatalogEntry`) marks it deleted (`deleted_at`/`deleted_by`) rather
+than removing the row: the row, its `current_version_id` and every past version stay exactly as
+they were. A deleted entry is excluded from every active read (`listCatalogEntries`/
+`getCatalogEntry`/`checkAttachable`'s own `loadEntry`) and can never be attached again or
+undeleted — a built-in's own `catalog_entry_tombstones` row still exists alongside this, so
+`ensureToolCatalogSeeded` never re-adds it — but the row itself persists so a historical
+`config_revisions` snapshot that once attached it can still be rolled back to: inserting its
+`catalog_attachments` projection row on rollback needs the entry it references to still exist, or
+the foreign key fails and the rollback cannot be written at all. `config rollback` and
+`requestAgentRestore` (an agent's attachments restored on a retire-then-restore round trip) each
+resolve this themselves, before committing: any attachment naming a deleted entry is dropped from
+what they actually commit, reported in the rollback's own output or the restore's own result,
+rather than failing the operation outright or silently bringing a retired capability back.
+
+`deleteCatalogEntry` locks `gateway_controls` before `catalog_entries`, the global lock order every
+configuration writer keeps (`commitChangeIn`'s own first lock): taking the entry row first risks a
+deadlock against a concurrent `attach_tool`/`update_attachment` commit, which always reaches for
+`gateway_controls` first.
 
 ### Legacy conversion: a read model, never written back
 
@@ -165,14 +227,15 @@ whatever the first read happened to see.
 Deleting a catalog entry (`deleteCatalogEntry`) removes its attachment from every agent that has
 one, atomically: a single `clear_tool_attachments` change set is committed (one new config
 revision, or none at all when nothing was attached), and, in the same database transaction, the
-entry's own row (and, implicitly, its `catalog_attachments` rows, already reconciled away by that
-same commit) is removed. A failure anywhere — the commit conflicting after its bounded retries, an
-unexpected constraint — rolls back everything: no partial state (an entry gone but an attachment
-left referencing it, or the reverse) is ever observable. For a **built-in** entry, deletion also
-writes a row to `catalog_entry_tombstones` (id, its `kind`, who deleted it, when); a non-built-in
-entry's deletion writes none, since nothing ever reseeds a capability nothing declared. Past
-versions are never deleted (the guard trigger would refuse it regardless) and remain readable,
-orphaned, after their entry is gone.
+entry's own row is marked deleted (see "Deleting an entry never removes its row" above — it is
+never actually removed). A failure anywhere — the commit conflicting after its bounded retries, an
+unexpected constraint — rolls back everything: no partial state (an entry marked deleted but an
+attachment left referencing it, or the reverse) is ever observable. For a **built-in** entry,
+deletion also writes a row to `catalog_entry_tombstones` (id, its `kind`, who deleted it, when),
+read by `ensureToolCatalogSeeded` alongside the entry's own now-permanent `deleted_at`; a
+non-built-in entry's deletion writes none, since nothing ever reseeds a capability nothing
+declared. Past versions are never deleted (the guard trigger would refuse it regardless) and
+remain readable after their entry is deleted.
 
 ### Seeding built-ins
 
@@ -234,6 +297,10 @@ agree on which row they mean.
   nothing here adds its own retention pass.
 - Rolling back to a release before this one keeps every existing table fully readable (ADR-020's
   expand-migration guarantee); `catalog_entries`/`catalog_entry_versions`/`catalog_attachments`/
-  `catalog_entry_tombstones` are simply additional tables an older release does not know about and
-  does not need, and `ConfigSnapshotBundleSchema.toolAttachments` defaults to `{}` wherever an older
-  bundle (or a `config export` directory predating `tool-attachments.json`) does not have it.
+  `catalog_entry_tombstones`/`config_attachment_snapshots` are simply additional tables (and, for
+  `config_revisions`, an additional nullable column) an older release does not know about and does
+  not need — `ConfigSnapshotBundleSchema` itself never gained a field for attachments at all, so an
+  older release's own copy of that schema parses every snapshot this release ever writes exactly as
+  it always has. A `config export` directory predating `tool-attachments.json` (or any directory
+  simply missing that file) resolves to every agent's attachments carrying forward unchanged, never
+  to `{}` unconditionally — see "Attachments: a document of their own" above.

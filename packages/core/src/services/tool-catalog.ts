@@ -8,14 +8,20 @@ import {
 	type ConfigRevisionSource,
 	type JsonObject,
 	type RuntimeAdapterId,
+	riskFloorAllows,
 	type ToolAttachment,
 	type ToolAttachmentMode,
+	ToolCatalogConfigSchemaSchema,
 	type ToolCatalogEntry,
+	ToolCatalogEntryDescriptionSchema,
 	type ToolCatalogEntryId,
 	type ToolCatalogEntryKind,
+	ToolCatalogEntryNameSchema,
 	type ToolCatalogEntryVersion,
 	type ToolCatalogEntryView,
 	type ToolCatalogRiskFloor,
+	ToolCatalogRiskFloorSchema,
+	ToolCatalogSupportedAdaptersSchema,
 	type ToolName,
 	type ToolPattern,
 	toolPatternCovers,
@@ -27,7 +33,7 @@ import {
 	catalogEntryVersions,
 	gatewayControls,
 } from "@agent-gateway/db";
-import { asc, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull } from "drizzle-orm";
 import { AdminError, inTransaction } from "./admin.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
 import {
@@ -356,16 +362,21 @@ const ENTRY_WITH_CURRENT_VERSION_COLUMNS = {
 	versionCreatedAt: catalogEntryVersions.createdAt,
 } as const;
 
+/** `entryId`'s current version, when it exists and is not deleted (`deleteCatalogEntry`'s own
+ * fix): a deleted entry's row stays, for its past versions and any historical attachment that
+ * once named it to stay referenceable, but it is never again attachable, editable or listed as
+ * active — this is the one place that exclusion is enforced for every reader below. */
 async function loadEntry(db: Db, entryId: string): Promise<ToolCatalogEntry | null> {
 	const [row] = await db
 		.select(ENTRY_WITH_CURRENT_VERSION_COLUMNS)
 		.from(catalogEntries)
 		.innerJoin(catalogEntryVersions, eq(catalogEntries.currentVersionId, catalogEntryVersions.id))
-		.where(eq(catalogEntries.id, entryId));
+		.where(and(eq(catalogEntries.id, entryId), isNull(catalogEntries.deletedAt)));
 	return row === undefined ? null : toEntry(row);
 }
 
-/** Every catalog entry with its current version, availability computed fresh, sorted by id. */
+/** Every active (not deleted) catalog entry with its current version, availability computed
+ * fresh, sorted by id. */
 export async function listCatalogEntries(
 	deps: ControlPlaneDeps,
 	context: ToolCatalogAvailabilityContext,
@@ -375,6 +386,7 @@ export async function listCatalogEntries(
 			.select(ENTRY_WITH_CURRENT_VERSION_COLUMNS)
 			.from(catalogEntries)
 			.innerJoin(catalogEntryVersions, eq(catalogEntries.currentVersionId, catalogEntryVersions.id))
+			.where(isNull(catalogEntries.deletedAt))
 			.orderBy(asc(catalogEntries.id));
 		return rows.map((row) => {
 			const entry = toEntry(row);
@@ -458,6 +470,48 @@ export function builtInEditProblems(
 }
 
 /**
+ * Every field `input` actually supplies, validated against the same contract schemas a version's
+ * own fields are parsed with (`ToolCatalogEntryVersionSchema`): a caller's `EditCatalogEntryInput`
+ * is a plain TypeScript type, never itself runtime-checked, so without this an out-of-bounds name,
+ * description, config schema, risk floor or adapter list would otherwise insert straight into
+ * `catalog_entry_versions` unvalidated. Pure, so directly unit-testable without a database.
+ */
+export function editCatalogEntryInputProblems(input: EditCatalogEntryInput): Readonly<string[]> {
+	const problems: string[] = [];
+	if (input.name !== undefined) {
+		const parsed = ToolCatalogEntryNameSchema.safeParse(input.name);
+		if (!parsed.success) {
+			problems.push(...parsed.error.issues.map((issue) => `name: ${issue.message}`));
+		}
+	}
+	if (input.description !== undefined) {
+		const parsed = ToolCatalogEntryDescriptionSchema.safeParse(input.description);
+		if (!parsed.success) {
+			problems.push(...parsed.error.issues.map((issue) => `description: ${issue.message}`));
+		}
+	}
+	if (input.configSchema !== undefined) {
+		const parsed = ToolCatalogConfigSchemaSchema.safeParse(input.configSchema);
+		if (!parsed.success) {
+			problems.push(...parsed.error.issues.map((issue) => `configSchema: ${issue.message}`));
+		}
+	}
+	if (input.riskFloor !== undefined) {
+		const parsed = ToolCatalogRiskFloorSchema.safeParse(input.riskFloor);
+		if (!parsed.success) {
+			problems.push(...parsed.error.issues.map((issue) => `riskFloor: ${issue.message}`));
+		}
+	}
+	if (input.supportedAdapters !== undefined) {
+		const parsed = ToolCatalogSupportedAdaptersSchema.safeParse(input.supportedAdapters);
+		if (!parsed.success) {
+			problems.push(...parsed.error.issues.map((issue) => `supportedAdapters: ${issue.message}`));
+		}
+	}
+	return problems;
+}
+
+/**
  * Publishes a new, immutable version of `entryId`, copying forward whatever `input` leaves unset.
  * Refused for a built-in entry whose patch touches `configSchema`/`riskFloor`/`supportedAdapters`
  * (`builtInEditProblems`); its `name`/`description` may still change. The entry's own
@@ -467,14 +521,24 @@ export async function editCatalogEntry(
 	deps: ControlPlaneDeps,
 	input: EditCatalogEntryInput,
 ): Promise<ToolCatalogEntry> {
+	const inputProblems = editCatalogEntryInputProblems(input);
+	if (inputProblems.length > 0) {
+		throw new AdminError(
+			`editing catalog entry '${input.entryId}':\n- ${inputProblems.join("\n- ")}`,
+		);
+	}
 	return inTransaction(deps, async (uow) => {
 		const { db } = uow.tx;
 		const [entryRow] = await db
-			.select({ id: catalogEntries.id, isBuiltin: catalogEntries.isBuiltin })
+			.select({
+				id: catalogEntries.id,
+				isBuiltin: catalogEntries.isBuiltin,
+				deletedAt: catalogEntries.deletedAt,
+			})
 			.from(catalogEntries)
 			.where(eq(catalogEntries.id, input.entryId))
 			.for("update");
-		if (entryRow === undefined) {
+		if (entryRow === undefined || entryRow.deletedAt !== null) {
 			throw new AdminError(`catalog entry '${input.entryId}' does not exist`);
 		}
 		if (entryRow.isBuiltin) {
@@ -531,7 +595,17 @@ export async function editCatalogEntry(
  * managed-configuration change — a conflict is retried once against the revision it names, the
  * same bounded retry `requestAgentCreate`/`requestAgentRetire` use); for a built-in entry, a
  * tombstone is written too, so `ensureToolCatalogSeeded` never re-adds it. A failure anywhere
- * rolls back everything: the change set, the entry and version rows, and the tombstone.
+ * rolls back everything: the change set and the attachment-clearing commit, the entry's own
+ * `deleted_at`/`deleted_by`, and the tombstone.
+ *
+ * The entry row itself is never removed — only marked deleted (`deleted_at`/`deleted_by`), its
+ * `current_version_id` left exactly as it was: deleting the row outright would FK-fail the very
+ * next commit that reinserts a `catalog_attachments` row for it (a rollback, or
+ * `requestAgentRestore`, reviving a historical revision that once attached it), making that
+ * history permanently unrestorable. A deleted entry stays excluded from every active read
+ * (`loadEntry`, so `listCatalogEntries`/`getCatalogEntry`/`checkAttachable` all already treat it
+ * as gone) and can never be attached again or un-deleted; its past versions stay exactly as
+ * recorded, inspectable (`listCatalogEntryVersions` reads them unfiltered).
  */
 export async function deleteCatalogEntry(
 	deps: ControlPlaneDeps,
@@ -542,16 +616,32 @@ export async function deleteCatalogEntry(
 	for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
 		const outcome = await inTransaction(deps, async (uow) => {
 			const { db } = uow.tx;
+			// `gateway_controls` locked first, before `catalog_entries`: the global lock order every
+			// configuration writer keeps (`commitChangeIn`'s own first statement locks this row, and
+			// `management.ts`'s own `lockLifecycleRows` documents the same convention for its own
+			// tables). Locking `catalog_entries` first — as an earlier version of this function did —
+			// could deadlock (40P01) against a concurrent `attach_tool`/`update_attachment` commit,
+			// which always takes `gateway_controls` first through `commitChangeIn`; this order can
+			// only ever serialize against it instead. Read here and reused below, rather than a
+			// second, later read: this transaction already holds the lock, so nothing it reads under
+			// it can move again before this transaction ends.
+			await db.insert(gatewayControls).values({ id: 1 }).onConflictDoNothing();
+			const [controls] = await db
+				.select({ revision: gatewayControls.activeConfigRevision })
+				.from(gatewayControls)
+				.where(eq(gatewayControls.id, 1))
+				.for("update");
 			const [entryRow] = await db
 				.select({
 					id: catalogEntries.id,
 					kind: catalogEntries.kind,
 					isBuiltin: catalogEntries.isBuiltin,
+					deletedAt: catalogEntries.deletedAt,
 				})
 				.from(catalogEntries)
 				.where(eq(catalogEntries.id, entryId))
 				.for("update");
-			if (entryRow === undefined) {
+			if (entryRow === undefined || entryRow.deletedAt !== null) {
 				throw new AdminError(`catalog entry '${entryId}' does not exist`);
 			}
 			const affected = await db
@@ -560,15 +650,6 @@ export async function deleteCatalogEntry(
 				.where(eq(catalogAttachments.entryId, entryId));
 			if (affected.length > 0) {
 				const changeSet: ChangeSet = [{ type: "clear_tool_attachments", entryId }];
-				// Read on this same connection/transaction, never a fresh `inTransaction` (which would
-				// ask the pool for a second connection while this one is still open — wasteful at
-				// best, a self-deadlock at worst on a narrow pool): `commitChangeIn` re-derives and
-				// compares the true current revision itself regardless, so a value that is merely
-				// stale here just yields `conflict`, retried by this function's own loop.
-				const [controls] = await db
-					.select({ revision: gatewayControls.activeConfigRevision })
-					.from(gatewayControls)
-					.where(eq(gatewayControls.id, 1));
 				const baseRevisionId = controls?.revision ?? null;
 				const commit = await commitChangeIn(
 					uow,
@@ -581,10 +662,13 @@ export async function deleteCatalogEntry(
 			}
 			await db
 				.update(catalogEntries)
-				.set({ currentVersionId: null })
+				.set({ deletedAt: uow.now, deletedBy: actor })
 				.where(eq(catalogEntries.id, entryId));
+			// Defensive: the `clear_tool_attachments` commit above already reconciled every live
+			// attachment of `entryId` away (when `affected.length > 0`); nothing should be left to
+			// delete, but a stale read racing a concurrent attach is cheaper to clean up here than to
+			// leave dangling.
 			await db.delete(catalogAttachments).where(eq(catalogAttachments.entryId, entryId));
-			await db.delete(catalogEntries).where(eq(catalogEntries.id, entryId));
 			if (entryRow.isBuiltin) {
 				await db.insert(catalogEntryTombstones).values({
 					entryId,
@@ -676,10 +760,14 @@ export function legacyAttachmentsFromPermissions(
 	return { attachments, unresolved };
 }
 
+/** Every entry the legacy conversion may resolve a pattern against: deleted entries are excluded,
+ * the same way they are everywhere else (`loadEntry`) — a tombstoned capability's old wildcard
+ * coverage reports `unresolved` from here on, never silently matching a retired entry. */
 async function knownCatalogEntries(db: Db): Promise<Readonly<KnownCatalogEntry[]>> {
 	return db
 		.select({ id: catalogEntries.id, implementationKey: catalogEntries.implementationKey })
-		.from(catalogEntries);
+		.from(catalogEntries)
+		.where(isNull(catalogEntries.deletedAt));
 }
 
 export type AgentToolAttachmentsRead = LegacyConversionResult &
@@ -741,13 +829,10 @@ async function currentRevisionIdIn(db: Db): Promise<number | null> {
 // Attach / detach / update an agent's binding
 // ---------------------------------------------------------------------------
 
-/** `mode: "allow"` is refused once `riskFloor` is `require_approval`; `disabled` is always fine. */
-export function riskFloorAllows(
-	mode: ToolAttachmentMode,
-	riskFloor: ToolCatalogRiskFloor,
-): boolean {
-	return mode !== "allow" || riskFloor === "allow";
-}
+/** Re-exported for direct unit testing from this module, the same way it always has been; the
+ * rule itself now lives in `@agent-gateway/contracts` (`riskFloorAllows`), shared with
+ * `management.ts`'s own catalog-constraint check so neither copy can drift from the other. */
+export { riskFloorAllows };
 
 async function checkAttachable(
 	deps: ControlPlaneDeps,

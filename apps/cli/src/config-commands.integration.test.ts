@@ -703,6 +703,47 @@ describe("config export/import: tool attachments round-trip (ADR-027)", () => {
 		expect(imported.hash).toBe(attach.hash);
 	});
 
+	it("an untouched export/import round-trips to a no-op even when attachments were made in a different order than export's own sort (ADR-027)", async () => {
+		// Attached in reverse alphabetical order of entryId: an export that sorts
+		// `tool-attachments.json` (`toolAttachmentsText`) but a stored bundle that still hashes them
+		// in attach order would make this untouched round-trip manufacture a new revision instead of
+		// a no-op.
+		await attachTool(harness.deps, {
+			agentId: "director",
+			entryId: "native-web-search",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+		const attached = await attachTool(harness.deps, {
+			agentId: "director",
+			entryId: "gateway-mattermost-post",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+
+		const dir = exportDir();
+		await configExport(harness.deps, { dir, revisionId: attached.revisionId }, noopPrint);
+		const imported = await configImport(
+			harness.deps,
+			{
+				dir,
+				root: dir,
+				expectedRevision: attached.revisionId,
+				reason: null,
+				actor: "test",
+			},
+			noopPrint,
+		);
+		expect(imported.noop).toBe(true);
+		expect(imported.hash).toBe(attached.hash);
+	});
+
 	it("rollback restores a prior revision's own attachments, not merely whatever is live now", async () => {
 		const before = await activeConfigRevisionId(harness.deps);
 		if (before === null) {
