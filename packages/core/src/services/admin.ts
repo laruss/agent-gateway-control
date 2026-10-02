@@ -51,7 +51,19 @@ import {
 	withTransaction,
 } from "@agent-gateway/db";
 import { canonicalHash } from "@agent-gateway/events";
-import { and, asc, desc, eq, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
+import {
+	and,
+	asc,
+	desc,
+	eq,
+	inArray,
+	isNotNull,
+	isNull,
+	ne,
+	notInArray,
+	or,
+	sql,
+} from "drizzle-orm";
 import { grantedChannels } from "../channel-access.ts";
 import { nextAgentState, requireTransition } from "../state-machine.ts";
 import { revokeQueuedActions, sweepApprovals, withdrawOpenApprovals } from "./approvals.ts";
@@ -918,10 +930,13 @@ export async function writeConfigRevisionIn(
  * Reconciles `catalog_attachments` — the current-state projection of
  * `ConfigSnapshotBundle.toolAttachments` (ADR-027), the same way the loop above reconciles `agents`
  * against `ConfigSnapshotBundle.agents` — to match `desired` exactly: a row for a binding no
- * longer in `desired` is removed, and one still there is inserted or updated. Runs on every
- * configuration write (`replace_bundle`, `attach_tool`, `detach_tool`, `update_attachment`,
- * `clear_tool_attachments` alike), so this table never drifts from the bundle that is the actual
- * source of truth.
+ * longer in `desired` is removed, and one still there is inserted or updated. Also reconciles
+ * `agents.tool_attachments_managed` to whether `desired` has a key for each agent at all (even an
+ * explicitly empty list counts): the live, cheap "hub-managed" signal `catalog_attachments` rows
+ * alone cannot give, since an empty list and "never touched" both have zero rows there. Runs on
+ * every configuration write (`replace_bundle`, `attach_tool`, `detach_tool`, `update_attachment`,
+ * `clear_tool_attachments` alike), so neither projection ever drifts from the bundle that is the
+ * actual source of truth.
  */
 async function reconcileCatalogAttachmentsIn(
 	uow: UnitOfWork,
@@ -967,6 +982,19 @@ async function reconcileCatalogAttachmentsIn(
 					updatedAt: uow.now,
 				},
 			});
+	}
+	const hubManagedIds = Object.keys(desired);
+	if (hubManagedIds.length === 0) {
+		await db.update(agents).set({ toolAttachmentsManaged: false });
+	} else {
+		await db
+			.update(agents)
+			.set({ toolAttachmentsManaged: true })
+			.where(inArray(agents.id, hubManagedIds));
+		await db
+			.update(agents)
+			.set({ toolAttachmentsManaged: false })
+			.where(notInArray(agents.id, hubManagedIds));
 	}
 }
 

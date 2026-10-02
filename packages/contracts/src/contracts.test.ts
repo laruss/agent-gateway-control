@@ -252,6 +252,37 @@ describe("AgentTurnInput", () => {
 		expect(issuePaths(AgentTurnInputSchema, v2)).toEqual(["schemaVersion"]);
 		expect(issuePaths(AgentTurnInputSchema, { ...v2, systemStatus: systemStatus() })).toEqual([]);
 	});
+
+	it("rejects version 1 or version 2 carrying capabilities (version 3 only)", () => {
+		expect(issuePaths(AgentTurnInputSchema, { ...input, capabilities: [] })).toEqual([
+			"schemaVersion",
+		]);
+		const v2 = agentTurnInput({ schemaVersion: 2, systemStatus: systemStatus() });
+		expect(issuePaths(AgentTurnInputSchema, { ...v2, capabilities: [] })).toEqual([
+			"schemaVersion",
+		]);
+	});
+
+	it("requires version 3 to carry capabilities; systemStatus there stays governed by observation alone, not the version number", () => {
+		const v3 = agentTurnInput({ schemaVersion: 3 });
+		expect(issuePaths(AgentTurnInputSchema, v3)).toEqual(["schemaVersion"]);
+		expect(issuePaths(AgentTurnInputSchema, { ...v3, capabilities: [] })).toEqual([]);
+		expect(
+			issuePaths(AgentTurnInputSchema, {
+				...v3,
+				capabilities: [],
+				systemStatus: systemStatus(),
+			}),
+		).toEqual([]);
+	});
+
+	it("rejects duplicate capability names", () => {
+		const v3 = agentTurnInput({ schemaVersion: 3 });
+		const capability = { name: "repository.read", description: "Read files.", mode: "allow" };
+		expect(
+			issuePaths(AgentTurnInputSchema, { ...v3, capabilities: [capability, capability] }),
+		).toEqual(["capabilities"]);
+	});
 });
 
 describe("ToolPolicySnapshot", () => {

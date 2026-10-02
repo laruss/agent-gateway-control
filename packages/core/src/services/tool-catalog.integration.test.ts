@@ -312,10 +312,13 @@ describe("tool catalog service (ADR-027)", () => {
 		).rows;
 		expect(attachRevision).toMatchObject({ source: "console", actor: "owner" });
 
+		// `gateway-memory-write` is a `gateway`-kind entry: it supports `allow`/`disabled` only
+		// (`modeSupportedByKind`), never `require_approval` — no enforcement point can pause a turn
+		// mid-flight for a human to approve a direct Gateway action.
 		const updated = await updateAttachment(deps, {
 			agentId: "alpha",
 			entryId: "gateway-memory-write",
-			mode: "require_approval",
+			mode: "disabled",
 			actor: "owner",
 			source: "console",
 		});
@@ -326,7 +329,7 @@ describe("tool catalog service (ADR-027)", () => {
 			{
 				entryId: "gateway-memory-write",
 				pinnedVersion: null,
-				mode: "require_approval",
+				mode: "disabled",
 				settings: {},
 			},
 		]);
@@ -575,5 +578,30 @@ describe("tool catalog service (ADR-027)", () => {
 			])
 		).rows[0];
 		expect(row.deleted_at).not.toBeNull();
+	});
+
+	it("refuses 'require_approval' for a native entry, and 'allow' for an executor entry, by kind", async () => {
+		await expect(
+			attachTool(deps, {
+				agentId: "alpha",
+				entryId: "native-repository-read",
+				pinnedVersion: null,
+				mode: "require_approval",
+				settings: {},
+				actor: "test",
+				source: "console",
+			}),
+		).rejects.toThrow(/does not support mode 'require_approval'/);
+		await expect(
+			attachTool(deps, {
+				agentId: "alpha",
+				entryId: "executor-finance-payment-create",
+				pinnedVersion: null,
+				mode: "allow",
+				settings: {},
+				actor: "test",
+				source: "console",
+			}),
+		).rejects.toThrow(/requires at least 'require_approval'/);
 	});
 });

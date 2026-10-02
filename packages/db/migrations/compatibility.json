@@ -33,7 +33,8 @@
     "0028_tool_catalog": "expand",
     "0029_tool_catalog_guards": "expand",
     "0030_config_attachment_snapshots": "expand",
-    "0031_config_attachment_snapshots_guards": "expand"
+    "0031_config_attachment_snapshots_guards": "expand",
+    "0032_agent_tool_attachments_managed": "expand"
   },
   "releases": [
     {

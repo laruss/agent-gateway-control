@@ -225,6 +225,13 @@
       "when": 1790975138398,
       "tag": "0031_config_attachment_snapshots_guards",
       "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1790980954251,
+      "tag": "0032_agent_tool_attachments_managed",
+      "breakpoints": true
     }
   ]
 }

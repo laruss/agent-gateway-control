@@ -23,8 +23,6 @@ import {
 	ToolCatalogRiskFloorSchema,
 	ToolCatalogSupportedAdaptersSchema,
 	type ToolName,
-	type ToolPattern,
-	toolPatternCovers,
 } from "@agent-gateway/contracts";
 import {
 	catalogAttachments,
@@ -33,9 +31,21 @@ import {
 	catalogEntryVersions,
 	gatewayControls,
 } from "@agent-gateway/db";
+import {
+	compileAttachments,
+	compiledAgentPermissions,
+	modeSupportedByKind,
+} from "@agent-gateway/policy";
 import { and, asc, eq, inArray, isNull } from "drizzle-orm";
 import { AdminError, inTransaction } from "./admin.ts";
+import { loadCompilableCatalogEntries } from "./attachment-validation.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
+import {
+	knownCatalogEntries,
+	type LegacyConversionResult,
+	type LegacyUnresolvedPattern,
+	legacyAttachmentsFromPermissions,
+} from "./effective-permissions.ts";
 import {
 	activeConfigRevisionId,
 	type CommitChangeResult,
@@ -693,82 +703,20 @@ export async function deleteCatalogEntry(
 }
 
 // ---------------------------------------------------------------------------
-// Legacy conversion: a read model, never written back (ADR-027)
+// Legacy conversion and effective permissions (ADR-027) live in `effective-permissions.ts`, a leaf
+// module `scheduler.ts`/`approvals.ts` can import without cycling back through `admin.ts`; the
+// pieces this file's own bundle-based reads still need are re-exported here so every existing
+// import path keeps working.
 // ---------------------------------------------------------------------------
 
-type PermissionListName = "tools_allow" | "tools_require_human_approval" | "tools_deny";
-
-export type LegacyUnresolvedPattern = Readonly<{ list: PermissionListName; pattern: ToolPattern }>;
-
-export type LegacyConversionResult = Readonly<{
-	attachments: Readonly<ToolAttachment[]>;
-	unresolved: Readonly<LegacyUnresolvedPattern[]>;
-}>;
-
-const MODE_BY_LIST: Readonly<Record<PermissionListName, ToolAttachmentMode>> = {
-	tools_deny: "disabled",
-	tools_require_human_approval: "require_approval",
-	tools_allow: "allow",
-};
-
-/** Minimal shape `legacyAttachmentsFromPermissions` needs of a known catalog entry. */
-export type KnownCatalogEntry = Readonly<{ id: ToolCatalogEntryId; implementationKey: ToolName }>;
-
-/**
- * Maps an agent's current `permissions` lists to catalog attachments, by pattern coverage against
- * `knownEntries` alone — never anything a future entry might add. A wildcard (`finance.*`)
- * expands into one attachment per currently known entry it covers; an exact pattern becomes one
- * attachment if it names a known entry's `implementationKey`. A pattern covering none of
- * `knownEntries` is reported `unresolved`, never silently dropped. `tools_deny` maps to
- * `disabled`, `tools_require_human_approval` to `require_approval`, `tools_allow` to `allow`; a
- * valid `AgentPermissions` never has two patterns (in the same list or across lists) that overlap
- * (`AgentPermissionsSchema`'s own check), so no entry is ever produced twice. Finance rules
- * (`config-bundle.ts`'s `financeIssues`) are already baked into each agent's own `permissions`
- * before this ever runs — nothing finance-specific happens here. Pure; this is the read model, it
- * writes nothing.
- */
-export function legacyAttachmentsFromPermissions(
-	permissions: AgentPermissions,
-	knownEntries: Readonly<KnownCatalogEntry[]>,
-): LegacyConversionResult {
-	const attachments: ToolAttachment[] = [];
-	const unresolved: LegacyUnresolvedPattern[] = [];
-	const lists: Readonly<[PermissionListName, Readonly<ToolPattern[]>][]> = [
-		["tools_deny", permissions.tools_deny],
-		["tools_require_human_approval", permissions.tools_require_human_approval],
-		["tools_allow", permissions.tools_allow],
-	];
-	for (const [list, patterns] of lists) {
-		for (const pattern of patterns) {
-			const matches = knownEntries.filter((entry) =>
-				toolPatternCovers(pattern, entry.implementationKey),
-			);
-			if (matches.length === 0) {
-				unresolved.push({ list, pattern });
-				continue;
-			}
-			for (const entry of matches) {
-				attachments.push({
-					entryId: entry.id,
-					pinnedVersion: null,
-					mode: MODE_BY_LIST[list],
-					settings: {},
-				});
-			}
-		}
-	}
-	return { attachments, unresolved };
-}
-
-/** Every entry the legacy conversion may resolve a pattern against: deleted entries are excluded,
- * the same way they are everywhere else (`loadEntry`) — a tombstoned capability's old wildcard
- * coverage reports `unresolved` from here on, never silently matching a retired entry. */
-async function knownCatalogEntries(db: Db): Promise<Readonly<KnownCatalogEntry[]>> {
-	return db
-		.select({ id: catalogEntries.id, implementationKey: catalogEntries.implementationKey })
-		.from(catalogEntries)
-		.where(isNull(catalogEntries.deletedAt));
-}
+export {
+	type EffectiveAgentPermissions,
+	type KnownCatalogEntry,
+	type LegacyConversionResult,
+	type LegacyUnresolvedPattern,
+	legacyAttachmentsFromPermissions,
+	loadEffectivePermissionsIn,
+} from "./effective-permissions.ts";
 
 export type AgentToolAttachmentsRead = LegacyConversionResult &
 	Readonly<{
@@ -826,6 +774,178 @@ async function currentRevisionIdIn(db: Db): Promise<number | null> {
 }
 
 // ---------------------------------------------------------------------------
+// Explicit migration: converting a legacy agent's `permissions` into real, recorded attachments
+// (`gateway tools adopt`). Never automatic — ADR-027 requires an owner to ask for this agent by
+// name, or `--all`, every time.
+// ---------------------------------------------------------------------------
+
+export type AdoptAgentResult = Readonly<{
+	agentId: AgentId;
+	/** Already hub-managed before this call: left untouched, nothing to adopt. */
+	alreadyHubManaged: boolean;
+	unresolved: Readonly<LegacyUnresolvedPattern[]>;
+	/** The agent's effective permissions before adoption (its `permissions` lists, or — for an
+	 * agent already hub-managed — its current compiled attachments, unchanged by this call). */
+	before: AgentPermissions;
+	/** The agent's effective permissions once its resolved attachments are compiled: identical in
+	 * effect to `before` whenever every pattern resolved, the whole point of a safe migration. */
+	after: AgentPermissions;
+	/** The attachments this call resolved (and, unless `dryRun` or `problems` is non-empty,
+	 * committed) for this agent; empty when there was nothing to resolve. */
+	attachments: Readonly<ToolAttachment[]>;
+	/** A resolved pattern's mode its own catalog entry's `kind` does not support
+	 * (`modeSupportedByKind`): a legacy `permissions` list naming a pattern in a way the catalog
+	 * model cannot express (e.g. a native tool in `tools_require_human_approval`, which has no
+	 * enforcement point that can pause a turn for a human). Non-empty: nothing is committed, even
+	 * when `dryRun` is false — the same refusal `attachTool`/the commit boundary would give, found
+	 * before attempting it. */
+	problems: Readonly<string[]>;
+	/** `null` when nothing was committed (`dryRun`, already hub-managed, `problems` non-empty, or
+	 * nothing resolved). */
+	commit: CommitChangeResult | null;
+}>;
+
+export type AdoptToolAttachmentsInput = Readonly<{
+	/** Explicit agent ids, or every currently configured agent (`--all`). */
+	agentIds: Readonly<AgentId[]>;
+	dryRun: boolean;
+	actor: string;
+	reason?: string;
+}>;
+
+/**
+ * Converts each named agent's current `permissions` lists into real, recorded attachments
+ * (`legacyAttachmentsFromPermissions`), one committed revision per agent (never combined: a batch
+ * of many agents' attachments could exceed `MAX_CHANGE_SET_OPERATIONS`, and one agent's adoption
+ * failing must never block another's). An agent already hub-managed is left alone and reported as
+ * such — adopting it again would silently overwrite real, deliberate attachments with a legacy
+ * reconstruction of a `permissions` list the hub may have long since stopped reflecting.
+ * `dryRun` resolves and previews every agent (including the catalog-constraint check every other
+ * write path shares) without committing anything.
+ */
+export async function adoptAgentToolAttachments(
+	deps: ControlPlaneDeps,
+	input: AdoptToolAttachmentsInput,
+): Promise<Readonly<AdoptAgentResult[]>> {
+	const all = await loadAllAgentToolAttachments(deps);
+	const results: AdoptAgentResult[] = [];
+	for (const agentId of input.agentIds) {
+		const read = all[agentId];
+		if (read === undefined) {
+			throw new AdminError(`agent '${agentId}' does not exist`);
+		}
+		results.push(await adoptOneAgent(deps, agentId, read, input));
+	}
+	return results;
+}
+
+async function adoptOneAgent(
+	deps: ControlPlaneDeps,
+	agentId: AgentId,
+	read: AgentToolAttachmentsRead,
+	input: AdoptToolAttachmentsInput,
+): Promise<AdoptAgentResult> {
+	const { bundle } = await inTransaction(deps, async ({ tx }) => {
+		const revisionId = await currentRevisionIdIn(tx.db);
+		return loadActiveBundle(tx.db, revisionId);
+	});
+	const agent = bundle.agents.find((a) => a.id === agentId);
+	if (agent === undefined) {
+		throw new AdminError(`agent '${agentId}' does not exist`);
+	}
+	const financeAgentId = bundle.organization?.organization.finance_agent_id ?? "";
+	const catalog = await inTransaction(deps, ({ tx }) =>
+		loadCompilableCatalogEntries(tx.db, { [agentId]: [...read.attachments] }),
+	);
+	const compiled = compileAttachments({
+		agentId,
+		financeAgentId,
+		adapter: agent.runtime.adapter,
+		attachments: read.attachments,
+		catalog,
+	});
+	const compiledPermissions = compiledAgentPermissions(compiled, {
+		agentId,
+		financeAgentId,
+		observeSystem: agent.permissions.observe_system === true,
+	});
+	if (read.hubManaged) {
+		return {
+			agentId,
+			alreadyHubManaged: true,
+			unresolved: [],
+			before: compiledPermissions,
+			after: compiledPermissions,
+			attachments: read.attachments,
+			problems: [],
+			commit: null,
+		};
+	}
+	const problems = read.attachments.flatMap((attachment) => {
+		const entry = catalog.get(attachment.entryId);
+		if (entry === undefined) {
+			return [`catalog entry '${attachment.entryId}' does not exist`];
+		}
+		return modeSupportedByKind(entry.kind, attachment.mode)
+			? []
+			: [
+					`catalog entry '${attachment.entryId}' (kind '${entry.kind}') does not support mode ` +
+						`'${attachment.mode}'`,
+				];
+	});
+	if (problems.length > 0) {
+		return {
+			agentId,
+			alreadyHubManaged: false,
+			unresolved: read.unresolved,
+			before: agent.permissions,
+			after: agent.permissions,
+			attachments: read.attachments,
+			problems,
+			commit: null,
+		};
+	}
+	if (read.attachments.length === 0 || input.dryRun) {
+		return {
+			agentId,
+			alreadyHubManaged: false,
+			unresolved: read.unresolved,
+			before: agent.permissions,
+			after: read.attachments.length === 0 ? agent.permissions : compiledPermissions,
+			attachments: read.attachments,
+			problems: [],
+			commit: null,
+		};
+	}
+	const changeSet: ChangeSet = read.attachments.map((attachment) => ({
+		type: "attach_tool",
+		agentId,
+		entryId: attachment.entryId,
+		pinnedVersion: attachment.pinnedVersion,
+		mode: attachment.mode,
+		settings: attachment.settings,
+	}));
+	const baseRevisionId = await activeConfigRevisionId(deps);
+	const commit = await commitChange(deps, {
+		changeSet,
+		baseRevisionId,
+		actor: input.actor,
+		source: "cli_apply",
+		...(input.reason === undefined ? {} : { reason: input.reason }),
+	});
+	return {
+		agentId,
+		alreadyHubManaged: false,
+		unresolved: read.unresolved,
+		before: agent.permissions,
+		after: compiledPermissions,
+		attachments: read.attachments,
+		problems: [],
+		commit,
+	};
+}
+
+// ---------------------------------------------------------------------------
 // Attach / detach / update an agent's binding
 // ---------------------------------------------------------------------------
 
@@ -847,6 +967,11 @@ async function checkAttachable(
 	if (!riskFloorAllows(mode, entry.currentVersion.riskFloor)) {
 		throw new AdminError(
 			`catalog entry '${entryId}' requires at least 'require_approval' (its risk floor)`,
+		);
+	}
+	if (!modeSupportedByKind(entry.kind, mode)) {
+		throw new AdminError(
+			`catalog entry '${entryId}' (kind '${entry.kind}') does not support mode '${mode}'`,
 		);
 	}
 	if (pinnedVersion !== null) {

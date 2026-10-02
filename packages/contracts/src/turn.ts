@@ -14,6 +14,7 @@ import {
 	Sha256HexSchema,
 	safeText,
 	TimestampSchema,
+	ToolNameSchema,
 	ToolPatternSchema,
 	TrustLevelSchema,
 	toolPatternOverlaps,
@@ -405,14 +406,50 @@ export const ChannelRefSchema = z.strictObject({
 });
 export type ChannelRef = z.infer<typeof ChannelRefSchema>;
 
+/** How a capability may be used, as `capabilities` describes it; `disabled` tools are never
+ * listed at all (there is nothing to describe). */
+export const CapabilityModeSchema = z.enum(["allow", "require_approval"]);
+export type CapabilityMode = z.infer<typeof CapabilityModeSchema>;
+
+/** A bounded, short description for `CapabilityDescriptionSchema`: enough for a runtime's prompt
+ * to explain a capability in one line, never a catalog entry's own longer description verbatim. */
+export const CapabilityDescriptionTextSchema = z.string().min(1).max(200);
+
 /**
- * Version 1 is every turn; version 2 adds the Gateway's system status for agents that observe
- * the system (ADR-023). A version 1 reader refuses version 2, so an older release fails such a
- * run instead of silently dropping the status.
+ * One effective tool the agent's turn carries a name, short description and mode for (version 3,
+ * ADR-023): a bounded, structured alternative to the runtime inferring what a bare tool name
+ * means. `name` is the concrete tool (`repository.read`, `finance.payment.create`), never a
+ * wildcard pattern.
+ */
+export const CapabilityDescriptionSchema = z.strictObject({
+	name: ToolNameSchema,
+	description: CapabilityDescriptionTextSchema,
+	mode: CapabilityModeSchema,
+});
+export type CapabilityDescription = z.infer<typeof CapabilityDescriptionSchema>;
+
+/** At most this many capabilities per turn; generous for a hub with a few dozen tools. */
+export const MAX_CAPABILITIES = 128;
+
+export const CapabilityDescriptionsSchema = z
+	.array(CapabilityDescriptionSchema)
+	.max(MAX_CAPABILITIES)
+	.refine(
+		(capabilities) => unique(capabilities.map((c) => c.name)),
+		"capability names must be unique",
+	);
+
+/**
+ * Version 1 is every turn and is unchanged in shape. Version 2 adds the Gateway's system status
+ * for agents that observe the system (ADR-023); a version 1 reader refuses version 2, so an older
+ * release fails such a run instead of silently dropping the status. Version 3 adds `capabilities`
+ * — bounded, structured descriptions of the agent's own effective tools — carried by every version
+ * 3 input regardless of `systemStatus`, which stays governed by observation alone, the same as
+ * version 2.
  */
 export const AgentTurnInputSchema = z
 	.strictObject({
-		schemaVersion: z.union([z.literal(1), z.literal(2)]),
+		schemaVersion: z.union([z.literal(1), z.literal(2), z.literal(3)]),
 		runId: UuidSchema,
 		agent: AgentIdentitySnapshotSchema,
 		organization: OrganizationSnapshotSchema,
@@ -430,16 +467,37 @@ export const AgentTurnInputSchema = z
 		/** JSON Schema of `AgentTurnModelOutput` the runtime must produce. */
 		outputSchema: JsonObjectSchema,
 		deadline: TimestampSchema,
-		/** Version 2 only: the Gateway's read-only snapshot of its own operation. */
+		/** Version 2 and 3 only, and only for an agent that observes the system: the Gateway's
+		 * read-only snapshot of its own operation. */
 		systemStatus: SystemStatusSchema.optional(),
+		/** Version 3 only, always present (possibly empty): bounded descriptions of the agent's own
+		 * effective tools, for the runtime prompt to describe them structurally. */
+		capabilities: CapabilityDescriptionsSchema.optional(),
 	})
 	.check((ctx) => {
-		if ((ctx.value.schemaVersion === 2) !== (ctx.value.systemStatus !== undefined)) {
+		const { schemaVersion, systemStatus, capabilities } = ctx.value;
+		if (schemaVersion === 1 && (systemStatus !== undefined || capabilities !== undefined)) {
 			ctx.issues.push({
 				code: "custom",
-				input: ctx.value.schemaVersion,
+				input: schemaVersion,
 				path: ["schemaVersion"],
-				message: "schemaVersion 2 carries systemStatus, and only version 2 does",
+				message: "schemaVersion 1 carries neither systemStatus nor capabilities",
+			});
+		}
+		if (schemaVersion === 2 && (systemStatus === undefined || capabilities !== undefined)) {
+			ctx.issues.push({
+				code: "custom",
+				input: schemaVersion,
+				path: ["schemaVersion"],
+				message: "schemaVersion 2 always carries systemStatus, and never capabilities",
+			});
+		}
+		if (schemaVersion === 3 && capabilities === undefined) {
+			ctx.issues.push({
+				code: "custom",
+				input: schemaVersion,
+				path: ["schemaVersion"],
+				message: "schemaVersion 3 always carries capabilities",
 			});
 		}
 	});

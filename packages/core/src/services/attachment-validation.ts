@@ -1,15 +1,23 @@
 import {
 	riskFloorAllows,
 	type ToolAttachmentsBundle,
+	type ToolCatalogEntryKind,
 	type ToolCatalogRiskFloor,
+	type ToolName,
 } from "@agent-gateway/contracts";
 import { catalogEntries, catalogEntryVersions } from "@agent-gateway/db";
+import { type CompiledCatalogEntry, modeSupportedByKind } from "@agent-gateway/policy";
 import { eq, inArray } from "drizzle-orm";
 import type { UnitOfWork } from "./deps.ts";
 
 type Db = UnitOfWork["tx"]["db"];
 
-type AttachableCatalogEntry = Readonly<{ deletedAt: Date | null; riskFloor: ToolCatalogRiskFloor }>;
+type AttachableCatalogEntry = Readonly<{
+	deletedAt: Date | null;
+	kind: ToolCatalogEntryKind;
+	implementationKey: ToolName;
+	riskFloor: ToolCatalogRiskFloor;
+}>;
 
 async function loadAttachableEntries(
 	db: Db,
@@ -22,14 +30,52 @@ async function loadAttachableEntries(
 		.select({
 			id: catalogEntries.id,
 			deletedAt: catalogEntries.deletedAt,
+			kind: catalogEntries.kind,
+			implementationKey: catalogEntries.implementationKey,
 			riskFloor: catalogEntryVersions.riskFloor,
 		})
 		.from(catalogEntries)
 		.innerJoin(catalogEntryVersions, eq(catalogEntries.currentVersionId, catalogEntryVersions.id))
 		.where(inArray(catalogEntries.id, [...entryIds]));
 	return new Map(
-		rows.map((row) => [row.id, { deletedAt: row.deletedAt, riskFloor: row.riskFloor }]),
+		rows.map((row) => [
+			row.id,
+			{
+				deletedAt: row.deletedAt,
+				kind: row.kind,
+				implementationKey: row.implementationKey,
+				riskFloor: row.riskFloor,
+			},
+		]),
 	);
+}
+
+/**
+ * Every entry named by any agent's attachments in `toolAttachments`, reduced to what the pure
+ * compiler needs (`kind`/`implementationKey` alone), excluding deleted entries — the compiler
+ * already treats an attachment naming one absent here as contributing nothing, the same as an
+ * unknown entry. Shared by `management.ts`'s bundle-permissions mirror
+ * (`mirrorCompiledAttachmentPermissionsIn`, ADR-027's bundle-mirror invariant) so it never loads
+ * catalog rows through a second, differently-shaped query.
+ */
+export async function loadCompilableCatalogEntries(
+	db: Db,
+	toolAttachments: ToolAttachmentsBundle,
+): Promise<ReadonlyMap<string, CompiledCatalogEntry>> {
+	const entryIds = new Set<string>();
+	for (const attachments of Object.values(toolAttachments)) {
+		for (const attachment of attachments) {
+			entryIds.add(attachment.entryId);
+		}
+	}
+	const entries = await loadAttachableEntries(db, entryIds);
+	const result = new Map<string, CompiledCatalogEntry>();
+	for (const [id, entry] of entries) {
+		if (entry.deletedAt === null) {
+			result.set(id, { kind: entry.kind, implementationKey: entry.implementationKey });
+		}
+	}
+	return result;
 }
 
 async function loadKnownEntryVersions(
@@ -55,9 +101,14 @@ async function loadKnownEntryVersions(
 /**
  * Every catalog constraint an attachment must satisfy, checked against the database: its entry
  * exists and is not deleted, its `pinnedVersion` (when set) names a real version of that entry,
- * and its `mode` respects the entry's own `riskFloor`. An attachment's `settings` bound is already
- * enforced structurally wherever one is parsed (`ToolAttachmentSettingsSchema`); nothing here
- * compiles `configSchema` into a validator (ADR-027 leaves that for later work).
+ * its `mode` respects the entry's own `riskFloor`, and its `mode` is one its entry's own `kind`
+ * actually supports (`modeSupportedByKind`, `@agent-gateway/policy`): a native capability or a
+ * direct Gateway action (`mattermost.post`, `memory.write`) has no enforcement point that can
+ * pause a turn mid-flight for a human, so `require_approval` is refused for them — only
+ * `allow`/`disabled` are; a tool-broker executor action always needs a human (its risk floor
+ * already refuses `allow`), so only `require_approval`/`disabled` are. An attachment's `settings`
+ * bound is already enforced structurally wherever one is parsed (`ToolAttachmentSettingsSchema`);
+ * nothing here compiles `configSchema` into a validator (ADR-027 leaves that for later work).
  */
 export async function attachmentCatalogProblems(
 	db: Db,
@@ -90,6 +141,12 @@ export async function attachmentCatalogProblems(
 				problems.push(
 					`toolAttachments: agent '${agentId}': catalog entry '${attachment.entryId}' requires at ` +
 						"least 'require_approval' (its risk floor)",
+				);
+			}
+			if (!modeSupportedByKind(entry.kind, attachment.mode)) {
+				problems.push(
+					`toolAttachments: agent '${agentId}': catalog entry '${attachment.entryId}' (kind ` +
+						`'${entry.kind}') does not support mode '${attachment.mode}'`,
 				);
 			}
 			if (

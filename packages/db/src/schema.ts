@@ -274,6 +274,16 @@ export const agents = pgTable(
 		maxActiveRuns: integer("max_active_runs").notNull(),
 		config: jsonb("config").$type<AgentConfig>().notNull(),
 		rolePrompt: text("role_prompt").notNull(),
+		/**
+		 * Whether the active revision's attachments document has an entry for this agent at all
+		 * (ADR-027): hub-managed, even with an explicitly empty attachment list (detached from
+		 * everything), rather than legacy. The live counterpart of
+		 * `ConfigSnapshotBundle.toolAttachments`'s own per-agent key, reconciled by
+		 * `writeConfigRevisionIn` exactly like `catalogAttachments`'s own rows — cheap to read
+		 * without deserializing a historical snapshot, which `catalogAttachments` alone cannot
+		 * distinguish from "never touched" once an agent's list is emptied back out.
+		 */
+		toolAttachmentsManaged: boolean("tool_attachments_managed").notNull().default(false),
 		stateChangedAt: timestamp("state_changed_at", { withTimezone: true }).notNull().defaultNow(),
 		createdAt: createdAt(),
 		updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

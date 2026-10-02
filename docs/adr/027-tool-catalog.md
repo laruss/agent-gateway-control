@@ -19,11 +19,15 @@ that holds it.
 This decision gives the catalog a durable data model: entries, their immutable version history,
 the availability a listing of them computes (never stores), and agents' attachments to them — the
 Instruments & Utils hub's "what exists" and "who has it", not yet "what runs" or "what a console
-shows". It makes no change to tool enforcement: `packages/policy` reads `permissions` exactly as it
-always has, and nothing here compiles an attachment into a grant. No UI reads any of this yet, and
-`custom_https` (an owner's own HTTPS-backed tool) is reserved as a `kind` with no definition —
-both are later work this decision anticipates and prepares storage for, the same way ADR-026
-anticipated automated Mattermost provisioning without performing it.
+shows". No UI reads any of this yet, and `custom_https` (an owner's own HTTPS-backed tool) is
+reserved as a `kind` with no definition — both are later work this decision anticipates and
+prepares storage for, the same way ADR-026 anticipated automated Mattermost provisioning without
+performing it.
+
+The data model alone made no change to tool enforcement, deliberately (see "Alternatives" below):
+attaching, detaching or editing an attachment was pure bookkeeping until "Effective permissions:
+compiled attachments as the single source of truth" below, which completes the work this decision
+anticipated — an agent's attachments now decide what it may actually do.
 
 ## Decision
 
@@ -124,19 +128,22 @@ to start at all — the moment an operator rolls back to it. Keeping the bundle 
 every release has always read, and the attachments document in a table of its own that an older
 release simply does not know exists (and does not need: `config_snapshots`/`config_revisions` stay
 fully readable, ADR-020's expand-migration guarantee), avoids that regression by construction. The
-bundle's own agent `permissions` lists stay present and valid regardless — later work may derive
-them from attachments, so an older release still enforces the same effective permissions after a
-binary rollback; this decision does not change what `permissions` means or how it is validated.
+bundle's own agent `permissions` lists stay present and valid regardless: "Effective permissions:
+compiled attachments as the single source of truth" below mirrors compiled attachments into them
+for exactly this reason, so an older release still enforces the same effective permissions after a
+binary rollback.
 
-**`permissions` is not derived from attachments, and attachments are not derived from
-`permissions`, in this release.** `packages/policy` keeps reading only `permissions`, completely
-unchanged; attaching, detaching or editing an attachment has no effect on what a running agent may
-actually do. This is deliberate, not an oversight: compiling attachments into enforcement (or
-making policy read them directly) is real design work — which direction, whether a floor interacts
-with `tools_require_human_approval`, how a `custom_https` definition would even execute — that
-belongs to a later phase building on this one, not to introducing the data model itself. Keeping
-the two independent this release is also what keeps this decision small enough to review and
-revert on its own: nothing about tool enforcement changes merely because this migration ran.
+**At the time entries, versions and attachments were introduced, `permissions` was not derived
+from attachments, and attachments were not derived from `permissions`.** `packages/policy` read
+only `permissions`, unchanged; attaching, detaching or editing an attachment had no effect on what
+a running agent could actually do. This was deliberate, not an oversight: compiling attachments
+into enforcement is real design work — which direction, whether a floor interacts with
+`tools_require_human_approval`, how a `custom_https` definition would even execute — that belonged
+to a later step building on this one, not to introducing the data model itself. Keeping the two
+independent at that point was also what kept that step small enough to review and revert on its
+own. "Effective permissions: compiled attachments as the single source of truth" below is that
+later step: for a hub-managed agent, `permissions` is now a mirror of its compiled attachments,
+never an independent fact — see that section for the exact rule.
 
 Every attachment named anywhere in a committed configuration is checked, at the same shared commit
 boundary every write path commits a bundle through (`prepareChange`/`commitChangeIn`): its entry
@@ -254,6 +261,133 @@ Built-in ids are deterministic (`<kind>-<implementation-key-with-hyphens>`, e.g.
 `native-repository-read`, `executor-finance-payment-create`), so reseeding and tombstoning always
 agree on which row they mean.
 
+### Effective permissions: compiled attachments as the single source of truth
+
+Attach a tool in the hub and the agent may use it on its next turn; detach it and it cannot,
+including anything already queued. `compileAttachments` (`@agent-gateway/policy`, pure, no IO)
+takes one agent's attachments and the catalog metadata (`kind`/`implementationKey`) of every entry
+they name, and produces disjoint, concrete tool lists — `allow`, `requireApproval`, `deny` — plus
+two derived maps, `impliedBy` and `missingPrerequisites`, and a `memoryWriteAllowed` flag.
+
+**Mode is bounded by an entry's own `kind`, not only its `riskFloor`.** `riskFloorAllows` (ADR-027's
+original rule) says how strict a mode must be; `modeSupportedByKind` says which modes an entry's
+`kind` can express at all, because not every kind has an enforcement point that can pause a turn
+for a human mid-flight:
+
+| Kind | Supported modes | Why |
+|------|------------------|-----|
+| `native` | `allow`, `disabled` | A runtime's own built-in tool runs inside the turn; nothing can intercept it to ask a human first. |
+| `gateway` | `allow`, `disabled` | `mattermost.post`/`memory.write` are direct Gateway actions with no approval flow of their own. |
+| `executor` | `require_approval`, `disabled` | A tool-broker action's risk floor is already `require_approval` (`riskFloorAllows` already refuses `allow` for it); this makes the bound explicit and kind-driven rather than an accident of every executor's own floor. |
+| `custom_https` | none | Reserved; nothing is ever attachable against it. |
+
+An attachment whose mode its entry's `kind` does not support is refused at the same shared write
+boundary that already checks `riskFloor` (`attachmentCatalogProblems`, reused rather than
+duplicated) and, earlier and more specifically, at `attachTool`/`updateAttachment`'s own
+`checkAttachable`.
+
+**Native dependencies are catalog data, not scattered `if`s.** Granting a native capability with
+`allow` can make another effectively usable even when it was never itself attached: `tests.run`
+implies `repository.read` and `workspace.write` (a runtime needs to read, and may need to write,
+the files a command touches), and `workspace.write` alone implies `repository.read`. This mirrors,
+for the compiled result, the same fail-closed inference `packages/runtime-sdk`'s `nativeToolGrants`
+already makes from a `ToolPolicySnapshot`'s raw lists — restated here so every enforcement point
+that reads the compiled result (not only `nativeToolGrants`) agrees on what is effectively allowed,
+and so a version 3 turn input's `capabilities` can describe the implied tool too. An explicit
+`disabled` or `require_approval` on the implied tool wins over the implication; `impliedBy` records
+which attached tool caused which implied one, for both the capability description and any future
+operator-facing display.
+
+A second, narrower kind of fact runs the other way: an **adapter-specific prerequisite**. Codex
+reads files only through its shell (`packages/runtime-codex`'s `SHELL_FEATURES`, withheld unless
+`tests.run` is granted), so `repository.read` alone gives a Codex agent no file access at all — a
+fact the adapter already enforces on its own (`sandboxArgs`), unconditionally, regardless of how a
+grant arrived. The compiler does not remove `repository.read` from `allow` to compensate (the
+adapter's own fail-closed behaviour already makes the capability inert); instead it surfaces the
+missing prerequisite (`missingPrerequisites: { "repository.read": ["tests.run"] }`), from a small,
+explicit, adapter-keyed table (`ADAPTER_NATIVE_PREREQUISITES`) — data an owner managing attachments
+(or a future console) can be shown, not a silent trap.
+
+**`memory.write` is always explicit, in `allow` or in `deny`, never silently absent from both.**
+Authority (`writableMemoryNamespaces`, `packages/core/src/turn-context.ts`) and the rendered prompt
+(`memoryWriteDenied`, `packages/runtime-sdk/src/prompt.ts`) both derive deniability from `deny`
+alone, a contract that predates this compiler; an attachment simply never existing for
+`memory.write` must still show up as an explicit denial, or that independent re-derivation would
+tell the model it may propose writes the turn's own authority then refuses. The compiler enforces
+this directly: whenever `memory.write` is not in `allow`, it is added to `deny` — whether it was
+explicitly attached `disabled` or never attached at all.
+
+**Finance capabilities compile in only for the organization's finance agent.** An attachment of a
+finance-kind entry held by any other agent contributes nothing at all, as though never attached —
+the same invariant `config-bundle.ts`'s `financeIssues` already enforces for hand-authored
+`permissions`, so attaching a finance entry to the wrong agent through the hub can never become a
+second, inconsistent way to grant finance access.
+
+**Single source of truth.** For a **hub-managed** agent — the active revision's attachments
+document has an entry for it, even an explicitly empty one (detached from everything) — effective
+permissions come only from `compileAttachments`'s result: `packages/policy`'s enforcement, the
+turn's own `toolPolicy`, memory-write authority and the runtime prompt all read it, never
+`agent.config.permissions` directly. For a **legacy** agent (no attachments document at all),
+effective permissions are exactly its `permissions` lists, byte for byte, the same as before this
+step — `loadEffectivePermissionsIn` (`packages/core/src/services/effective-permissions.ts`) is the
+one function that resolves this distinction, so no enforcement point can read one fact for one kind
+of agent and a different one for the other by accident. `agents.tool_attachments_managed`
+(migration `0032`) is the live, cheap signal for "hub-managed, including an empty list" that
+`catalog_attachments` rows alone cannot give (an empty list and "never touched" both have zero
+rows); it is reconciled by `writeConfigRevisionIn` exactly like `catalog_attachments` itself, and
+was backfilled, at migration time, from the then-active revision's own attachments document (every
+agent key present there, regardless of its list's length).
+
+**Never converted implicitly.** A legacy agent stays legacy until an owner
+explicitly asks for it: `adoptAgentToolAttachments` (`gateway tools adopt <agent>|--all
+[--dry-run]`) is a core function and CLI command that converts one named agent's (or every
+currently legacy agent's, for `--all`) current `permissions` into real, recorded attachments
+(`legacyAttachmentsFromPermissions`, unchanged from ADR-027's original read model), committing one
+revision per agent (never combined: a batch could exceed `MAX_CHANGE_SET_OPERATIONS`, and one
+agent's adoption failing must never block another's). It reports, per agent: whether it was already
+hub-managed (left untouched), every unresolved pattern, the effective permissions before and after
+(identical in effect whenever every pattern resolved — the whole point of a safe migration), and
+any resolved attachment whose mode its entry's `kind` does not support (found before attempting a
+commit that would otherwise refuse it). `--dry-run` previews everything above without committing.
+An agent whose legacy conversion resolves to zero attachments (every pattern unresolved, or no
+permissions at all) is not adopted even without `--dry-run`: there is no change-set operation that
+marks an *existing* agent hub-managed with an explicitly empty list (only `add_agent`/
+`replace_bundle` can start one that way), so `tools adopt` reports this rather than silently doing
+nothing useful — attach at least one entry directly instead.
+
+**The bundle-mirror invariant.** Whenever a hub-managed agent's compiled attachments could have
+changed — any `attach_tool`/`detach_tool`/`update_attachment`/`clear_tool_attachments`, or a plain
+`replace_bundle` that supplies a `toolAttachments` document — `mirrorCompiledAttachmentPermissionsIn`
+(`management.ts`) recompiles every hub-managed agent's attachments and replaces its `permissions`
+field with the result (`compiledAgentPermissions`), in the very same draft the catalog-constraint
+check and the hash are computed from, so the mirror is never a separate write and never a separate
+revision. This is what keeps a binary rollback to a release before this step (0.6.0, which enforces
+only `permissions`) safe: it enforces exactly the effective permissions the compiler would have, not
+whatever `permissions` happened to say before the owner last touched an attachment. Tested directly:
+bundle `permissions` equals the compiled result of that same revision's attachments, after every
+attach/detach/delete/rollback.
+
+**Enforcement points.** Every place that read `agent.config.permissions` for a policy decision now
+reads `loadEffectivePermissionsIn`'s result instead: the turn scheduler (`scheduler.ts`, once per
+scheduled turn, stored in the run's own `toolPolicy` snapshot — a run's authority is fixed at
+scheduling time, same as before this step), the human-approval grant/revoke path (`approvals.ts`'s
+`executionIssues`, re-read live — not the run's stale snapshot — since a human may decide, or a
+configuration change may land, long after a turn was scheduled), and the runtime prompt/environment
+(`packages/runtime-sdk`, which already read the turn's own `toolPolicy`, unchanged in shape).
+`revokeQueuedActions` (`approvals.ts`), already run after every configuration commit, now also
+withdraws a still-**pending** approval (not only an already-**queued**, granted tool action) once
+the live, recompiled policy no longer permits it — a capability detached, or turned `disabled`,
+revokes or refuses either, with an audit entry, before it can execute.
+
+### Turn input version 3 (ADR-023)
+
+A version 3 `AgentTurnInput` always carries `capabilities`: bounded descriptions (name, a short,
+catalog-sourced description, mode) of the agent's own effective tools, compiled the same way for a
+hub-managed or a legacy agent (a read model, not an enforcement decision — an unresolved legacy
+pattern has no catalog entry to describe, and is simply left out). `packages/runtime-sdk`'s prompt
+renders them as a structured alternative to the bare tool-name lists it already shows. See ADR-023
+for the exact schema rule and its rollback consequence.
+
 ## Alternatives
 
 - **Attachments derived from `permissions`, never stored separately.** Rejected: a bare permission
@@ -262,13 +396,15 @@ agree on which row they mean.
   be real, addressable rows, not a projection recomputed from strings that happen to overlap a tool
   name.
 - **Compile attachments into `permissions` at write time, so `packages/policy` needs no change
-  ever.** Considered. Rejected for this step specifically: deciding the compilation rule (how a
+  ever.** Considered, and deferred rather than rejected: deciding the compilation rule (how a
   `require_approval` floor interacts with an agent's own `tools_require_human_approval`, whether a
   `disabled` attachment must also appear in `tools_deny` or simply absent is enough, what happens
-  to a pinned-version attachment once its entry is edited) is real design work on its own, better
-  done once the catalog model it operates on already exists and is tested, not invented
-  simultaneously with the storage. Nothing here forecloses it: `permissions` keeps its existing
-  shape and meaning exactly.
+  to a pinned-version attachment once its entry is edited) was real design work on its own, better
+  done once the catalog model it operates on already existed and was tested, not invented
+  simultaneously with the storage. "Effective permissions: compiled attachments as the single
+  source of truth" below is that work, done once the model had settled: for a hub-managed agent,
+  `packages/policy`'s enforcement now reads the compiled result (mirrored into `permissions` too,
+  for rollback), not a second, independent decision path.
 - **Reconstruct a legacy agent's attachments once and persist them, rather than converting on every
   read.** Rejected: persisting a conversion the owner never asked for would make that agent
   "hub-managed" by accident, freezing it away from ever reflecting a newly added catalog entry
@@ -283,12 +419,12 @@ agree on which row they mean.
 
 ## Consequences
 
-- No UI reads any of this yet; no console route, no CLI command beyond what `gateway config
-  export`/`import`/`diff`/`rollback` already print as part of the bundle. Surfacing the catalog and
-  its attachments to an owner is later work.
-- No tool's actual permission changes because of this release: attaching, detaching or editing an
-  attachment is pure bookkeeping until a later phase compiles it into enforcement or changes
-  `packages/policy` to read it directly.
+- No console route reads any of this yet; surfacing the catalog and its attachments in the
+  console is later work. `gateway config export`/`import`/`diff`/`rollback` print it as part of
+  the bundle, and `gateway tools adopt` (below) surfaces a legacy agent's own conversion.
+- Attaching, detaching or editing an attachment now changes what a hub-managed agent may actually
+  do, on its very next turn — see "Effective permissions: compiled attachments as the single
+  source of truth" below.
 - `configSchema`/`settings` are bounded JSON, structurally validated only; nothing compiles a JSON
   Schema into an actual validator this release. An attachment's `settings` can hold anything that
   fits the bound regardless of what `configSchema` claims to require — a gap a later phase closes

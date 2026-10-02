@@ -2201,8 +2201,8 @@ Released as 0.6.0 (migrations `0024_agent_lifecycle` to `0027_lifecycle_retry_of
 
 ## Phase 15 - Tool catalog: entries, versions and attachments
 
-Status: **in progress** (the catalog data model is complete; enforcement, a console/CLI surface
-and `custom_https` definitions are later work)
+Status: **in progress** (the catalog data model, the compiler and enforcement are complete; a
+console surface and `custom_https` definitions are later work)
 
 | Item | State | Evidence |
 |------|-------|----------|
@@ -2217,10 +2217,16 @@ and `custom_https` definitions are later work)
 | `writeConfigRevisionIn` resolves and stores this revision's own attachments snapshot (carried forward or replaced — never derived from `bundle`) and reconciles `catalog_attachments` to it on every write, the same way it reconciles `agents`; `applyConfig`'s own `resolveApplyToolAttachments` carries attachments forward when no document was supplied | done | `packages/core/src/services/admin.ts` |
 | `dropAttachmentsToUnknownEntriesIn`: `config rollback` and `requestAgentRestore` each drop an attachment naming a catalog entry deleted since, reporting it (the rollback's own printed note; `RequestAgentRestoreResult.droppedAttachments`), rather than failing or resurrecting the capability | done | `packages/core/src/services/management.ts`, `apps/cli/src/config-commands.ts`, `packages/core/src/services/agent-lifecycle.ts` |
 | `gateway config export`/`import` round-trip `tool-attachments.json`, optional (an export from before this phase, or a hand-written directory, has none and carries existing attachments forward rather than clearing them); `config rollback` carries the target revision's own attachments forward, minus any dropped; `formatConfigDiff` renders every attachment change | done | `apps/cli/src/config-files.ts`, `apps/cli/src/config-commands.ts` |
+| `compileAttachments` (pure): disjoint `allow`/`requireApproval`/`deny`, native dependency propagation (`NATIVE_TOOL_DEPENDENCIES`) with `impliedBy`, an adapter-specific prerequisite table (`ADAPTER_NATIVE_PREREQUISITES`) surfaced as `missingPrerequisites` without changing what is granted, `memory.write` always explicit in `allow` or `deny`, finance capabilities compiled in only for the finance agent; `modeSupportedByKind` (native/gateway: `allow`/`disabled`; executor: `require_approval`/`disabled`) checked at the same shared write boundary as the risk floor | done | `packages/policy/src/compile.ts` |
+| `loadEffectivePermissionsIn`: the single source of truth — compiled attachments for a hub-managed agent (`agents.tool_attachments_managed`, migration `0032`, reconciled alongside `catalog_attachments`), a legacy agent's `permissions` lists unchanged otherwise; read by the turn scheduler (stored in the run's own `toolPolicy` snapshot), the approval grant/revoke path (read live), and capability descriptions for turn input version 3 | done | `packages/core/src/services/effective-permissions.ts` |
+| `mirrorCompiledAttachmentPermissionsIn`: every hub-managed agent's `permissions` replaced with its compiled attachments in the same draft `prepareChange`/`commitChangeIn` hash and validate — the bundle-mirror invariant that keeps a binary rollback to 0.6.0 enforcing the same effective permissions | done | `packages/core/src/services/management.ts` |
+| `adoptAgentToolAttachments` / `gateway tools adopt <agent>\|--all [--dry-run]`: explicit, never-implicit migration of a legacy agent's `permissions` into real attachments, one committed revision per agent, reporting unresolved patterns, before/after effective permissions and any mode a resolved pattern's entry `kind` cannot support | done | `packages/core/src/services/tool-catalog.ts`, `apps/cli/src/commands.ts` |
+| `revokeQueuedActions` also withdraws a still-pending approval (not only an already-granted, queued tool action) once the live, recompiled policy no longer permits it, with an audit entry | done | `packages/core/src/services/approvals.ts` |
+| `AgentTurnInput.schemaVersion` 3 (ADR-023): bounded capability descriptions (`name`/`description`/`mode`), decoupled from `systemStatus`'s own presence rule; versions 1/2 still accepted for an already-queued job; the rendered prompt describes capabilities structurally when present | done | `packages/contracts/src/turn.ts`, `packages/core/src/turn-context.ts`, `packages/runtime-sdk/src/prompt.ts` |
 
-Not yet done: no console route or CLI command surfaces the catalog to an owner; no compilation of
-attachments into `permissions`/policy enforcement (deliberately deferred — ADR-027); `custom_https`
-has no definition; executor availability has no live signal from a running tool runner yet
+Not yet done: no console route surfaces the catalog or an agent's effective permissions to an
+owner (the CLI does: `gateway tools adopt --dry-run`, `gateway agents show`); `custom_https` has no
+definition; executor availability has no live signal from a running tool runner yet
 (`registeredExecutorActionTypes` is supplied by the caller, always empty in production today).
 
 Acceptance:
@@ -2246,5 +2252,34 @@ Acceptance:
   before this phase still imports, carrying existing attachments forward; retiring then restoring
   an agent carries its last hub-managed attachments forward (including an explicitly empty list),
   minus any naming a catalog entry deleted since.
+- [x] Unit (the compiler, `packages/policy/src/compile.test.ts`): disjoint lists from each
+  attachment's own mode; an unknown/deleted entry id grants nothing; `tests.run` implies
+  `repository.read`/`workspace.write` with `impliedBy` recorded, an explicit deny of the implied
+  tool wins; a Codex-only prerequisite is surfaced (`missingPrerequisites`) without being granted or
+  removed, another adapter has none; `memory.write` is always explicit in `allow` or `deny`; a
+  finance attachment held by a non-finance agent grants nothing, the finance agent's own compiles
+  normally; the bundle-mirror mapping adds `finance.*` to `tools_deny` only for a non-finance agent,
+  never alongside an individual finance pattern; `modeSupportedByKind` per kind.
+- [x] Integration (`packages/core/src/services/effective-permissions.integration.test.ts`): every
+  catalog toggle against `loadEffectivePermissionsIn` for each built-in kind — attach `allow` →
+  permitted, `disabled` → denied, a broker action needs `require_approval` and refuses `allow`;
+  native dependency propagation verified in both the compiled result and the mirrored bundle
+  `permissions` (the bundle-mirror invariant, directly, against the stored `agents.config` row); an
+  adapter-specific prerequisite surfaces without changing what is granted; detaching (or never
+  attaching) `memory.write` removes memory authority; a finance attachment on a non-finance agent
+  grants nothing; a legacy agent's effective permissions are unchanged; `gateway tools adopt`
+  dry-run and commit (identical before/after when every pattern resolves, a no-op the second time,
+  `--all`), and the explicit memory-write narrowing a dry-run surfaces for an agent that never
+  denied it.
+- [x] Integration, end to end (`apps/controller/src/tool-catalog-enforcement.integration.test.ts`):
+  a broker action attached `require_approval` creates a real pending approval through the mock
+  runtime; detaching it cancels the still-pending approval with an audit entry
+  (`approvals.revoked`), and the agent's own wait resumes normally; an agent with `memory.write`
+  never attached has its memory proposal rejected by the turn's own authority, end to end (no
+  memory item is ever accepted for that run).
+- [x] Integration (`apps/controller/src/operator-turns.integration.test.ts`, updated): every
+  scheduled turn is version 3 regardless of `observe_system`; `systemStatus` presence still follows
+  observation alone; old queued jobs are not re-exercised here (versions 1/2 remain
+  schema-acceptable, unit-tested in `packages/contracts/src/contracts.test.ts`).
 
 Not yet released; see the Changelog's `[Unreleased]` section.

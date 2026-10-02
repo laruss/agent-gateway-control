@@ -4,6 +4,7 @@ import {
 	checkTurnResultAuthority,
 	type OrganizationConfig,
 	type SystemStatus,
+	toolPatternCovers,
 } from "@agent-gateway/contracts";
 import { describe, expect, it } from "vitest";
 import type { ChannelAccess } from "./channel-access.ts";
@@ -92,6 +93,7 @@ function agentRecord(id: string, permissions: Partial<AgentPermissions> = {}): A
 		config: agentConfig(id, permissions),
 		rolePrompt: `You are ${id}.`,
 		configVersion: "v1",
+		toolAttachmentsManaged: false,
 	};
 }
 
@@ -115,8 +117,25 @@ function status(overrides: Partial<SystemStatus> = {}): SystemStatus {
 	};
 }
 
+/** `loadEffectivePermissionsIn`'s legacy branch, reproduced for a unit test that never touches the
+ * database: a legacy agent's effective permissions are exactly its `permissions` lists, unchanged. */
+function legacyEffectivePermissions(
+	agent: AgentRecord,
+): TurnContextSources["effectivePermissions"] {
+	const { tools_allow, tools_require_human_approval, tools_deny } = agent.config.permissions;
+	return {
+		toolPolicy: {
+			allow: tools_allow,
+			requireHumanApproval: tools_require_human_approval,
+			deny: tools_deny,
+		},
+		memoryWriteAllowed: !tools_deny.some((pattern) => toolPatternCovers(pattern, "memory.write")),
+		capabilities: [],
+	};
+}
+
 function sources(overrides: Partial<TurnContextSources> = {}): TurnContextSources {
-	const agent = agentRecord("developer");
+	const agent = overrides.agent ?? agentRecord("developer");
 	return {
 		runId: RUN_ID,
 		agent,
@@ -132,23 +151,25 @@ function sources(overrides: Partial<TurnContextSources> = {}): TurnContextSource
 		memories: [],
 		waitableUserIds: [],
 		systemStatus: null,
+		effectivePermissions: legacyEffectivePermissions(agent),
 		now: NOW,
 		...overrides,
 	};
 }
 
 describe("buildTurnContext and the system status (ADR-023)", () => {
-	it("builds a version 1 input with no systemStatus for an ordinary agent", () => {
+	it("builds a version 3 input with no systemStatus for an ordinary agent", () => {
 		const result = buildTurnContext(sources());
 		expect(result.ok).toBe(true);
 		if (!result.ok) {
 			throw new Error(result.reason);
 		}
-		expect(result.context.input.schemaVersion).toBe(1);
+		expect(result.context.input.schemaVersion).toBe(3);
 		expect(result.context.input.systemStatus).toBeUndefined();
+		expect(result.context.input.capabilities).toEqual([]);
 	});
 
-	it("builds a version 2 input carrying the given status for an observing agent", () => {
+	it("builds a version 3 input carrying the given status for an observing agent", () => {
 		const operator = agentRecord("operator", { observe_system: true });
 		const given = status({ killSwitch: true });
 		const result = buildTurnContext(
@@ -158,7 +179,7 @@ describe("buildTurnContext and the system status (ADR-023)", () => {
 		if (!result.ok) {
 			throw new Error(result.reason);
 		}
-		expect(result.context.input.schemaVersion).toBe(2);
+		expect(result.context.input.schemaVersion).toBe(3);
 		expect(result.context.input.systemStatus).toEqual(given);
 	});
 

@@ -3,6 +3,7 @@ import {
 	type AgentId,
 	type AgentTurnInput,
 	AgentTurnInputSchema,
+	type CapabilityDescription,
 	type GatewayEvent,
 	type MattermostId,
 	type MemoryItem,
@@ -11,13 +12,25 @@ import {
 	type ResolvedWait,
 	type SystemStatus,
 	type ThreadContext,
+	type ToolPolicySnapshot,
 	type TurnAuthorityContext,
-	toolPatternCovers,
 	type Uuid,
 	type WorkingSummary,
 } from "@agent-gateway/contracts";
 import type { AgentState } from "@agent-gateway/db";
 import { agentChannelRefs, type ChannelAccess } from "./channel-access.ts";
+
+/**
+ * An agent's effective permissions, already resolved against the catalog (ADR-027): compiled from
+ * its recorded attachments for a hub-managed agent, or its `permissions` lists unchanged for a
+ * legacy one — `packages/core/src/services/tool-catalog.ts`'s `loadEffectivePermissionsIn` is the
+ * one place this is computed, since doing so needs the database this module never touches.
+ */
+export type EffectivePermissions = Readonly<{
+	toolPolicy: Pick<ToolPolicySnapshot, "allow" | "requireHumanApproval" | "deny">;
+	memoryWriteAllowed: boolean;
+	capabilities: Readonly<CapabilityDescription[]>;
+}>;
 
 /**
  * The largest turn input a run starts with, serialized. A neutral constant (no IO, no service
@@ -34,6 +47,10 @@ export type AgentRecord = Readonly<{
 	config: AgentConfig;
 	rolePrompt: string;
 	configVersion: string;
+	/** The active revision's attachments document has an entry for this agent (ADR-027), even an
+	 * explicitly empty one: hub-managed, so its effective permissions come only from compiled
+	 * attachments — `loadEffectivePermissionsIn` (`effective-permissions.ts`). */
+	toolAttachmentsManaged: boolean;
 }>;
 
 export type TurnContextSources = Readonly<{
@@ -62,6 +79,9 @@ export type TurnContextSources = Readonly<{
 	 * an observing agent handed none, is refused rather than silently reconciled.
 	 */
 	systemStatus: SystemStatus | null;
+	/** The agent's effective permissions right now (ADR-027's single source of truth), already
+	 * resolved by the caller against the catalog — see `EffectivePermissions`. */
+	effectivePermissions: EffectivePermissions;
 	now: Date;
 }>;
 
@@ -87,24 +107,22 @@ export function buildTurnContext(sources: TurnContextSources): TurnContextResult
 	}
 	const others = sources.agents.filter((a) => a.id !== agent.id && a.state !== "disabled");
 	const { permissions, memory, runtime } = agent.config;
+	const { effectivePermissions } = sources;
 	const toolPolicy = {
 		policyVersion: agent.configVersion,
-		allow: permissions.tools_allow,
-		requireHumanApproval: permissions.tools_require_human_approval,
-		deny: permissions.tools_deny,
+		...effectivePermissions.toolPolicy,
 	};
 
-	// Namespace authorization alone would still let an agent propose memory writes; an explicit
-	// `memory.write` deny (a concrete pattern or a covering wildcard like `memory.*`) leaves it no
-	// writable namespace at all, private or shared, so the existing namespace check in
-	// `checkTurnResultAuthority` rejects every proposal rather than needing its own tool check.
-	// `memoryNamespaces.shared` below is never filtered by this: shared memory is still folded
-	// into `memories` for reading whether or not writes are denied, and the prompt (runtime-sdk)
-	// derives writability from `toolPolicy.deny` itself, so hiding the namespace here would only
-	// make the turn input inaccurate without gating anything the authority check does not already.
-	const memoryWriteDenied = permissions.tools_deny.some((pattern) =>
-		toolPatternCovers(pattern, "memory.write"),
-	);
+	// Namespace authorization alone would still let an agent propose memory writes; the caller's
+	// compiled `memoryWriteAllowed` (detaching `memory.write`, or denying it in a legacy agent's
+	// `permissions`) leaves it no writable namespace at all, private or shared, so the existing
+	// namespace check in `checkTurnResultAuthority` rejects every proposal rather than needing its
+	// own tool check. `memoryNamespaces.shared` below is never filtered by this: shared memory is
+	// still folded into `memories` for reading whether or not writes are denied, and the prompt
+	// (runtime-sdk) derives writability from `toolPolicy.deny` itself, so hiding the namespace here
+	// would only make the turn input inaccurate without gating anything the authority check does
+	// not already.
+	const memoryWriteDenied = !effectivePermissions.memoryWriteAllowed;
 
 	// The status is placed, never collected: the caller only queries it for an agent whose
 	// permissions actually grant observation (ADR-023). A mismatch here is the caller's bug, not
@@ -124,7 +142,10 @@ export function buildTurnContext(sources: TurnContextSources): TurnContextResult
 	}
 
 	const candidate = {
-		schemaVersion: observesSystem ? 2 : 1,
+		// Every new turn carries version 3's bounded capability descriptions now; version 1/2
+		// inputs are only ever the shape of a job queued by a release before this one (still
+		// accepted by `AgentTurnInputSchema`, see ADR-023's turn input version 3).
+		schemaVersion: 3,
 		runId: sources.runId,
 		agent: {
 			agentId: agent.id,
@@ -157,6 +178,7 @@ export function buildTurnContext(sources: TurnContextSources): TurnContextResult
 		outputSchema: modelOutputJsonSchema(),
 		deadline: new Date(now.getTime() + runtime.timeout_seconds * 1000).toISOString(),
 		systemStatus,
+		capabilities: effectivePermissions.capabilities,
 	};
 	const parsed = AgentTurnInputSchema.safeParse(candidate);
 	if (!parsed.success) {

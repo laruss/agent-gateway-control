@@ -753,11 +753,14 @@ describe("config export/import: tool attachments round-trip (ADR-027)", () => {
 		const { bundle: beforeBundle } = await inTransaction(harness.deps, ({ tx }) =>
 			loadActiveBundle(tx.db, before),
 		);
+		// `gateway-mattermost-post` is a `gateway`-kind entry: `allow`/`disabled` only
+		// (`modeSupportedByKind`) — no enforcement point pauses a turn mid-flight for a human to
+		// approve a direct Gateway action.
 		await attachTool(harness.deps, {
 			agentId: "director",
 			entryId: "gateway-mattermost-post",
 			pinnedVersion: null,
-			mode: "require_approval",
+			mode: "disabled",
 			settings: {},
 			actor: "test",
 			source: "cli_apply",

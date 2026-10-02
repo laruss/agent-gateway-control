@@ -34,9 +34,31 @@ All notable changes are documented here. The project follows Semantic Versioning
   attachments would look like, read-only, against catalog entries known right now — a pattern
   matching none of them is reported unresolved, never dropped. `config diff`/`config rollback` show
   every attachment added, removed or changed (mode, pinned version, settings) per agent per entry.
-  Tool enforcement itself is unchanged: `packages/policy` still reads only `permissions`; nothing
-  here compiles an attachment into a grant yet, and no console or CLI surface reads the catalog yet
-  either.
+- Attachments now compile into enforcement (ADR-027): `compileAttachments`
+  (`@agent-gateway/policy`) turns one agent's attachments into disjoint `allow`/`requireApproval`/
+  `deny` tool lists, applying native dependencies (`tests.run` implies `repository.read`/
+  `workspace.write`), surfacing an adapter-specific prerequisite Codex needs for `repository.read`
+  without silently granting or revoking it, keeping `memory.write` always explicit (`deny` when not
+  `allow`, never silently absent from both), and excluding every finance capability for any agent
+  but the organization's own finance agent. A mode an entry's own `kind` cannot express
+  (`require_approval` for a native/gateway capability, `allow` for a broker executor action) is
+  refused at the same shared write boundary `attachTool`/`updateAttachment` already check.
+  `loadEffectivePermissionsIn` is the single source of truth every enforcement point now reads
+  instead of `agent.config.permissions` directly: a hub-managed agent (the active revision's
+  attachments document has an entry for it, even an explicitly empty one — the live
+  `agents.tool_attachments_managed` column, migration `0032`) gets only its compiled attachments;
+  every other agent keeps today's behaviour, its `permissions` lists unchanged. Whenever a
+  hub-managed agent's attachments could have changed, its `permissions` field is replaced with the
+  compiled result in the same revision (never a separate write), so a binary rollback to 0.6.0
+  still enforces the same effective permissions. `gateway tools adopt <agent>|--all [--dry-run]`
+  is the explicit, never-implicit migration from a legacy agent's `permissions` into real
+  attachments, one committed revision per agent, reporting unresolved patterns and the
+  before/after effective permissions. A queued tool action or a still-pending approval for a
+  capability just detached or turned `disabled` is revoked or refused, with an audit entry, before
+  it can execute. `AgentTurnInput.schemaVersion` 3 (ADR-023) carries bounded capability
+  descriptions (name, short description, mode) of an agent's effective tools for the runtime
+  prompt to describe structurally; versions 1 and 2 are still accepted, for a job a release before
+  this one already queued.
 
 ## [0.6.0] - 2026-10-02
 

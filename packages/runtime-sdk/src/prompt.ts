@@ -67,6 +67,19 @@ function builtInTools(
 	];
 }
 
+/** One line per capability (version 3 only, ADR-023): the catalog's own short description beside
+ * its mode, a bounded, structured alternative to inferring what a bare tool name means. */
+function capabilitiesList(capabilities: Readonly<AgentTurnInput["capabilities"]>): string {
+	if (capabilities === undefined || capabilities.length === 0) {
+		return "(none)";
+	}
+	return list(
+		capabilities.map(
+			(c) => `${c.name} (${c.mode === "allow" ? "allowed" : "needs approval"}): ${c.description}`,
+		),
+	);
+}
+
 /** JSON for a <data> block: `<` is escaped, so no content can close the block early. */
 function dataJson(value: JsonValue | object): string {
 	return JSON.stringify(value, null, 2).replace(/</g, "\\u003c");
@@ -120,6 +133,9 @@ export function renderTurnPrompt(
 			`Tools allowed: ${toolPolicy.allow.join(", ") || "(none)"}`,
 			`Tools that need human approval (request with nextState "needs_human"): ${toolPolicy.requireHumanApproval.join(", ") || "(none)"}`,
 			`Tools denied: ${toolPolicy.deny.join(", ") || "(none)"}`,
+			...(input.capabilities === undefined
+				? []
+				: [`Your capabilities, described:\n${capabilitiesList(input.capabilities)}`]),
 			`Built-in tools of your runtime, in your working directory (enforced by the runtime):\n${list(builtInTools(input, confinable))}`,
 			`Channels you may post to:\n${list(input.channels.map((c) => `#${c.name} (${c.channelId})`))}`,
 			memoryDenied

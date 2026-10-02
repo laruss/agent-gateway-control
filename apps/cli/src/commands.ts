@@ -21,7 +21,9 @@ import {
 	toolReportQueue,
 } from "@agent-gateway/contracts";
 import {
+	type AdoptAgentResult,
 	ackConfigRevision,
+	adoptAgentToolAttachments,
 	applyConfig,
 	budgetReport,
 	type CancelledJob,
@@ -222,6 +224,13 @@ export const USAGE = `gateway <command>
   tools settle <action-id> <succeeded|failed|cancelled> --note <text>
                                       record what an unknown action did, after checking the
                                       provider by its idempotency key
+  tools adopt <agent-id>|--all [--dry-run] [--reason <text>]
+                                      explicit migration (ADR-027): converts a legacy agent's
+                                      permissions into real catalog attachments, one committed
+                                      revision per agent (never implicit); prints unresolved
+                                      patterns and the before/after effective permissions;
+                                      --dry-run previews without committing; an agent already
+                                      managed through the hub is left untouched
   budgets                             today's usage (UTC) per agent and in total, and holds
   memory list [--status <status>] [--namespace <ns>] [--limit <n>] [--offset <n>]
   memory accept <id> | reject <id>    review memory proposals to shared namespaces
@@ -1390,6 +1399,24 @@ async function dispatchSessionCommand(
 			const settled = await settleToolAction(deps, arg(args, 2, "action-id"), outcome, who, note);
 			out.print(`tool action ${settled.id} settled as ${settled.status}`);
 			return 0;
+		}
+		case "tools adopt": {
+			const target = args[2];
+			if (target === undefined || (target.startsWith("--") && target !== "--all")) {
+				throw new UsageError("missing <agent-id>|--all");
+			}
+			const dryRun = args.includes("--dry-run");
+			const reason = flag(args, "reason");
+			const agentIds =
+				target === "--all" ? (await listAgents(deps)).map((row) => row.id) : [target];
+			const results: Readonly<AdoptAgentResult[]> = await adoptAgentToolAttachments(deps, {
+				agentIds,
+				dryRun,
+				actor: who,
+				...(reason === null ? {} : { reason }),
+			});
+			out.print(json(results));
+			return results.some((result) => result.problems.length > 0) ? 1 : 0;
 		}
 		case "budgets":
 			out.print(json(await budgetReport(deps)));

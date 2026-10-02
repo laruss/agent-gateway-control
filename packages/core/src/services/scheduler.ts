@@ -60,6 +60,7 @@ import {
 	withCurrentPosts,
 } from "./context-store.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
+import { loadEffectivePermissionsIn } from "./effective-permissions.ts";
 import {
 	audit,
 	isKillSwitchOn,
@@ -429,6 +430,16 @@ export async function scheduleAgent(
 		systemStatus = status.status;
 	}
 
+	// The single source of truth (ADR-027): compiled from recorded attachments for a hub-managed
+	// agent, or the agent's own `permissions` lists unchanged for a legacy one. Resolved fresh on
+	// every scheduling attempt (redrive and wait resumption included), in this same transaction, so
+	// a turn never carries permissions staler than what the hub shows right now.
+	const effectivePermissions = await loadEffectivePermissionsIn(
+		uow.tx,
+		agent,
+		config.organization.organization.finance_agent_id,
+	);
+
 	const runId = randomUUID();
 	const built = buildTurnContext({
 		runId,
@@ -445,6 +456,7 @@ export async function scheduleAgent(
 		memories: context.memories,
 		waitableUserIds: context.waitableUserIds,
 		systemStatus,
+		effectivePermissions,
 		now: uow.now,
 	});
 	if (!built.ok) {

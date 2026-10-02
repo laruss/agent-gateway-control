@@ -84,6 +84,7 @@ export function toAgentRecord(row: AgentRow): AgentRecord {
 		config: row.config,
 		rolePrompt: row.rolePrompt,
 		configVersion: row.configVersion,
+		toolAttachmentsManaged: row.toolAttachmentsManaged,
 	};
 }
 

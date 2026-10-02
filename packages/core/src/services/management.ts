@@ -36,6 +36,7 @@ import {
 	gatewayControls,
 } from "@agent-gateway/db";
 import { canonicalHash } from "@agent-gateway/events";
+import { compileAttachments, compiledAgentPermissions } from "@agent-gateway/policy";
 import { asc, desc, eq, inArray, or } from "drizzle-orm";
 import {
 	AdminError,
@@ -47,7 +48,10 @@ import {
 	inTransaction,
 	writeConfigRevisionIn,
 } from "./admin.ts";
-import { attachmentCatalogProblems } from "./attachment-validation.ts";
+import {
+	attachmentCatalogProblems,
+	loadCompilableCatalogEntries,
+} from "./attachment-validation.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
 import {
 	rejectLifecycleOwnedRemovals,
@@ -553,6 +557,55 @@ export function draftBundleProblems(draft: ConfigDraftBundle): string[] {
 // sets never touch `toolAttachments` in the first place, so nothing is lost by excluding it there.
 // ---------------------------------------------------------------------------
 
+/**
+ * The bundle-mirror invariant (ADR-027): every hub-managed agent's `permissions` field is replaced
+ * with its own compiled attachments, in the same draft and so the same revision an attachment
+ * write ever produces — never a separate, later write. This is what keeps an older release (one
+ * before the compiler existed, enforcing only `permissions`) safe to roll back to: it reads the
+ * same effective permissions a compiler-aware release would have enforced, because the bundle
+ * itself already carries them, not only the separate attachments document an older release does
+ * not know how to read. A legacy agent (no `toolAttachments` entry at all) is returned unchanged —
+ * its `permissions` stay exactly what it was given, the single source of truth it already is. Run
+ * only once an organization exists (nothing compiles before a finance agent is known) and skipped
+ * entirely when no agent has ever been touched through the hub, so a plain YAML `config apply`
+ * that never mentions attachments costs this function nothing beyond the one check.
+ */
+export async function mirrorCompiledAttachmentPermissionsIn(
+	db: Db,
+	draft: ConfigDraftBundle,
+): Promise<ConfigDraftBundle> {
+	if (draft.organization === null || Object.keys(draft.toolAttachments).length === 0) {
+		return draft;
+	}
+	const financeAgentId = draft.organization.organization.finance_agent_id;
+	const catalog = await loadCompilableCatalogEntries(db, draft.toolAttachments);
+	let changed = false;
+	const agents = draft.agents.map((agent) => {
+		const attachments = draft.toolAttachments[agent.id];
+		if (attachments === undefined) {
+			return agent;
+		}
+		const compiled = compileAttachments({
+			agentId: agent.id,
+			financeAgentId,
+			adapter: agent.runtime.adapter,
+			attachments,
+			catalog,
+		});
+		const permissions = compiledAgentPermissions(compiled, {
+			agentId: agent.id,
+			financeAgentId,
+			observeSystem: agent.permissions.observe_system === true,
+		});
+		if (deepEqual(agent.permissions, permissions)) {
+			return agent;
+		}
+		changed = true;
+		return { ...agent, permissions };
+	});
+	return changed ? { ...draft, agents } : draft;
+}
+
 // ---------------------------------------------------------------------------
 // Dropping attachments to a retired catalog entry: `config rollback` and `requestAgentRestore`
 // reintroduce historical content they themselves resolved, not something an operator hand-typed,
@@ -855,9 +908,10 @@ export async function prepareChange(
 				),
 			};
 		}
-		const { draft, problems: opProblems } = applyChangeSet(base, shape.data);
+		const applied = applyChangeSet(base, shape.data);
+		const draft = await mirrorCompiledAttachmentPermissionsIn(db, applied.draft);
 		const attachmentProblems = await attachmentCatalogProblems(db, draft.toolAttachments);
-		const problems = [...opProblems, ...draftBundleProblems(draft), ...attachmentProblems];
+		const problems = [...applied.problems, ...draftBundleProblems(draft), ...attachmentProblems];
 		const newHash = previewHash(draft);
 		const noop =
 			problems.length === 0 &&
@@ -1314,9 +1368,10 @@ export async function commitChangeIn(
 	}
 
 	const { bundle: base, hash: baseHash } = await loadActiveBundle(db, currentRevisionId);
-	const { draft, problems: opProblems } = applyChangeSet(base, changeSet);
+	const applied = applyChangeSet(base, changeSet);
+	const draft = await mirrorCompiledAttachmentPermissionsIn(db, applied.draft);
 	const attachmentProblems = await attachmentCatalogProblems(db, draft.toolAttachments);
-	const problems = [...opProblems, ...draftBundleProblems(draft), ...attachmentProblems];
+	const problems = [...applied.problems, ...draftBundleProblems(draft), ...attachmentProblems];
 	if (problems.length > 0) {
 		throw new AdminError(`configuration is invalid:\n- ${problems.join("\n- ")}`);
 	}
