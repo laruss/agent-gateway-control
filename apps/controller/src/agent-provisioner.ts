@@ -168,8 +168,14 @@ export async function runProvisionerPass(
 	}
 	// Excludes this account from routing (never a wake-up, never an approval): resolved every
 	// tick, not only at startup, so a rotated or replaced admin account is picked up without a
-	// restart.
-	await setDirectoryEntry(deps, "user", PROVISIONING_ADMIN_DIRECTORY_NAME, me.id, actor);
+	// restart. Written (and audited, `directory.set`) only when it actually changed — `me.id` is
+	// otherwise the same account this already recorded every previous tick, and `setDirectoryEntry`
+	// itself writes and audits unconditionally, so skipping the call here is what keeps a years-old
+	// deployment's audit log from gaining one row every 3 seconds for nothing.
+	const recordedAdminId = await loadDirectoryEntry(deps, "user", PROVISIONING_ADMIN_DIRECTORY_NAME);
+	if (recordedAdminId !== me.id) {
+		await setDirectoryEntry(deps, "user", PROVISIONING_ADMIN_DIRECTORY_NAME, me.id, actor);
+	}
 
 	const running = (await listRunningLifecycleOperations(deps)).filter((operation) =>
 		PROVISIONING_KINDS.includes(operation.kind),
@@ -179,7 +185,7 @@ export async function runProvisionerPass(
 		if (stopped()) {
 			return;
 		}
-		await processOperation(deps, admin, options, actor, operation, log, resolveTokenOwner);
+		await processOperation(deps, admin, options, actor, operation, log, resolveTokenOwner, me.id);
 	}
 
 	const retiring = (await listRunningLifecycleOperations(deps)).filter((operation) =>
@@ -202,6 +208,7 @@ async function processOperation(
 	operation: LifecycleOperation,
 	log: Logger,
 	resolveTokenOwner: typeof tokenOwner,
+	adminUserId: MattermostId,
 ): Promise<void> {
 	// A cheap precheck, before ever claiming the operation: is there anything to provision yet at
 	// all. Re-read fresh right after claiming below — never this copy — since a config edit that
@@ -256,17 +263,24 @@ async function processOperation(
 
 	let checkpoints = operation.checkpoints;
 	try {
+		// Read once, before `ensureBot`, not only afterwards: this agent's own recorded identity (if
+		// any) is exactly what lets `ensureBot` tell its own, previously-resolved bot apart from an
+		// unrelated account that merely happens to share its username (`guard.knownUserId` below).
+		const identity = await loadMattermostIdentity(deps, operation.agentId);
 		let botUserId = checkpoints.bot_user_id;
 		if (botUserId === undefined) {
 			try {
-				botUserId = await ensureBot(admin, {
-					username: agentConfig.mattermost.username,
-					displayName: agentConfig.display_name,
-				});
+				botUserId = await ensureBot(
+					admin,
+					{ username: agentConfig.mattermost.username, displayName: agentConfig.display_name },
+					{ knownUserId: identity?.userId ?? null, adminUserId },
+				);
 			} catch (error) {
 				if (error instanceof BootstrapError) {
 					// `ensureBot` already refuses a username that is not plausibly the Gateway's own
-					// plain bot (a regular user, or a bot with elevated roles) — never adopting a
+					// plain bot (a regular user, a bot with elevated roles, or — for a fresh `create`,
+					// `restore` or `reprovision` with no recorded identity yet of its own — a plain bot
+					// this Gateway's own admin account did not create either) — never adopting a
 					// stranger's account.
 					throw new PermanentProvisioningError(
 						`username '${agentConfig.mattermost.username}' is taken: ${error.message}`,
@@ -282,7 +296,6 @@ async function processOperation(
 		// completing can never leave the operation to finish with no identity ever recorded (a null
 		// `mattermost_user_id` forever): the next pass sees the checkpoint, skips `ensureBot` again,
 		// but still finds the identity unset and writes it.
-		const identity = await loadMattermostIdentity(deps, operation.agentId);
 		if (identity?.userId !== botUserId) {
 			await setAgentBotUser(deps, operation.agentId, botUserId, actor);
 		}
@@ -340,6 +353,37 @@ async function processOperation(
 				if (isExtraChannel(channel, allowed)) {
 					await admin.removeChannelMember(channel.id, botUserId);
 				}
+			}
+		}
+
+		// A `create`/`restore` operation's own channel list (`agentConfig` above) was read once,
+		// right after this operation was claimed; an edit to `allowed_channels` committed anywhere
+		// between that read and here never queues its own `reprovision` (`queueMembershipReprovisioning`
+		// only reprovisions a `ready` agent, never one still `reconciling`), so this is the only
+		// chance to join a channel such an edit added before the operation completes and the agent
+		// goes `ready` with a stale membership nothing will ever revisit. Reloaded fresh immediately
+		// before completing, narrowing the race to the gap between this read and `completeOperation`
+		// itself; an unresolved channel id is left for the next tick, exactly like the main loop
+		// above, rather than completing with it silently unjoined.
+		if (operation.kind === "create" || operation.kind === "restore") {
+			const freshConfig = await loadAgentConfig(deps, operation.agentId);
+			for (const name of freshConfig?.mattermost.allowed_channels ?? []) {
+				if (joined.has(name)) {
+					continue;
+				}
+				const channelId = channelIdsByName.get(name);
+				if (channelId === undefined) {
+					log.info("agent provisioner: channel not resolved yet; waiting", {
+						agent_id: operation.agentId,
+						channel: name,
+					});
+					return;
+				}
+				await admin.addChannelMember(channelId, botUserId);
+				joined.add(name);
+				checkpoints = await checkpoint(deps, operation.id, checkpoints, {
+					channels_joined: [...joined],
+				});
 			}
 		}
 

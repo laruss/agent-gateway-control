@@ -79,6 +79,64 @@ All notable changes are documented here. The project follows Semantic Versioning
   provisioner's own leaving-channels step now re-checks active grants immediately before each
   channel removal, rather than once at the start of its pass, so a grant made mid-pass is still
   honored.
+- A channel edit landing while a `create`/`restore` operation was still in flight (`reconciling`)
+  could be lost entirely: the provisioner read the agent's channel list once, right after claiming
+  the operation, and the edit's own commit never queued a `reprovision` for an agent that was not
+  yet `ready`. It now reloads the configuration once more, immediately before completing, and joins
+  any channel a concurrent edit added — narrowing the gap to the reload itself rather than the
+  whole operation's own duration.
+- Changing the organization's own Mattermost team produced no `reprovision` for any agent whose own
+  `allowed_channels` had not also changed in the same commit, so lifecycle-owned bots never joined
+  the new team. Both committing paths (a managed commit, `config apply`) now queue one for every
+  current, lifecycle-owned, `ready` agent when the team changes, not only ones with a channel diff.
+- Restoring a former finance agent failed whole-bundle validation (its historical permissions still
+  allowed finance tools, never required to deny them while it held the role) unless the request
+  also reassigns the role back to it (`makeFinanceAgent`, new); by default its permissions are now
+  normalized the same way a fresh non-finance agent's are instead of failing the restore outright.
+- A `reprovision` operation that failed permanently moved its agent to `failed`, stopping the
+  scheduler over nothing worse than a membership change it could not finish — contradicting its own
+  documented rule that a `reprovision` never moves an agent out of `ready`. It now leaves the agent
+  `ready` on a permanent failure (recording `last_error` and the failed operation, still visible and
+  retryable) and keeps it `ready` through a retry too, never passing it through `pending` the way a
+  retried `create`/`restore` does.
+- A config write outside `requestAgentRetire` itself (a managed commit, `config apply`,
+  `setAgentEnabled`'s own disable-as-removal fallback) could drop a lifecycle-owned agent that was
+  not yet `retiring`/`retired` out of the active configuration, leaving its bot active in
+  Mattermost and its lifecycle row stuck — unretireable (its own `remove_agent` found nothing left
+  to remove) and unrestorable (never reaching `retired`). Every such path now refuses the write,
+  naming `gateway agents retire` instead; retiring an agent already missing from the configuration
+  this way (a state only an older release's own bug could have left behind) is now tolerated —
+  its own `remove_agent` is skipped and every other cleanup step still runs.
+- `gateway doctor`'s `mattermost_provisioning` check counted a pending/running `create`, `restore`
+  or `reprovision` as waiting on the admin token, but not a `retire` — driven by the very same,
+  equally idle tick with no token configured. It now counts a waiting `retire` too.
+- The lifecycle provisioner wrote the resolved admin account's directory entry, and a `directory.set`
+  audit row with it, on every tick (every few seconds) even when the account had not changed; it now
+  writes (and audits) only when it actually has.
+- The console's agent page hid retirement progress entirely while a `retire` operation was actually
+  in flight (`pending`/`running`): unlike `create`/`restore`/`reprovision`, a `retire` leaves the
+  agent `retiring` throughout rather than passing it through `reconciling`, which the panel had not
+  accounted for. It now shows the same live checkpoint progress for an in-flight (or retried) retire.
+- A fresh `create`'s own bot resolution (`ensureBot`) adopted any existing plain Mattermost bot at
+  the agent's chosen username unconditionally, including one this Gateway never created — an
+  unrelated integration's bot sharing the same name, say — and the next step would revoke its
+  existing access tokens. It now adopts an existing bot only when it is already this agent's own
+  recorded identity or was created by this Gateway's own admin account; anything else is a
+  permanent "username taken" failure. `restore` and `reprovision`, and `gateway mattermost
+  bootstrap`'s own bulk reconcile, are unchanged.
+- `gateway mattermost admin-token rotate` revoked every personal access token the admin account
+  had, not only ones it created itself — an unrelated token the same account happened to hold would
+  be silently revoked too. It now revokes only tokens carrying its own description
+  (`agent-gateway-admin`); the very first token on the account, entered by hand through
+  `admin-token set`, is never one of those, so the first rotation after it leaves that one alone
+  (revoke it yourself, the same as the bootstrap admin token).
+- `requestOperationRetry`'s idempotency-key replay checked only that a reused key named the same
+  agent, not the same kind of operation — unlike `requestAgentCreate`/`requestAgentRetire`/
+  `requestAgentRestore`, which all also check their own fixed kind. It now refuses a key already
+  used for a different kind of operation on the same agent too.
+- `gateway outbox list --status` rejected `cancelled` (added for a retired agent's own blocked
+  deliveries), since its own list of accepted values was a second copy that never picked it up. It
+  now validates against the one shared, authoritative list.
 
 ## [0.5.0] - 2026-10-02
 

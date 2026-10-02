@@ -288,10 +288,26 @@ export async function tokenOwner(
  * agent at a time, ADR-026). Refuses to adopt a username that is not plausibly the Gateway's own
  * plain bot — a regular user account, or a bot with elevated system roles — rather than silently
  * taking over a stranger's account.
+ *
+ * `guard`, given only by the lifecycle provisioner's own `create`/`restore`/`reprovision` step
+ * (never bootstrap's bulk reconcile, whose own looser adoption of a pre-existing plain bot is
+ * unchanged): narrows which *existing* bot may be adopted at all. A plain bot at this username is
+ * otherwise adopted unconditionally — correct for an agent whose identity is already recorded
+ * (`restore`, or `create`/`reprovision` resuming an operation that already got this far) or one
+ * `bootstrapMattermost` is reconciling for the first time — but wrong for a brand-new `create`:
+ * nothing has ever resolved *this* agent's bot before, so any existing plain bot at its username
+ * is, by default, somebody else's (an unrelated integration's, say) — adopting it would hand the
+ * provisioner the next step's own token revocation and rewriting over an account it does not own.
+ * Adoption is allowed only when the existing account is already this agent's own recorded identity
+ * (`guard.knownUserId`) or was created by this Gateway's own admin account (`guard.adminUserId`,
+ * checked against the bot's own `owner_id` — covers a `create` resuming after a crash between
+ * `createBot` succeeding and its `bot_user_id` checkpoint ever being persisted); refused otherwise,
+ * the same permanent "taken" failure an elevated-roles or regular-user collision already is.
  */
 export async function ensureBot(
 	admin: AdminMattermostClient,
 	bot: Readonly<Pick<BotSpec, "username" | "displayName">>,
+	guard?: Readonly<{ knownUserId: MattermostId | null; adminUserId: MattermostId }>,
 ): Promise<MattermostId> {
 	const existing = await admin.userByUsername(bot.username);
 	if (existing === null) {
@@ -312,6 +328,14 @@ export async function ensureBot(
 		throw new BootstrapError(
 			`bot '${bot.username}' has roles '${existing.roles}'; the Gateway adopts only plain members (system_user)`,
 		);
+	}
+	if (guard !== undefined && guard.knownUserId !== existing.id) {
+		const record = await admin.getBot(existing.id);
+		if (record?.owner_id !== guard.adminUserId) {
+			throw new BootstrapError(
+				`username '${bot.username}' is taken by a bot this Gateway did not create`,
+			);
+		}
 	}
 	if (existing.delete_at > 0) {
 		await admin.enableBot(existing.id);

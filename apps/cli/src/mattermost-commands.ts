@@ -265,18 +265,23 @@ export async function mattermostAdminTokenRotate(
 		);
 	}
 	writeSecretFile(options.secretPath, created.token);
-	// `userAccessTokenIds` already pages through every token the account has; listed and revoked
-	// again, bounded, until only the one just written remains — the same margin `revokeAllTokens`
-	// (bootstrap's own retirement cleanup) leaves for a token appearing mid-revoke.
+	// `userAccessTokens` already pages through every token the account has; listed and revoked
+	// again, bounded, until none of its own (`ADMIN_TOKEN_DESCRIPTION`) remain but the one just
+	// written — the same margin `revokeAllTokens` (bootstrap's own retirement cleanup) leaves for a
+	// token appearing mid-revoke. Only a token carrying this description is ever touched: the
+	// account may hold others of its own, unrelated to the Gateway, which must never be revoked by
+	// a rotation that merely meant to replace its own.
 	let revoked = 0;
 	for (let round = 0; round < 1000; round += 1) {
-		const remaining = (await next.userAccessTokenIds(me.id)).filter((id) => id !== created.id);
+		const remaining = (await next.userAccessTokens(me.id)).filter(
+			(token) => token.id !== created.id && token.description === ADMIN_TOKEN_DESCRIPTION,
+		);
 		if (remaining.length === 0) {
 			print(`admin token rotated for account '${me.username}'; revoked ${revoked} old token(s)`);
 			return;
 		}
-		for (const tokenId of remaining) {
-			await next.revokeUserAccessToken(tokenId);
+		for (const token of remaining) {
+			await next.revokeUserAccessToken(token.id);
 			revoked += 1;
 		}
 	}

@@ -77,6 +77,8 @@ import {
 	holdDeploymentLock,
 	loadLocalSchema,
 	migrateSchema,
+	OUTBOX_STATUSES,
+	type OutboxStatus,
 	readSchemaState,
 	schemaCompatibility,
 } from "@agent-gateway/db";
@@ -195,8 +197,11 @@ export const USAGE = `gateway <command>
                                       grants, blocks its pending deliveries, then asks the
                                       provisioner to deactivate its bot; refused for the
                                       organization's finance agent without --reassign-finance-to
-  agents restore <id>                 re-adds a retired agent's last configuration (pending ->
-                                      provisioning again); the provisioner re-enables its bot
+  agents restore <id> [--make-finance-agent]
+                                      re-adds a retired agent's last configuration (pending ->
+                                      provisioning again); the provisioner re-enables its bot.
+                                      A former finance agent's permissions are normalized unless
+                                      --make-finance-agent reassigns the role back to it atomically
   agents retry <id>                   queues a fresh attempt of a failed create/restore/
                                       reprovision operation, or a retiring agent's own failed
                                       retire cleanup; carries forward whatever it already
@@ -287,6 +292,20 @@ function flag(args: Readonly<string[]>, name: string): string | null {
 		throw new UsageError(`--${name} needs a value`);
 	}
 	return value;
+}
+
+/** `gateway outbox list --status <status>`'s own validation: `null` for no flag at all, the
+ * matching status otherwise, refusing anything not in {@link OUTBOX_STATUSES} — kept in sync with
+ * that shared, authoritative list (the same one the database's own check constraint enforces,
+ * `@agent-gateway/db`) rather than a second, separately maintained one that can drift from it and
+ * silently refuse a real status (`cancelled`, added for a retired agent's own blocked deliveries,
+ * ADR-026). Exported so this one rule is tested without a database. */
+export function parseOutboxStatusFlag(status: string | null): OutboxStatus | null {
+	const valid = OUTBOX_STATUSES.find((candidate) => candidate === status);
+	if (status !== null && valid === undefined) {
+		throw new UsageError(`--status must be one of ${OUTBOX_STATUSES.join(", ")}`);
+	}
+	return valid ?? null;
 }
 
 /** Every value of a flag given more than once (`--channel hq --channel research`), in order. */
@@ -529,11 +548,14 @@ export async function doctor(session: Session, out: Output): Promise<boolean> {
 					: `held on ${budgets.day}: ${held.map((agent) => `@${agent.agentId}`).join(", ")}`,
 		});
 		// The lifecycle provisioner (ADR-026) is idle with no admin token configured: a
-		// `create`/`restore`/`reprovision` operation stays `pending` indefinitely until one is set.
+		// `create`/`restore`/`reprovision` operation stays `pending` indefinitely until one is set —
+		// and so does a `retire`, driven by the very same tick (`runProvisionerPass`'s own
+		// `processRetireOperation` loop, gated on the same admin token as `processOperation`).
 		const adminTokenConfigured = readOptionalFileSetting("MATTERMOST_ADMIN_TOKEN") !== undefined;
 		const waiting = await pool.query<{ n: number }>(
 			`select count(*)::int as n from agent_lifecycle_operations
-			  where state in ('pending', 'running') and kind in ('create', 'restore', 'reprovision')`,
+			  where state in ('pending', 'running')
+			    and kind in ('create', 'restore', 'reprovision', 'retire')`,
 		);
 		const waitingCount = waiting.rows[0]?.n ?? 0;
 		checks.push({
@@ -1142,6 +1164,7 @@ async function dispatchSessionCommand(
 						agentId: arg(args, 2, "id"),
 						actor: who,
 						source: "cli",
+						...(args.includes("--make-finance-agent") ? { makeFinanceAgent: true } : {}),
 					}),
 				),
 			);
@@ -1241,13 +1264,7 @@ async function dispatchSessionCommand(
 			return 0;
 		}
 		case "outbox list": {
-			const status = flag(args, "status");
-			const statuses = ["pending", "sending", "sent", "dead"] as const;
-			const valid = statuses.find((s) => s === status);
-			if (status !== null && valid === undefined) {
-				throw new UsageError(`--status must be one of ${statuses.join(", ")}`);
-			}
-			out.print(json(await listOutbox(deps, valid ?? null)));
+			out.print(json(await listOutbox(deps, parseOutboxStatusFlag(flag(args, "status")))));
 			return 0;
 		}
 		case "outbox redrive":

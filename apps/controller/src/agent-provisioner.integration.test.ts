@@ -140,6 +140,10 @@ class FakeAdminClient {
 	private readonly usersByUsername = new Map<string, FakeUser>();
 	private readonly tokensByUser = new Map<string, Set<string>>();
 	private readonly tokenOwners = new Map<string, string>();
+	/** `user_id` -> the account that created that bot (`ApiBot.owner_id`): every bot `createBot`
+	 * itself makes is owned by this fake admin account, the same as a real server would record;
+	 * `seedUser`'s own bots default to a fresh, unrelated id — a stranger's bot, never this one's. */
+	private readonly botOwners = new Map<string, string>();
 	private readonly channelNamesById: Readonly<Record<string, string>>;
 	private sequence = 0;
 
@@ -175,8 +179,10 @@ class FakeAdminClient {
 	}
 
 	/** Seeds an existing account under `username`: a name already taken by something the
-	 * provisioner must refuse to adopt. */
-	seedUser(username: string, overrides: Partial<FakeUser> = {}): FakeUser {
+	 * provisioner must refuse to adopt. A seeded bot (`overrides.is_bot`) is owned by `ownerId` when
+	 * given, or else a fresh, unrelated id of its own — a stranger's bot, by default, never this
+	 * fake admin's own (`this.adminId`); pass `this.adminId` explicitly for the one case that is. */
+	seedUser(username: string, overrides: Partial<FakeUser> = {}, ownerId?: string): FakeUser {
 		const user: FakeUser = {
 			id: this.newId(),
 			username,
@@ -187,6 +193,9 @@ class FakeAdminClient {
 		};
 		this.usersById.set(user.id, user);
 		this.usersByUsername.set(username, user);
+		if (user.is_bot) {
+			this.botOwners.set(user.id, ownerId ?? this.newId());
+		}
 		return user;
 	}
 
@@ -231,7 +240,18 @@ class FakeAdminClient {
 		};
 		this.usersById.set(id, user);
 		this.usersByUsername.set(bot.username, user);
-		return { user_id: id, username: bot.username, delete_at: 0 };
+		this.botOwners.set(id, this.adminId);
+		return { user_id: id, owner_id: this.adminId, username: bot.username, delete_at: 0 };
+	};
+
+	/** Null for an id that is not a bot at all — the real client's own `include_deleted=true`
+	 * query means a disabled one is still found, so this never gates on `delete_at`. */
+	getBot = async (userId: string): Promise<ApiBot | null> => {
+		const user = this.usersById.get(userId);
+		const ownerId = this.botOwners.get(userId);
+		return user === undefined || !user.is_bot || ownerId === undefined
+			? null
+			: { user_id: userId, owner_id: ownerId, username: user.username, delete_at: user.delete_at };
 	};
 
 	/** Updates both maps together: a real server has one user record, not two independent copies,
@@ -250,12 +270,22 @@ class FakeAdminClient {
 
 	enableBot = async (userId: string): Promise<ApiBot> => {
 		const user = this.setDeleteAt(userId, 0);
-		return { user_id: userId, username: user.username, delete_at: 0 };
+		return {
+			user_id: userId,
+			owner_id: this.botOwners.get(userId) ?? userId,
+			username: user.username,
+			delete_at: 0,
+		};
 	};
 
 	disableBot = async (userId: string): Promise<ApiBot> => {
 		const user = this.setDeleteAt(userId, 1);
-		return { user_id: userId, username: user.username, delete_at: 1 };
+		return {
+			user_id: userId,
+			owner_id: this.botOwners.get(userId) ?? userId,
+			username: user.username,
+			delete_at: 1,
+		};
 	};
 
 	addTeamMember = async (_teamId: string, userId: string): Promise<void> => {
@@ -424,6 +454,31 @@ describe("agent lifecycle provisioner (ADR-026)", () => {
 			admin.resolveTokenOwner,
 		);
 
+	it("records the provisioning admin account's directory entry once, not on every tick, while it stays the same account", async () => {
+		const admin = new FakeAdminClient(CHANNEL_IDS);
+		const { logger } = recordingLogger();
+
+		await pass(admin, logger);
+		await pass(admin, logger);
+		await pass(admin, logger);
+
+		const [{ n: directoryRows }] = (
+			await pool.query(
+				"select count(*)::int as n from mattermost_directory where kind = 'user' and name = '#provisioning-admin'",
+			)
+		).rows;
+		expect(directoryRows).toBe(1);
+		// `setDirectoryEntry` itself writes and audits unconditionally every time it is called; three
+		// ticks resolving the very same admin account must still leave exactly one `directory.set`
+		// audit row, not one per tick.
+		const [{ n: auditRows }] = (
+			await pool.query(
+				"select count(*)::int as n from audit_log where action = 'directory.set' and subject_type = 'user' and subject_id = '#provisioning-admin'",
+			)
+		).rows;
+		expect(auditRows).toBe(1);
+	});
+
 	it("provisions a new agent end to end: bot, token, team and channel membership, then ready", async () => {
 		const admin = new FakeAdminClient(CHANNEL_IDS);
 		const created = await requestAgentCreate(deps, createInput("analyst", ["hq", "research"]));
@@ -463,6 +518,55 @@ describe("agent lifecycle provisioner (ADR-026)", () => {
 		const tokenPath = join(secretsDir, "mm_analyst_token");
 		expect(secretFileState(tokenPath)).toBe("private");
 		expect(readFileSync(tokenPath, "utf8").trim().length).toBeGreaterThan(0);
+	});
+
+	it("a channel edit committed while create is in flight is still joined before the agent goes ready", async () => {
+		const admin = new FakeAdminClient(CHANNEL_IDS);
+		const created = await requestAgentCreate(deps, createInput("analyst", ["hq"]));
+		const { logger } = recordingLogger();
+
+		// Simulates an owner's edit landing mid-flight: after `agentConfig` was already read for
+		// this pass (right after the operation was claimed), but before the operation completes.
+		// The agent is still `reconciling` the whole time, so `queueMembershipReprovisioning` never
+		// sees this edit (it only reprovisions a `ready` agent) — the reload right before
+		// `completeOperation` is the only thing that can still pick it up.
+		const originalAddTeamMember = admin.addTeamMember;
+		admin.addTeamMember = async (teamId: string, userId: string) => {
+			const [{ config }] = (await pool.query("select config from agents where id = 'analyst'"))
+				.rows;
+			const edited: AgentConfig = {
+				...config,
+				mattermost: { ...config.mattermost, allowed_channels: ["hq", "research"] },
+			};
+			await commitChange(deps, {
+				changeSet: [{ type: "update_agent", agent: edited }],
+				baseRevisionId: await activeConfigRevisionId(deps),
+				actor: "owner",
+				source: "console",
+			});
+			return originalAddTeamMember(teamId, userId);
+		};
+
+		await pass(admin, logger);
+
+		const [lifecycle] = (
+			await pool.query("select status from agent_lifecycle where agent_id = 'analyst'")
+		).rows;
+		expect(lifecycle.status).toBe("ready");
+		const [operation] = (
+			await pool.query("select state, checkpoints from agent_lifecycle_operations where id = $1", [
+				created.operationId,
+			])
+		).rows;
+		expect(operation.state).toBe("succeeded");
+		expect(operation.checkpoints.channels_joined).toEqual(
+			expect.arrayContaining(["hq", "research"]),
+		);
+		const botUserId: string = operation.checkpoints.bot_user_id;
+		expect(admin.channelMembers.get(CHANNEL_IDS.hq)?.has(botUserId)).toBe(true);
+		// The channel the edit added mid-flight: never seen by this operation's own stale config
+		// read, joined only because the provisioner reloads it fresh right before completing.
+		expect(admin.channelMembers.get(CHANNEL_IDS.research)?.has(botUserId)).toBe(true);
 	});
 
 	it("resumes after a transient failure without repeating already-checkpointed steps", async () => {
@@ -574,6 +678,59 @@ describe("agent lifecycle provisioner (ADR-026)", () => {
 			)
 		).rows;
 		expect(identity.mattermost_user_id).toBe(bot.user_id);
+	});
+
+	it("refuses to adopt a stranger's existing plain bot for a fresh create, never touching its tokens", async () => {
+		const admin = new FakeAdminClient(CHANNEL_IDS);
+		// An unrelated integration's own bot, already at this exact username: a plain member
+		// (`is_bot`, plain roles), same as a Gateway-owned bot would be, but never created by this
+		// admin account (`seedUser`'s own default: an owner id of its own, never `admin.adminId`).
+		const stranger = admin.seedUser("github", { is_bot: true });
+		const strangerToken = await admin.createUserAccessToken(stranger.id, "unrelated integration");
+		const created = await requestAgentCreate(deps, createInput("github", ["hq"]));
+		const { logger } = recordingLogger();
+
+		await pass(admin, logger);
+
+		const [lifecycle] = (
+			await pool.query("select status, last_error from agent_lifecycle where agent_id = 'github'")
+		).rows;
+		expect(lifecycle.status).toBe("failed");
+		expect(lifecycle.last_error).toMatch(/taken/i);
+		const [operation] = (
+			await pool.query("select state from agent_lifecycle_operations where id = $1", [
+				created.operationId,
+			])
+		).rows;
+		expect(operation.state).toBe("failed");
+		// The stranger's own bot is never adopted at all: its existing token is left exactly as it
+		// was, never revoked the way a legitimately adopted bot's own stray token would be.
+		expect(await admin.userAccessTokenIds(stranger.id)).toContain(strangerToken.id);
+		expect(admin.calls).not.toContain(`enableBot:${stranger.id}`);
+	});
+
+	it("still adopts a bot this Gateway's own admin account created, with no recorded identity yet (a create resuming after a crash before its bot_user_id checkpoint was ever written)", async () => {
+		const admin = new FakeAdminClient(CHANNEL_IDS);
+		const created = await requestAgentCreate(deps, createInput("analyst", ["hq"]));
+		// Simulates a crash between `createBot` succeeding and the very first checkpoint
+		// (`bot_user_id`) ever being persisted: the bot already exists, owned by this same admin
+		// account, but nothing here has recorded it yet — no checkpoint, no identity row.
+		const bot = await admin.createBot({
+			username: "analyst",
+			display_name: "analyst",
+			description: "",
+		});
+		const { logger } = recordingLogger();
+
+		await pass(admin, logger);
+
+		const [operation] = (
+			await pool.query("select state, checkpoints from agent_lifecycle_operations where id = $1", [
+				created.operationId,
+			])
+		).rows;
+		expect(operation.state).toBe("succeeded");
+		expect(operation.checkpoints.bot_user_id).toBe(bot.user_id);
 	});
 
 	it("fails permanently when the bot's username is taken by a non-Gateway account", async () => {

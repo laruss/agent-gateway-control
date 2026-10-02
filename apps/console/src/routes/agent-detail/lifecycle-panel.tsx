@@ -92,10 +92,14 @@ export type LifecyclePanelProps = Readonly<{
 }>;
 
 /**
- * Live lifecycle progress (ADR-026): polls while the agent is `pending`/`reconciling` (its
- * current operation's own checkpoints, as they complete) and shows an actionable failure with a
- * Retry button once it is `failed`, or `retiring` with its own retire cleanup permanently failed.
- * Renders nothing for `ready` — the status badge in the page header already says so.
+ * Live lifecycle progress (ADR-026): polls while the agent is `pending`/`reconciling`, or
+ * `retiring` with its own retire operation still actually in flight (`pending`/`running` — a
+ * `retire` never moves the agent through `reconciling` the way `create`/`restore`/`reprovision`
+ * do, so `retiring` alone does not mean nothing is happening), showing the current operation's own
+ * checkpoints as they complete either way. Shows an actionable failure with a Retry button once
+ * the current operation is `failed` (the agent itself `failed`, or `retiring` with its own retire
+ * cleanup permanently failed). Renders nothing for `ready` — the status badge in the page header
+ * already says so.
  */
 export function LifecyclePanel({
 	agentId,
@@ -113,6 +117,15 @@ export function LifecyclePanel({
 		current !== undefined &&
 		current.state === "failed" &&
 		(data.status === "failed" || data.status === "retiring");
+	// A `retire` operation leaves the agent `retiring` throughout — never `pending`/`reconciling`,
+	// the two statuses a `create`/`restore`/`reprovision` operation runs under — so an in-flight
+	// retire (or a retried one, which stays `retiring` the same way) needs its own check here: its
+	// current operation still `pending`/`running`, not yet `failed` (that is `canRetry`'s own case)
+	// or `succeeded` (the agent would no longer be `retiring` at all by then).
+	const inFlight =
+		data.status === "pending" ||
+		data.status === "reconciling" ||
+		(data.status === "retiring" && current !== undefined && current.state !== "failed");
 
 	async function handleRetry() {
 		setRetrying(true);
@@ -137,7 +150,7 @@ export function LifecyclePanel({
 		}
 	}
 
-	if (data.status !== "pending" && data.status !== "reconciling" && !canRetry) {
+	if (!inFlight && !canRetry) {
 		return null;
 	}
 
@@ -157,9 +170,7 @@ export function LifecyclePanel({
 				)}
 			</div>
 			{data.lastError !== null && <p className="text-sm text-destructive">{data.lastError}</p>}
-			{current !== undefined && (data.status === "pending" || data.status === "reconciling") && (
-				<CheckpointList operation={current} />
-			)}
+			{current !== undefined && inFlight && <CheckpointList operation={current} />}
 		</div>
 	);
 }

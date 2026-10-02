@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildAgentCreateRequest, UsageError } from "./commands.ts";
+import { buildAgentCreateRequest, parseOutboxStatusFlag, UsageError } from "./commands.ts";
 
 /** A `--root` with `prompts/<file>` already written, for `--role-prompt-file` to read. */
 function rootWithPrompt(fileName: string, content: string): string {
@@ -143,5 +143,21 @@ describe("buildAgentCreateRequest (gateway agents create)", () => {
 				"cli:owner",
 			),
 		).toThrow();
+	});
+});
+
+describe("parseOutboxStatusFlag (gateway outbox list --status)", () => {
+	it("accepts every status the shared, authoritative list names, including 'cancelled'", () => {
+		for (const status of ["pending", "sending", "sent", "dead", "cancelled"]) {
+			expect(parseOutboxStatusFlag(status)).toBe(status);
+		}
+	});
+
+	it("accepts no flag at all", () => {
+		expect(parseOutboxStatusFlag(null)).toBeNull();
+	});
+
+	it("refuses a status outside the shared list", () => {
+		expect(() => parseOutboxStatusFlag("bogus")).toThrow(UsageError);
 	});
 });

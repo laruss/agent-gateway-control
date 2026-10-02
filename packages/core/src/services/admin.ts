@@ -866,6 +866,79 @@ function channelsChangedAgentIdsIn(
 		.sort();
 }
 
+/** Refuses a commit that drops a lifecycle-owned agent out of the active configuration any way
+ * but `requestAgentRetire`'s own `remove_agent` — see `management.ts`'s own
+ * `rejectLifecycleOwnedRemovals` for the full rationale; kept as a second copy here for the same
+ * reason as `rejectUnownedBotSecretPathsIn` above. */
+async function rejectLifecycleOwnedRemovalsIn(
+	db: Db,
+	before: Readonly<AgentConfig[]>,
+	after: Readonly<AgentConfig[]>,
+	trustedAgentIds: ReadonlySet<AgentId>,
+): Promise<Readonly<string[]>> {
+	const afterIds = new Set(after.map((agent) => agent.id));
+	const removedIds = before
+		.map((agent) => agent.id)
+		.filter((id) => !afterIds.has(id) && !trustedAgentIds.has(id));
+	if (removedIds.length === 0) {
+		return [];
+	}
+	const owned = await lifecycleOwnedAgentIds(db, removedIds);
+	if (owned.size === 0) {
+		return [];
+	}
+	const rows = await db
+		.select({ agentId: agentLifecycle.agentId, status: agentLifecycle.status })
+		.from(agentLifecycle)
+		.where(inArray(agentLifecycle.agentId, [...owned]));
+	return rows
+		.filter((row) => row.status !== "retiring" && row.status !== "retired")
+		.map(
+			(row) =>
+				`agent ${row.agentId} is lifecycle-owned and still '${row.status}'; removing it from the ` +
+				"configuration this way would leave its Mattermost identity active — use " +
+				`'gateway agents retire ${row.agentId}' instead`,
+		);
+}
+
+/**
+ * The organization behind `revisionId` (`null`: no revision has ever been recorded, or its
+ * snapshot is somehow missing — the empty-database state `loadActiveBundle` itself treats as "no
+ * organization yet"), read the same trusted-column way `priorAgents` above reads `agents.config`:
+ * `applyConfig` only ever needs this one field (`mattermost.team`) to detect a team change, never
+ * the validated, cached reader `management.ts`'s own `loadActiveBundle` is (kept a separate copy
+ * for the same reason as the rest of this section).
+ */
+async function loadOrganizationIn(
+	db: Db,
+	revisionId: number | null,
+): Promise<OrganizationConfig | null> {
+	if (revisionId === null) {
+		return null;
+	}
+	const [revision] = await db
+		.select({ snapshotHash: configRevisions.snapshotHash })
+		.from(configRevisions)
+		.where(eq(configRevisions.id, revisionId));
+	if (revision === undefined) {
+		return null;
+	}
+	const [snapshot] = await db
+		.select({ bundle: configSnapshots.bundle })
+		.from(configSnapshots)
+		.where(eq(configSnapshots.hash, revision.snapshotHash));
+	return snapshot?.bundle.organization ?? null;
+}
+
+/** Whether the organization's own Mattermost team just changed — see `management.ts`'s own
+ * `organizationTeamChanged` for the full rationale. */
+function organizationTeamChangedIn(
+	before: OrganizationConfig | null,
+	after: OrganizationConfig,
+): boolean {
+	return before !== null && before.mattermost.team !== after.mattermost.team;
+}
+
 type AgentLifecycleRow = typeof agentLifecycle.$inferSelect;
 
 /** Locks (`for update`) the `agent_lifecycle` rows of `agentIds`, in ascending id order — see
@@ -1016,7 +1089,26 @@ export async function applyConfig(
 		const priorAgents = (await db.select({ config: agents.config }).from(agents)).map(
 			(row) => row.config,
 		);
-		const channelsChangedIds = channelsChangedAgentIdsIn(priorAgents, input.agents);
+		// `config apply` never has a trusted removal id of its own (see `rejectLifecycleOwnedRemovalsIn`):
+		// an agent's retirement always runs through `requestAgentRetire`, never a whole-bundle replace.
+		const removalProblems = await rejectLifecycleOwnedRemovalsIn(
+			db,
+			priorAgents,
+			input.agents,
+			new Set(),
+		);
+		if (removalProblems.length > 0) {
+			throw new AdminError(`configuration is invalid:\n- ${removalProblems.join("\n- ")}`);
+		}
+		const priorOrganization = await loadOrganizationIn(db, parentRevisionId);
+		const channelsChangedIds = organizationTeamChangedIn(priorOrganization, input.organization)
+			? [
+					...new Set([
+						...channelsChangedAgentIdsIn(priorAgents, input.agents),
+						...input.agents.map((agent) => agent.id),
+					]),
+				].sort()
+			: channelsChangedAgentIdsIn(priorAgents, input.agents);
 		const lockedLifecycle = await lockLifecycleRowsIn(db, channelsChangedIds);
 		const result = await writeConfigRevisionIn(uow, {
 			input,

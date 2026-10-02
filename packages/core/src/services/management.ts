@@ -733,6 +733,51 @@ export async function rejectUnownedBotSecretPaths(
 		);
 }
 
+/**
+ * Refuses a commit that drops a lifecycle-owned agent out of the active configuration any way but
+ * `requestAgentRetire`'s own `remove_agent` (ADR-026): removing one any other way — a plain
+ * console edit, a CLI import, a YAML `config apply`, `setAgentEnabled`'s own disable-as-removal
+ * fallback — would leave its bot active in Mattermost and its lifecycle row stuck wherever it
+ * already was, never `retiring`, since nothing here drives it there; retiring it afterwards then
+ * fails ("does not exist", since `requestAgentRetire` only ever looks at the active configuration
+ * this very commit just removed it from), and restoring it needs `retired`, which it never reached
+ * either. `trustedAgentIds` is `requestAgentRetire`'s own agent id: its lifecycle row has not moved
+ * to `retiring` yet at the point this runs (that update happens only after its own commit returns),
+ * so it is trusted the same way `rejectUnownedBotSecretPaths` trusts a fresh `create`'s id — only
+ * `agent-lifecycle.ts`'s own internal `commitWithinLock` may pass it, never `commitChange`, the
+ * public entry point every other caller uses.
+ */
+export async function rejectLifecycleOwnedRemovals(
+	db: Db,
+	before: Readonly<AgentConfig[]>,
+	after: Readonly<AgentConfig[]>,
+	trustedAgentIds: ReadonlySet<AgentId>,
+): Promise<Readonly<string[]>> {
+	const afterIds = new Set(after.map((agent) => agent.id));
+	const removedIds = before
+		.map((agent) => agent.id)
+		.filter((id) => !afterIds.has(id) && !trustedAgentIds.has(id));
+	if (removedIds.length === 0) {
+		return [];
+	}
+	const owned = await lifecycleOwnedAgentIds(db, removedIds);
+	if (owned.size === 0) {
+		return [];
+	}
+	const rows = await db
+		.select({ agentId: agentLifecycle.agentId, status: agentLifecycle.status })
+		.from(agentLifecycle)
+		.where(inArray(agentLifecycle.agentId, [...owned]));
+	return rows
+		.filter((row) => row.status !== "retiring" && row.status !== "retired")
+		.map(
+			(row) =>
+				`agent ${row.agentId} is lifecycle-owned and still '${row.status}'; removing it from the ` +
+				"configuration this way would leave its Mattermost identity active — use " +
+				`'gateway agents retire ${row.agentId}' instead`,
+		);
+}
+
 /** The nearest `AgentLifecycleSource` for a configuration commit's own `ConfigRevisionSource`: a
  * console edit stays `console`, an agent's own proposal stays `agent`, and every CLI-driven source
  * this journal has (`cli_apply`, `import`, `rollback`, `backfill`) maps to the lifecycle's own,
@@ -774,6 +819,19 @@ export function channelsChangedAgentIds(
 		})
 		.map((agent) => agent.id)
 		.sort();
+}
+
+/**
+ * True when the organization's own Mattermost team just changed: every lifecycle-owned, `ready`
+ * agent's bot needs to join the new team, not only the ones whose own `allowed_channels` also
+ * changed in the same commit (ADR-026) — `null` (nothing active yet) is never a "change", since no
+ * agent can be lifecycle-owned before an organization has ever been committed.
+ */
+function organizationTeamChanged(
+	before: OrganizationConfig | null,
+	after: OrganizationConfig,
+): boolean {
+	return before !== null && before.mattermost.team !== after.mattermost.team;
 }
 
 /**
@@ -913,6 +971,13 @@ export async function commitChangeIn(
 	 * `commitWithinLock` may pass this.
 	 */
 	trustedBotSecretAgentIds: ReadonlySet<AgentId> = new Set(),
+	/**
+	 * `requestAgentRetire`'s own agent id: trusted to remove a lifecycle-owned agent even though
+	 * its `agent_lifecycle` row has not moved to `retiring` yet this same transaction (that update
+	 * happens right after this commit returns). Never set by `commitChange`; see
+	 * `rejectLifecycleOwnedRemovals`.
+	 */
+	trustedRemovalAgentIds: ReadonlySet<AgentId> = new Set(),
 ): Promise<CommitOutcome> {
 	const { db } = uow.tx;
 	await db.insert(gatewayControls).values({ id: 1 }).onConflictDoNothing();
@@ -998,6 +1063,15 @@ export async function commitChangeIn(
 	if (botSecretProblems.length > 0) {
 		throw new AdminError(`configuration is invalid:\n- ${botSecretProblems.join("\n- ")}`);
 	}
+	const removalProblems = await rejectLifecycleOwnedRemovals(
+		db,
+		base.agents,
+		draft.agents,
+		trustedRemovalAgentIds,
+	);
+	if (removalProblems.length > 0) {
+		throw new AdminError(`configuration is invalid:\n- ${removalProblems.join("\n- ")}`);
+	}
 	const resolvedInput: ConfigApplyInput = {
 		organization: draft.organization,
 		agents: draft.agents,
@@ -1026,8 +1100,18 @@ export async function commitChangeIn(
 
 	// Locked before `writeConfigRevisionIn` locks the `agents` table itself, so the global lock
 	// order (`gateway_controls` -> lifecycle row(s) -> agent row(s) -> operation rows) holds even
-	// though the actual queuing only happens after the write below (see `lockLifecycleRows`).
-	const channelsChangedIds = channelsChangedAgentIds(base.agents, draft.agents);
+	// though the actual queuing only happens after the write below (see `lockLifecycleRows`). A
+	// team change reprovisions every current agent, not only the ones whose own `allowed_channels`
+	// changed in this same commit (`organizationTeamChanged`, ADR-026): every lifecycle-owned bot
+	// needs the new team joined, regardless of whether its channel list also moved.
+	const channelsChangedIds = organizationTeamChanged(base.organization, draft.organization)
+		? [
+				...new Set([
+					...channelsChangedAgentIds(base.agents, draft.agents),
+					...draft.agents.map((agent) => agent.id),
+				]),
+			].sort()
+		: channelsChangedAgentIds(base.agents, draft.agents);
 	const lockedLifecycle = await lockLifecycleRows(db, channelsChangedIds);
 
 	const result = await writeConfigRevisionIn(uow, {

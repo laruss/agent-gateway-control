@@ -170,6 +170,12 @@ export class MattermostClient {
 		return this.call("POST", "bots", ApiBotSchema, bot);
 	}
 
+	/** Null for an id that is not a bot at all (404) — `include_deleted=true` so a disabled one is
+	 * still found, the same lookups elsewhere already tolerate. */
+	getBot(userId: MattermostId): Promise<ApiBot | null> {
+		return this.optional(this.call("GET", `bots/${userId}?include_deleted=true`, ApiBotSchema));
+	}
+
 	enableBot(userId: MattermostId): Promise<ApiBot> {
 		return this.call("POST", `bots/${userId}/enable`, ApiBotSchema);
 	}
@@ -243,17 +249,27 @@ export class MattermostClient {
 	 * (a pile left by earlier crashed rotations, say) must still be seen in full, not just its
 	 * first page. */
 	async userAccessTokenIds(userId: MattermostId): Promise<Readonly<string[]>> {
+		return (await this.userAccessTokens(userId)).map((token) => token.id);
+	}
+
+	/** Every access token of an account, id and description (values are never returned), paged the
+	 * same way `userAccessTokenIds` is: `gateway mattermost admin-token rotate`'s own way of telling
+	 * its own tokens apart from an unrelated one the account also happens to have, which must never
+	 * be revoked. */
+	async userAccessTokens(
+		userId: MattermostId,
+	): Promise<Readonly<{ id: string; description: string }[]>> {
 		const perPage = 200;
-		const ids: string[] = [];
+		const tokens: { id: string; description: string }[] = [];
 		for (let page = 0; ; page += 1) {
-			const tokens = await this.call(
+			const pageTokens = await this.call(
 				"GET",
 				`users/${userId}/tokens?page=${page}&per_page=${perPage}`,
-				z.array(z.looseObject({ id: z.string() })),
+				z.array(z.looseObject({ id: z.string(), description: z.string() })),
 			);
-			ids.push(...tokens.map((token) => token.id));
-			if (tokens.length < perPage) {
-				return ids;
+			tokens.push(...pageTokens);
+			if (pageTokens.length < perPage) {
+				return tokens;
 			}
 		}
 	}
@@ -360,6 +376,7 @@ export type AdminMattermostClient = Pick<
 	| "user"
 	| "userByUsername"
 	| "createBot"
+	| "getBot"
 	| "enableBot"
 	| "disableBot"
 	| "addTeamMember"

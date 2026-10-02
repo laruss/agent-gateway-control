@@ -218,6 +218,18 @@ export const RequestAgentRestoreInputSchema = z.strictObject({
 	actor: z.string().min(1).max(200),
 	source: AgentLifecycleSourceSchema,
 	idempotencyKey: IdempotencyKeySchema.optional(),
+	/**
+	 * Reassigns the organization's `finance_agent_id` to the restored agent, atomically with the
+	 * restore itself (`set_finance_agent`, committed in the same change set): without it, an agent
+	 * restored from a historical configuration in which it *was* the finance agent has its
+	 * permissions normalized instead — any finance-touching `tools_allow`/`tools_require_human_approval`
+	 * entry stripped, `finance.*` added to `tools_deny` — since a non-finance agent may not keep
+	 * them (`validateConfigBundle`'s own finance rule, `@agent-gateway/contracts`'s own
+	 * `financeIssues`). Refused the same way `requestAgentRetire`'s own `reassignFinanceTo` is when
+	 * the resulting bundle is otherwise invalid (an existing finance agent left holding finance
+	 * tools it may no longer have, say): a plain configuration error, nothing special-cased here.
+	 */
+	makeFinanceAgent: z.boolean().optional(),
 });
 export type RequestAgentRestoreInput = z.input<typeof RequestAgentRestoreInputSchema>;
 

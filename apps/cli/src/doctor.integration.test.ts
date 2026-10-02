@@ -6,8 +6,11 @@ import { fileURLToPath } from "node:url";
 import {
 	applyConfig,
 	type ControlPlaneDeps,
+	completeOperation,
+	markProvisioning,
 	recordWorkerStatus,
 	requestAgentCreate,
+	requestAgentRetire,
 } from "@agent-gateway/core";
 import { createPool, migrateSchema } from "@agent-gateway/db";
 import { DEVELOPMENT_VERSION, silentLogger } from "@agent-gateway/logging";
@@ -128,5 +131,39 @@ describe("gateway doctor: 'mattermost_provisioning' sees the admin token the sam
 		const check = checks.find((c) => c.name === "mattermost_provisioning");
 		expect(check).toMatchObject({ ok: true });
 		expect(check?.detail).toContain("admin token configured");
+	});
+
+	it("counts a pending retire as waiting too, not only create/restore/reprovision", async () => {
+		const created = await requestAgentCreate(deps, {
+			agent: {
+				id: "retiring-agent",
+				display_name: "Retiring Agent",
+				mattermost: { username: "retiring-agent" },
+				runtime: { adapter: "mock" },
+				prompts: { role_file: "prompts/retiring-agent.md" },
+				wake_rules: [],
+				concurrency: { while_running: "enqueue" },
+				memory: { private_namespace: "agents/retiring-agent", shared_namespaces: [] },
+			},
+			rolePrompt: "Role.",
+			actor: "test",
+			source: "cli",
+		});
+		await markProvisioning(deps, created.operationId, "test");
+		await completeOperation(deps, created.operationId, "test");
+		// A `retire` operation stays `pending` the same way a `create` does with no admin token
+		// configured — driven by the very same tick, `processRetireOperation` gated on the same
+		// token as `processOperation` (`agent-provisioner.ts`) — so `mattermost_provisioning` must
+		// count it too, not only `create`/`restore`/`reprovision`.
+		await requestAgentRetire(deps, { agentId: "retiring-agent", actor: "test", source: "cli" });
+
+		// A fresh, still-absent path — not the one a prior test in this file already wrote a token
+		// to (that file, once written, stays on disk for the rest of the suite).
+		process.env.MATTERMOST_ADMIN_TOKEN_FILE = join(tokenDir, "mattermost_admin_token_retire_test");
+		const checks = await runDoctor(session);
+		const check = checks.find((c) => c.name === "mattermost_provisioning");
+		expect(check).toMatchObject({ ok: false });
+		// "waiting-agent"'s own still-pending create, plus this retire.
+		expect(check?.detail).toContain("2 operation(s) waiting");
 	});
 });

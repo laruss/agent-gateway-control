@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { AgentConfig, OrganizationConfig } from "@agent-gateway/contracts";
+import type { AgentConfig, ChangeSet, OrganizationConfig } from "@agent-gateway/contracts";
 import { AgentConfigSchema, OrganizationConfigSchema } from "@agent-gateway/contracts";
 import { createPool, migrateSchema } from "@agent-gateway/db";
 import { DEVELOPMENT_VERSION, silentLogger } from "@agent-gateway/logging";
@@ -7,7 +7,7 @@ import { createBoss, migrateQueues, transactionalJobSink } from "@agent-gateway/
 import { startTestPostgres, type TestPostgres } from "@agent-gateway/testkit";
 import type pg from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { AdminError, applyConfig } from "./admin.ts";
+import { AdminError, applyConfig, inTransaction } from "./admin.ts";
 import {
 	checkpointOperation,
 	completeOperation,
@@ -24,7 +24,7 @@ import {
 	StaleLifecycleOperationError,
 } from "./agent-lifecycle.ts";
 import type { ControlPlaneDeps } from "./deps.ts";
-import { activeConfigRevisionId, commitChange } from "./management.ts";
+import { activeConfigRevisionId, commitChange, commitChangeIn } from "./management.ts";
 import { listMemory } from "./memory.ts";
 import { handleRunReport } from "./runs.ts";
 import { recordWorkerStatus } from "./runtime-health.ts";
@@ -313,6 +313,87 @@ describe("agent lifecycle service (ADR-026)", () => {
 		expect(queued).toMatchObject({ kind: "reprovision", state: "pending" });
 	});
 
+	it("config apply that only changes the organization's Mattermost team queues a reprovision for a ready lifecycle-owned agent whose own channels never changed", async () => {
+		const created = await requestAgentCreate(
+			deps,
+			createInput("team-move", {
+				mattermost: { username: "team-move", allowed_channels: ["hq"] },
+			}),
+		);
+		await markProvisioning(deps, created.operationId, "test");
+		await completeOperation(deps, created.operationId, "test");
+
+		const [{ config: financeConfig }] = (
+			await pool.query("select config from agents where id = 'finance'")
+		).rows;
+		const [{ config: movedConfig }] = (
+			await pool.query("select config from agents where id = 'team-move'")
+		).rows;
+		const org = organization();
+		const movedOrg = { ...org, mattermost: { ...org.mattermost, team: "lab2" } };
+		await applyConfig(
+			deps,
+			{
+				organization: movedOrg,
+				agents: [financeConfig, movedConfig],
+				constitution: "Be helpful.",
+				rolePrompts: { finance: "Role prompt for finance.", "team-move": "Role prompt." },
+			},
+			"test",
+		);
+		const [queued] = (
+			await pool.query(
+				"select kind, state from agent_lifecycle_operations where agent_id = 'team-move' order by created_at desc limit 1",
+			)
+		).rows;
+		expect(queued).toMatchObject({ kind: "reprovision", state: "pending" });
+	});
+
+	it("a managed commit that only changes the organization's Mattermost team queues a reprovision for a ready lifecycle-owned agent whose own channels never changed", async () => {
+		const created = await requestAgentCreate(
+			deps,
+			createInput("team-move-managed", {
+				mattermost: { username: "team-move-managed", allowed_channels: ["hq"] },
+			}),
+		);
+		await markProvisioning(deps, created.operationId, "test");
+		await completeOperation(deps, created.operationId, "test");
+
+		const [{ config: financeConfig }] = (
+			await pool.query("select config from agents where id = 'finance'")
+		).rows;
+		const [{ config: movedConfig }] = (
+			await pool.query("select config from agents where id = 'team-move-managed'")
+		).rows;
+		const org = organization();
+		const movedOrg = { ...org, mattermost: { ...org.mattermost, team: "lab2" } };
+		await commitChange(deps, {
+			changeSet: [
+				{
+					type: "replace_bundle",
+					bundle: {
+						organization: movedOrg,
+						agents: [financeConfig, movedConfig],
+						constitution: "Be helpful.",
+						rolePrompts: {
+							finance: "Role prompt for finance.",
+							"team-move-managed": "Role prompt.",
+						},
+					},
+				},
+			],
+			baseRevisionId: await activeConfigRevisionId(deps),
+			actor: "owner",
+			source: "console",
+		});
+		const [queued] = (
+			await pool.query(
+				"select kind, state from agent_lifecycle_operations where agent_id = 'team-move-managed' order by created_at desc limit 1",
+			)
+		).rows;
+		expect(queued).toMatchObject({ kind: "reprovision", state: "pending" });
+	});
+
 	it("an invalid agent definition leaves no trace: no revision, no agent row, no lifecycle row", async () => {
 		const revisionsBefore = (await pool.query("select count(*)::int as n from config_revisions"))
 			.rows[0].n;
@@ -496,6 +577,110 @@ describe("agent lifecycle service (ADR-026)", () => {
 		expect(await activeConfigRevisionId(deps)).toBe(restored.revisionId);
 	});
 
+	it("restore normalizes a former finance agent's permissions, unless makeFinanceAgent reassigns the role back to it atomically", async () => {
+		await reset([agent("accountant")]);
+		await ensureAgentLifecycleAdoption(deps, "test");
+
+		// Grants "finance" the shape `financeIssues` allows only while an agent actually is the
+		// organization's finance agent: a non-read finance action in `tools_require_human_approval`
+		// (never required in `tools_allow`), and no `finance.*` in `tools_deny` (never required of
+		// it either while it holds the role).
+		const [{ config: financeConfig }] = (
+			await pool.query("select config from agents where id = 'finance'")
+		).rows;
+		const financeShaped: AgentConfig = {
+			...financeConfig,
+			permissions: {
+				tools_allow: ["finance.read"],
+				tools_require_human_approval: ["finance.payment.create"],
+				tools_deny: [],
+			},
+		};
+		await commitChange(deps, {
+			changeSet: [{ type: "update_agent", agent: financeShaped }],
+			baseRevisionId: await activeConfigRevisionId(deps),
+			actor: "test",
+			source: "cli_apply",
+		});
+
+		const retired = await requestAgentRetire(deps, {
+			agentId: "finance",
+			actor: "test",
+			source: "cli",
+			reassignFinanceTo: "accountant",
+		});
+		await markProvisioning(deps, retired.operationId, "test");
+		await completeOperation(deps, retired.operationId, "test");
+
+		// Restoring it unchanged would fail `validateConfigBundle`'s own finance rule the moment it
+		// restores to anyone but today's finance agent ("accountant", now): this must not throw.
+		const restored = await requestAgentRestore(deps, {
+			agentId: "finance",
+			actor: "test",
+			source: "cli",
+		});
+		expect(await activeConfigRevisionId(deps)).toBe(restored.revisionId);
+		const [{ config: normalized }] = (
+			await pool.query("select config from agents where id = 'finance'")
+		).rows;
+		expect(normalized.permissions.tools_allow).not.toContain("finance.read");
+		expect(normalized.permissions.tools_require_human_approval).not.toContain(
+			"finance.payment.create",
+		);
+		expect(normalized.permissions.tools_deny).toContain("finance.*");
+	});
+
+	it("restore with makeFinanceAgent reassigns the finance role atomically and keeps the restored agent's finance-shaped permissions", async () => {
+		await reset([agent("accountant")]);
+		await ensureAgentLifecycleAdoption(deps, "test");
+
+		const [{ config: financeConfig }] = (
+			await pool.query("select config from agents where id = 'finance'")
+		).rows;
+		const financeShaped: AgentConfig = {
+			...financeConfig,
+			permissions: {
+				tools_allow: ["finance.read"],
+				tools_require_human_approval: ["finance.payment.create"],
+				tools_deny: [],
+			},
+		};
+		await commitChange(deps, {
+			changeSet: [{ type: "update_agent", agent: financeShaped }],
+			baseRevisionId: await activeConfigRevisionId(deps),
+			actor: "test",
+			source: "cli_apply",
+		});
+
+		const retired = await requestAgentRetire(deps, {
+			agentId: "finance",
+			actor: "test",
+			source: "cli",
+			reassignFinanceTo: "accountant",
+		});
+		await markProvisioning(deps, retired.operationId, "test");
+		await completeOperation(deps, retired.operationId, "test");
+
+		const restored = await requestAgentRestore(deps, {
+			agentId: "finance",
+			actor: "test",
+			source: "cli",
+			makeFinanceAgent: true,
+		});
+		expect(await activeConfigRevisionId(deps)).toBe(restored.revisionId);
+		const [{ config: keptShaped }] = (
+			await pool.query("select config from agents where id = 'finance'")
+		).rows;
+		expect(keptShaped.permissions).toEqual(financeShaped.permissions);
+		const [org] = (
+			await pool.query(
+				"select bundle -> 'organization' -> 'organization' ->> 'finance_agent_id' as finance_agent_id from config_snapshots s join config_revisions r on r.snapshot_hash = s.hash where r.id = $1",
+				[restored.revisionId],
+			)
+		).rows;
+		expect(org.finance_agent_id).toBe("finance");
+	});
+
 	it("refuses to complete an operation a later request already superseded", async () => {
 		const created = await requestAgentCreate(deps, createInput("lambda"));
 		// Supersedes the create operation: a new `retire` operation and generation.
@@ -626,6 +811,28 @@ describe("agent lifecycle service (ADR-026)", () => {
 			)
 		).rows[0].n;
 		expect(operationCountSecond).toBe(operationCountFirst);
+	});
+
+	it("retire adopts an agent added by config apply/import while the controller kept running, rather than refusing 'has no lifecycle record'", async () => {
+		// `reset` itself never calls `ensureAgentLifecycleAdoption`, so "added-live" starts with no
+		// `agent_lifecycle` row at all — exactly the gap a config apply/import while the controller
+		// runs leaves (adoption happens only at startup or a fresh CLI session, ADR-026).
+		await reset([agent("added-live")]);
+		const [missing] = (
+			await pool.query("select status from agent_lifecycle where agent_id = 'added-live'")
+		).rows;
+		expect(missing).toBeUndefined();
+
+		const retired = await requestAgentRetire(deps, {
+			agentId: "added-live",
+			actor: "test",
+			source: "cli",
+		});
+		expect(await activeConfigRevisionId(deps)).toBe(retired.revisionId);
+		const [lifecycle] = (
+			await pool.query("select status from agent_lifecycle where agent_id = 'added-live'")
+		).rows;
+		expect(lifecycle.status).toBe("retiring");
 	});
 
 	it("lets several concurrent adoptions race without error, exactly one adopt operation per agent", async () => {
@@ -874,6 +1081,80 @@ describe("agent lifecycle service (ADR-026)", () => {
 			expect(settled.status).toBe("retired");
 		});
 
+		it("a reprovision that fails permanently leaves the agent ready, and retrying it keeps the agent ready throughout", async () => {
+			const agentId = "retry-reprovision";
+			const created = await requestAgentCreate(
+				deps,
+				createInput(agentId, { mattermost: { username: agentId, allowed_channels: ["hq"] } }),
+			);
+			await markProvisioning(deps, created.operationId, "test");
+			await completeOperation(deps, created.operationId, "test");
+
+			const [{ config }] = (await pool.query("select config from agents where id = $1", [agentId]))
+				.rows;
+			const changed = {
+				...config,
+				mattermost: { ...config.mattermost, allowed_channels: [] },
+			};
+			await commitChange(deps, {
+				changeSet: [{ type: "update_agent", agent: changed }],
+				baseRevisionId: await activeConfigRevisionId(deps),
+				actor: "owner",
+				source: "console",
+			});
+			const [reprovisionOp] = (
+				await pool.query(
+					"select id from agent_lifecycle_operations where agent_id = $1 and kind = 'reprovision' order by created_at desc limit 1",
+					[agentId],
+				)
+			).rows;
+
+			// Queuing it never moved the agent out of `ready` (ADR-026); nor does claiming it.
+			await markProvisioning(deps, reprovisionOp.id, "test");
+			const [reconciling] = (
+				await pool.query("select status from agent_lifecycle where agent_id = $1", [agentId])
+			).rows;
+			expect(reconciling.status).toBe("ready");
+
+			await failOperation(deps, reprovisionOp.id, "test", "the bot's username is taken");
+			const [failed] = (
+				await pool.query("select status, last_error from agent_lifecycle where agent_id = $1", [
+					agentId,
+				])
+			).rows;
+			// A permanent failure does not stop the scheduler either: still `ready`, with the error
+			// recorded for `gateway doctor` and the console to surface, and the failed operation
+			// itself still visible (and retryable) rather than silently dropped.
+			expect(failed).toMatchObject({ status: "ready", last_error: "the bot's username is taken" });
+			const [failedOp] = (
+				await pool.query("select state from agent_lifecycle_operations where id = $1", [
+					reprovisionOp.id,
+				])
+			).rows;
+			expect(failedOp.state).toBe("failed");
+
+			const retried = await requestOperationRetry(deps, { agentId, actor: "test", source: "cli" });
+			expect(retried.kind).toBe("reprovision");
+			const [afterRetry] = (
+				await pool.query("select status, last_error from agent_lifecycle where agent_id = $1", [
+					agentId,
+				])
+			).rows;
+			expect(afterRetry).toMatchObject({ status: "ready", last_error: null });
+
+			await markProvisioning(deps, retried.operationId, "test");
+			const [stillReady] = (
+				await pool.query("select status from agent_lifecycle where agent_id = $1", [agentId])
+			).rows;
+			expect(stillReady.status).toBe("ready");
+
+			await completeOperation(deps, retried.operationId, "test");
+			const [settled] = (
+				await pool.query("select status from agent_lifecycle where agent_id = $1", [agentId])
+			).rows;
+			expect(settled.status).toBe("ready");
+		});
+
 		it("refuses to retry an agent whose current operation is not actually failed", async () => {
 			const created = await requestAgentCreate(deps, createInput("retry-not-failed"));
 			// Still `pending`: nothing has failed yet.
@@ -927,6 +1208,60 @@ describe("agent lifecycle service (ADR-026)", () => {
 			).rows;
 			// The original `create` plus the one retry — the replayed call inserted nothing further.
 			expect(n).toBe(2);
+		});
+
+		it("refuses an idempotency key already used for a retry of a different kind of operation on the same agent", async () => {
+			const agentId = "retry-kind-mismatch";
+			const created = await requestAgentCreate(
+				deps,
+				createInput(agentId, { mattermost: { username: agentId, allowed_channels: ["hq"] } }),
+			);
+			await markProvisioning(deps, created.operationId, "test");
+			await failOperation(
+				deps,
+				created.operationId,
+				"test",
+				"the bot account could not be created",
+			);
+
+			const idempotencyKey = randomUUID();
+			const createRetry = await requestOperationRetry(deps, {
+				agentId,
+				actor: "test",
+				source: "cli",
+				idempotencyKey,
+			});
+			expect(createRetry.kind).toBe("create");
+			await markProvisioning(deps, createRetry.operationId, "test");
+			await completeOperation(deps, createRetry.operationId, "test");
+
+			// The agent's current operation is now a failed `reprovision`, not the `create` the key was
+			// first used for: reusing it must be refused, never silently handed back as if it had just
+			// retried this entirely different operation.
+			const [{ config }] = (await pool.query("select config from agents where id = $1", [agentId]))
+				.rows;
+			const changed = {
+				...config,
+				mattermost: { ...config.mattermost, allowed_channels: [] },
+			};
+			await commitChange(deps, {
+				changeSet: [{ type: "update_agent", agent: changed }],
+				baseRevisionId: await activeConfigRevisionId(deps),
+				actor: "owner",
+				source: "console",
+			});
+			const [reprovisionOp] = (
+				await pool.query(
+					"select id from agent_lifecycle_operations where agent_id = $1 and kind = 'reprovision' order by created_at desc limit 1",
+					[agentId],
+				)
+			).rows;
+			await markProvisioning(deps, reprovisionOp.id, "test");
+			await failOperation(deps, reprovisionOp.id, "test", "the bot's username is taken");
+
+			await expect(
+				requestOperationRetry(deps, { agentId, actor: "test", source: "cli", idempotencyKey }),
+			).rejects.toThrow(/already used for a different request/);
 		});
 
 		it("two concurrent retries racing on the same idempotency key both get the first's result, never a spurious 422", async () => {
@@ -1227,6 +1562,125 @@ describe("agent lifecycle service (ADR-026)", () => {
 			});
 			expect(all.some((item) => item.namespace === "agents/memory-agent")).toBe(false);
 			expect(all.some((item) => item.namespace === "organization/shared")).toBe(true);
+		});
+	});
+
+	describe("a lifecycle-owned agent cannot be dropped from configuration outside its own retire (ADR-026)", () => {
+		it("refuses a managed commit that removes a lifecycle-owned, ready agent", async () => {
+			const created = await requestAgentCreate(deps, createInput("drop-managed"));
+			await markProvisioning(deps, created.operationId, "test");
+			await completeOperation(deps, created.operationId, "test");
+
+			await expect(
+				commitChange(deps, {
+					changeSet: [{ type: "remove_agent", agentId: "drop-managed" }],
+					baseRevisionId: await activeConfigRevisionId(deps),
+					actor: "owner",
+					source: "console",
+				}),
+			).rejects.toThrow(/gateway agents retire drop-managed/);
+
+			const [lifecycle] = (
+				await pool.query("select status from agent_lifecycle where agent_id = 'drop-managed'")
+			).rows;
+			expect(lifecycle.status).toBe("ready");
+			const [row] = (await pool.query("select enabled from agents where id = 'drop-managed'")).rows;
+			expect(row.enabled).toBe(true);
+		});
+
+		it("refuses a whole-bundle config apply that drops a lifecycle-owned, ready agent", async () => {
+			const created = await requestAgentCreate(deps, createInput("drop-apply"));
+			await markProvisioning(deps, created.operationId, "test");
+			await completeOperation(deps, created.operationId, "test");
+
+			const [{ config: financeConfig }] = (
+				await pool.query("select config from agents where id = 'finance'")
+			).rows;
+			await expect(
+				applyConfig(
+					deps,
+					{
+						organization: organization(),
+						agents: [financeConfig],
+						constitution: "Be helpful.",
+						rolePrompts: { finance: "Role prompt for finance." },
+					},
+					"test",
+				),
+			).rejects.toThrow(/gateway agents retire drop-apply/);
+
+			const [row] = (await pool.query("select enabled from agents where id = 'drop-apply'")).rows;
+			expect(row.enabled).toBe(true);
+		});
+
+		// `setAgentEnabled`'s own `remove_agent` fallback (`management.ts`) commits through the very
+		// same public `commitChange` the test above calls directly, so it is refused by the identical
+		// mechanism; reproducing its own specific precondition (disabling alone insufficient, only
+		// reachable by simulating a retained configuration a cross-release rule change invalidated)
+		// would only re-exercise the same check already covered there.
+
+		it("retire tolerates an agent already missing from the active configuration (a stuck legacy state), still running its own cleanup", async () => {
+			const agentId = "already-gone";
+			const created = await requestAgentCreate(deps, createInput(agentId));
+			await markProvisioning(deps, created.operationId, "test");
+			await completeOperation(deps, created.operationId, "test");
+			await pool.query(
+				`insert into runtime_sessions (agent_id, adapter, provider_session_ref, runtime_version, status)
+				 values ($1, 'mock', 'transcript-1', 'mock/1', 'active')`,
+				[agentId],
+			);
+
+			// Simulates a stuck state only an older release's own bug could leave behind — a config
+			// write removing a lifecycle-owned agent any way but its own retire — never something this
+			// release's own writers can still produce, now that `rejectLifecycleOwnedRemovals` refuses
+			// it: the agent's configuration is gone from the active bundle, but its lifecycle row was
+			// never moved to `retiring`, still `ready` exactly as it was. Reproduced here the same way
+			// the bug itself would have: a direct `commitChangeIn` call trusted to remove it, bypassing
+			// the lifecycle row update `requestAgentRetire` itself always does in the same transaction.
+			const baseRevisionId = await activeConfigRevisionId(deps);
+			const changeSet: ChangeSet = [{ type: "remove_agent", agentId }];
+			await inTransaction(deps, (uow) =>
+				commitChangeIn(
+					uow,
+					{ changeSet, baseRevisionId, actor: "test", source: "cli_apply" },
+					changeSet,
+					undefined,
+					new Set([agentId]),
+				),
+			);
+			const [stuck] = (
+				await pool.query("select status from agent_lifecycle where agent_id = $1", [agentId])
+			).rows;
+			expect(stuck.status).toBe("ready");
+			// Out of the active bundle `loadActiveBundle` reads, even though its projection row (never
+			// deleted, only ever disabled, like any agent leaving the configuration) still exists.
+			const [disabled] = (await pool.query("select enabled from agents where id = $1", [agentId]))
+				.rows;
+			expect(disabled.enabled).toBe(false);
+
+			const retired = await requestAgentRetire(deps, { agentId, actor: "test", source: "cli" });
+
+			const [lifecycle] = (
+				await pool.query("select status from agent_lifecycle where agent_id = $1", [agentId])
+			).rows;
+			expect(lifecycle.status).toBe("retiring");
+			const [operation] = (
+				await pool.query("select kind, state from agent_lifecycle_operations where id = $1", [
+					retired.operationId,
+				])
+			).rows;
+			expect(operation).toMatchObject({ kind: "retire", state: "pending" });
+
+			// Every other retirement cleanup step still ran, even with nothing left to remove from the
+			// configuration: its stored runtime session is ended unconditionally, the same as any other
+			// retire.
+			const [session] = (
+				await pool.query(
+					"select status from runtime_sessions where agent_id = $1 and adapter = 'mock'",
+					[agentId],
+				)
+			).rows;
+			expect(session.status).toBe("revoked");
 		});
 	});
 });

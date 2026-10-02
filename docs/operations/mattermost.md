@@ -310,9 +310,14 @@ a sync after a failure is pending.
   bun run gateway mattermost admin-token rotate --secrets-dir secrets
   ```
 
-  Create-verify-switch-revoke (ADR-026): it creates a new personal access token for the same
-  `gateway-admin` account, verifies it authenticates as that account, writes it over the current
-  file — the controller's provisioner reads it on its next pass, no restart needed — and only then
-  revokes every other token the account has. A crash between any two of those steps leaves a token
-  that still works; re-running the command finishes it (it revokes every token that is not the one
-  it just wrote, however many stray ones a crashed earlier attempt left behind).
+  Create-verify-switch-revoke (ADR-026): it creates a new personal access token (tagged with a
+  fixed description, `agent-gateway-admin`) for the same `gateway-admin` account, verifies it
+  authenticates as that account, writes it over the current file — the controller's provisioner
+  reads it on its next pass, no restart needed — and only then revokes every *other* token carrying
+  that same description. A crash between any two of those steps leaves a token that still works;
+  re-running the command finishes it (it revokes every one of its own tokens that is not the one it
+  just wrote, however many stray ones a crashed earlier attempt left behind). A token on the account
+  without that description — an unrelated personal access token the admin also happens to hold, or
+  the very first one, entered by hand through `admin-token set` and never created by this command —
+  is never touched; revoke that one yourself if it is no longer needed, the same as the bootstrap
+  admin token above.

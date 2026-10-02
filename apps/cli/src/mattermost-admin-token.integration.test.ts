@@ -47,16 +47,26 @@ type FakeAccount = Readonly<{
 function startFakeMattermost() {
 	const accountsById = new Map<string, FakeAccount>();
 	const accountByTokenValue = new Map<string, string>();
-	const tokens = new Map<string, { value: string; userId: string }>();
+	const tokens = new Map<string, { value: string; userId: string; description: string }>();
 	const tokensByUser = new Map<string, Set<string>>();
 
-	const addAccount = (token: string, account: FakeAccount): void => {
+	/** The description a token this fake creates carries unless told otherwise: the Gateway's own
+	 * (`ADMIN_TOKEN_DESCRIPTION`, `mattermost-commands.ts`) — every existing test's own tokens stay
+	 * exactly as before; a test for an *unrelated* token on the account passes its own description
+	 * explicitly instead. */
+	const DEFAULT_DESCRIPTION = "agent-gateway-admin";
+
+	const addAccount = (
+		token: string,
+		account: FakeAccount,
+		description: string = DEFAULT_DESCRIPTION,
+	): void => {
 		accountsById.set(account.id, account);
 		accountByTokenValue.set(token, account.id);
 		// Registered as a real, revocable token too (not just a lookup shortcut): `rotate` must be
 		// able to find and revoke this one through `users/{id}/tokens`, exactly like any other.
 		const tokenId = randomUUID();
-		tokens.set(tokenId, { value: token, userId: account.id });
+		tokens.set(tokenId, { value: token, userId: account.id, description });
 		const ids = tokensByUser.get(account.id) ?? new Set<string>();
 		ids.add(tokenId);
 		tokensByUser.set(account.id, ids);
@@ -85,19 +95,16 @@ function startFakeMattermost() {
 					return json({}, 401);
 				}
 				const userId = createOrList[1] ?? "";
+				const body = (await request.json()) as { description?: string };
 				const tokenId = randomUUID();
 				const value = `tok-${randomUUID()}`;
-				tokens.set(tokenId, { value, userId });
+				const description = body.description ?? DEFAULT_DESCRIPTION;
+				tokens.set(tokenId, { value, userId, description });
 				accountByTokenValue.set(value, userId);
 				const ids = tokensByUser.get(userId) ?? new Set<string>();
 				ids.add(tokenId);
 				tokensByUser.set(userId, ids);
-				return json({
-					id: tokenId,
-					token: value,
-					user_id: userId,
-					description: "agent-gateway-admin",
-				});
+				return json({ id: tokenId, token: value, user_id: userId, description });
 			}
 			if (createOrList !== null && request.method === "GET") {
 				if (caller === undefined) {
@@ -112,7 +119,14 @@ function startFakeMattermost() {
 					page * perPage,
 					(page + 1) * perPage,
 				);
-				return json(ids.map((id) => ({ id, description: "agent-gateway-admin", is_active: true })));
+				return json(
+					ids.flatMap((id) => {
+						const entry = tokens.get(id);
+						return entry === undefined
+							? []
+							: [{ id, description: entry.description, is_active: true }];
+					}),
+				);
 			}
 			if (url.pathname === "/api/v4/users/tokens/revoke" && request.method === "POST") {
 				if (caller === undefined) {
@@ -134,12 +148,17 @@ function startFakeMattermost() {
 
 	/** Seeds `count` more revocable tokens on `userId`, standing in for a stray pile of old ones
 	 * (a crashed earlier rotate, say) — only their count and revocation matter here, never their
-	 * values, so `me()` never needs to look any of them up by value. */
-	const addTokens = (userId: string, count: number): void => {
+	 * values, so `me()` never needs to look any of them up by value. Each carries the Gateway's own
+	 * description by default, same as `addAccount`'s own seed token. */
+	const addTokens = (
+		userId: string,
+		count: number,
+		description: string = DEFAULT_DESCRIPTION,
+	): void => {
 		for (let i = 0; i < count; i += 1) {
 			const tokenId = randomUUID();
 			const value = `extra-${randomUUID()}`;
-			tokens.set(tokenId, { value, userId });
+			tokens.set(tokenId, { value, userId, description });
 			accountByTokenValue.set(value, userId);
 			const ids = tokensByUser.get(userId) ?? new Set<string>();
 			ids.add(tokenId);
@@ -316,5 +335,42 @@ describe("gateway mattermost admin-token set|rotate (ADR-026)", () => {
 		expect(fake.worksNow(newToken)).toBe(true);
 		// Nothing left but the one just written: every stray token, on every page, was revoked.
 		expect(fake.tokenCount(adminId)).toBe(1);
+	});
+
+	it("never revokes an unrelated personal access token the admin account also happens to hold", async () => {
+		fake = startFakeMattermost();
+		const adminId = mmId("admin");
+		const account: FakeAccount = {
+			id: adminId,
+			username: "gateway-admin",
+			is_bot: false,
+			roles: "system_user system_admin",
+			delete_at: 0,
+		};
+		fake.addAccount("token-a", account);
+		// A personal access token the admin uses for something else entirely, never created by
+		// this command — rotate must leave it exactly alone, never folding it into "every other
+		// token the account has".
+		const unrelated = "a-totally-unrelated-integration-token";
+		fake.addAccount(unrelated, account, "some other integration");
+		// A stray token from an earlier crashed rotation, carrying the Gateway's own description:
+		// this one must still be revoked, exactly like before.
+		fake.addTokens(adminId, 1);
+		expect(fake.tokenCount(adminId)).toBe(3);
+
+		const path = secretPath();
+		await mattermostAdminTokenSet(
+			{ baseUrl: fake.baseUrl, secretPath: path, reader: fakeReader(["token-a"]) },
+			() => undefined,
+		);
+
+		await mattermostAdminTokenRotate({ baseUrl: fake.baseUrl, secretPath: path }, () => undefined);
+
+		expect(fake.worksNow("token-a")).toBe(false);
+		expect(fake.worksNow(unrelated)).toBe(true);
+		const newToken = readFileSync(path, "utf8").trim();
+		expect(fake.worksNow(newToken)).toBe(true);
+		// The unrelated token, plus the newly written one: the stray Gateway-tagged token is gone.
+		expect(fake.tokenCount(adminId)).toBe(2);
 	});
 });

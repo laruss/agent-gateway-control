@@ -23,6 +23,7 @@ import {
 	RequestOperationRetryInputSchema,
 	type RuntimeAdapterId,
 	type SecretFile,
+	toolPatternsOverlap,
 } from "@agent-gateway/contracts";
 import {
 	agentLifecycle,
@@ -161,6 +162,10 @@ async function commitWithinLock(
 	/** `requestAgentCreate`'s own agent id: trusted to claim `/run/bot-secrets/` even though its
 	 * `agent_lifecycle` row does not exist yet this same transaction (see `commitChangeIn`). */
 	trustedBotSecretAgentIds?: ReadonlySet<AgentId>,
+	/** `requestAgentRetire`'s own agent id: trusted to remove a lifecycle-owned agent even though
+	 * its own `agent_lifecycle` row has not moved to `retiring` yet this same transaction (see
+	 * `rejectLifecycleOwnedRemovals`). */
+	trustedRemovalAgentIds?: ReadonlySet<AgentId>,
 ): Promise<CommittedOutcome> {
 	let base = baseRevisionId;
 	for (let attempt = 1; attempt <= MAX_LIFECYCLE_COMMIT_ATTEMPTS; attempt += 1) {
@@ -175,6 +180,7 @@ async function commitWithinLock(
 			},
 			changeSet,
 			trustedBotSecretAgentIds,
+			trustedRemovalAgentIds,
 		);
 		if (outcome.kind === "committed") {
 			return outcome;
@@ -427,6 +433,13 @@ export async function requestAgentRetire(
 		RequestAgentRetireInputSchema.safeParse(input),
 		"agent retire request",
 	);
+	// Its own, already-committed transaction, before the one below ever takes the lifecycle row's
+	// lock — the same precedent `commitChange`'s own `ensureConfigHistory` call sets. An agent added
+	// through `config apply`/`import` while the controller keeps running is adopted only at startup
+	// or the start of a CLI session (ADR-026): this call is what lets this very retire still find a
+	// lifecycle row for one added since, rather than refusing "has no lifecycle record" for an agent
+	// that is, in every other way, perfectly configured and retireable.
+	await ensureAgentLifecycleAdoption(deps, parsed.actor);
 	const result = await inTransaction(deps, async (uow) => {
 		const { db } = uow.tx;
 		const baseRevisionId = await lockGatewayControls(db);
@@ -468,7 +481,16 @@ export async function requestAgentRetire(
 
 		const { bundle: base } = await loadActiveBundle(db, baseRevisionId);
 		const financeAgentId = base.organization?.organization.finance_agent_id ?? null;
-		const changeSet: ChangeSet = [{ type: "remove_agent", agentId: parsed.agentId }];
+		// Tolerates an agent already missing from the active configuration — stuck there by an
+		// older release's own bug (a config write that dropped a lifecycle-owned agent any way but
+		// this one; `rejectLifecycleOwnedRemovals` now refuses that going forward) rather than by
+		// this retire: `remove_agent` itself refuses a nonexistent id (`applyChangeSet`'s own "does
+		// not exist"), which would otherwise make such an agent permanently un-retireable. Skipping
+		// it here is safe — there is nothing left to remove — and every other cleanup step below
+		// still runs, so a stuck agent like this can still be recovered.
+		const changeSet: ChangeSet = base.agents.some((agent) => agent.id === parsed.agentId)
+			? [{ type: "remove_agent", agentId: parsed.agentId }]
+			: [];
 		if (financeAgentId === parsed.agentId) {
 			if (parsed.reassignFinanceTo === undefined) {
 				throw new AdminError(
@@ -512,6 +534,8 @@ export async function requestAgentRetire(
 			parsed.actor,
 			configRevisionSourceOf(parsed.source),
 			parsed.reason,
+			undefined,
+			new Set([parsed.agentId]),
 		);
 
 		// Every channel it was ever granted directly (ADR-022) is tombstoned: a retired agent can
@@ -640,6 +664,33 @@ async function findLastConfiguredAgent(
 	return agent === undefined || rolePrompt === undefined ? null : { agent, rolePrompt };
 }
 
+const FINANCE_TOOLS = "finance.*";
+
+/**
+ * Permissions an agent's historical configuration carried as the finance agent (free to hold
+ * finance tools, so never required `finance.*` in `tools_deny`), normalized for one that is not
+ * (or no longer) the organization's finance agent: any finance-touching `tools_allow`/
+ * `tools_require_human_approval` entry is dropped, and `finance.*` is added to `tools_deny` when
+ * missing. Restoring a former finance agent's configuration unchanged would otherwise fail
+ * `validateConfigBundle`'s own finance rule the moment it restores to anyone but today's finance
+ * agent (`financeIssues`, `@agent-gateway/contracts`'s own `config-bundle.ts`) — the same baseline
+ * `defaultAgentPermissions` already seeds a fresh non-finance agent with.
+ */
+function normalizeNonFinancePermissions(
+	permissions: AgentConfig["permissions"],
+): AgentConfig["permissions"] {
+	const touchesFinance = (pattern: string) => toolPatternsOverlap(pattern, FINANCE_TOOLS);
+	return {
+		tools_allow: permissions.tools_allow.filter((pattern) => !touchesFinance(pattern)),
+		tools_require_human_approval: permissions.tools_require_human_approval.filter(
+			(pattern) => !touchesFinance(pattern),
+		),
+		tools_deny: permissions.tools_deny.includes(FINANCE_TOOLS)
+			? permissions.tools_deny
+			: [...permissions.tools_deny, FINANCE_TOOLS],
+	};
+}
+
 /**
  * Restores a retired agent: re-adds its configuration from the last recorded snapshot that still
  * had it (re-enabled, its token reference migrated to the lifecycle provisioner's own
@@ -655,6 +706,12 @@ async function findLastConfiguredAgent(
  * stuck `reconciling` forever, now also skipped by `gateway mattermost bootstrap` for being
  * lifecycle-owned. Migrating to `defaultBotSecretFile` sidesteps all of that; the old
  * `/run/secrets/...` file is simply stale from here on (`docs/operations/mattermost.md`).
+ *
+ * A former finance agent's permissions are normalized the same way (`normalizeNonFinancePermissions`)
+ * unless the request also names `makeFinanceAgent`, which instead reassigns the role to it
+ * atomically — a `set_finance_agent` operation in the very same change set — and restores its
+ * historical permissions unchanged, trusting them to already be finance-shaped (they were valid as
+ * such before it retired); `validateConfigBundle` still refuses the commit if they are not.
  */
 export async function requestAgentRestore(
 	deps: ControlPlaneDeps,
@@ -709,6 +766,19 @@ export async function requestAgentRestore(
 			);
 		}
 
+		const { bundle: base } = await loadActiveBundle(db, baseRevisionId);
+		const financeAgentId = base.organization?.organization.finance_agent_id ?? null;
+		const makeFinanceAgent = parsed.makeFinanceAgent === true;
+		// A former finance agent's historical permissions are normalized for anyone else (never
+		// required `finance.*` in `tools_deny` while it was finance, see `normalizeNonFinancePermissions`)
+		// unless this request reassigns the role back to it atomically, in which case they are
+		// restored unchanged and `validateConfigBundle` is trusted to still refuse them if they are
+		// not actually finance-shaped.
+		const permissions =
+			makeFinanceAgent || historical.agent.id === financeAgentId
+				? historical.agent.permissions
+				: normalizeNonFinancePermissions(historical.agent.permissions);
+
 		// The token reference always migrates to the provisioner's own, server-generated path, never
 		// kept as historical.agent.mattermost.token_secret_file named it: for an agent restored from
 		// a bootstrap-managed (adopted) configuration, that path is still the operator's read-only
@@ -724,8 +794,12 @@ export async function requestAgentRestore(
 				...historical.agent.mattermost,
 				token_secret_file: defaultBotSecretFile(parsed.agentId),
 			},
+			permissions,
 		};
 		const changeSet: ChangeSet = [{ type: "add_agent", agent, rolePrompt: historical.rolePrompt }];
+		if (makeFinanceAgent) {
+			changeSet.push({ type: "set_finance_agent", agentId: parsed.agentId });
+		}
 		const commit = await commitWithinLock(
 			uow,
 			baseRevisionId,
@@ -792,15 +866,17 @@ export type RequestOperationRetryResult = Readonly<{
 
 /**
  * Requests a fresh attempt of an agent's own current operation: refused unless that operation is
- * actually `failed` — a `create`/`restore`/`reprovision` that left the agent `failed`, or a
- * `retire` that left it `retiring` with a permanent failure of its own cleanup. Queues a new
- * operation of the *same* kind, `pending`, carrying the failed operation's own checkpoints forward
- * (a step it already completed is not repeated) — never resurrects the failed row itself, since
- * the operation journal is append-only and only ever moves a row's own state forward (ADR-026).
- * The agent itself moves back to `pending` (the state a fresh `create`/`restore`/`reprovision`
- * starts from) except for a retiring agent, which stays `retiring` throughout, the same way
- * `markProvisioning` already leaves it for a `retire` operation; `last_error` is cleared either
- * way, since this is a fresh attempt, not a continuation of the failure it is replacing.
+ * actually `failed` — a `create`/`restore` that left the agent `failed`, a `reprovision` that left
+ * it `ready` (it never moves its agent out of `ready`, including on a permanent failure,
+ * `failOperation`'s own carve-out), or a `retire` that left it `retiring` with a permanent failure
+ * of its own cleanup. Queues a new operation of the *same* kind, `pending`, carrying the failed
+ * operation's own checkpoints forward (a step it already completed is not repeated) — never
+ * resurrects the failed row itself, since the operation journal is append-only and only ever moves
+ * a row's own state forward (ADR-026). The agent itself moves back to `pending` (the state a fresh
+ * `create`/`restore` starts from) except for a retiring agent, which stays `retiring` throughout,
+ * and a `reprovision`, which stays `ready` throughout — both the same way `markProvisioning`
+ * already leaves the agent for that operation kind; `last_error` is cleared either way, since this
+ * is a fresh attempt, not a continuation of the failure it is replacing.
  *
  * A repeat with the same `idempotencyKey` replays the first call's own result rather than
  * re-validating — the same convention `requestAgentCreate`/`requestAgentRetire`/
@@ -839,7 +915,22 @@ export async function requestOperationRetry(
 				.from(agentLifecycleOperations)
 				.where(eq(agentLifecycleOperations.idempotencyKey, parsed.idempotencyKey));
 			if (existing !== undefined) {
-				if (existing.agentId !== parsed.agentId) {
+				// Matched by agent *and* kind, the same way `requestAgentCreate`/`requestAgentRetire`/
+				// `requestAgentRestore` each match their own fixed literal kind: this request has none
+				// of its own (it retries whatever kind the agent's current operation already is), so the
+				// kind to match is read fresh from the agent's own lifecycle row instead — on a genuine
+				// replay, nothing else has changed since the first call, so this is exactly `existing`
+				// own kind; a key reused for a different request (even one for the same agent, say a
+				// `retire` or a later, different retry) is refused rather than silently handed back as
+				// if it had been the request just made.
+				const [current] =
+					lifecycle.operationId === null
+						? []
+						: await db
+								.select({ kind: agentLifecycleOperations.kind })
+								.from(agentLifecycleOperations)
+								.where(eq(agentLifecycleOperations.id, lifecycle.operationId));
+				if (existing.agentId !== parsed.agentId || current?.kind !== existing.kind) {
 					throw new AdminError(
 						`idempotency key '${parsed.idempotencyKey}' was already used for a different request`,
 					);
@@ -870,6 +961,15 @@ export async function requestOperationRetry(
 					`agent '${parsed.agentId}' is retiring with an unexpected operation kind '${failed.kind}'`,
 				);
 			}
+			// A `reprovision` never moves its agent out of `ready` (ADR-026), including when it fails
+			// permanently (`failOperation`'s own carve-out): its agent is still `ready`, not `failed`,
+			// the one other status besides `retiring` that can still have something to retry.
+		} else if (lifecycle.status === "ready") {
+			if (failed.kind !== "reprovision") {
+				throw new AdminError(
+					`agent '${parsed.agentId}' is 'ready' with an unexpected operation kind '${failed.kind}'`,
+				);
+			}
 		} else if (lifecycle.status !== "failed") {
 			throw new AdminError(
 				`agent '${parsed.agentId}' is '${lifecycle.status}', not failed or retiring; nothing to retry`,
@@ -892,8 +992,16 @@ export async function requestOperationRetry(
 			createdAt: uow.now,
 			updatedAt: uow.now,
 		});
+		// A `reprovision` retry leaves the agent `ready` throughout, the same way `markProvisioning`
+		// already leaves it for the fresh operation this queues (never `reconciling`): a membership-
+		// only operation retrying is never a reason to pause scheduling, any more than running one
+		// the first time was.
 		const nextStatus: AgentLifecycleStatus =
-			lifecycle.status === "retiring" ? "retiring" : "pending";
+			lifecycle.status === "retiring"
+				? "retiring"
+				: failed.kind === "reprovision"
+					? "ready"
+					: "pending";
 		await db
 			.update(agentLifecycle)
 			.set({
@@ -1088,11 +1196,16 @@ const MAX_LIFECYCLE_ERROR_LENGTH = 2000;
  * `error` is redacted (`redactForStorage`, the same helper runtime-health and approval failures
  * already use) before it is bounded and persisted: a provisioner's own error text may quote a
  * request or response that still carries a credential. The agent itself moves to `failed` — except
- * for a `retire` operation, which leaves it `retiring`: a retired agent's desired state never
+ * for a `retire` operation, which leaves it `retiring` (a retired agent's desired state never
  * changes because its cleanup hit a permanent snag, and `retiring` is what names the specific
- * attention it still needs (resume the cleanup by hand, or fix the underlying Mattermost problem),
- * never the generic `failed` a stuck `create`/`restore`/`reprovision` already means. Refused for a
- * stale or already terminal operation.
+ * attention it still needs — resume the cleanup by hand, or fix the underlying Mattermost problem,
+ * never the generic `failed` a stuck `create`/`restore` already means), and a `reprovision`
+ * operation, which leaves it `ready`: ADR-026 is explicit that a `reprovision` never moves its
+ * agent out of `ready`, a permanent failure of one included — the scheduler would otherwise stop a
+ * perfectly working agent over nothing worse than a membership change it could not finish, and
+ * `last_error` plus the failed operation itself (still visible in `gateway doctor` and the console,
+ * and retryable, `requestOperationRetry`) already surface exactly what needs attention. Refused for
+ * a stale or already terminal operation.
  */
 export async function failOperation(
 	deps: ControlPlaneDeps,
@@ -1111,7 +1224,12 @@ export async function failOperation(
 			.update(agentLifecycleOperations)
 			.set({ state: "failed", error: bounded, updatedAt: uow.now, finishedAt: uow.now })
 			.where(eq(agentLifecycleOperations.id, operationId));
-		const status: AgentLifecycleStatus = operation.kind === "retire" ? "retiring" : "failed";
+		const status: AgentLifecycleStatus =
+			operation.kind === "retire"
+				? "retiring"
+				: operation.kind === "reprovision"
+					? "ready"
+					: "failed";
 		await db
 			.update(agentLifecycle)
 			.set({ status, statusChangedAt: uow.now, lastError: bounded })
