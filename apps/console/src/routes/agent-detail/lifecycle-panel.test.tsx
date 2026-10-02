@@ -114,6 +114,67 @@ describe("LifecyclePanel", () => {
 		expect(screen.queryByRole("button", { name: /retry/i })).not.toBeInTheDocument();
 	});
 
+	it("renders a progress checklist for a running reprovision, which never moves the agent out of ready", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () =>
+				jsonResponse({
+					status: "ready",
+					generation: 3,
+					lastError: null,
+					statusChangedAt: new Date().toISOString(),
+					retiredAt: null,
+					operations: [
+						{
+							id: "33333333-3333-4333-8333-333333333335",
+							kind: "reprovision",
+							state: "running",
+							checkpoints: { channels_joined: ["hq"] },
+							error: null,
+							createdAt: new Date().toISOString(),
+							updatedAt: new Date().toISOString(),
+							finishedAt: null,
+						},
+					],
+				}),
+			),
+		);
+		renderPanel();
+		expect(await screen.findByText(/join newly configured channels/i)).toBeInTheDocument();
+		expect(screen.getByText(/leave channels no longer configured/i)).toBeInTheDocument();
+		expect(screen.queryByRole("button", { name: /retry/i })).not.toBeInTheDocument();
+	});
+
+	it("shows the actionable failure with a Retry button for a failed reprovision, which leaves the agent ready rather than failed", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () =>
+				jsonResponse({
+					status: "ready",
+					generation: 3,
+					lastError: "channel 'ops' could not be resolved",
+					statusChangedAt: new Date().toISOString(),
+					retiredAt: null,
+					operations: [
+						{
+							id: "33333333-3333-4333-8333-333333333336",
+							kind: "reprovision",
+							state: "failed",
+							checkpoints: {},
+							error: "channel 'ops' could not be resolved",
+							createdAt: new Date().toISOString(),
+							updatedAt: new Date().toISOString(),
+							finishedAt: new Date().toISOString(),
+						},
+					],
+				}),
+			),
+		);
+		renderPanel();
+		expect(await screen.findByText(/channel 'ops' could not be resolved/i)).toBeInTheDocument();
+		expect(screen.getByRole("button", { name: /^retry$/i })).toBeInTheDocument();
+	});
+
 	it("shows the actionable failure with a Retry button once failed, and retrying calls the API", async () => {
 		const user = userEvent.setup();
 		const calls: string[] = [];

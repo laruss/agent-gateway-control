@@ -293,6 +293,14 @@ class FakeAdminClient {
 		this.teamMembers.add(userId);
 	};
 
+	/** Keyed by team id too (unlike `addTeamMember`'s own call key): a team-change test needs to
+	 * tell "left the old team" apart from "never joined a team at all". `teamMembers` itself stays
+	 * a flat set — none of the existing tests need more than one team to track membership in. */
+	removeTeamMember = async (teamId: string, userId: string): Promise<void> => {
+		this.maybeFail(`removeTeamMember:${teamId}:${userId}`);
+		this.teamMembers.delete(userId);
+	};
+
 	addChannelMember = async (channelId: string, userId: string): Promise<void> => {
 		const name = this.channelNamesById[channelId] ?? channelId;
 		this.maybeFail(`addChannelMember:${name}`);
@@ -567,6 +575,162 @@ describe("agent lifecycle provisioner (ADR-026)", () => {
 		// The channel the edit added mid-flight: never seen by this operation's own stale config
 		// read, joined only because the provisioner reloads it fresh right before completing.
 		expect(admin.channelMembers.get(CHANNEL_IDS.research)?.has(botUserId)).toBe(true);
+	});
+
+	it("a channel removed from configuration while create is in flight is left by a reprovision completeOperation itself queues, never silently kept", async () => {
+		const admin = new FakeAdminClient(CHANNEL_IDS);
+		await requestAgentCreate(deps, createInput("analyst", ["hq", "research"]));
+		const { logger } = recordingLogger();
+
+		// Simulates an owner's edit landing mid-flight, after this operation's own `agentConfig` was
+		// already read (so its main join loop still joins "research" from that stale copy, exactly
+		// like the addition case above) but before `completeOperation`'s own fresh read. Unlike an
+		// addition, a removal is never caught by the fresh-config reload right before completing
+		// (that loop only ever adds a channel, never drops one) — only `completeOperation`'s own
+		// reconciliation fence (ADR-026) can still catch it.
+		const originalAddTeamMember = admin.addTeamMember;
+		admin.addTeamMember = async (teamId: string, userId: string) => {
+			const [{ config }] = (await pool.query("select config from agents where id = 'analyst'"))
+				.rows;
+			const edited: AgentConfig = {
+				...config,
+				mattermost: { ...config.mattermost, allowed_channels: ["hq"] },
+			};
+			await commitChange(deps, {
+				changeSet: [{ type: "update_agent", agent: edited }],
+				baseRevisionId: await activeConfigRevisionId(deps),
+				actor: "owner",
+				source: "console",
+			});
+			return originalAddTeamMember(teamId, userId);
+		};
+
+		await pass(admin, logger);
+
+		const [lifecycle] = (
+			await pool.query("select status from agent_lifecycle where agent_id = 'analyst'")
+		).rows;
+		expect(lifecycle.status).toBe("ready");
+		const [{ mattermost_user_id: botUserId }] = (
+			await pool.query(
+				"select mattermost_user_id from mattermost_identities where agent_id = 'analyst'",
+			)
+		).rows;
+		// The now-unconfigured channel was still joined by this operation's own stale read of its
+		// own configuration...
+		expect(admin.channelMembers.get(CHANNEL_IDS.research)?.has(botUserId)).toBe(true);
+		// ...but `completeOperation` itself noticed the mismatch and queued a reprovision to leave it,
+		// rather than leaving the agent `ready` with a membership nothing would otherwise revisit.
+		const [queued] = (
+			await pool.query(
+				"select kind, state from agent_lifecycle_operations where agent_id = 'analyst' order by created_at desc limit 1",
+			)
+		).rows;
+		expect(queued).toMatchObject({ kind: "reprovision", state: "pending" });
+
+		await pass(admin, logger);
+
+		expect(admin.channelMembers.get(CHANNEL_IDS.hq)?.has(botUserId)).toBe(true);
+		expect(admin.channelMembers.get(CHANNEL_IDS.research)?.has(botUserId)).toBe(false);
+	});
+
+	it("a Mattermost team change mid-create is picked up on resume: stale team-scoped checkpoints are redone and the old team (and its channels) are left", async () => {
+		const admin = new FakeAdminClient(CHANNEL_IDS);
+		const created = await requestAgentCreate(deps, createInput("analyst", ["hq", "research"]));
+		const { logger } = recordingLogger();
+
+		// "research" fails so the operation stays `running` with "hq" already joined and its own
+		// `team_joined`/`team` checkpoint (the organization's original team) already persisted.
+		admin.failures.set("addChannelMember:research", new Error("mattermost unavailable"));
+		await pass(admin, logger);
+		let [operation] = (
+			await pool.query("select state, checkpoints from agent_lifecycle_operations where id = $1", [
+				created.operationId,
+			])
+		).rows;
+		expect(operation.state).toBe("running");
+		expect(operation.checkpoints).toMatchObject({ team_joined: true, team: TEAM });
+		const [{ mattermost_user_id: botUserId }] = (
+			await pool.query(
+				"select mattermost_user_id from mattermost_identities where agent_id = 'analyst'",
+			)
+		).rows;
+		expect(admin.channelMembers.get(CHANNEL_IDS.hq)?.has(botUserId)).toBe(true);
+
+		// The organization moves to a new Mattermost team meanwhile, resolved in the directory the
+		// same way `gateway mattermost bootstrap` would once it actually exists there — exactly the
+		// `replace_bundle` shape `management.integration.test.ts`'s own team-change tests already use.
+		const NEW_TEAM = "lab2";
+		const NEW_TEAM_ID = fixedId("newteam");
+		const NEW_CHANNEL_ID = fixedId("newhq");
+		const [{ config: financeConfig }] = (
+			await pool.query("select config from agents where id = 'finance'")
+		).rows;
+		const [{ config: analystConfig }] = (
+			await pool.query("select config from agents where id = 'analyst'")
+		).rows;
+		const org = organization();
+		const movedOrg = {
+			...org,
+			mattermost: {
+				...org.mattermost,
+				team: NEW_TEAM,
+				channels: ["hq2"],
+				approvals_channel: "hq2",
+				alerts_channel: "hq2",
+			},
+		};
+		const movedAnalyst: AgentConfig = {
+			...analystConfig,
+			mattermost: { ...analystConfig.mattermost, allowed_channels: ["hq2"] },
+		};
+		await commitChange(deps, {
+			changeSet: [
+				{
+					type: "replace_bundle",
+					bundle: {
+						organization: movedOrg,
+						agents: [financeConfig, movedAnalyst],
+						constitution: "Be helpful.",
+						rolePrompts: {
+							finance: "Role prompt.",
+							analyst: createInput("analyst", []).rolePrompt,
+						},
+					},
+				},
+			],
+			baseRevisionId: await activeConfigRevisionId(deps),
+			actor: "owner",
+			source: "console",
+		});
+		await setDirectoryEntry(deps, "team", NEW_TEAM, NEW_TEAM_ID, "test");
+		await setDirectoryEntry(deps, "channel", "hq2", NEW_CHANNEL_ID, "test");
+
+		// Still this same `create` operation, never superseded: `queueMembershipReprovisioning` only
+		// reprovisions a `ready` agent, and this one is still `reconciling` throughout.
+		[operation] = (
+			await pool.query("select state, kind from agent_lifecycle_operations where id = $1", [
+				created.operationId,
+			])
+		).rows;
+		expect(operation).toMatchObject({ state: "running", kind: "create" });
+
+		await pass(admin, logger);
+
+		[operation] = (
+			await pool.query("select state, checkpoints from agent_lifecycle_operations where id = $1", [
+				created.operationId,
+			])
+		).rows;
+		expect(operation.state).toBe("succeeded");
+		// Rejoined against the now-current team, not skipped as already done for the old one.
+		expect(operation.checkpoints).toMatchObject({ team_joined: true, team: NEW_TEAM });
+		expect(operation.checkpoints.channels_joined).toEqual(["hq2"]);
+		expect(admin.channelMembers.get(NEW_CHANNEL_ID)?.has(botUserId)).toBe(true);
+		// The old team's own channel is left, and the old team itself too (one team only, as a plain
+		// member — the same invariant `bootstrapMattermost` already keeps).
+		expect(admin.channelMembers.get(CHANNEL_IDS.hq)?.has(botUserId)).toBe(false);
+		expect(admin.calls).toContain(`removeTeamMember:${TEAM_ID}:${botUserId}`);
 	});
 
 	it("resumes after a transient failure without repeating already-checkpointed steps", async () => {
@@ -1048,6 +1212,39 @@ describe("agent lifecycle provisioner (ADR-026)", () => {
 				await pool.query("select status from agent_lifecycle where agent_id = 'analyst'")
 			).rows;
 			expect(lifecycle.status).toBe("retired");
+		});
+
+		it("skips Mattermost cleanup, rather than adopting it, when a plain bot at the agent's own username is not plausibly this Gateway's own", async () => {
+			const admin = new FakeAdminClient(CHANNEL_IDS);
+			await requestAgentCreate(deps, createInput("analyst", ["hq"]));
+			// The create itself never got far enough to resolve a bot (no checkpoint, no identity) —
+			// but by the time this agent is retired, an unrelated integration already created its own
+			// plain bot at the exact same username (`analyst`'s own create would have failed on
+			// "username taken" had it ever run; this retire must not revoke that stranger's tokens).
+			const stranger = admin.seedUser("analyst", { is_bot: true });
+			const strangerToken = await admin.createUserAccessToken(stranger.id, "unrelated integration");
+
+			await requestAgentRetire(deps, { agentId: "analyst", actor: "test", source: "cli" });
+			const { logger, calls } = recordingLogger();
+			await pass(admin, logger);
+
+			const [lifecycle] = (
+				await pool.query("select status from agent_lifecycle where agent_id = 'analyst'")
+			).rows;
+			expect(lifecycle.status).toBe("retired");
+			// The stranger's own bot is never touched: not disabled, its token never revoked.
+			expect(await admin.user(stranger.id)).toMatchObject({ delete_at: 0 });
+			expect(await admin.userAccessTokenIds(stranger.id)).toContain(strangerToken.id);
+			expect(
+				calls.some((call) => {
+					const reason = call.fields?.reason;
+					return (
+						call.message.includes("Mattermost-side cleanup was skipped") &&
+						typeof reason === "string" &&
+						reason.includes("not plausibly")
+					);
+				}),
+			).toBe(true);
 		});
 
 		it("resumes retirement after a transient failure, without repeating an already-checkpointed step", async () => {

@@ -86,10 +86,22 @@ below.
    bun run gateway mattermost admin-token set --secrets-dir secrets
    ```
 
-   This validates the token (`users/me`: a non-bot account with the `system_admin` role) and
-   writes it to `<secrets-dir>/mattermost_admin_token`, mounted read-only into the controller at
-   `/run/secrets/mattermost_admin_token` (`MATTERMOST_ADMIN_TOKEN_FILE`). The controller's
-   provisioner picks it up on its own next pass — no restart needed.
+   This validates the token (`users/me`: a non-bot account with the `system_admin` role), then
+   mints a gateway-tagged token from it, verifies that one too, and writes *that* one to
+   `<secrets-dir>/mattermost_admin_token`, mounted read-only into the controller at
+   `/run/secrets/mattermost_admin_token` (`MATTERMOST_ADMIN_TOKEN_FILE`) — the controller's
+   provisioner picks it up on its own next pass, no restart needed. The token you pasted is then
+   revoked (printed as "the token you entered was revoked"): on the freshly prepared account this
+   command is meant for, it is the only token found, so there is nothing ambiguous about which one
+   to retire. If the account already held more than one token, none are touched — a warning says
+   so, and the one you pasted is left for you to revoke by hand once you have confirmed the new
+   one works, exactly like `admin-token rotate`'s own "unrelated personal token" rule below.
+
+   Minting a tagged token immediately, rather than storing the pasted value as is, is what lets
+   every later `admin-token rotate` account for it correctly from the very first run: a token
+   entered by hand carries whatever description the operator gave it in Mattermost, never
+   guaranteed to be this command's own, so a plain hand-pasted token sitting in the file in place
+   of this step would simply never come up in rotate's own revoke pass.
 
 With no admin token configured yet, `create`/`restore`/`reprovision` operations simply stay
 `pending`; `gateway doctor`'s `mattermost_provisioning` check names this plainly rather than
@@ -115,7 +127,10 @@ off, and a lost token response is recreated rather than reused. Once every step 
 becomes `ready` and a waiting mention runs at once. `agents operations` shows each operation's
 state, checkpoints and error, if any; a permanent failure (the username really is taken, or the
 admin token is rejected) needs an operator's attention — everything else (a slow or unreachable
-Mattermost) retries on its own.
+Mattermost) retries on its own. `gateway doctor`'s own `lifecycle_failures` check counts every agent
+whose own current lifecycle operation is `failed`, including a failed `reprovision` (below) — which
+never shows up as the agent's own status, since it leaves the agent `ready` throughout — so a stuck
+operation is never invisible just because its agent otherwise looks fine.
 
 The bot's token file is in `secrets/controller-bots/`, backed up and restored along with the rest
 of `$GATEWAY_HOME` (`docs/operations/home-server.md`); nothing needs to be reprovisioned after an
@@ -317,7 +332,10 @@ a sync after a failure is pending.
   that same description. A crash between any two of those steps leaves a token that still works;
   re-running the command finishes it (it revokes every one of its own tokens that is not the one it
   just wrote, however many stray ones a crashed earlier attempt left behind). A token on the account
-  without that description — an unrelated personal access token the admin also happens to hold, or
-  the very first one, entered by hand through `admin-token set` and never created by this command —
-  is never touched; revoke that one yourself if it is no longer needed, the same as the bootstrap
-  admin token above.
+  without that description — an unrelated personal access token the admin also happens to hold — is
+  never touched; revoke that one yourself if it is no longer needed. `admin-token set` itself mints
+  and tags its own token from the moment it is first run (above), so there is no longer a "first
+  rotation never revokes the hand-entered one" gap to work around; if a rotate ever does revoke 0
+  tokens, it prints a warning rather than staying quiet about it — a sign that the token currently
+  in the file somehow never got tagged (an operator wrote the file directly, say), worth tracking
+  down and revoking by hand.

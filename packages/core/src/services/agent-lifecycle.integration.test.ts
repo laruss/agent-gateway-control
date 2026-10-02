@@ -594,6 +594,10 @@ describe("agent lifecycle service (ADR-026)", () => {
 				tools_allow: ["finance.read"],
 				tools_require_human_approval: ["finance.payment.create"],
 				tools_deny: [],
+				// An unrelated permission field, same as the operator example agent's own
+				// (`config/examples/agents/operator.yaml`): normalizing the finance-related fields
+				// must never drop a field it does not itself adjust.
+				observe_system: true,
 			},
 		};
 		await commitChange(deps, {
@@ -628,6 +632,7 @@ describe("agent lifecycle service (ADR-026)", () => {
 			"finance.payment.create",
 		);
 		expect(normalized.permissions.tools_deny).toContain("finance.*");
+		expect(normalized.permissions.observe_system).toBe(true);
 	});
 
 	it("restore with makeFinanceAgent reassigns the finance role atomically and keeps the restored agent's finance-shaped permissions", async () => {
@@ -672,6 +677,69 @@ describe("agent lifecycle service (ADR-026)", () => {
 			await pool.query("select config from agents where id = 'finance'")
 		).rows;
 		expect(keptShaped.permissions).toEqual(financeShaped.permissions);
+		const [org] = (
+			await pool.query(
+				"select bundle -> 'organization' -> 'organization' ->> 'finance_agent_id' as finance_agent_id from config_snapshots s join config_revisions r on r.snapshot_hash = s.hash where r.id = $1",
+				[restored.revisionId],
+			)
+		).rows;
+		expect(org.finance_agent_id).toBe("finance");
+	});
+
+	it("restore with makeFinanceAgent also normalizes the outgoing finance agent's permissions, when it actually holds finance tools rather than merely the role", async () => {
+		await reset([agent("accountant")]);
+		await ensureAgentLifecycleAdoption(deps, "test");
+
+		const retired = await requestAgentRetire(deps, {
+			agentId: "finance",
+			actor: "test",
+			source: "cli",
+			reassignFinanceTo: "accountant",
+		});
+		await markProvisioning(deps, retired.operationId, "test");
+		await completeOperation(deps, retired.operationId, "test");
+
+		// "accountant" is now the active finance agent, and genuinely holds finance tools (the same
+		// working shape `config/examples/agents/finance.yaml` itself uses) — not merely named the
+		// role with none of its own, the way the tests above leave it.
+		const [{ config: accountantConfig }] = (
+			await pool.query("select config from agents where id = 'accountant'")
+		).rows;
+		const financeShaped: AgentConfig = {
+			...accountantConfig,
+			permissions: {
+				tools_allow: ["finance.read"],
+				tools_require_human_approval: ["finance.payment.create"],
+				tools_deny: [],
+			},
+		};
+		await commitChange(deps, {
+			changeSet: [{ type: "update_agent", agent: financeShaped }],
+			baseRevisionId: await activeConfigRevisionId(deps),
+			actor: "test",
+			source: "cli_apply",
+		});
+
+		// Restoring "finance" with `makeFinanceAgent` reassigns the role back to it atomically.
+		// Without normalizing "accountant" in the same change set, it would be left holding finance
+		// tools while no longer the finance agent — refused outright by whole-bundle validation.
+		const restored = await requestAgentRestore(deps, {
+			agentId: "finance",
+			actor: "test",
+			source: "cli",
+			makeFinanceAgent: true,
+		});
+		expect(await activeConfigRevisionId(deps)).toBe(restored.revisionId);
+
+		const [{ config: normalizedAccountant }] = (
+			await pool.query("select config from agents where id = 'accountant'")
+		).rows;
+		expect(normalizedAccountant.permissions.tools_allow).not.toContain("finance.read");
+		expect(normalizedAccountant.permissions.tools_require_human_approval).not.toContain(
+			"finance.payment.create",
+		);
+		expect(normalizedAccountant.permissions.tools_deny).toContain("finance.*");
+
 		const [org] = (
 			await pool.query(
 				"select bundle -> 'organization' -> 'organization' ->> 'finance_agent_id' as finance_agent_id from config_snapshots s join config_revisions r on r.snapshot_hash = s.hash where r.id = $1",
@@ -1262,6 +1330,38 @@ describe("agent lifecycle service (ADR-026)", () => {
 			await expect(
 				requestOperationRetry(deps, { agentId, actor: "test", source: "cli", idempotencyKey }),
 			).rejects.toThrow(/already used for a different request/);
+		});
+
+		it("refuses an idempotency key a create request already used, even though the agent's own current operation happens to share that retry's kind", async () => {
+			const agentId = "retry-replays-create-key";
+			const idempotencyKey = randomUUID();
+			// `create`'s own operation carries kind `create` — exactly the kind a retry of it would
+			// also carry, so `kind` alone could not tell the two apart; only `retry_of` (set solely by
+			// `requestOperationRetry`'s own insert) can.
+			const created = await requestAgentCreate(deps, {
+				...createInput(agentId),
+				idempotencyKey,
+			});
+			await markProvisioning(deps, created.operationId, "test");
+			await failOperation(
+				deps,
+				created.operationId,
+				"test",
+				"the bot account could not be created",
+			);
+
+			await expect(
+				requestOperationRetry(deps, { agentId, actor: "test", source: "cli", idempotencyKey }),
+			).rejects.toThrow(/already used for a different request/);
+
+			// Never silently "replayed" as a retry: no second operation was queued.
+			const [{ n }] = (
+				await pool.query(
+					"select count(*)::int as n from agent_lifecycle_operations where agent_id = $1",
+					[agentId],
+				)
+			).rows;
+			expect(n).toBe(1);
 		});
 
 		it("two concurrent retries racing on the same idempotency key both get the first's result, never a spurious 422", async () => {

@@ -196,7 +196,7 @@ export async function runProvisionerPass(
 		if (stopped()) {
 			return;
 		}
-		await processRetireOperation(deps, admin, options, actor, operation, log);
+		await processRetireOperation(deps, admin, options, actor, operation, log, me.id);
 	}
 }
 
@@ -262,6 +262,21 @@ async function processOperation(
 	}
 
 	let checkpoints = operation.checkpoints;
+	// A `team_joined`/`channels_joined` checkpoint recorded for a Mattermost team this operation
+	// already left behind (the organization's own team changed since, `commitChangeIn`'s own
+	// `organizationTeamChanged` check having queued a fresh `reprovision` for every other
+	// lifecycle-owned agent, but this one's own `create`/`restore`/`reprovision` was already
+	// running) is stale: both are scoped to the team they were recorded against, so this operation
+	// must rejoin the now-current team and its channels rather than skip steps already marked done
+	// for one the agent is no longer meant to be in. The old team's own channels (and the team
+	// itself) are left further down, once the bot has rejoined the current one.
+	const staleTeam =
+		checkpoints.team !== undefined && checkpoints.team !== snapshot.organization.mattermost.team
+			? checkpoints.team
+			: null;
+	if (staleTeam !== null) {
+		checkpoints = { ...checkpoints, team_joined: false, channels_joined: [] };
+	}
 	try {
 		// Read once, before `ensureBot`, not only afterwards: this agent's own recorded identity (if
 		// any) is exactly what lets `ensureBot` tell its own, previously-resolved bot apart from an
@@ -313,7 +328,10 @@ async function processOperation(
 
 		if (checkpoints.team_joined !== true) {
 			await admin.addTeamMember(teamId, botUserId);
-			checkpoints = await checkpoint(deps, operation.id, checkpoints, { team_joined: true });
+			checkpoints = await checkpoint(deps, operation.id, checkpoints, {
+				team_joined: true,
+				team: snapshot.organization.mattermost.team,
+			});
 		}
 
 		const channelIdsByName = new Map(
@@ -337,6 +355,27 @@ async function processOperation(
 			checkpoints = await checkpoint(deps, operation.id, checkpoints, {
 				channels_joined: [...joined],
 			});
+		}
+
+		// The old team is left once the bot has rejoined the current one above: every channel of it
+		// the bot is still a member of, except one an owner or admin granted its bot directly (ADR-022,
+		// checked fresh, never from a snapshot taken earlier in this pass — same rule as the
+		// `reprovision` leaving-step just below), then the team itself — the same "one team only, as
+		// a plain member" invariant `bootstrapMattermost` already keeps. Resolved by the old team's own
+		// recorded name (`staleTeam`), never a live `userTeams` listing: a crash here leaves the bot in
+		// both teams until the next pass, which recomputes `staleTeam` from the checkpoints the same
+		// way and simply finishes the job.
+		if (staleTeam !== null) {
+			const oldTeamId = await loadDirectoryEntry(deps, "team", staleTeam);
+			if (oldTeamId !== null) {
+				for (const channel of await admin.userChannelsInTeam(botUserId, oldTeamId)) {
+					const allowed = await loadAgentAllowedChannelIds(deps, operation.agentId);
+					if (isExtraChannel(channel, allowed)) {
+						await admin.removeChannelMember(channel.id, botUserId);
+					}
+				}
+				await admin.removeTeamMember(oldTeamId, botUserId);
+			}
 		}
 
 		// A `reprovision` operation's own membership step (ADR-026): channels the committed change
@@ -435,6 +474,16 @@ async function ensureBotToken(
 	writeSecretFile(resolvedPath, created.token);
 }
 
+/** What {@link recoverRetiringBotUserId} found. */
+type RecoveredRetiringBot =
+	| Readonly<{ kind: "found"; userId: MattermostId }>
+	| Readonly<{ kind: "not_found" }>
+	/** A plain bot exists at the agent's own configured username, but it is not plausibly this
+	 * Gateway's own (`findPlausibleGatewayBot`'s own ownership guard): retirement must not adopt a
+	 * stranger's account merely because nothing else claims the name, so its Mattermost-side
+	 * cleanup is skipped instead of revoking that unrelated bot's tokens and disabling it. */
+	| Readonly<{ kind: "skipped"; reason: string }>;
+
 /**
  * Recovers a retiring agent's bot id when `mattermost_identities` never recorded one: a
  * create/restore operation can checkpoint `bot_user_id` and then be superseded by this very retire
@@ -443,26 +492,47 @@ async function ensureBotToken(
  * retirement would wrongly conclude there is no Mattermost cleanup needed and leave both in place.
  * Checked first against every operation this agent ever had (newest first): a superseded
  * operation's checkpoints survive being cancelled, so the `create`/`restore` this retire just
- * superseded, or an earlier one, still names the account if it ever got that far. Only as a last
- * resort is the account looked up by `username` (the agent's own last known configuration) —
- * never adopting one that is not plausibly the Gateway's own bot (`findPlausibleGatewayBot`).
+ * superseded, or an earlier one, still names the account if it ever got that far — always `found`
+ * this way, never subject to the ownership guard below, since this agent's own operation journal is
+ * exactly what makes the account its own. Only as a last resort is the account looked up by
+ * `username` (the agent's own last known configuration), and only when it is plausibly the
+ * Gateway's own plain bot (`findPlausibleGatewayBot`'s own `owner_id` check against `adminUserId`):
+ * a username-only match is never enough by itself — an agent whose own `create` genuinely failed on
+ * "username taken" must not have this retire revoke an unrelated bot's tokens and disable it.
  */
 async function recoverRetiringBotUserId(
 	deps: ControlPlaneDeps,
 	admin: AdminMattermostClient,
 	agentId: AgentId,
 	username: string | undefined,
-): Promise<MattermostId | null> {
+	adminUserId: MattermostId,
+): Promise<RecoveredRetiringBot> {
 	const operations = await listLifecycleOperations(deps, agentId);
 	for (const op of operations) {
 		if (
 			(op.kind === "create" || op.kind === "restore") &&
 			op.checkpoints.bot_user_id !== undefined
 		) {
-			return op.checkpoints.bot_user_id;
+			return { kind: "found", userId: op.checkpoints.bot_user_id };
 		}
 	}
-	return username === undefined ? null : findPlausibleGatewayBot(admin, username);
+	if (username === undefined) {
+		return { kind: "not_found" };
+	}
+	const found = await findPlausibleGatewayBot(admin, username, adminUserId);
+	if (found !== null) {
+		return { kind: "found", userId: found };
+	}
+	// Looked up again, only to tell the two apart in the log line below: `findPlausibleGatewayBot`
+	// already returned null whether nothing is there at all or something is but is not plausibly
+	// ours, and only the latter is worth an operator's attention.
+	const existing = await admin.userByUsername(username);
+	return existing === null
+		? { kind: "not_found" }
+		: {
+				kind: "skipped",
+				reason: `a plain bot named '${username}' exists but is not plausibly this Gateway's own`,
+			};
 }
 
 /**
@@ -483,6 +553,7 @@ async function processRetireOperation(
 	actor: string,
 	operation: LifecycleOperation,
 	log: Logger,
+	adminUserId: MattermostId,
 ): Promise<void> {
 	if (operation.state === "pending") {
 		try {
@@ -501,16 +572,30 @@ async function processRetireOperation(
 		let botUserId = identity?.userId ?? null;
 		if (botUserId === null) {
 			const agentConfig = await loadAgentConfig(deps, operation.agentId);
-			botUserId = await recoverRetiringBotUserId(
+			const recovered = await recoverRetiringBotUserId(
 				deps,
 				admin,
 				operation.agentId,
 				agentConfig?.mattermost.username,
+				adminUserId,
 			);
-			if (botUserId !== null) {
+			if (recovered.kind === "found") {
+				botUserId = recovered.userId;
 				// Recorded now, the same write a crash between the `bot_user_id` checkpoint and this
 				// would otherwise have skipped entirely: never left silently blank once recovered.
 				await setAgentBotUser(deps, operation.agentId, botUserId, actor);
+			} else if (recovered.kind === "skipped") {
+				// A plain bot sharing this agent's own configured username exists, but nothing (not
+				// this agent's own operation journal, not its `owner_id`) says it is actually the
+				// Gateway's: never adopted, so there is nothing of this agent's own left to clean up
+				// Mattermost-side — recorded here, not silently folded into the "nothing was ever
+				// provisioned" case below, so an operator can tell the two apart.
+				await completeOperation(deps, operation.id, actor, checkpoints);
+				log.info("agent provisioner: agent retired; its Mattermost-side cleanup was skipped", {
+					agent_id: operation.agentId,
+					reason: recovered.reason,
+				});
+				return;
 			}
 		}
 		if (botUserId === null) {

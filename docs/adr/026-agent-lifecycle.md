@@ -81,10 +81,13 @@ identity is refused the same way, whether or not that agent is still active.
 revision it carried, the `generation` it pursues, its own state (`pending -> running -> {succeeded,
 failed, cancelled}`), and `checkpoints` — ids and references only, never a token's value, filled in
 by the provisioner as it completes each external step (a later decision adds the actual steps:
-`bot_user_id`, `token_ref`, `team_joined`, `channels_joined`). A database trigger enforces the
-append-only guarantee at the column level, the same way the configuration journal's guard does
-(ADR-024): every identity column is immutable once written, and only `state`, `checkpoints`,
-`error` and the timestamps besides `created_at` may ever change, moving `state` forward only.
+`bot_user_id`, `token_ref`, `team_joined`, `team`, `channels_joined`). A row `requestOperationRetry`
+itself produces additionally names the operation it retried (`retry_of`, migration 0027), null for
+every other kind of request — see "Retry", below, for why `kind` alone cannot serve the same
+purpose. A database trigger enforces the append-only guarantee at the column level, the same way
+the configuration journal's guard does (ADR-024): every identity column is immutable once written,
+and only `state`, `checkpoints`, `error` and the timestamps besides `created_at` may ever change,
+moving `state` forward only.
 
 `requestAgentCreate` validates the request — the id's format, that it is unused, that the
 Mattermost username is free, that the resolved runtime adapter has a fresh, ready worker on this
@@ -215,9 +218,27 @@ constrained in code to exactly the actions provisioning performs, never handed t
   current, lifecycle-owned, `ready` agent the same way, team membership being exactly as much this
   step's own concern as a channel is; an agent still `pending`/`reconciling` (a `create`/`restore`
   still provisioning it) is left alone either way — its own operation already owns reconciling its
-  membership once, from whatever the configuration is by the time it reaches that step (reloaded
-  immediately before it completes, not only when it started, so an edit landing anywhere in between
-  is still seen). The queued operation is later driven by the provisioner like any other: keep the bot's
+  membership once, from whatever the configuration is by the time it reaches that step. Newly
+  configured channels are joined from a reload taken immediately before the operation completes, not
+  only from the configuration it started with, so an edit adding one lands no matter when it commits
+  during the run; a channel the same edit took away, or a team the organization's own Mattermost team
+  changed to, cannot be caught the same way (an addition is simply joined when found; there is
+  nothing equivalent to "notice a removal" in a loop that only ever adds) — `completeOperation`
+  itself closes that gap instead, still holding the same `agent_lifecycle` row lock every config
+  writer takes before queuing a `reprovision` (`lockLifecycleRows`): for a `create`/`restore`, it
+  compares the agent's current `allowed_channels` and the organization's current team against what
+  the operation's own checkpoints record having actually joined, and queues a `reprovision` in the
+  same transaction on any difference, rather than leaving the agent `ready` with a membership nothing
+  would otherwise ever revisit. A concurrent commit touching this same agent cannot slip past this
+  check either way: it must lock the same row first, so it either already happened (and this read
+  sees it) or waits for this transaction to finish (and finds the agent already `ready`, queuing its
+  own `reprovision` the ordinary way). Checkpoints are themselves scoped to the team they were
+  recorded against (`team`, alongside `team_joined`): an operation resumed after the organization's
+  team changed mid-run sees its own `team_joined`/`channels_joined` checkpoints as stale rather than
+  already done, rejoins the now-current team and its channels, and — the same way a `reprovision`
+  already leaves a channel no longer configured — leaves the old team's own channels (except one an
+  owner or admin granted the bot directly) and the team itself, one team only being as much a plain
+  member's own invariant as a bot's channels are. The queued operation is later driven by the provisioner like any other: keep the bot's
   existing token if it still works (verified with it, `users/me`, before ever reissuing), join
   every channel now configured, and leave every channel no longer configured, except one an owner
   or admin granted the bot directly (ADR-022) — checked from the grant records, never assumed, so
@@ -254,14 +275,26 @@ constrained in code to exactly the actions provisioning performs, never handed t
   revokes whatever the interrupted attempt left stranded, since nothing but the file itself says
   which token is current. The account's tokens are listed a page at a time until a page comes back
   short, so an account with more of them than one page holds is still seen in full; revoking is
-  itself listed and repeated, bounded, until none of its own remain but the newly written token.
-  The very first token on the account — entered by hand, `gateway mattermost admin-token set`,
-  never created by this rotation — carries whatever description the operator gave it in Mattermost,
-  so the first rotation after it leaves it unrevoked; the operator who created it by hand is the one
-  who revokes it by hand too, the same way the bootstrap admin token already is ("It is needed only
-  for bootstrap; revoke it afterwards", `docs/operations/mattermost.md`). Every rotation after that
-  first one only ever finds tokens this same rotation created, so this is a one-time edge, not an
-  ongoing gap.
+  itself listed and repeated, bounded, until none of its own remain but the newly written token. A
+  rotation that ends up revoking none of them prints a warning rather than reporting success
+  plainly: ordinarily that just means an earlier rotation's own crash left nothing of its own
+  stranded, but it is also exactly what a token in the file that was never tagged in the first place
+  would produce, every single time, so it is called out rather than folded into an
+  identical-looking "0 revoked" success line.
+
+  The very first token on the account — entered by hand in Mattermost, then given to
+  `gateway mattermost admin-token set` — is never trusted to already carry this rotation's own
+  description (an operator names it however they like in Mattermost): `admin-token set` itself now
+  runs the very same create-verify-switch dance described here, minting and tagging its own token
+  from the pasted one before ever writing the file, and revokes the pasted token right away when the
+  account held exactly that one token to begin with — the only case it is unambiguous which one was
+  just entered. An account that already held more than one is left untouched instead, named in a
+  warning, the same "never guess" rule this rotation's own "token without that description" case
+  already follows. This closes what used to be this scheme's one acknowledged gap: a hand-entered
+  token `admin-token set` once wrote verbatim, never tagged, so no later rotation's own
+  description-scoped revoke could ever find it — now minted and tagged (and, ordinarily, revoked
+  outright) the moment it is first set, rather than merely documented as the operator's own standing
+  responsibility.
 
 ### Retirement's cleanup
 
@@ -375,7 +408,12 @@ baseline) — any finance-touching `tools_allow`/`tools_require_human_approval` 
 agent. `requestAgentRestore` accepts an optional `makeFinanceAgent` flag instead: given, it
 reassigns the role back to the restored agent atomically (`set_finance_agent`, the same change set
 as the restore's own `add_agent`) and keeps its historical permissions unchanged, trusting them to
-already be finance-shaped — `validateConfigBundle` still refuses the commit if they are not.
+already be finance-shaped — `validateConfigBundle` still refuses the commit if they are not. The
+agent the role moves *from* gives it up in the very same change set, its own permissions normalized
+the identical way (`update_agent`, preserving every other field) — otherwise the organization would
+be left with two agents holding finance tools at once (the outgoing one, and the restored one), and
+`validateConfigBundle`'s own finance rule would refuse the commit for naming a finance agent that is
+not the only one still allowed to hold them.
 
 ### Retry
 
@@ -394,9 +432,15 @@ its last checkpoint. The agent itself moves back to `pending` (the state a fresh
 `create`/`restore`/`reprovision` starts from, and `markProvisioning` reconciles from there as
 usual) — except a retiring agent, which stays `retiring` throughout, matching `markProvisioning`'s
 own rule for a `retire` operation; `last_error` is cleared either way, since this is a fresh
-attempt, not a continuation of the one that failed. A repeat with the same `idempotencyKey`
-replays the first call's own result, the same convention every other lifecycle request already
-follows. `gateway agents retry <id>` is its CLI surface; the console's agent page shows the same
+attempt, not a continuation of the one that failed. The new row itself records which operation it
+retried (`retry_of`, migration 0027): `kind` alone cannot tell a retry-created `create` operation
+apart from a fresh one `requestAgentCreate` itself produced — both carry the identical kind — so a
+repeated `idempotencyKey` is replayed only once `retry_of` also says the row it found was actually
+this request's own kind of result; one some other request (`requestAgentCreate`/
+`requestAgentRetire`/`requestAgentRestore`) produced instead is refused the same "already used for
+a different request" way a key reused across any other two of these kinds already is. A genuine
+repeat replays the first call's own result, the same convention every other lifecycle request
+already follows. `gateway agents retry <id>` is its CLI surface; the console's agent page shows the same
 action next to the agent's own actionable failure message, live checkpoints as they complete while
 an operation is in flight (polling `GET /api/agents/:id/lifecycle`), and a progress view for
 `pending`/`reconciling`.

@@ -4,9 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+	activeConfigRevisionId,
 	applyConfig,
 	type ControlPlaneDeps,
+	commitChange,
 	completeOperation,
+	failOperation,
 	markProvisioning,
 	recordWorkerStatus,
 	requestAgentCreate,
@@ -165,5 +168,77 @@ describe("gateway doctor: 'mattermost_provisioning' sees the admin token the sam
 		expect(check).toMatchObject({ ok: false });
 		// "waiting-agent"'s own still-pending create, plus this retire.
 		expect(check?.detail).toContain("2 operation(s) waiting");
+	});
+
+	it("reports a failed lifecycle operation such as a failed reprovision, which leaves its agent 'ready' rather than 'failed'", async () => {
+		await requestAgentCreate(deps, {
+			agent: {
+				id: "reprovision-agent",
+				display_name: "Reprovision Agent",
+				mattermost: { username: "reprovision-agent" },
+				runtime: { adapter: "mock" },
+				prompts: { role_file: "prompts/reprovision-agent.md" },
+				wake_rules: [],
+				concurrency: { while_running: "enqueue" },
+				memory: { private_namespace: "agents/reprovision-agent", shared_namespaces: [] },
+			},
+			rolePrompt: "Role.",
+			actor: "test",
+			source: "cli",
+		});
+		const [{ operation_id: createOperationId }] = (
+			await pool.query("select operation_id from agent_lifecycle where agent_id = $1", [
+				"reprovision-agent",
+			])
+		).rows;
+		await markProvisioning(deps, createOperationId, "test");
+		await completeOperation(deps, createOperationId, "test");
+
+		// A channel edit on a now-`ready` lifecycle-owned agent queues a `reprovision`
+		// (`queueMembershipReprovisioning`); failing it permanently leaves its agent `ready`
+		// throughout (ADR-026's own carve-out for this kind), never `failed` the way a stuck
+		// `create`/`restore` would — invisible from the agent's own status alone.
+		const [{ config }] = (
+			await pool.query("select config from agents where id = $1", ["reprovision-agent"])
+		).rows;
+		await commitChange(deps, {
+			changeSet: [
+				{
+					type: "update_agent",
+					agent: {
+						...config,
+						mattermost: { ...config.mattermost, allowed_channels: ["research"] },
+					},
+				},
+			],
+			baseRevisionId: await activeConfigRevisionId(deps),
+			actor: "owner",
+			source: "console",
+		});
+		const [{ operation_id: reprovisionOperationId }] = (
+			await pool.query("select operation_id from agent_lifecycle where agent_id = $1", [
+				"reprovision-agent",
+			])
+		).rows;
+		await markProvisioning(deps, reprovisionOperationId, "test");
+		await failOperation(
+			deps,
+			reprovisionOperationId,
+			"test",
+			"channel 'research' could not be resolved",
+		);
+
+		const [lifecycle] = (
+			await pool.query("select status from agent_lifecycle where agent_id = $1", [
+				"reprovision-agent",
+			])
+		).rows;
+		expect(lifecycle.status).toBe("ready");
+
+		process.env.MATTERMOST_ADMIN_TOKEN_FILE = join(tokenDir, "mattermost_admin_token");
+		const checks = await runDoctor(session);
+		const check = checks.find((c) => c.name === "lifecycle_failures");
+		expect(check).toMatchObject({ ok: false });
+		expect(check?.detail).toContain("1 agent(s)");
 	});
 });

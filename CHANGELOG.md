@@ -137,6 +137,56 @@ All notable changes are documented here. The project follows Semantic Versioning
 - `gateway outbox list --status` rejected `cancelled` (added for a retired agent's own blocked
   deliveries), since its own list of accepted values was a second copy that never picked it up. It
   now validates against the one shared, authoritative list.
+- Retirement's own last-resort bot recovery (looking an agent's bot up by its configured username
+  when neither its recorded identity nor its own create/restore checkpoints ever named one) adopted
+  any plain bot at that username, including one this Gateway never created — the same guard
+  `ensureBot` already applies to a fresh `create`, missing here. It now accepts a username-only
+  match only when the bot's `owner_id` names this Gateway's own admin account; anything else skips
+  Mattermost-side cleanup for that agent entirely (nothing of its own to clean up) rather than
+  revoking a stranger's tokens and disabling its account, and says why in the log.
+- A `create`/`restore` operation's own channel-reload before completing only ever added a channel a
+  concurrent edit introduced, never noticed one the same edit took away, and never accounted for the
+  organization's own Mattermost team changing mid-run at all (its `team_joined`/`channels_joined`
+  checkpoints, scoped to the team it started against, were treated as already done for the new one
+  too). `completeOperation` itself now compares the agent's current `allowed_channels` and Mattermost
+  team against what the operation's own checkpoints record having actually joined, still holding the
+  same lifecycle-row lock every config writer takes, and queues a `reprovision` on any difference in
+  the same transaction; a resumed operation whose checkpoints turn out to be scoped to a team the
+  organization has since moved away from rejoins the current one instead of skipping steps already
+  marked done for the old one, and a `reprovision`'s own membership step now leaves the old team's
+  channels (and the team itself) once the bot has rejoined the current one.
+- Restoring a retired agent dropped every permission field this service does not itself rewrite
+  (`observe_system`, say) when normalizing a former finance agent's permissions for anyone else,
+  since the normalization built a new object from only the three tool-pattern fields it touches
+  instead of adjusting those fields on a copy of the original. It now preserves every other field.
+- Restoring a retired agent with `makeFinanceAgent` reassigned the finance role to it atomically but
+  left the agent the role moved *from* still holding finance tools, which whole-bundle validation
+  then refused (only one agent may hold them at a time). The outgoing finance agent's permissions
+  are now normalized in the very same change set, the same way a restored former finance agent's own
+  are when it is not reclaiming the role.
+- The console's lifecycle panel rendered nothing at all for a failed `reprovision` (no error, no
+  Retry button) and for one still running, since a `reprovision` never moves its agent out of
+  `ready` the way `create`/`restore`/`retire` do, which the panel's own visibility and retry-
+  eligibility checks had not accounted for. It now shows both the same way it already does for the
+  statuses a `create`/`restore`/`retire` operation runs under. `gateway doctor` also gains a
+  `lifecycle_failures` check (any agent whose own current lifecycle operation is `failed`), so a
+  failed `reprovision` — invisible from the agent's own status alone — is visible from the CLI too.
+- `gateway mattermost admin-token set` stored a hand-entered token exactly as pasted, carrying
+  whatever description the operator gave it in Mattermost; `admin-token rotate`'s own revoke pass
+  only ever matches its own description, so the first rotation after `set` never revoked it, leaving
+  it working indefinitely. `admin-token set` now runs the same create-verify-switch dance `rotate`
+  already does, minting and tagging its own token from the pasted one before ever writing the file,
+  and revokes the pasted token outright when the account held exactly that one token to begin with
+  (unambiguous); an account that already held more than one is left untouched instead, named in a
+  warning. `admin-token rotate` now also warns, rather than reporting success plainly, whenever it
+  ends up revoking 0 tokens.
+- `requestOperationRetry`'s idempotency-key replay matched a reused key by agent and operation kind
+  alone, which could not tell its own retry-created row apart from a `requestAgentCreate`/
+  `requestAgentRetire`/`requestAgentRestore` row that merely happens to carry the same kind (a
+  retry's own operation always carries the kind it retried, never a kind of its own) — a key one of
+  those other requests already used could be wrongly "replayed" as a retry. Each retry-created
+  operation now records which failed operation it retried (`retry_of`); a key is replayed only when
+  the row it finds is actually one.
 
 ## [0.5.0] - 2026-10-02
 

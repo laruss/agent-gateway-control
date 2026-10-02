@@ -28,7 +28,8 @@
     "0023_console_csrf_derived": "expand",
     "0024_agent_lifecycle": "expand",
     "0025_agent_lifecycle_guards": "expand",
-    "0026_outbox_cancelled_status": "expand"
+    "0026_outbox_cancelled_status": "expand",
+    "0027_lifecycle_retry_of": "expand"
   },
   "releases": [
     {

@@ -331,6 +331,12 @@ export const agentLifecycleOperations = pgTable(
 		),
 		/** The `agent_lifecycle.generation` this operation pursues; see `completeOperation`. */
 		generation: bigint("generation", { mode: "number" }).notNull(),
+		/** Set only by `requestOperationRetry`, naming the `failed` operation it retried: lets a
+		 * repeated `idempotencyKey` be told apart from one already used for a different kind of
+		 * request (`requestAgentCreate`, say) that merely happens to share this row's own `kind` —
+		 * `kind` alone cannot, since a retry's own operation carries the kind it is retrying, never a
+		 * kind of its own (migration 0027). Null for every operation no retry ever produced. */
+		retryOf: uuid("retry_of").references((): AnyPgColumn => agentLifecycleOperations.id),
 		state: text("state").$type<AgentLifecycleOperationState>().notNull(),
 		/** Ids and references only, set by the provisioner as it completes each step; never a
 		 * token value (see `AgentLifecycleCheckpointsSchema`). */

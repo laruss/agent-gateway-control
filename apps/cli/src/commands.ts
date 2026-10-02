@@ -566,6 +566,25 @@ export async function doctor(session: Session, out: Output): Promise<boolean> {
 				: `no Mattermost admin token configured; ${waitingCount} operation(s) waiting ` +
 					"('gateway mattermost admin-token set')",
 		});
+		// An agent's own current operation left `failed`: a stuck `create`/`restore` (the agent
+		// itself `failed`) or `retire` (`retiring` with its own cleanup stuck) already show up as the
+		// agent's own status, but a failed `reprovision` never moves its agent out of `ready`
+		// (ADR-026) — invisible from `gateway agents list` alone, and easy to miss without this,
+		// since nothing else about a `ready` agent says one of its own operations needs attention.
+		const failedLifecycle = await pool.query<{ n: number }>(
+			`select count(*)::int as n
+			   from agent_lifecycle al
+			   join agent_lifecycle_operations op on op.id = al.operation_id
+			  where op.state = 'failed'`,
+		);
+		const failedLifecycleCount = failedLifecycle.rows[0]?.n ?? 0;
+		checks.push({
+			name: "lifecycle_failures",
+			ok: failedLifecycleCount === 0,
+			detail:
+				`${failedLifecycleCount} agent(s) with a failed lifecycle operation` +
+				(failedLifecycleCount === 0 ? "" : " ('gateway agents retry <id>')"),
+		});
 		// `doctor` never runs `ensureConfigHistory` itself (it is read-only), so right after a
 		// forward upgrade the journal's latest entry can still look exactly as it did before the
 		// upgrade even though the live projections have already drifted (see

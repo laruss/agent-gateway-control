@@ -194,9 +194,29 @@ export type MattermostAdminTokenSetOptions = Readonly<{
 /**
  * `gateway mattermost admin-token set`: hidden entry of a personal access token an operator
  * already created in Mattermost for a dedicated, non-bot system-admin account (ADR-026) —
- * validated (`users/me`: a non-bot account with the `system_admin` role) and written atomically,
- * 0600, into the controller's secrets directory. Refuses anything but an interactive terminal, and
- * never prints the token; only the account's own username confirms which one was just set.
+ * validated (`users/me`: a non-bot account with the `system_admin` role), then converted into a
+ * gateway-tagged token the same way `rotate` always has: create-verify-switch-revoke, with the
+ * pasted token itself the credential that creates its own replacement. Refuses anything but an
+ * interactive terminal, and never prints either token; only the account's own username confirms
+ * which one was just set.
+ *
+ * A token entered by hand carries whatever description the operator gave it in Mattermost (often
+ * not `ADMIN_TOKEN_DESCRIPTION`), so `rotate`'s own revoke loop — which only ever touches tokens
+ * carrying its own description — would otherwise never revoke it: this command's own first run was
+ * the one gap in that scheme (ADR-026's own "Rotation" section used to document it as accepted,
+ * one-time edge; this closes it instead). Minting a tagged token right away, before the pasted one
+ * is ever written to the file, means the file always holds a token `rotate` can account for from
+ * the very first `set` onward.
+ *
+ * The pasted token is revoked once the minted one is safely written, never before (the crash
+ * boundary: a crash between these two steps leaves the pasted token — which still works — as the
+ * one credential in the file, never neither working). Revoking it specifically needs its own token
+ * id, which Mattermost never exposes by value — only by listing the account's existing tokens. On
+ * the dedicated, freshly prepared account this command is meant for (ADR-026), that listing holds
+ * exactly one token before this call ever mints its own: the one just pasted, safely identified
+ * and revoked. An account that already held more than one is left alone instead and named in a
+ * warning — an unrelated personal token the account's admin also happens to hold (`rotate`'s own
+ * documented concern) must never be revoked on a guess.
  */
 export async function mattermostAdminTokenSet(
 	options: MattermostAdminTokenSetOptions,
@@ -205,11 +225,12 @@ export async function mattermostAdminTokenSet(
 	if (!options.reader.isTTY) {
 		throw new MattermostCommandError("stdin is not a terminal; run this from an interactive shell");
 	}
-	const token = await options.reader.readLine("Mattermost admin token: ");
-	if (token.length === 0) {
+	const pasted = await options.reader.readLine("Mattermost admin token: ");
+	if (pasted.length === 0) {
 		throw new MattermostCommandError("the token must not be empty");
 	}
-	const me = await new MattermostClient({ baseUrl: options.baseUrl, token }).me();
+	const client = new MattermostClient({ baseUrl: options.baseUrl, token: pasted });
+	const me = await client.me();
 	if (me.is_bot) {
 		throw new MattermostCommandError(
 			`'${me.username}' is a bot account; Mattermost bots cannot create other bots, so the ` +
@@ -219,8 +240,33 @@ export async function mattermostAdminTokenSet(
 	if (!me.roles.split(/\s+/).includes("system_admin")) {
 		throw new MattermostCommandError(`'${me.username}' does not have the 'system_admin' role`);
 	}
-	writeSecretFile(options.secretPath, token);
-	print(`admin token set for account '${me.username}'`);
+	const existingBefore = await client.userAccessTokenIds(me.id);
+	const created = await client.createUserAccessToken(me.id, ADMIN_TOKEN_DESCRIPTION);
+	// Every call from here on authenticates with the newly minted token, never the pasted one about
+	// to be revoked: see `mattermostAdminTokenRotate`'s own identical reasoning.
+	const next = new MattermostClient({ baseUrl: options.baseUrl, token: created.token });
+	const verified = await next.me();
+	if (verified.id !== me.id) {
+		throw new MattermostCommandError(
+			"the newly minted token did not verify against the same account; nothing was changed",
+		);
+	}
+	writeSecretFile(options.secretPath, created.token);
+	if (existingBefore.length === 1) {
+		const [pastedTokenId] = existingBefore;
+		if (pastedTokenId !== undefined) {
+			await next.revokeUserAccessToken(pastedTokenId);
+		}
+		print(`admin token set for account '${me.username}'; the token you entered was revoked`);
+	} else if (existingBefore.length === 0) {
+		print(`admin token set for account '${me.username}'`);
+	} else {
+		print(
+			`admin token set for account '${me.username}'; warning: it already held ` +
+				`${existingBefore.length} token(s) before this one — the token you entered was left in ` +
+				"place; revoke it by hand in Mattermost once you have confirmed the new one works",
+		);
+	}
 }
 
 export type MattermostAdminTokenRotateOptions = Readonly<{
@@ -277,7 +323,18 @@ export async function mattermostAdminTokenRotate(
 			(token) => token.id !== created.id && token.description === ADMIN_TOKEN_DESCRIPTION,
 		);
 		if (remaining.length === 0) {
-			print(`admin token rotated for account '${me.username}'; revoked ${revoked} old token(s)`);
+			// 0 revoked is expected on a routine rotate that crashed right after writing its own new
+			// token (nothing of this description was left stranded) — but it is also exactly what a
+			// stale, never-tagged token left in the file would produce every time, forever: called out
+			// plainly rather than folded into the same line as a normal rotate, so a token that should
+			// have been revoked but structurally could not be (`admin-token set`'s own "more than one
+			// token already" case, say) is never silently mistaken for "nothing needed doing".
+			print(
+				revoked === 0
+					? `admin token rotated for account '${me.username}'; warning: revoked 0 old token(s) — ` +
+							"if a previous token is still meant to be retired, revoke it by hand in Mattermost"
+					: `admin token rotated for account '${me.username}'; revoked ${revoked} old token(s)`,
+			);
 			return;
 		}
 		for (const token of remaining) {

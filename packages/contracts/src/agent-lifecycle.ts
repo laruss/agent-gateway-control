@@ -82,6 +82,12 @@ export const AgentLifecycleCheckpointsSchema = z.strictObject({
 	bot_user_id: MattermostIdSchema.optional(),
 	token_ref: SecretFileSchema.optional(),
 	team_joined: z.boolean().optional(),
+	/** The organization's own Mattermost team name this operation actually joined, recorded
+	 * alongside `team_joined` (ADR-026): lets a resumed operation tell a team changed since a
+	 * previous checkpoint apart from one that has not, so `team_joined`/`channels_joined` (both
+	 * scoped to the team they were recorded against) are redone for the now-current team rather
+	 * than skipped as already done for one the agent is no longer meant to be in. */
+	team: MattermostNameSchema.optional(),
 	channels_joined: z.array(MattermostNameSchema).max(32).optional(),
 	/** `retire`'s own steps: every token revoked server-side, the bot account disabled, every
 	 * channel it was a member of (by id, since a `retire` operation lists them live rather than

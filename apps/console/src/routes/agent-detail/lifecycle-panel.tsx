@@ -93,13 +93,16 @@ export type LifecyclePanelProps = Readonly<{
 
 /**
  * Live lifecycle progress (ADR-026): polls while the agent is `pending`/`reconciling`, or
- * `retiring` with its own retire operation still actually in flight (`pending`/`running` — a
- * `retire` never moves the agent through `reconciling` the way `create`/`restore`/`reprovision`
- * do, so `retiring` alone does not mean nothing is happening), showing the current operation's own
- * checkpoints as they complete either way. Shows an actionable failure with a Retry button once
- * the current operation is `failed` (the agent itself `failed`, or `retiring` with its own retire
- * cleanup permanently failed). Renders nothing for `ready` — the status badge in the page header
- * already says so.
+ * `retiring`/`ready` with its own current operation still actually in flight (`pending`/`running`
+ * — a `retire` never moves the agent through `reconciling` the way `create`/`restore` do, and a
+ * `reprovision` never moves it out of `ready` at all, so neither status alone means nothing is
+ * happening), showing the current operation's own checkpoints as they complete either way. Shows
+ * an actionable failure with a Retry button once the current operation is `failed` (the agent
+ * itself `failed`, `retiring` with its own retire cleanup permanently failed, or `ready` with a
+ * failed `reprovision` — which never moves the agent out of `ready` either, so a membership change
+ * going wrong must still be visible and retryable here, not silently invisible because the agent
+ * otherwise looks fine). Renders nothing once a `ready` agent's own last operation actually
+ * succeeded — the status badge in the page header already says so.
  */
 export function LifecyclePanel({
 	agentId,
@@ -116,16 +119,20 @@ export function LifecyclePanel({
 	const canRetry =
 		current !== undefined &&
 		current.state === "failed" &&
-		(data.status === "failed" || data.status === "retiring");
-	// A `retire` operation leaves the agent `retiring` throughout — never `pending`/`reconciling`,
-	// the two statuses a `create`/`restore`/`reprovision` operation runs under — so an in-flight
-	// retire (or a retried one, which stays `retiring` the same way) needs its own check here: its
-	// current operation still `pending`/`running`, not yet `failed` (that is `canRetry`'s own case)
-	// or `succeeded` (the agent would no longer be `retiring` at all by then).
+		(data.status === "failed" || data.status === "retiring" || data.status === "ready");
+	// A `retire` operation leaves the agent `retiring` throughout, and a `reprovision` leaves it
+	// `ready` throughout (ADR-026) — neither the `pending`/`reconciling` statuses a `create`/
+	// `restore` operation runs under — so both need their own check here: a current operation still
+	// `pending`/`running`, not yet `failed` (that is `canRetry`'s own case) or `succeeded` (the
+	// agent would no longer be `retiring` at all by then, or its `ready` row would have no
+	// unfinished operation left to show).
 	const inFlight =
 		data.status === "pending" ||
 		data.status === "reconciling" ||
-		(data.status === "retiring" && current !== undefined && current.state !== "failed");
+		(data.status === "retiring" && current !== undefined && current.state !== "failed") ||
+		(data.status === "ready" &&
+			current !== undefined &&
+			(current.state === "pending" || current.state === "running"));
 
 	async function handleRetry() {
 		setRetrying(true);

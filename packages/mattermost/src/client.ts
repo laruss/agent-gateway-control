@@ -380,6 +380,7 @@ export type AdminMattermostClient = Pick<
 	| "enableBot"
 	| "disableBot"
 	| "addTeamMember"
+	| "removeTeamMember"
 	| "addChannelMember"
 	| "removeChannelMember"
 	| "userChannelsInTeam"

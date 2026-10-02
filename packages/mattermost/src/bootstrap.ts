@@ -351,14 +351,28 @@ export async function ensureBot(
  * empty even though the bot, and a working token, already exist. Null for anything that is not
  * plausibly the Gateway's own plain bot — no account at all, a regular user, or a bot with elevated
  * system roles — the same plausibility `ensureBot` itself checks before ever creating or adopting
- * one: this is never a stranger's account to sweep up.
+ * one.
+ *
+ * A plain bot's own `owner_id` must also name this Gateway's own admin account, exactly the
+ * ownership guard `ensureBot` applies to a fresh `create`'s own username-only resolution (never
+ * only `knownUserId`, since the whole point of this recovery path is that no identity was ever
+ * recorded): a username collision with an unrelated integration's own plain bot must never be
+ * mistaken for this agent's own account merely because nothing else claims the name. Retiring an
+ * agent whose own `create` genuinely failed on "username taken" must not revoke a stranger's bot's
+ * tokens and disable it — skipped instead (the caller has nothing Mattermost-side left to clean up
+ * for this agent, and logs why).
  */
 export async function findPlausibleGatewayBot(
-	admin: Pick<AdminMattermostClient, "userByUsername">,
+	admin: Pick<AdminMattermostClient, "userByUsername" | "getBot">,
 	username: string,
+	adminUserId: MattermostId,
 ): Promise<MattermostId | null> {
 	const existing = await admin.userByUsername(username);
 	if (existing === null || !existing.is_bot || !isPlainSystemRoles(existing.roles)) {
+		return null;
+	}
+	const record = await admin.getBot(existing.id);
+	if (record?.owner_id !== adminUserId) {
 		return null;
 	}
 	return existing.id;

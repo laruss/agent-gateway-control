@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { secretFileState } from "@agent-gateway/service";
+import { secretFileState, writeSecretFile } from "@agent-gateway/service";
 import { afterEach, describe, expect, it } from "vitest";
 import type { HiddenLineReader } from "./console-commands.ts";
 import {
@@ -187,7 +187,7 @@ describe("gateway mattermost admin-token set|rotate (ADR-026)", () => {
 	const secretPath = () =>
 		join(mkdtempSync(join(tmpdir(), "gateway-admin-token-")), "mattermost_admin_token");
 
-	it("stores a validated token (non-bot, system_admin) and prints only the username", async () => {
+	it("mints a gateway-tagged token from the pasted one, writes it, and revokes the pasted one", async () => {
 		fake = startFakeMattermost();
 		fake.addAccount("admin-token-value", {
 			id: mmId("admin"),
@@ -205,9 +205,48 @@ describe("gateway mattermost admin-token set|rotate (ADR-026)", () => {
 		);
 
 		expect(secretFileState(path)).toBe("private");
-		expect(readFileSync(path, "utf8").trim()).toBe("admin-token-value");
+		// Never the literal pasted value: a freshly minted, gateway-tagged token instead, exactly
+		// like `rotate`'s own first call already produces.
+		const written = readFileSync(path, "utf8").trim();
+		expect(written).not.toBe("admin-token-value");
+		expect(fake.worksNow(written)).toBe(true);
+		// The pasted token itself is revoked right away (the account held exactly one token before
+		// this call, unambiguously the one just entered): never left stranded, working forever,
+		// until an operator happens to run `rotate` for the first time.
+		expect(fake.worksNow("admin-token-value")).toBe(false);
 		expect(printed.join("\n")).toContain("gateway-admin");
+		expect(printed.join("\n")).toContain("revoked");
 		expect(printed.join("\n")).not.toContain("admin-token-value");
+		expect(printed.join("\n")).not.toContain(written);
+	});
+
+	it("mints and writes the new token but leaves the pasted one in place, with a warning, when the account already held more than one token", async () => {
+		fake = startFakeMattermost();
+		const adminId = mmId("admin");
+		const account: FakeAccount = {
+			id: adminId,
+			username: "gateway-admin",
+			is_bot: false,
+			roles: "system_user system_admin",
+			delete_at: 0,
+		};
+		fake.addAccount("admin-token-value", account);
+		// A second, unrelated token already on this account: `set` must never guess which of the two
+		// is the one just pasted, so it revokes neither.
+		fake.addTokens(adminId, 1, "some other integration");
+		const path = secretPath();
+		const printed: string[] = [];
+
+		await mattermostAdminTokenSet(
+			{ baseUrl: fake.baseUrl, secretPath: path, reader: fakeReader(["admin-token-value"]) },
+			(line) => printed.push(line),
+		);
+
+		expect(fake.worksNow("admin-token-value")).toBe(true);
+		const written = readFileSync(path, "utf8").trim();
+		expect(fake.worksNow(written)).toBe(true);
+		expect(printed.join("\n")).toContain("warning");
+		expect(printed.join("\n")).toContain("revoke it by hand");
 	});
 
 	it("refuses a bot account's token", async () => {
@@ -264,7 +303,9 @@ describe("gateway mattermost admin-token set|rotate (ADR-026)", () => {
 			{ baseUrl: fake.baseUrl, secretPath: path, reader: fakeReader(["old-token-value"]) },
 			() => undefined,
 		);
-		expect(fake.worksNow("old-token-value")).toBe(true);
+		// Already revoked by `set` itself (the account held exactly this one token): rotate below has
+		// only the token `set` just minted to deal with.
+		expect(fake.worksNow("old-token-value")).toBe(false);
 
 		const printed: string[] = [];
 		await mattermostAdminTokenRotate({ baseUrl: fake.baseUrl, secretPath: path }, (line) =>
@@ -304,6 +345,37 @@ describe("gateway mattermost admin-token set|rotate (ADR-026)", () => {
 		expect(afterSecondRotate).not.toBe(afterFirstRotate);
 		expect(fake.worksNow(afterFirstRotate)).toBe(false);
 		expect(fake.worksNow(afterSecondRotate)).toBe(true);
+	});
+
+	it("warns when it revokes 0 old tokens: the current one in the file was never tagged as the Gateway's own", async () => {
+		fake = startFakeMattermost();
+		// Never went through `admin-token set`'s own mint step (a file written some other way, or one
+		// `set`'s own "more than one token already" case left pointing at an untagged token): the file
+		// holds a token carrying a description other than the Gateway's own.
+		fake.addAccount(
+			"untagged-token",
+			{
+				id: mmId("admin"),
+				username: "gateway-admin",
+				is_bot: false,
+				roles: "system_user system_admin",
+				delete_at: 0,
+			},
+			"entered by hand in the Mattermost console",
+		);
+		const path = secretPath();
+		writeSecretFile(path, "untagged-token");
+		const printed: string[] = [];
+
+		await mattermostAdminTokenRotate({ baseUrl: fake.baseUrl, secretPath: path }, (line) =>
+			printed.push(line),
+		);
+
+		expect(printed.join("\n")).toContain("warning");
+		expect(printed.join("\n")).toContain("revoked 0 old token(s)");
+		// The rotate itself still worked: a fresh, working, gateway-tagged token is now in the file.
+		const written = readFileSync(path, "utf8").trim();
+		expect(fake.worksNow(written)).toBe(true);
 	});
 
 	it("revokes every old token even when the account has more than one page of them", async () => {

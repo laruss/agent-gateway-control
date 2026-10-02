@@ -28,6 +28,7 @@ import {
 import {
 	agentLifecycle,
 	agentLifecycleOperations,
+	agents,
 	gatewayControls,
 	mattermostIdentities,
 	runtimeWorkers,
@@ -53,7 +54,7 @@ import {
 } from "./management.ts";
 import { WORKER_STALE_MS } from "./runtime-health.ts";
 import { scheduleAgent } from "./scheduler.ts";
-import { audit, lifecycleOwnedAgentIds, lockAgent } from "./store.ts";
+import { audit, lifecycleOwnedAgentIds, loadActiveConfig, lockAgent } from "./store.ts";
 
 type Db = UnitOfWork["tx"]["db"];
 type AgentLifecycleRow = typeof agentLifecycle.$inferSelect;
@@ -681,6 +682,9 @@ function normalizeNonFinancePermissions(
 ): AgentConfig["permissions"] {
 	const touchesFinance = (pattern: string) => toolPatternsOverlap(pattern, FINANCE_TOOLS);
 	return {
+		// Every other field (`observe_system` today) is preserved unchanged: this only adjusts the
+		// finance-related tool-pattern entries, never drops a field it does not know about.
+		...permissions,
 		tools_allow: permissions.tools_allow.filter((pattern) => !touchesFinance(pattern)),
 		tools_require_human_approval: permissions.tools_require_human_approval.filter(
 			(pattern) => !touchesFinance(pattern),
@@ -798,6 +802,26 @@ export async function requestAgentRestore(
 		};
 		const changeSet: ChangeSet = [{ type: "add_agent", agent, rolePrompt: historical.rolePrompt }];
 		if (makeFinanceAgent) {
+			// The role moves to the restored agent atomically; the agent it moves *from* must give up
+			// finance tools in the very same change set, or `validateConfigBundle`'s own finance rule
+			// refuses the whole commit (only today's finance agent may hold them) — the same
+			// normalization a restored former finance agent itself gets when it is not reclaiming the
+			// role (`normalizeNonFinancePermissions`, just above), applied here to whoever currently
+			// holds it instead. Skipped when there is no current finance agent to move it from (a
+			// fresh deployment's first restore), or when it is this very agent (redundant: `agent`
+			// above already carries its own, unchanged historical permissions).
+			if (financeAgentId !== null && financeAgentId !== parsed.agentId) {
+				const outgoing = base.agents.find((candidate) => candidate.id === financeAgentId);
+				if (outgoing !== undefined) {
+					changeSet.push({
+						type: "update_agent",
+						agent: {
+							...outgoing,
+							permissions: normalizeNonFinancePermissions(outgoing.permissions),
+						},
+					});
+				}
+			}
 			changeSet.push({ type: "set_finance_agent", agentId: parsed.agentId });
 		}
 		const commit = await commitWithinLock(
@@ -922,7 +946,12 @@ export async function requestOperationRetry(
 				// replay, nothing else has changed since the first call, so this is exactly `existing`
 				// own kind; a key reused for a different request (even one for the same agent, say a
 				// `retire` or a later, different retry) is refused rather than silently handed back as
-				// if it had been the request just made.
+				// if it had been the request just made. `kind` alone is not enough: a `create`'s own
+				// operation carries kind `create`, exactly what a retry of some other, later `create`
+				// would too, so `existing` must also actually be a retry-created row (`retryOf` set) —
+				// never a `create`/`restore`/`retire` request's own, which never sets it — or a key one
+				// of those other requests already used is wrongly "replayed" as if this retry had made
+				// it.
 				const [current] =
 					lifecycle.operationId === null
 						? []
@@ -930,7 +959,11 @@ export async function requestOperationRetry(
 								.select({ kind: agentLifecycleOperations.kind })
 								.from(agentLifecycleOperations)
 								.where(eq(agentLifecycleOperations.id, lifecycle.operationId));
-				if (existing.agentId !== parsed.agentId || current?.kind !== existing.kind) {
+				if (
+					existing.agentId !== parsed.agentId ||
+					existing.retryOf === null ||
+					current?.kind !== existing.kind
+				) {
 					throw new AdminError(
 						`idempotency key '${parsed.idempotencyKey}' was already used for a different request`,
 					);
@@ -987,6 +1020,10 @@ export async function requestOperationRetry(
 			idempotencyKey: parsed.idempotencyKey ?? null,
 			configRevisionId: failed.configRevisionId,
 			generation,
+			// Names the operation this very call retried: the one thing that tells this row apart
+			// from a `create`/`restore`/`retire` request's own, which never sets it, even though
+			// either can carry the exact same `kind` (see the idempotency check above).
+			retryOf: failed.id,
 			state: "pending",
 			checkpoints: failed.checkpoints,
 			createdAt: uow.now,
@@ -1141,11 +1178,29 @@ export async function checkpointOperation(
 	});
 }
 
+/** True for two name sets with exactly the same members, order aside. */
+function sameNameSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+	return a.size === b.size && [...a].every((name) => b.has(name));
+}
+
 /**
  * Marks an operation `succeeded` and its agent `ready` (`retired` for a `retire` operation),
  * clearing `last_error`, and wakes the agent (`scheduleAgent`) so inbox work that arrived while it
  * was not yet ready runs without waiting for the periodic sweep. Refused for a stale or already
  * terminal operation.
+ *
+ * For a `create`/`restore` operation, also closes the race a config edit committed between the
+ * provisioner's own last fresh read and this very call could otherwise leave open: still holding
+ * the `agent_lifecycle` row lock every config writer also takes before queuing a `reprovision`
+ * (`lockLifecycleRows`), the agent's current `allowed_channels` and the organization's current
+ * Mattermost team are compared against what this operation's own checkpoints actually record
+ * having joined; any difference queues a `reprovision` in this same transaction rather than
+ * leaving the agent `ready` with a membership nothing would otherwise ever revisit. A concurrent
+ * commit touching this same agent cannot interleave with this check: `lockLifecycleRows` blocks on
+ * the same row this function already holds `for update` (`lockCurrentOperation`), so it either
+ * completed before this transaction started (its own edit is what this reads) or waits for this
+ * transaction to commit (then queues its own `reprovision` the ordinary way, finding this
+ * operation's agent already `ready`).
  */
 export async function completeOperation(
 	deps: ControlPlaneDeps,
@@ -1159,20 +1214,64 @@ export async function completeOperation(
 		if (isTerminalOperationState(operation.state)) {
 			throw new AdminError(`lifecycle operation '${operationId}' is already '${operation.state}'`);
 		}
+		const finalCheckpoints = checkpoints ?? operation.checkpoints;
 		await db
 			.update(agentLifecycleOperations)
 			.set({
 				state: "succeeded",
-				checkpoints: checkpoints ?? operation.checkpoints,
+				checkpoints: finalCheckpoints,
 				updatedAt: uow.now,
 				finishedAt: uow.now,
 			})
 			.where(eq(agentLifecycleOperations.id, operationId));
 		const status = readyStatusOf(operation.kind);
+
+		let nextOperationId = operation.id;
+		let nextGeneration = lifecycle.generation;
+		if ((operation.kind === "create" || operation.kind === "restore") && status === "ready") {
+			const [agentRow] = await db
+				.select({ config: agents.config })
+				.from(agents)
+				.where(eq(agents.id, operation.agentId));
+			const activeConfig = await loadActiveConfig(db);
+			const joinedChannels = new Set(finalCheckpoints.channels_joined ?? []);
+			const currentChannels = new Set(agentRow?.config.mattermost.allowed_channels ?? []);
+			const teamChanged =
+				finalCheckpoints.team !== undefined &&
+				activeConfig !== null &&
+				finalCheckpoints.team !== activeConfig.organization.mattermost.team;
+			const channelsChanged =
+				agentRow !== undefined && !sameNameSet(joinedChannels, currentChannels);
+			if (agentRow !== undefined && (teamChanged || channelsChanged)) {
+				const reprovisionId = randomUUID();
+				nextGeneration = lifecycle.generation + 1;
+				nextOperationId = reprovisionId;
+				await db.insert(agentLifecycleOperations).values({
+					id: reprovisionId,
+					agentId: operation.agentId,
+					kind: "reprovision",
+					requestedBy: actor,
+					source: operation.source,
+					configRevisionId: operation.configRevisionId,
+					generation: nextGeneration,
+					state: "pending",
+					checkpoints: {},
+					createdAt: uow.now,
+					updatedAt: uow.now,
+				});
+				await audit(uow, actor, "agent_lifecycle.reprovision", "agent", operation.agentId, {
+					operation_id: reprovisionId,
+					reason: "configuration changed while this agent was being provisioned",
+				});
+			}
+		}
+
 		await db
 			.update(agentLifecycle)
 			.set({
 				status,
+				generation: nextGeneration,
+				operationId: nextOperationId,
 				statusChangedAt: uow.now,
 				lastError: null,
 				retiredAt: status === "retired" ? uow.now : lifecycle.retiredAt,
