@@ -2196,3 +2196,5 @@ Not yet released; see the Changelog's `[Unreleased]` section.
   swap retried rather than failed, lifecycle refreshed after a revoke.
 - Final review of the fix commit: 2 P2 (bootstrap's token read under the lock, a connection whose
   credential unlock failed is discarded) — fixed.
+
+Released as 0.6.0 (migrations `0024_agent_lifecycle` to `0027_lifecycle_retry_of`, all expand; head `0027_lifecycle_retry_of`, pg-boss schema 42).
