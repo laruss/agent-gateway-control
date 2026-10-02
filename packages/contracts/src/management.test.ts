@@ -175,6 +175,7 @@ describe("ConfigDiffSchema", () => {
 			],
 			organizationFieldPaths: ["mattermost.channels"],
 			constitution: { changed: false, beforeSize: 11, afterSize: 11 },
+			toolAttachmentsChangedAgentIds: ["gamma"],
 		};
 		expect(issuePaths(ConfigDiffSchema, diff)).toEqual([]);
 	});
@@ -185,6 +186,7 @@ describe("ConfigDiffSchema", () => {
 				agents: [],
 				organizationFieldPaths: [],
 				constitution: { changed: false, beforeSize: 11, afterSize: 11 },
+				toolAttachmentsChangedAgentIds: [],
 			}),
 		).toEqual([]);
 	});

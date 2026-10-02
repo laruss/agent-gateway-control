@@ -14,6 +14,7 @@ import {
 	type ControlPlaneDeps,
 	ensureAgentLifecycleAdoption,
 	ensureConfigHistory,
+	ensureToolCatalogSeeded,
 	handleRunReport,
 	handleRunTimeout,
 	handleToolReport,
@@ -129,6 +130,9 @@ export async function startController(options: ControllerOptions): Promise<Runni
 	// ADR-026: adopts every configured agent that has no `agent_lifecycle` row yet (a database
 	// upgraded from a release before this table existed) — a no-op once every agent is adopted.
 	await ensureAgentLifecycleAdoption(deps, "system");
+	// ADR-027: seeds every built-in catalog entry this release ships, skipping one the owner
+	// already deleted (tombstoned) — a no-op once every built-in is seeded.
+	await ensureToolCatalogSeeded(deps, "system");
 	const metrics = options.metrics ?? new MetricsRegistry();
 	registerControllerMetrics(metrics, pool, clock);
 	const reportsApplied = metrics.counter(

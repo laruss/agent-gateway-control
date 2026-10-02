@@ -197,6 +197,20 @@
       "when": 1790948436452,
       "tag": "0027_lifecycle_retry_of",
       "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1790971072591,
+      "tag": "0028_tool_catalog",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1790971112142,
+      "tag": "0029_tool_catalog_guards",
+      "breakpoints": true
     }
   ]
 }

@@ -2198,3 +2198,41 @@ Not yet released; see the Changelog's `[Unreleased]` section.
   credential unlock failed is discarded) — fixed.
 
 Released as 0.6.0 (migrations `0024_agent_lifecycle` to `0027_lifecycle_retry_of`, all expand; head `0027_lifecycle_retry_of`, pg-boss schema 42).
+
+## Phase 15 - Tool catalog: entries, versions and attachments
+
+Status: **in progress** (the catalog data model is complete; enforcement, a console/CLI surface
+and `custom_https` definitions are later work)
+
+| Item | State | Evidence |
+|------|-------|----------|
+| Catalog entry/version/attachment contracts: `kind` (`native`/`gateway`/`executor`, `custom_https` reserved), immutable `implementationKey`, bounded `configSchema`/`settings`, `riskFloor`, `supportedAdapters`, `ToolAttachment` (`entryId`/`pinnedVersion`/`mode`/`settings`) | done | `packages/contracts/src/tool-catalog.ts` |
+| `ConfigSnapshotBundle.toolAttachments` (defaults to `{}`), four new change operations (`attach_tool`/`detach_tool`/`update_attachment`/`clear_tool_attachments`), a `toolAttachmentsChangedAgentIds` diff field | done | `packages/contracts/src/management.ts` |
+| Schema: `catalog_entries`, `catalog_entry_versions` (append-only — migration `0029` guards it), `catalog_attachments` (the bundle's current-state projection), `catalog_entry_tombstones` | done | `packages/db/src/schema.ts`, migrations `0028_tool_catalog`/`0029_tool_catalog_guards` |
+| `ensureToolCatalogSeeded`: idempotent, seeds every built-in this release ships, never re-adds a tombstoned one; run at controller startup and every CLI session | done | `packages/core/src/services/tool-catalog.ts`, `apps/controller/src/controller.ts`, `apps/cli/src/commands.ts` |
+| `legacyAttachmentsFromPermissions` (pure) and `loadAllAgentToolAttachments`/`loadAgentToolAttachments`: a hub-managed agent's recorded attachments, or a legacy agent's `permissions` converted on the fly against entries known right now, with unresolved patterns kept visible | done | `packages/core/src/services/tool-catalog.ts` |
+| `listCatalogEntries`/`getCatalogEntry` (availability computed from a caller-supplied context, never stored), `listCatalogEntryVersions`, `editCatalogEntry` (a new version; a built-in's `configSchema`/`riskFloor`/`supportedAdapters` refused), `deleteCatalogEntry` (every attachment cleared atomically, a tombstone for a built-in), `attachTool`/`detachTool`/`updateAttachment` (through `commitChange`, a risk-floor check before attaching `allow`) | done | `packages/core/src/services/tool-catalog.ts` |
+| `writeConfigRevisionIn` reconciles `catalog_attachments` to the committed bundle on every write, the same way it reconciles `agents` | done | `packages/core/src/services/admin.ts` (`reconcileCatalogAttachmentsIn`) |
+| `gateway config export`/`import` round-trip `tool-attachments.json`, optional (an export from before this phase, or a hand-written directory, has none and converts to `{}`); `config rollback` carries the target revision's own attachments forward | done | `apps/cli/src/config-files.ts`, `apps/cli/src/config-commands.ts` |
+
+Not yet done: no console route or CLI command surfaces the catalog to an owner; no compilation of
+attachments into `permissions`/policy enforcement (deliberately deferred — ADR-027); `custom_https`
+has no definition; executor availability has no live signal from a running tool runner yet
+(`registeredExecutorActionTypes` is supplied by the caller, always empty in production today).
+
+Acceptance:
+
+- [x] Unit: legacy conversion (exact match, wildcard expansion only against known entries,
+  unresolved patterns kept, `tools_deny` to `disabled`, finance rules honoured), a built-in's
+  immutable fields refused on edit, availability computation (an unregistered executor action is
+  unavailable; a native capability needs an installed adapter; a gateway capability is always
+  available; `custom_https` never is).
+- [x] Integration: seeding is idempotent; a tombstoned built-in never returns across reseeding
+  while the rest still do; editing publishes a new, immutable version with readable history (the
+  guard trigger refuses a direct UPDATE/DELETE of a version row); deleting an entry removes every
+  agent's attachment of it in the same transaction as its tombstone; attach/detach/update each
+  commit a revision carrying their given source and are covered by rollback; an attachment
+  round-trips through `config export`/`import` losslessly at the same hash; a directory from
+  before this phase still imports, converting to no attachments rather than refusing.
+
+Not yet released; see the Changelog's `[Unreleased]` section.

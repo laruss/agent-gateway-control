@@ -14,10 +14,14 @@ import {
 	AdminError,
 	activeConfigRevisionId,
 	applyConfig,
+	attachTool,
 	type ControlPlaneDeps,
 	commitChange,
 	configBundleProblems,
 	configSnapshotBundle,
+	ensureToolCatalogSeeded,
+	inTransaction,
+	loadActiveBundle,
 	ManagementConflictError,
 	prepareChange,
 } from "@agent-gateway/core";
@@ -621,5 +625,112 @@ describe("config export: a stored snapshot predating the shared-path validation"
 		} finally {
 			await harness.stop();
 		}
+	});
+});
+
+describe("config export/import: tool attachments round-trip (ADR-027)", () => {
+	let harness: Awaited<ReturnType<typeof startHarness>>;
+
+	beforeAll(async () => {
+		harness = await startHarness();
+		await applyConfig(harness.deps, exampleInput(), "test");
+		await ensureToolCatalogSeeded(harness.deps, "test");
+	});
+
+	afterAll(async () => {
+		await harness.stop();
+	});
+
+	it("pre-change export imports: a directory with no tool-attachments.json converts to empty, not refused", async () => {
+		// `EXAMPLES_DIR` is exactly what a directory from before ADR-027 looks like: it has no
+		// `tool-attachments.json` at all.
+		const expectedRevision = await activeConfigRevisionId(harness.deps);
+		const result = await configImport(
+			harness.deps,
+			{ dir: EXAMPLES_DIR, root: repoRoot, expectedRevision, reason: null, actor: "test" },
+			noopPrint,
+		);
+		const { bundle } = await inTransaction(harness.deps, ({ tx }) =>
+			loadActiveBundle(tx.db, result.revisionId),
+		);
+		expect(bundle.toolAttachments).toEqual({});
+	});
+
+	it("an attachment round-trips through export and import, losslessly, at the same hash", async () => {
+		const attach = await attachTool(harness.deps, {
+			agentId: "director",
+			entryId: "gateway-memory-write",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: { note: "integration test" },
+			actor: "test",
+			source: "cli_apply",
+		});
+		expect(attach.noop).toBe(false);
+
+		const dir = exportDir();
+		await configExport(harness.deps, { dir, revisionId: attach.revisionId }, noopPrint);
+		const written = JSON.parse(readFileSync(join(dir, "tool-attachments.json"), "utf8"));
+		expect(written).toEqual({
+			director: [
+				{
+					entryId: "gateway-memory-write",
+					pinnedVersion: null,
+					mode: "allow",
+					settings: { note: "integration test" },
+				},
+			],
+		});
+
+		const reloaded = loadConfigDirectory(dir, dir);
+		expect(reloaded.toolAttachments).toEqual(written);
+
+		const reimportDir = exportDir();
+		rmSync(reimportDir, { recursive: true, force: true });
+		cpSync(dir, reimportDir, { recursive: true });
+		const imported = await configImport(
+			harness.deps,
+			{
+				dir: reimportDir,
+				root: reimportDir,
+				expectedRevision: attach.revisionId,
+				reason: null,
+				actor: "test",
+			},
+			noopPrint,
+		);
+		expect(imported.noop).toBe(true);
+		expect(imported.hash).toBe(attach.hash);
+	});
+
+	it("rollback restores a prior revision's own attachments, not merely whatever is live now", async () => {
+		const before = await activeConfigRevisionId(harness.deps);
+		if (before === null) {
+			throw new Error("expected an active revision");
+		}
+		const { bundle: beforeBundle } = await inTransaction(harness.deps, ({ tx }) =>
+			loadActiveBundle(tx.db, before),
+		);
+		await attachTool(harness.deps, {
+			agentId: "director",
+			entryId: "gateway-mattermost-post",
+			pinnedVersion: null,
+			mode: "require_approval",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+		const afterAttach = await activeConfigRevisionId(harness.deps);
+		const result = await configRollback(
+			harness.deps,
+			{ revisionId: before, expectedRevision: afterAttach ?? before, reason: null, actor: "test" },
+			noopPrint,
+		);
+		const { bundle: rolledBack } = await inTransaction(harness.deps, ({ tx }) =>
+			loadActiveBundle(tx.db, result.revisionId),
+		);
+		expect(rolledBack.toolAttachments.director).toEqual(
+			beforeBundle.toolAttachments.director ?? [],
+		);
 	});
 });

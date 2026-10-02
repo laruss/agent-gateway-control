@@ -43,6 +43,7 @@ export {
 	raiseAlert,
 } from "./services/store.ts";
 export * from "./services/system-status.ts";
+export * from "./services/tool-catalog.ts";
 export * from "./services/wait-timeouts.ts";
 export * from "./state-machine.ts";
 export * from "./turn-context.ts";

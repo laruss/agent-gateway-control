@@ -17,6 +17,7 @@ import {
 	QUEUES,
 	RolePromptSchema,
 	type RuntimeAdapterId,
+	type ToolAttachmentsBundle,
 	validateConfigBundle,
 } from "@agent-gateway/contracts";
 import {
@@ -27,6 +28,7 @@ import {
 	agentRuns,
 	agents,
 	approvalRequests,
+	catalogAttachments,
 	configRevisionAcks,
 	configRevisions,
 	configSnapshots,
@@ -91,12 +93,17 @@ export class AdminError extends Error {
 // Configuration
 // ---------------------------------------------------------------------------
 
-/** A configuration bundle as read from disk, with prompt files already resolved to text. */
+/** A configuration bundle as read from disk, with prompt files already resolved to text.
+ * `toolAttachments` is optional (defaults to `{}` in `configSnapshotBundle`): plain YAML-sourced
+ * configuration never carries it (ADR-027 — attachments are hub-managed state, not an
+ * `AgentConfig` field), so every existing caller of `configSnapshotBundle` keeps compiling and
+ * behaving exactly as before. */
 export type ConfigApplyInput = Readonly<{
 	organization: OrganizationConfig;
 	agents: Readonly<AgentConfig[]>;
 	constitution: string;
 	rolePrompts: Readonly<Record<string, string>>;
+	toolAttachments?: ToolAttachmentsBundle;
 }>;
 
 export type ConfigApplyResult = Readonly<{
@@ -282,6 +289,7 @@ export function configSnapshotBundle(input: ConfigApplyInput): ConfigSnapshotBun
 		agents: [...input.agents].sort((a, b) => compareAgentIds(a.id, b.id)),
 		constitution: input.constitution,
 		rolePrompts: { ...input.rolePrompts },
+		toolAttachments: { ...(input.toolAttachments ?? {}) },
 	};
 }
 
@@ -399,6 +407,9 @@ export async function ensureConfigHistoryIn(
 		agents: agentRows.map((agent) => ({ ...agent.config, enabled: agent.enabled })),
 		constitution: versionRow.constitution,
 		rolePrompts: Object.fromEntries(agentRows.map((agent) => [agent.config.id, agent.rolePrompt])),
+		// A database upgraded from a release before ADR-027 never recorded any attachment: this
+		// backfill snapshot honestly has none, the same way it never reconstructs lost history.
+		toolAttachments: {},
 	};
 	const hash = canonicalHash(bundle);
 	await db
@@ -776,6 +787,7 @@ export async function writeConfigRevisionIn(
 			disabled.push(id);
 		}
 	}
+	await reconcileCatalogAttachmentsIn(uow, bundle.toolAttachments);
 	// Approved actions that have not begun are checked against the new policy.
 	await revokeQueuedActions(uow);
 	// Cards live in the approvals channel, and only replies there decide: when it moves (or the
@@ -801,6 +813,62 @@ export async function writeConfigRevisionIn(
 		source,
 	});
 	return { version, revisionId: revision.id, created, updated, disabled };
+}
+
+/**
+ * Reconciles `catalog_attachments` — the current-state projection of
+ * `ConfigSnapshotBundle.toolAttachments` (ADR-027), the same way the loop above reconciles `agents`
+ * against `ConfigSnapshotBundle.agents` — to match `desired` exactly: a row for a binding no
+ * longer in `desired` is removed, and one still there is inserted or updated. Runs on every
+ * configuration write (`replace_bundle`, `attach_tool`, `detach_tool`, `update_attachment`,
+ * `clear_tool_attachments` alike), so this table never drifts from the bundle that is the actual
+ * source of truth.
+ */
+async function reconcileCatalogAttachmentsIn(
+	uow: UnitOfWork,
+	desired: ToolAttachmentsBundle,
+): Promise<void> {
+	const { db } = uow.tx;
+	const desiredRows = Object.entries(desired).flatMap(([agentId, attachments]) =>
+		attachments.map((attachment) => ({ agentId, ...attachment })),
+	);
+	const existing = await db
+		.select({ agentId: catalogAttachments.agentId, entryId: catalogAttachments.entryId })
+		.from(catalogAttachments);
+	const desiredKeys = new Set(desiredRows.map((row) => `${row.agentId}\u0000${row.entryId}`));
+	const stale = existing.filter((row) => !desiredKeys.has(`${row.agentId}\u0000${row.entryId}`));
+	for (const row of stale) {
+		await db
+			.delete(catalogAttachments)
+			.where(
+				and(
+					eq(catalogAttachments.agentId, row.agentId),
+					eq(catalogAttachments.entryId, row.entryId),
+				),
+			);
+	}
+	for (const row of desiredRows) {
+		await db
+			.insert(catalogAttachments)
+			.values({
+				agentId: row.agentId,
+				entryId: row.entryId,
+				pinnedVersion: row.pinnedVersion,
+				mode: row.mode,
+				settings: row.settings,
+				createdAt: uow.now,
+				updatedAt: uow.now,
+			})
+			.onConflictDoUpdate({
+				target: [catalogAttachments.agentId, catalogAttachments.entryId],
+				set: {
+					pinnedVersion: row.pinnedVersion,
+					mode: row.mode,
+					settings: row.settings,
+					updatedAt: uow.now,
+				},
+			});
+	}
 }
 
 // ---------------------------------------------------------------------------

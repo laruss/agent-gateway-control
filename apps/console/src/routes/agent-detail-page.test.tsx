@@ -150,6 +150,7 @@ function stubFetch(commitOutcome: CommitOutcome): {
 						],
 						organizationFieldPaths: [],
 						constitution: { changed: false, beforeSize: 0, afterSize: 0 },
+						toolAttachmentsChangedAgentIds: [],
 					},
 				});
 			}
@@ -537,6 +538,7 @@ describe("AgentDetailPage", () => {
 							],
 							organizationFieldPaths: [],
 							constitution: { changed: false, beforeSize: 0, afterSize: 0 },
+							toolAttachmentsChangedAgentIds: [],
 						},
 					});
 				}

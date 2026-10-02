@@ -19,6 +19,9 @@ import type {
 	RuntimeUsage,
 	ThreadSummary,
 	ToolActionStatus,
+	ToolAttachmentMode,
+	ToolCatalogEntryKind,
+	ToolCatalogRiskFloor,
 	ToolNamespace,
 	ToolReceipt,
 	TurnAuthorityContext,
@@ -35,6 +38,9 @@ import {
 	CONFIG_REVISION_SOURCES,
 	GMAIL_MODES,
 	TOOL_ACTION_STATUSES,
+	TOOL_ATTACHMENT_MODES,
+	TOOL_CATALOG_ENTRY_KINDS,
+	TOOL_CATALOG_RISK_FLOORS,
 	TOOL_NAMESPACES,
 	WorkerStatusSchema,
 } from "@agent-gateway/contracts";
@@ -356,6 +362,105 @@ export const agentLifecycleOperations = pgTable(
 		check("agent_lifecycle_operations_state", oneOf("state", AGENT_LIFECYCLE_OPERATION_STATES)),
 	],
 );
+
+// ---------------------------------------------------------------------------
+// Tool catalog (ADR-027): catalog entries, their immutable versions, agents' attachments and
+// built-in retirement tombstones.
+// ---------------------------------------------------------------------------
+
+/**
+ * One catalog entry's own, immutable identity: `kind`/`implementationKey` never change across its
+ * versions, and `isBuiltin` decides whether deleting it (`deleteCatalogEntry`) also writes a
+ * tombstone. `currentVersionId` has no foreign key: it is set right after the first version row is
+ * inserted, in the same transaction (the same reason `agent_lifecycle.operation_id` has none).
+ */
+export const catalogEntries = pgTable(
+	"catalog_entries",
+	{
+		id: text("id").primaryKey(),
+		kind: text("kind").$type<ToolCatalogEntryKind>().notNull(),
+		implementationKey: text("implementation_key").notNull(),
+		isBuiltin: boolean("is_builtin").notNull().default(false),
+		currentVersionId: bigint("current_version_id", { mode: "number" }),
+		createdAt: createdAt(),
+	},
+	() => [check("catalog_entries_kind", oneOf("kind", TOOL_CATALOG_ENTRY_KINDS))],
+);
+
+/**
+ * Append-only history of a catalog entry's own content (migration's own guard trigger rejects
+ * UPDATE, DELETE and TRUNCATE outright — unlike `agent_lifecycle_operations`, no column of a
+ * version ever changes once written). `entryId` carries no foreign key: deleting an entry
+ * (`deleteCatalogEntry`) never touches its past versions, which stay exactly as inspectable
+ * history, entry gone or not.
+ */
+export const catalogEntryVersions = pgTable(
+	"catalog_entry_versions",
+	{
+		id: bigserial("id", { mode: "number" }).primaryKey(),
+		entryId: text("entry_id").notNull(),
+		version: integer("version").notNull(),
+		kind: text("kind").$type<ToolCatalogEntryKind>().notNull(),
+		implementationKey: text("implementation_key").notNull(),
+		name: text("name").notNull(),
+		description: text("description").notNull(),
+		configSchema: jsonb("config_schema").$type<JsonObject>().notNull().default({}),
+		riskFloor: text("risk_floor").$type<ToolCatalogRiskFloor>().notNull(),
+		supportedAdapters: jsonb("supported_adapters")
+			.$type<RuntimeAdapterId[]>()
+			.notNull()
+			.default([]),
+		createdBy: text("created_by").notNull(),
+		createdAt: createdAt(),
+	},
+	(t) => [
+		uniqueIndex("catalog_entry_versions_entry_version").on(t.entryId, t.version),
+		index("catalog_entry_versions_entry").on(t.entryId),
+		check("catalog_entry_versions_kind", oneOf("kind", TOOL_CATALOG_ENTRY_KINDS)),
+		check("catalog_entry_versions_risk_floor", oneOf("risk_floor", TOOL_CATALOG_RISK_FLOORS)),
+	],
+);
+
+/**
+ * The current projection of `ConfigSnapshotBundle.toolAttachments` (ADR-027) — one row per
+ * (agent, entry) binding, reconciled by `writeConfigRevisionIn` on every commit exactly the way
+ * `agents` projects `ConfigSnapshotBundle.agents`. The bundle itself, not this table, is what
+ * config history, rollback and export/import carry; this table only ever mirrors it for a cheap
+ * current-state read (listing an agent's attachments, or every agent attached to an entry).
+ */
+export const catalogAttachments = pgTable(
+	"catalog_attachments",
+	{
+		agentId: text("agent_id")
+			.notNull()
+			.references(() => agents.id),
+		entryId: text("entry_id")
+			.notNull()
+			.references(() => catalogEntries.id),
+		pinnedVersion: integer("pinned_version"),
+		mode: text("mode").$type<ToolAttachmentMode>().notNull(),
+		settings: jsonb("settings").$type<JsonObject>().notNull().default({}),
+		createdAt: createdAt(),
+		updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+	},
+	(t) => [
+		primaryKey({ columns: [t.agentId, t.entryId] }),
+		index("catalog_attachments_entry").on(t.entryId),
+		check("catalog_attachments_mode", oneOf("mode", TOOL_ATTACHMENT_MODES)),
+	],
+);
+
+/**
+ * A built-in catalog entry the owner deleted: reseeding (`ensureToolCatalogSeeded`, run at every
+ * controller start and CLI session) never re-adds an id recorded here. Never written for a
+ * non-built-in entry's deletion — nothing ever reseeds those.
+ */
+export const catalogEntryTombstones = pgTable("catalog_entry_tombstones", {
+	entryId: text("entry_id").primaryKey(),
+	kind: text("kind").$type<ToolCatalogEntryKind>().notNull(),
+	deletedBy: text("deleted_by").notNull(),
+	deletedAt: timestamp("deleted_at", { withTimezone: true }).notNull().defaultNow(),
+});
 
 export const CHANNEL_GRANT_STATES = ["active", "revoked"] as const;
 export type ChannelGrantState = (typeof CHANNEL_GRANT_STATES)[number];

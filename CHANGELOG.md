@@ -4,6 +4,28 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## [Unreleased]
 
+### Added
+
+- A tool catalog data model (ADR-027): catalog entries (a stable id, an immutable `kind` —
+  `native`/`gateway`/`executor`, `custom_https` reserved — and implementation key), append-only
+  immutable versions (name, description, a bounded config schema, a risk floor, supported runtime
+  adapters), and per-agent attachments (a pinned version or "current", an `allow`/
+  `require_approval`/`disabled` mode, bounded settings) living in the configuration bundle
+  alongside `agents`/`rolePrompts` — versioned, rolled back and exported/imported exactly like the
+  rest of it. `ensureToolCatalogSeeded` (controller startup, every CLI session) idempotently seeds
+  every built-in this release actually has — five native runtime capabilities, `mattermost.post`
+  and `memory.write`, and the two sandbox tool-broker executor actions — skipping one the owner
+  already deleted (a tombstone survives reseeding, forever). Editing a built-in entry may only
+  change its name/description (a new immutable version); deleting one removes every agent's
+  attachment of it atomically, in the same transaction as (for a built-in) its tombstone.
+  `attachTool`/`detachTool`/`updateAttachment` commit through the same managed-configuration writer
+  every other configuration change does, so a revision records them and rollback covers them.
+  `legacyAttachmentsFromPermissions` converts an agent's existing `permissions` lists to what its
+  attachments would look like, read-only, against catalog entries known right now — a pattern
+  matching none of them is reported unresolved, never dropped. Tool enforcement itself is
+  unchanged: `packages/policy` still reads only `permissions`; nothing here compiles an attachment
+  into a grant yet, and no console or CLI surface reads the catalog yet either.
+
 ## [0.6.0] - 2026-10-02
 
 ### Added

@@ -15,6 +15,7 @@ import type {
 	ChangeSetInput,
 	ConfigDiffAgent,
 	OrganizationConfig,
+	ToolAttachmentsBundle,
 } from "@agent-gateway/contracts";
 import {
 	AdminError,
@@ -31,19 +32,26 @@ import {
 	prepareChange,
 } from "@agent-gateway/core";
 import { canonicalHash, sha256Hex } from "@agent-gateway/events";
-import { ConfigFileError, loadConfigDirectoryForImport } from "./config-files.ts";
+import {
+	ConfigFileError,
+	loadConfigDirectoryForImport,
+	TOOL_ATTACHMENTS_FILE,
+} from "./config-files.ts";
 
 const ORGANIZATION_FILE = "organization.yaml";
 const AGENTS_DIR = "agents";
 /** `manifest.json`'s own shape version, independent of `CONFIG_SNAPSHOT_FORMAT`. */
 const MANIFEST_FORMAT = 1;
 
-/** A bundle in plain, writable-array shape, as every `replace_bundle` change set needs it. */
+/** A bundle in plain, writable-array shape, as every `replace_bundle` change set needs it.
+ * `toolAttachments` defaults to `{}` in `configSnapshotBundle`, so a caller with nothing to carry
+ * forward (a fresh directory with no hub-managed agent) may still omit it. */
 type ReplaceableBundle = Readonly<{
 	organization: OrganizationConfig;
 	agents: Readonly<AgentConfig[]>;
 	constitution: string;
 	rolePrompts: Readonly<Record<string, string>>;
+	toolAttachments?: ToolAttachmentsBundle;
 }>;
 
 /**
@@ -167,11 +175,24 @@ function setFileContent(files: Map<string, string>, path: string, content: strin
  * (`setFileContent`), happens here, before anything touches disk. Returns paths in a stable,
  * sorted order.
  */
+/** Deterministic JSON text for `tool-attachments.json`: agent ids and each agent's attachments
+ * sorted, so two exports of the same revision are byte-for-byte identical. */
+function toolAttachmentsText(toolAttachments: ToolAttachmentsBundle): string {
+	const ordered: Record<string, unknown> = {};
+	for (const agentId of Object.keys(toolAttachments).sort()) {
+		ordered[agentId] = [...(toolAttachments[agentId] ?? [])].sort((a, b) =>
+			a.entryId < b.entryId ? -1 : a.entryId > b.entryId ? 1 : 0,
+		);
+	}
+	return `${JSON.stringify(ordered, null, 2)}\n`;
+}
+
 function buildExportFiles(
 	organization: OrganizationConfig,
 	agents: Readonly<AgentConfig[]>,
 	constitution: string,
 	rolePrompts: Readonly<Record<string, string>>,
+	toolAttachments: ToolAttachmentsBundle,
 	revisionId: number,
 	hash: string,
 ): Readonly<[string, string][]> {
@@ -182,6 +203,7 @@ function buildExportFiles(
 		files.set(`${AGENTS_DIR}/${agent.id}.yaml`, yamlText(agent));
 		setFileContent(files, agent.prompts.role_file, rolePrompts[agent.id] ?? "");
 	}
+	files.set(TOOL_ATTACHMENTS_FILE, toolAttachmentsText(toolAttachments));
 	const manifestFiles: Record<string, string> = {};
 	for (const [path, content] of files) {
 		manifestFiles[path] = sha256Hex(content);
@@ -262,6 +284,7 @@ export async function configExport(
 		bundle.agents,
 		bundle.constitution,
 		bundle.rolePrompts,
+		bundle.toolAttachments,
 		revisionId,
 		hash,
 	);
@@ -507,6 +530,7 @@ export async function configRollback(
 		agents: bundle.agents,
 		constitution: bundle.constitution,
 		rolePrompts: bundle.rolePrompts,
+		toolAttachments: bundle.toolAttachments,
 	});
 	const preview = await prepareChange(deps, changeSet);
 	print(formatConfigDiff(preview));

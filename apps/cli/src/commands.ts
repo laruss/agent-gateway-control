@@ -33,6 +33,7 @@ import {
 	decideMemory,
 	ensureAgentLifecycleAdoption,
 	ensureConfigHistory,
+	ensureToolCatalogSeeded,
 	ingestEvent,
 	killAll,
 	listAgents,
@@ -1032,6 +1033,8 @@ async function runSessionCommand(
 			await ensureConfigHistory(session.deps, actor());
 			// ADR-026: adopts every configured agent that has no `agent_lifecycle` row yet.
 			await ensureAgentLifecycleAdoption(session.deps, actor());
+			// ADR-027: seeds every built-in catalog entry this release ships.
+			await ensureToolCatalogSeeded(session.deps, actor());
 		}
 		return await dispatchSessionCommand(session, command, args, out);
 	} finally {

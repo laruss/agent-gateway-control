@@ -16,6 +16,7 @@ export * from "./outbox.ts";
 export * from "./system-status.ts";
 export * from "./thread-summary.ts";
 export * from "./tool-action.ts";
+export * from "./tool-catalog.ts";
 export * from "./turn.ts";
 export * from "./turn-authority.ts";
 export * from "./wait.ts";

@@ -2,24 +2,36 @@ import { z } from "zod";
 import { AgentConfigSchema } from "./agent-config.ts";
 import { AgentIdSchema, Sha256HexSchema, safeText, TimestampSchema } from "./common.ts";
 import { OrganizationConfigSchema } from "./organization.ts";
+import {
+	ToolAttachmentModeSchema,
+	ToolAttachmentSettingsSchema,
+	ToolAttachmentsBundleSchema,
+	ToolCatalogEntryIdSchema,
+} from "./tool-catalog.ts";
 
 /**
  * The bundle shape's own version, independent of the database schema: a later format may add
- * or change fields an older reader does not expect. Every snapshot stored today is format 1.
+ * or change fields an older reader does not expect. Every snapshot stored before ADR-027 is
+ * format 1; `toolAttachments` is read by every format (it defaults to `{}` when absent), so the
+ * format number itself did not need to move for this addition.
  */
 export const CONFIG_SNAPSHOT_FORMAT = 1;
 
 /**
  * A complete, reproducible configuration: everything `applyConfig` hashes and needs to
  * reconstruct the effective configuration without reading anything else (organization, every
- * agent definition and its resolved role prompt, the constitution text). This is the payload a
- * `config_snapshots` row stores, content-addressed by its canonical hash.
+ * agent definition and its resolved role prompt, the constitution text, and every agent's tool
+ * attachments — ADR-027). This is the payload a `config_snapshots` row stores, content-addressed
+ * by its canonical hash. `toolAttachments` defaults to `{}` so a snapshot stored before ADR-027
+ * still parses, and an old `config export` directory (with no `tool-attachments.json`) still
+ * imports.
  */
 export const ConfigSnapshotBundleSchema = z.strictObject({
 	organization: OrganizationConfigSchema,
 	agents: z.array(AgentConfigSchema),
 	constitution: z.string().min(1),
 	rolePrompts: z.record(AgentIdSchema, z.string().min(1)),
+	toolAttachments: ToolAttachmentsBundleSchema.default({}),
 });
 export type ConfigSnapshotBundle = z.infer<typeof ConfigSnapshotBundleSchema>;
 
@@ -104,6 +116,35 @@ export const ChangeOperationSchema = z.discriminatedUnion("type", [
 	/** Reassigns the organization's finance role to a different agent (`requestAgentRetire`'s own
 	 * `reassignFinanceTo`, committed in the same change set as the `remove_agent` it accompanies). */
 	z.strictObject({ type: z.literal("set_finance_agent"), agentId: AgentIdSchema }),
+	/** Binds (or rebinds) one catalog entry to an agent (ADR-027); replaces any existing attachment
+	 * of the same `entryId` for that agent. */
+	z.strictObject({
+		type: z.literal("attach_tool"),
+		agentId: AgentIdSchema,
+		entryId: ToolCatalogEntryIdSchema,
+		pinnedVersion: z.int().positive().nullable(),
+		mode: ToolAttachmentModeSchema,
+		settings: ToolAttachmentSettingsSchema,
+	}),
+	/** Removes one agent's attachment of `entryId`; a no-op when it has none (ADR-027). */
+	z.strictObject({
+		type: z.literal("detach_tool"),
+		agentId: AgentIdSchema,
+		entryId: ToolCatalogEntryIdSchema,
+	}),
+	/** Patches an existing attachment's own fields, leaving the rest unchanged (ADR-027). */
+	z.strictObject({
+		type: z.literal("update_attachment"),
+		agentId: AgentIdSchema,
+		entryId: ToolCatalogEntryIdSchema,
+		pinnedVersion: z.int().positive().nullable().optional(),
+		mode: ToolAttachmentModeSchema.optional(),
+		settings: ToolAttachmentSettingsSchema.optional(),
+	}),
+	/** Removes `entryId`'s attachment from every agent that has one, in one operation regardless of
+	 * how many agents that is (`deleteCatalogEntry`, ADR-027) — never expressed as one `detach_tool`
+	 * per agent, which `MAX_CHANGE_SET_OPERATIONS` could not bound for an entry attached widely. */
+	z.strictObject({ type: z.literal("clear_tool_attachments"), entryId: ToolCatalogEntryIdSchema }),
 ]);
 export type ChangeOperation = z.infer<typeof ChangeOperationSchema>;
 export type ChangeOperationType = ChangeOperation["type"];
@@ -146,12 +187,15 @@ export type ConfigDiffAgent = z.infer<typeof ConfigDiffAgentSchema>;
 /**
  * A deterministic structural diff of two configuration bundles: every agent added, removed or
  * changed (a changed agent names its own changed top-level fields and its role prompt's change),
- * the organization's changed field paths, and the constitution's change. Same inputs always
- * produce an identical diff; see `prepareChange`.
+ * the organization's changed field paths, the constitution's change, and the ids of agents whose
+ * own tool attachments differ (ADR-027; not expanded field-by-field, since an attachment's own
+ * `settings` is opaque, caller-defined JSON). Same inputs always produce an identical diff; see
+ * `prepareChange`.
  */
 export const ConfigDiffSchema = z.strictObject({
 	agents: z.array(ConfigDiffAgentSchema),
 	organizationFieldPaths: FieldPathsSchema,
 	constitution: TextChangeSchema,
+	toolAttachmentsChangedAgentIds: z.array(AgentIdSchema),
 });
 export type ConfigDiff = z.infer<typeof ConfigDiffSchema>;

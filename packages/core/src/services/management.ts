@@ -17,8 +17,11 @@ import {
 	ConfigRevisionSourceSchema,
 	ConfigSnapshotBundleSchema,
 	IdempotencyKeySchema,
+	MAX_ATTACHMENTS_PER_AGENT,
 	type OrganizationConfig,
 	type TextChange,
+	type ToolAttachment,
+	type ToolAttachmentsBundle,
 } from "@agent-gateway/contracts";
 import {
 	agentLifecycle,
@@ -61,6 +64,10 @@ export type ConfigDraftBundle = Readonly<{
 	agents: Readonly<AgentConfig[]>;
 	constitution: string;
 	rolePrompts: Readonly<Record<string, string>>;
+	/** Every agent's catalog attachments, keyed by agent id (ADR-027); an agent absent from this
+	 * map has never been touched through the tool-catalog service — `loadAllAgentToolAttachments`
+	 * (`tool-catalog.ts`) falls back to converting its `permissions` lists instead. */
+	toolAttachments: ToolAttachmentsBundle;
 }>;
 
 const EMPTY_DRAFT_BUNDLE: ConfigDraftBundle = {
@@ -68,6 +75,7 @@ const EMPTY_DRAFT_BUNDLE: ConfigDraftBundle = {
 	agents: [],
 	constitution: "",
 	rolePrompts: {},
+	toolAttachments: {},
 };
 
 /** The same order `configSnapshotBundle` sorts agents in, so a hash never depends on array order. */
@@ -87,6 +95,7 @@ export function previewHash(draft: ConfigDraftBundle): string {
 		agents: [...draft.agents].sort(byAgentId),
 		constitution: draft.constitution,
 		rolePrompts: { ...draft.rolePrompts },
+		toolAttachments: { ...draft.toolAttachments },
 	});
 }
 
@@ -245,6 +254,7 @@ function applyOperation(draft: ConfigDraftBundle, op: ChangeOperation): Operatio
 					agents: op.bundle.agents,
 					constitution: op.bundle.constitution,
 					rolePrompts: op.bundle.rolePrompts,
+					toolAttachments: op.bundle.toolAttachments,
 				},
 				problems: [],
 			};
@@ -278,11 +288,14 @@ function applyOperation(draft: ConfigDraftBundle, op: ChangeOperation): Operatio
 			}
 			const rolePrompts = { ...draft.rolePrompts };
 			delete rolePrompts[op.agentId];
+			const toolAttachments = { ...draft.toolAttachments };
+			delete toolAttachments[op.agentId];
 			return {
 				draft: {
 					...draft,
 					agents: draft.agents.filter((agent) => agent.id !== op.agentId),
 					rolePrompts,
+					toolAttachments,
 				},
 				problems: [],
 			};
@@ -321,6 +334,80 @@ function applyOperation(draft: ConfigDraftBundle, op: ChangeOperation): Operatio
 				problems: [],
 			};
 		}
+		case "attach_tool": {
+			if (!draft.agents.some((agent) => agent.id === op.agentId)) {
+				return { draft, problems: [`attach_tool: agent '${op.agentId}' does not exist`] };
+			}
+			const existing = draft.toolAttachments[op.agentId] ?? [];
+			const attachment: ToolAttachment = {
+				entryId: op.entryId,
+				pinnedVersion: op.pinnedVersion,
+				mode: op.mode,
+				settings: op.settings,
+			};
+			return {
+				draft: {
+					...draft,
+					toolAttachments: {
+						...draft.toolAttachments,
+						[op.agentId]: [...existing.filter((a) => a.entryId !== op.entryId), attachment],
+					},
+				},
+				problems: [],
+			};
+		}
+		case "detach_tool": {
+			const existing = draft.toolAttachments[op.agentId];
+			if (existing === undefined || !existing.some((a) => a.entryId === op.entryId)) {
+				// Idempotent: detaching something never (or no longer) attached changes nothing.
+				return { draft, problems: [] };
+			}
+			return {
+				draft: {
+					...draft,
+					toolAttachments: {
+						...draft.toolAttachments,
+						[op.agentId]: existing.filter((a) => a.entryId !== op.entryId),
+					},
+				},
+				problems: [],
+			};
+		}
+		case "update_attachment": {
+			const existing = draft.toolAttachments[op.agentId];
+			const current = existing?.find((a) => a.entryId === op.entryId);
+			if (existing === undefined || current === undefined) {
+				return {
+					draft,
+					problems: [
+						`update_attachment: agent '${op.agentId}' has no attachment of '${op.entryId}'`,
+					],
+				};
+			}
+			const updated: ToolAttachment = {
+				entryId: op.entryId,
+				pinnedVersion: op.pinnedVersion === undefined ? current.pinnedVersion : op.pinnedVersion,
+				mode: op.mode ?? current.mode,
+				settings: op.settings ?? current.settings,
+			};
+			return {
+				draft: {
+					...draft,
+					toolAttachments: {
+						...draft.toolAttachments,
+						[op.agentId]: existing.map((a) => (a.entryId === op.entryId ? updated : a)),
+					},
+				},
+				problems: [],
+			};
+		}
+		case "clear_tool_attachments": {
+			const toolAttachments: Record<string, ToolAttachment[]> = {};
+			for (const [agentId, attachments] of Object.entries(draft.toolAttachments)) {
+				toolAttachments[agentId] = attachments.filter((a) => a.entryId !== op.entryId);
+			}
+			return { draft: { ...draft, toolAttachments }, problems: [] };
+		}
 	}
 }
 
@@ -345,7 +432,7 @@ export function draftBundleProblems(draft: ConfigDraftBundle): string[] {
 	if (draft.organization === null) {
 		return ["organization: configuration is missing; the first change must replace_bundle"];
 	}
-	return [
+	const problems = [
 		...configBundleProblems({
 			organization: draft.organization,
 			agents: draft.agents,
@@ -353,6 +440,18 @@ export function draftBundleProblems(draft: ConfigDraftBundle): string[] {
 			rolePrompts: draft.rolePrompts,
 		}),
 	];
+	const configuredAgentIds = new Set(draft.agents.map((agent) => agent.id));
+	for (const [agentId, attachments] of Object.entries(draft.toolAttachments)) {
+		if (!configuredAgentIds.has(agentId)) {
+			problems.push(`toolAttachments: '${agentId}' has attachments but is not a configured agent`);
+		}
+		if (attachments.length > MAX_ATTACHMENTS_PER_AGENT) {
+			problems.push(
+				`toolAttachments: agent '${agentId}' has ${attachments.length} attachments, over the ${MAX_ATTACHMENTS_PER_AGENT} limit`,
+			);
+		}
+	}
+	return problems;
 }
 
 // ---------------------------------------------------------------------------
@@ -450,6 +549,9 @@ export function configDiff(before: ConfigDraftBundle, after: ConfigDraftBundle):
 		}
 		agents.push({ kind: "changed", agentId: id, fieldPaths, rolePrompt });
 	}
+	const toolAttachmentsChangedAgentIds = ids.filter(
+		(id) => !deepEqual(before.toolAttachments[id] ?? [], after.toolAttachments[id] ?? []),
+	);
 	return {
 		agents,
 		organizationFieldPaths: structuralFieldPaths(
@@ -458,6 +560,7 @@ export function configDiff(before: ConfigDraftBundle, after: ConfigDraftBundle):
 			Number.POSITIVE_INFINITY,
 		),
 		constitution: textChange(before.constitution, after.constitution),
+		toolAttachmentsChangedAgentIds,
 	};
 }
 
@@ -1062,6 +1165,7 @@ export async function commitChangeIn(
 		agents: draft.agents,
 		constitution: draft.constitution,
 		rolePrompts: draft.rolePrompts,
+		toolAttachments: draft.toolAttachments,
 	};
 	const bundle = configSnapshotBundle(resolvedInput);
 	const version = canonicalHash(bundle);
