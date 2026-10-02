@@ -2,6 +2,7 @@ export * from "./channel-access.ts";
 export * from "./outcome.ts";
 export * from "./routing.ts";
 export * from "./services/admin.ts";
+export * from "./services/agent-lifecycle.ts";
 export * from "./services/alerts.ts";
 export {
 	ApprovalCardPendingError,

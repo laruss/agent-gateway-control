@@ -25,7 +25,9 @@
     "0020_config_revision_idempotency": "expand",
     "0021_config_revision_acks": "expand",
     "0022_console_sessions": "expand",
-    "0023_console_csrf_derived": "expand"
+    "0023_console_csrf_derived": "expand",
+    "0024_agent_lifecycle": "expand",
+    "0025_agent_lifecycle_guards": "expand"
   },
   "releases": [
     {

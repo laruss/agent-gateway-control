@@ -12,6 +12,7 @@ import {
 } from "@agent-gateway/contracts";
 import {
 	type ControlPlaneDeps,
+	ensureAgentLifecycleAdoption,
 	ensureConfigHistory,
 	handleRunReport,
 	handleRunTimeout,
@@ -120,6 +121,9 @@ export async function startController(options: ControllerOptions): Promise<Runni
 	// before configuration history existed, so it is never left permanently unbackfilled on a
 	// controller that is restarted without an intervening `config apply`.
 	await ensureConfigHistory(deps, "system");
+	// ADR-026: adopts every configured agent that has no `agent_lifecycle` row yet (a database
+	// upgraded from a release before this table existed) — a no-op once every agent is adopted.
+	await ensureAgentLifecycleAdoption(deps, "system");
 	const metrics = options.metrics ?? new MetricsRegistry();
 	registerControllerMetrics(metrics, pool, clock);
 	const reportsApplied = metrics.counter(

@@ -602,7 +602,7 @@ export class ManagementConflictError extends Error {
 }
 
 /** What the commit transaction settled on; a conflict is thrown only once it has committed. */
-type CommitOutcome =
+export type CommitOutcome =
 	| Readonly<{ kind: "committed"; result: CommitChangeResult }>
 	| Readonly<{ kind: "conflict"; currentRevisionId: number | null }>;
 
@@ -670,6 +670,146 @@ function checkCommitChangeInput(
 }
 
 /**
+ * {@link commitChange}'s own transactional body, taking an already-open `uow` instead of opening
+ * one of its own: `requestAgentCreate`/`requestAgentRetire` (`agent-lifecycle.ts`) call this
+ * directly so their own lifecycle rows commit or roll back in the exact same transaction as the
+ * configuration change they carry, something the public `commitChange` — which always opens and
+ * commits its own transaction — cannot give a caller. `changeSet` is the already-parsed value (see
+ * `checkCommitChangeInput`); a caller building its own change set internally (never raw, unparsed
+ * request input) passes it directly, skipping a redundant re-parse.
+ */
+export async function commitChangeIn(
+	uow: UnitOfWork,
+	input: CommitChangeInput,
+	changeSet: ChangeSet,
+): Promise<CommitOutcome> {
+	const { db } = uow.tx;
+	await db.insert(gatewayControls).values({ id: 1 }).onConflictDoNothing();
+	const [controls] = await db
+		.select({
+			version: gatewayControls.activeConfigVersion,
+			generation: gatewayControls.configGeneration,
+			revision: gatewayControls.activeConfigRevision,
+		})
+		.from(gatewayControls)
+		.where(eq(gatewayControls.id, 1))
+		.for("update");
+	const generation = (controls?.generation ?? 0) + 1;
+
+	// Idempotent replay, checked under the lock: by the time a concurrent commit of the same key
+	// gets here, an earlier one that already wrote a row has committed and become visible (the
+	// lock serializes them), so this never races a conflict it should instead have replayed.
+	if (input.idempotencyKey !== undefined) {
+		const [existing] = await db
+			.select({
+				id: configRevisions.id,
+				snapshotHash: configRevisions.snapshotHash,
+				changeHash: configRevisions.changeHash,
+			})
+			.from(configRevisions)
+			.where(eq(configRevisions.idempotencyKey, input.idempotencyKey));
+		if (existing !== undefined) {
+			const changeHash = canonicalHash(changeSet);
+			if (existing.changeHash !== changeHash) {
+				throw new AdminError(
+					`idempotency key '${input.idempotencyKey}' was already used with a different change set`,
+				);
+			}
+			return {
+				kind: "committed",
+				result: {
+					revisionId: existing.id,
+					hash: existing.snapshotHash,
+					noop: false,
+					replayed: true,
+					activeRevisionId: controls?.revision ?? null,
+				},
+			};
+		}
+	}
+
+	const currentRevisionId = await ensureConfigHistoryIn(
+		uow,
+		{
+			version: controls?.version ?? null,
+			generation: controls?.generation ?? 0,
+			revision: controls?.revision ?? null,
+		},
+		input.actor,
+	);
+	if (input.baseRevisionId !== currentRevisionId) {
+		if (currentRevisionId !== (controls?.revision ?? null)) {
+			// A backfill this transaction just recorded (an older release changed the configuration
+			// since `ensureConfigHistory` above): committed with its active pointer, so the conflict
+			// names a revision that exists.
+			await db
+				.update(gatewayControls)
+				.set({ activeConfigRevision: currentRevisionId, updatedAt: uow.now })
+				.where(eq(gatewayControls.id, 1));
+		}
+		return { kind: "conflict", currentRevisionId };
+	}
+
+	const { bundle: base, hash: baseHash } = await loadActiveBundle(db, currentRevisionId);
+	const { draft, problems: opProblems } = applyChangeSet(base, changeSet);
+	const problems = [...opProblems, ...draftBundleProblems(draft)];
+	if (problems.length > 0) {
+		throw new AdminError(`configuration is invalid:\n- ${problems.join("\n- ")}`);
+	}
+	if (draft.organization === null) {
+		throw new AdminError("internal: a validated configuration always has an organization");
+	}
+	const resolvedInput: ConfigApplyInput = {
+		organization: draft.organization,
+		agents: draft.agents,
+		constitution: draft.constitution,
+		rolePrompts: draft.rolePrompts,
+	};
+	const bundle = configSnapshotBundle(resolvedInput);
+	const version = canonicalHash(bundle);
+
+	if (
+		currentRevisionId !== null &&
+		baseHash === version &&
+		!(await liveEnabledDiverges(db, enabledById(draft.agents)))
+	) {
+		return {
+			kind: "committed",
+			result: {
+				revisionId: currentRevisionId,
+				hash: version,
+				noop: true,
+				replayed: false,
+				activeRevisionId: currentRevisionId,
+			},
+		};
+	}
+
+	const result = await writeConfigRevisionIn(uow, {
+		input: resolvedInput,
+		bundle,
+		version,
+		generation,
+		parentRevisionId: currentRevisionId,
+		actor: input.actor,
+		source: input.source,
+		reason: input.reason ?? null,
+		idempotencyKey: input.idempotencyKey ?? null,
+		changeHash: input.idempotencyKey === undefined ? null : canonicalHash(changeSet),
+	});
+	return {
+		kind: "committed",
+		result: {
+			revisionId: result.revisionId,
+			hash: result.version,
+			noop: false,
+			replayed: false,
+			activeRevisionId: result.revisionId,
+		},
+	};
+}
+
+/**
  * Applies `changeSet` to the active configuration and commits the result, in one transaction with
  * the same lock order `applyConfig` uses (the `gateway_controls` row first). Conflict: the active
  * revision has moved past `baseRevisionId` — {@link ManagementConflictError} names the revision it
@@ -695,132 +835,7 @@ export async function commitChange(
 	// a backfill this commit's own attempt discovers it needs must survive even when the commit
 	// itself goes on to conflict and roll back (see `prepareChange`).
 	await ensureConfigHistory(deps, input.actor);
-	const outcome = await inTransaction(deps, async (uow): Promise<CommitOutcome> => {
-		const { db } = uow.tx;
-		await db.insert(gatewayControls).values({ id: 1 }).onConflictDoNothing();
-		const [controls] = await db
-			.select({
-				version: gatewayControls.activeConfigVersion,
-				generation: gatewayControls.configGeneration,
-				revision: gatewayControls.activeConfigRevision,
-			})
-			.from(gatewayControls)
-			.where(eq(gatewayControls.id, 1))
-			.for("update");
-		const generation = (controls?.generation ?? 0) + 1;
-
-		// Idempotent replay, checked under the lock: by the time a concurrent commit of the same key
-		// gets here, an earlier one that already wrote a row has committed and become visible (the
-		// lock serializes them), so this never races a conflict it should instead have replayed.
-		if (input.idempotencyKey !== undefined) {
-			const [existing] = await db
-				.select({
-					id: configRevisions.id,
-					snapshotHash: configRevisions.snapshotHash,
-					changeHash: configRevisions.changeHash,
-				})
-				.from(configRevisions)
-				.where(eq(configRevisions.idempotencyKey, input.idempotencyKey));
-			if (existing !== undefined) {
-				const changeHash = canonicalHash(changeSet);
-				if (existing.changeHash !== changeHash) {
-					throw new AdminError(
-						`idempotency key '${input.idempotencyKey}' was already used with a different change set`,
-					);
-				}
-				return {
-					kind: "committed",
-					result: {
-						revisionId: existing.id,
-						hash: existing.snapshotHash,
-						noop: false,
-						replayed: true,
-						activeRevisionId: controls?.revision ?? null,
-					},
-				};
-			}
-		}
-
-		const currentRevisionId = await ensureConfigHistoryIn(
-			uow,
-			{
-				version: controls?.version ?? null,
-				generation: controls?.generation ?? 0,
-				revision: controls?.revision ?? null,
-			},
-			input.actor,
-		);
-		if (input.baseRevisionId !== currentRevisionId) {
-			if (currentRevisionId !== (controls?.revision ?? null)) {
-				// A backfill this transaction just recorded (an older release changed the configuration
-				// since `ensureConfigHistory` above): committed with its active pointer, so the conflict
-				// names a revision that exists.
-				await db
-					.update(gatewayControls)
-					.set({ activeConfigRevision: currentRevisionId, updatedAt: uow.now })
-					.where(eq(gatewayControls.id, 1));
-			}
-			return { kind: "conflict", currentRevisionId };
-		}
-
-		const { bundle: base, hash: baseHash } = await loadActiveBundle(db, currentRevisionId);
-		const { draft, problems: opProblems } = applyChangeSet(base, changeSet);
-		const problems = [...opProblems, ...draftBundleProblems(draft)];
-		if (problems.length > 0) {
-			throw new AdminError(`configuration is invalid:\n- ${problems.join("\n- ")}`);
-		}
-		if (draft.organization === null) {
-			throw new AdminError("internal: a validated configuration always has an organization");
-		}
-		const resolvedInput: ConfigApplyInput = {
-			organization: draft.organization,
-			agents: draft.agents,
-			constitution: draft.constitution,
-			rolePrompts: draft.rolePrompts,
-		};
-		const bundle = configSnapshotBundle(resolvedInput);
-		const version = canonicalHash(bundle);
-
-		if (
-			currentRevisionId !== null &&
-			baseHash === version &&
-			!(await liveEnabledDiverges(db, enabledById(draft.agents)))
-		) {
-			return {
-				kind: "committed",
-				result: {
-					revisionId: currentRevisionId,
-					hash: version,
-					noop: true,
-					replayed: false,
-					activeRevisionId: currentRevisionId,
-				},
-			};
-		}
-
-		const result = await writeConfigRevisionIn(uow, {
-			input: resolvedInput,
-			bundle,
-			version,
-			generation,
-			parentRevisionId: currentRevisionId,
-			actor: input.actor,
-			source: input.source,
-			reason: input.reason ?? null,
-			idempotencyKey: input.idempotencyKey ?? null,
-			changeHash: input.idempotencyKey === undefined ? null : canonicalHash(changeSet),
-		});
-		return {
-			kind: "committed",
-			result: {
-				revisionId: result.revisionId,
-				hash: result.version,
-				noop: false,
-				replayed: false,
-				activeRevisionId: result.revisionId,
-			},
-		};
-	});
+	const outcome = await inTransaction(deps, (uow) => commitChangeIn(uow, input, changeSet));
 	if (outcome.kind === "conflict") {
 		throw new ManagementConflictError(outcome.currentRevisionId);
 	}

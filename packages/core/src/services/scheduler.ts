@@ -64,6 +64,7 @@ import {
 	audit,
 	isKillSwitchOn,
 	loadActiveConfig,
+	loadAgentLifecycleStatus,
 	loadAgents,
 	loadChannelAccess,
 	loadOwnerUserIds,
@@ -273,6 +274,16 @@ export async function scheduleAgent(
 		return { skipped: "unknown_agent" };
 	}
 	const agent = toAgentRecord(agentRow);
+	// ADR-026: an agent's Mattermost identity may still be provisioning (or have none at all) even
+	// though its configuration is enabled. No lifecycle row at all (only possible before the
+	// startup adoption backfill has run) behaves exactly as before this table existed. Checked
+	// before any inbox claim, exactly like a disabled agent: the event stays pending, picked up
+	// once the lifecycle reaches `ready` (`completeOperation` wakes the agent itself; the periodic
+	// sweep is the backstop for everything else).
+	const lifecycleStatus = await loadAgentLifecycleStatus(db, agentId);
+	if (lifecycleStatus !== null && lifecycleStatus !== "ready") {
+		return { skipped: `lifecycle_${lifecycleStatus}` };
+	}
 	const transition =
 		agent.state === "idle"
 			? "schedule"

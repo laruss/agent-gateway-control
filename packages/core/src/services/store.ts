@@ -1,4 +1,5 @@
 import {
+	type AgentLifecycleStatus,
 	type GatewayEvent,
 	GatewayEventSchema,
 	type JsonObject,
@@ -9,6 +10,7 @@ import {
 } from "@agent-gateway/contracts";
 import {
 	type AgentState,
+	agentLifecycle,
 	agentRuns,
 	agents,
 	auditLog,
@@ -162,6 +164,24 @@ export async function lockConfigShared(uow: UnitOfWork): Promise<void> {
 export async function lockAgent(db: Db, agentId: string): Promise<AgentRow | null> {
 	const rows = await db.select().from(agents).where(eq(agents.id, agentId)).for("no key update");
 	return rows[0] ?? null;
+}
+
+/**
+ * The agent's Mattermost-provisioning status (ADR-026), null when no `agent_lifecycle` row exists
+ * at all — only possible for a configured agent before the startup adoption backfill has run, in
+ * which case scheduling behaves exactly as it did before this table existed. The scheduler gates
+ * a run on this being `ready`; nothing else reads it on the hot path, so this is a plain read, no
+ * lock.
+ */
+export async function loadAgentLifecycleStatus(
+	db: Db,
+	agentId: string,
+): Promise<AgentLifecycleStatus | null> {
+	const [row] = await db
+		.select({ status: agentLifecycle.status })
+		.from(agentLifecycle)
+		.where(eq(agentLifecycle.agentId, agentId));
+	return row?.status ?? null;
 }
 
 export async function setAgentState(

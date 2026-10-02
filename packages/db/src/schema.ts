@@ -1,6 +1,11 @@
 import type {
 	ActionParams,
 	AgentConfig,
+	AgentLifecycleCheckpoints,
+	AgentLifecycleOperationKind,
+	AgentLifecycleOperationState,
+	AgentLifecycleSource,
+	AgentLifecycleStatus,
 	AgentTurnInput,
 	ConfigRevisionSource,
 	ConfigSnapshotBundle,
@@ -22,6 +27,10 @@ import type {
 	WorkingSummary,
 } from "@agent-gateway/contracts";
 import {
+	AGENT_LIFECYCLE_OPERATION_KINDS,
+	AGENT_LIFECYCLE_OPERATION_STATES,
+	AGENT_LIFECYCLE_SOURCES,
+	AGENT_LIFECYCLE_STATUSES,
 	APPROVAL_STATUSES,
 	CONFIG_REVISION_SOURCES,
 	GMAIL_MODES,
@@ -267,6 +276,77 @@ export const mattermostIdentities = pgTable("mattermost_identities", {
 	tokenSecretRef: text("token_secret_ref").notNull(),
 	lastVerifiedAt: timestamp("last_verified_at", { withTimezone: true }),
 });
+
+/**
+ * Provisioning status of one agent id, kept apart from its desired configuration
+ * (`agents.enabled`): one row per agent id ever created through the lifecycle service or adopted
+ * at startup from a pre-existing configuration. The id is never reused — a row here in any status,
+ * including `retired`, refuses a later `add_agent` of the same id (`requestAgentCreate`).
+ */
+export const agentLifecycle = pgTable(
+	"agent_lifecycle",
+	{
+		agentId: text("agent_id")
+			.primaryKey()
+			.references(() => agents.id),
+		status: text("status").$type<AgentLifecycleStatus>().notNull(),
+		/** Bumped by every desired-state change (`create`/`retire`/`restore`/`reprovision`). */
+		generation: bigint("generation", { mode: "number" }).notNull().default(0),
+		/** The lifecycle operation currently (or last) pursuing `generation`; no foreign key, since
+		 * the operation row referencing this agent is written in the same transaction, right after
+		 * this row exists (see `agent_lifecycle_operations.agent_id`'s own foreign key). */
+		operationId: uuid("operation_id"),
+		/** Bounded, never a secret; the last operation's own failure. */
+		lastError: text("last_error"),
+		statusChangedAt: timestamp("status_changed_at", { withTimezone: true }).notNull().defaultNow(),
+		createdAt: createdAt(),
+		retiredAt: timestamp("retired_at", { withTimezone: true }),
+	},
+	() => [check("agent_lifecycle_status", oneOf("status", AGENT_LIFECYCLE_STATUSES))],
+);
+
+/**
+ * Append-only journal of lifecycle operations (migration 0025 guards it: only `state`,
+ * `checkpoints`, `error` and the timestamps besides `created_at` may ever change; every other
+ * column, and the row itself, is immutable once written).
+ */
+export const agentLifecycleOperations = pgTable(
+	"agent_lifecycle_operations",
+	{
+		id: uuid("id").primaryKey().defaultRandom(),
+		agentId: text("agent_id")
+			.notNull()
+			.references(() => agentLifecycle.agentId),
+		kind: text("kind").$type<AgentLifecycleOperationKind>().notNull(),
+		requestedBy: text("requested_by").notNull(),
+		source: text("source").$type<AgentLifecycleSource>().notNull(),
+		/** A caller-supplied retry token: a repeat with the same key replays this row. */
+		idempotencyKey: text("idempotency_key"),
+		/** The configuration revision that carried this operation's desired-state change. */
+		configRevisionId: bigint("config_revision_id", { mode: "number" }).references(
+			() => configRevisions.id,
+		),
+		/** The `agent_lifecycle.generation` this operation pursues; see `completeOperation`. */
+		generation: bigint("generation", { mode: "number" }).notNull(),
+		state: text("state").$type<AgentLifecycleOperationState>().notNull(),
+		/** Ids and references only, set by the provisioner as it completes each step; never a
+		 * token value (see `AgentLifecycleCheckpointsSchema`). */
+		checkpoints: jsonb("checkpoints").$type<AgentLifecycleCheckpoints>().notNull().default({}),
+		error: text("error"),
+		createdAt: createdAt(),
+		updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+		finishedAt: timestamp("finished_at", { withTimezone: true }),
+	},
+	(t) => [
+		index("agent_lifecycle_operations_agent").on(t.agentId),
+		uniqueIndex("agent_lifecycle_operations_idempotency_key")
+			.on(t.idempotencyKey)
+			.where(sql`${t.idempotencyKey} is not null`),
+		check("agent_lifecycle_operations_kind", oneOf("kind", AGENT_LIFECYCLE_OPERATION_KINDS)),
+		check("agent_lifecycle_operations_source", oneOf("source", AGENT_LIFECYCLE_SOURCES)),
+		check("agent_lifecycle_operations_state", oneOf("state", AGENT_LIFECYCLE_OPERATION_STATES)),
+	],
+);
 
 export const CHANNEL_GRANT_STATES = ["active", "revoked"] as const;
 export type ChannelGrantState = (typeof CHANNEL_GRANT_STATES)[number];

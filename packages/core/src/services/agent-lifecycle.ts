@@ -1,0 +1,810 @@
+import { randomUUID } from "node:crypto";
+import {
+	type AgentConfig,
+	type AgentCreateInput,
+	type AgentId,
+	type AgentLifecycleCheckpoints,
+	type AgentLifecycleOperationKind,
+	type AgentLifecycleSource,
+	type AgentLifecycleStatus,
+	type ChangeSet,
+	type ConfigRevisionSource,
+	ConfigSnapshotBundleSchema,
+	type RequestAgentCreateInput,
+	RequestAgentCreateInputSchema,
+	type RequestAgentRestoreInput,
+	RequestAgentRestoreInputSchema,
+	type RequestAgentRetireInput,
+	RequestAgentRetireInputSchema,
+	type RuntimeAdapterId,
+} from "@agent-gateway/contracts";
+import {
+	agentLifecycle,
+	agentLifecycleOperations,
+	gatewayControls,
+	mattermostIdentities,
+	runtimeWorkers,
+} from "@agent-gateway/db";
+import { asc, eq, gt, inArray } from "drizzle-orm";
+import type { z } from "zod";
+import { AdminError, inTransaction } from "./admin.ts";
+import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
+import {
+	activeConfigRevisionId,
+	type CommitOutcome,
+	commitChangeIn,
+	loadActiveBundle,
+	ManagementConflictError,
+} from "./management.ts";
+import { WORKER_STALE_MS } from "./runtime-health.ts";
+import { scheduleAgent } from "./scheduler.ts";
+import { audit } from "./store.ts";
+
+type Db = UnitOfWork["tx"]["db"];
+type AgentLifecycleRow = typeof agentLifecycle.$inferSelect;
+type AgentLifecycleOperationRow = typeof agentLifecycleOperations.$inferSelect;
+type CommittedOutcome = Extract<CommitOutcome, { kind: "committed" }>;
+
+/**
+ * A lifecycle operation is no longer the one its agent's `agent_lifecycle` row is currently
+ * pursuing (a later request superseded it: `operationId`, and the `generation` it was issued for,
+ * have both moved on). A stale worker's own `markProvisioning`/`completeOperation`/`failOperation`
+ * call is refused this way rather than silently applied to a request nobody is waiting on anymore.
+ */
+export class StaleLifecycleOperationError extends Error {
+	constructor(readonly operationId: string) {
+		super(`lifecycle operation '${operationId}' is no longer its agent's current operation`);
+		this.name = "StaleLifecycleOperationError";
+	}
+}
+
+/** The three surfaces a lifecycle request can come from, mapped to the configuration journal's
+ * own, longer-standing vocabulary (ADR-024): `cli` commits as `cli_apply`, the same source
+ * `gateway agent enable|disable` already uses; `console`/`agent` are identical in both. */
+function configRevisionSourceOf(source: AgentLifecycleSource): ConfigRevisionSource {
+	return source === "cli" ? "cli_apply" : source;
+}
+
+/** Adapters with at least one fresh, ready worker: "installed and qualified on this deployment"
+ * (`runtime_workers`, migration 0007 / `runtime-health.ts`), read inside the caller's own
+ * transaction rather than through `runtimeHealth`'s own pooled transaction. */
+async function readyRuntimeAdapters(db: Db, now: Date): Promise<ReadonlySet<RuntimeAdapterId>> {
+	const rows = await db
+		.select({ adapter: runtimeWorkers.adapter, status: runtimeWorkers.status })
+		.from(runtimeWorkers)
+		.where(gt(runtimeWorkers.lastSeenAt, new Date(now.getTime() - WORKER_STALE_MS)));
+	return new Set(rows.filter((row) => row.status === "ready").map((row) => row.adapter));
+}
+
+const DEFAULT_CREATE_ADAPTER: RuntimeAdapterId = "codex";
+const DEFAULT_CREATE_SESSION_POLICY = "resumable-if-available" as const;
+const DEFAULT_CREATE_TIMEOUT_SECONDS = 1800;
+
+/**
+ * The runtime a new agent gets when `input` leaves fields unset: the deployment's Codex settings.
+ * `adapter` defaults to `codex`; `model` then defaults to the one model every enabled Codex agent
+ * in `existingAgents` already shares (`undefined` when none do, or they disagree — the runtime
+ * adapter's own default model applies, exactly as an existing agent's own unset `model` already
+ * behaves). `profile`/`session_policy`/`timeout_seconds` default the same way regardless of
+ * adapter. An explicit `input.adapter` other than `codex` never looks at existing agents' models.
+ * Pure and deterministic: `requestAgentCreate` validates the result's availability separately.
+ */
+export function resolveCreateRuntime(
+	existingAgents: Readonly<AgentConfig[]>,
+	input: AgentCreateInput["runtime"],
+): AgentConfig["runtime"] {
+	const adapter = input?.adapter ?? DEFAULT_CREATE_ADAPTER;
+	const profile = input?.profile ?? "default";
+	const session_policy = input?.session_policy ?? DEFAULT_CREATE_SESSION_POLICY;
+	const timeout_seconds = input?.timeout_seconds ?? DEFAULT_CREATE_TIMEOUT_SECONDS;
+	let model = input?.model;
+	if (model === undefined && adapter === "codex") {
+		const codexModels = new Set(
+			existingAgents
+				.filter((agent) => agent.runtime.adapter === "codex")
+				.map((agent) => agent.runtime.model)
+				.filter((value): value is string => value !== undefined),
+		);
+		model = codexModels.size === 1 ? [...codexModels][0] : undefined;
+	}
+	return model === undefined
+		? { adapter, profile, session_policy, timeout_seconds }
+		: { adapter, profile, session_policy, timeout_seconds, model };
+}
+
+/** Attempts a lifecycle request's own configuration commit may need: see `commitWithinLock`. */
+const MAX_LIFECYCLE_COMMIT_ATTEMPTS = 2;
+
+/**
+ * Commits `changeSet` through {@link commitChangeIn}, in the caller's already-open `uow` and under
+ * the `gateway_controls` lock it already holds. A true conflict — another transaction moving the
+ * active revision — cannot happen while that lock is held; the only way `commitChangeIn` still
+ * reports one is its own internal backfill discovering, on its very first commit since, a drift
+ * that predates this transaction entirely (see `ensureConfigHistoryIn`). Retrying once more
+ * against the revision it just recorded always succeeds, since nothing else can move it for the
+ * rest of this transaction.
+ */
+async function commitWithinLock(
+	uow: UnitOfWork,
+	baseRevisionId: number | null,
+	changeSet: ChangeSet,
+	actor: string,
+	source: ConfigRevisionSource,
+	reason?: string,
+): Promise<CommittedOutcome> {
+	let base = baseRevisionId;
+	for (let attempt = 1; attempt <= MAX_LIFECYCLE_COMMIT_ATTEMPTS; attempt += 1) {
+		const outcome = await commitChangeIn(
+			uow,
+			{
+				changeSet,
+				baseRevisionId: base,
+				actor,
+				source,
+				...(reason === undefined ? {} : { reason }),
+			},
+			changeSet,
+		);
+		if (outcome.kind === "committed") {
+			return outcome;
+		}
+		base = outcome.currentRevisionId;
+	}
+	throw new ManagementConflictError(base);
+}
+
+/** A `z.strictObject(...).safeParse(input)` result, refused as `AdminError` rather than left as a
+ * raw `ZodError` — every other validation failure in this service surfaces the same way. */
+function parseOrRefuse<T>(result: z.ZodSafeParseResult<T>, what: string): T {
+	if (result.success) {
+		return result.data;
+	}
+	throw new AdminError(
+		`${what} is invalid:\n- ${result.error.issues
+			.map((issue) => `${issue.path.join(".")}: ${issue.message}`)
+			.join("\n- ")}`,
+	);
+}
+
+async function lockGatewayControls(db: Db): Promise<number | null> {
+	await db.insert(gatewayControls).values({ id: 1 }).onConflictDoNothing();
+	const [controls] = await db
+		.select({ revision: gatewayControls.activeConfigRevision })
+		.from(gatewayControls)
+		.where(eq(gatewayControls.id, 1))
+		.for("update");
+	return controls?.revision ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// Create
+// ---------------------------------------------------------------------------
+
+export type RequestAgentCreateResult = Readonly<{
+	operationId: string;
+	agentId: AgentId;
+	revisionId: number;
+}>;
+
+/**
+ * Creates a new agent: validates the request, then, in one transaction, commits an `add_agent`
+ * change set (`enabled: true`) and records the agent as `pending` with a `create` operation
+ * `pending` — a failure anywhere in that transaction (an invalid configuration, a stale backfill
+ * that still cannot resolve, a duplicate id discovered under the lock) rolls back both the
+ * configuration change and the lifecycle rows together. No Mattermost call is made here; actually
+ * provisioning the agent's bot is later work, which resumes through `markProvisioning` and
+ * completes through `completeOperation`/`failOperation` using the operation id this returns.
+ *
+ * Refused, before anything is written: the agent id already exists in `agent_lifecycle` in any
+ * status, including `retired` (ids are never reused); the Mattermost username is already used by
+ * another agent's identity (adopted or not); the resolved runtime adapter has no fresh, ready
+ * worker on this deployment. A repeat with the same `idempotencyKey` replays the first call's
+ * result instead of re-validating.
+ */
+export async function requestAgentCreate(
+	deps: ControlPlaneDeps,
+	input: RequestAgentCreateInput,
+): Promise<RequestAgentCreateResult> {
+	const parsed = parseOrRefuse(
+		RequestAgentCreateInputSchema.safeParse(input),
+		"agent create request",
+	);
+	return inTransaction(deps, async (uow) => {
+		const { db } = uow.tx;
+		const baseRevisionId = await lockGatewayControls(db);
+
+		if (parsed.idempotencyKey !== undefined) {
+			const [existing] = await db
+				.select()
+				.from(agentLifecycleOperations)
+				.where(eq(agentLifecycleOperations.idempotencyKey, parsed.idempotencyKey));
+			if (existing !== undefined) {
+				if (existing.kind !== "create" || existing.agentId !== parsed.agent.id) {
+					throw new AdminError(
+						`idempotency key '${parsed.idempotencyKey}' was already used for a different request`,
+					);
+				}
+				if (existing.configRevisionId === null) {
+					throw new AdminError(`operation '${existing.id}' has no recorded configuration revision`);
+				}
+				return {
+					operationId: existing.id,
+					agentId: existing.agentId,
+					revisionId: existing.configRevisionId,
+				};
+			}
+		}
+
+		const [existingLifecycle] = await db
+			.select({ status: agentLifecycle.status })
+			.from(agentLifecycle)
+			.where(eq(agentLifecycle.agentId, parsed.agent.id));
+		if (existingLifecycle !== undefined) {
+			throw new AdminError(
+				`agent id '${parsed.agent.id}' was already created (status '${existingLifecycle.status}'); agent ids are never reused`,
+			);
+		}
+
+		const [existingIdentity] = await db
+			.select({ agentId: mattermostIdentities.agentId })
+			.from(mattermostIdentities)
+			.where(eq(mattermostIdentities.username, parsed.agent.mattermost.username));
+		if (existingIdentity !== undefined) {
+			throw new AdminError(
+				`Mattermost username '${parsed.agent.mattermost.username}' is already used by agent '${existingIdentity.agentId}'`,
+			);
+		}
+
+		const { bundle: base } = await loadActiveBundle(db, baseRevisionId);
+		const runtime = resolveCreateRuntime(base.agents, parsed.agent.runtime);
+		const ready = await readyRuntimeAdapters(db, uow.now);
+		if (!ready.has(runtime.adapter)) {
+			throw new AdminError(
+				`runtime adapter '${runtime.adapter}' is not installed and qualified on this deployment`,
+			);
+		}
+
+		const agent: AgentConfig = { ...parsed.agent, schema_version: 1, enabled: true, runtime };
+		const changeSet: ChangeSet = [{ type: "add_agent", agent, rolePrompt: parsed.rolePrompt }];
+		const commit = await commitWithinLock(
+			uow,
+			baseRevisionId,
+			changeSet,
+			parsed.actor,
+			configRevisionSourceOf(parsed.source),
+		);
+
+		const operationId = randomUUID();
+		// `agents.id` (and so `agent_lifecycle.agent_id`'s own foreign key) already exists: the
+		// commit above upserted it as part of writing the `add_agent` revision.
+		await db.insert(agentLifecycle).values({
+			agentId: agent.id,
+			status: "pending",
+			generation: 1,
+			operationId,
+			statusChangedAt: uow.now,
+			createdAt: uow.now,
+		});
+		await db.insert(agentLifecycleOperations).values({
+			id: operationId,
+			agentId: agent.id,
+			kind: "create",
+			requestedBy: parsed.actor,
+			source: parsed.source,
+			idempotencyKey: parsed.idempotencyKey ?? null,
+			configRevisionId: commit.result.revisionId,
+			generation: 1,
+			state: "pending",
+			checkpoints: {},
+			createdAt: uow.now,
+			updatedAt: uow.now,
+		});
+		await audit(uow, parsed.actor, "agent_lifecycle.create", "agent", agent.id, {
+			operation_id: operationId,
+			revision_id: commit.result.revisionId,
+		});
+		return { operationId, agentId: agent.id, revisionId: commit.result.revisionId };
+	});
+}
+
+// ---------------------------------------------------------------------------
+// Retire
+// ---------------------------------------------------------------------------
+
+export type RequestAgentRetireResult = Readonly<{
+	operationId: string;
+	agentId: AgentId;
+	revisionId: number;
+}>;
+
+/**
+ * Retires an agent: validates, then, in one transaction, commits a `remove_agent` change set and
+ * moves the lifecycle row to `retiring` with a `retire` operation `pending`. The actual cleanup —
+ * cancelling runs, waits and approvals, deactivating the bot — is later work; this only records
+ * the desired state and an operation id for that work to resume and complete through
+ * `markProvisioning`/`completeOperation`/`failOperation`.
+ */
+export async function requestAgentRetire(
+	deps: ControlPlaneDeps,
+	input: RequestAgentRetireInput,
+): Promise<RequestAgentRetireResult> {
+	const parsed = parseOrRefuse(
+		RequestAgentRetireInputSchema.safeParse(input),
+		"agent retire request",
+	);
+	return inTransaction(deps, async (uow) => {
+		const { db } = uow.tx;
+		const baseRevisionId = await lockGatewayControls(db);
+
+		if (parsed.idempotencyKey !== undefined) {
+			const [existing] = await db
+				.select()
+				.from(agentLifecycleOperations)
+				.where(eq(agentLifecycleOperations.idempotencyKey, parsed.idempotencyKey));
+			if (existing !== undefined) {
+				if (existing.kind !== "retire" || existing.agentId !== parsed.agentId) {
+					throw new AdminError(
+						`idempotency key '${parsed.idempotencyKey}' was already used for a different request`,
+					);
+				}
+				if (existing.configRevisionId === null) {
+					throw new AdminError(`operation '${existing.id}' has no recorded configuration revision`);
+				}
+				return {
+					operationId: existing.id,
+					agentId: existing.agentId,
+					revisionId: existing.configRevisionId,
+				};
+			}
+		}
+
+		const [lifecycle] = await db
+			.select()
+			.from(agentLifecycle)
+			.where(eq(agentLifecycle.agentId, parsed.agentId))
+			.for("update");
+		if (lifecycle === undefined) {
+			throw new AdminError(`agent '${parsed.agentId}' has no lifecycle record`);
+		}
+		if (lifecycle.status === "retiring" || lifecycle.status === "retired") {
+			throw new AdminError(`agent '${parsed.agentId}' is already '${lifecycle.status}'`);
+		}
+
+		const changeSet: ChangeSet = [{ type: "remove_agent", agentId: parsed.agentId }];
+		const commit = await commitWithinLock(
+			uow,
+			baseRevisionId,
+			changeSet,
+			parsed.actor,
+			configRevisionSourceOf(parsed.source),
+			parsed.reason,
+		);
+
+		const operationId = randomUUID();
+		const generation = lifecycle.generation + 1;
+		await db.insert(agentLifecycleOperations).values({
+			id: operationId,
+			agentId: parsed.agentId,
+			kind: "retire",
+			requestedBy: parsed.actor,
+			source: parsed.source,
+			idempotencyKey: parsed.idempotencyKey ?? null,
+			configRevisionId: commit.result.revisionId,
+			generation,
+			state: "pending",
+			checkpoints: {},
+			createdAt: uow.now,
+			updatedAt: uow.now,
+		});
+		await db
+			.update(agentLifecycle)
+			.set({ status: "retiring", generation, operationId, statusChangedAt: uow.now })
+			.where(eq(agentLifecycle.agentId, parsed.agentId));
+		await audit(uow, parsed.actor, "agent_lifecycle.retire", "agent", parsed.agentId, {
+			operation_id: operationId,
+			revision_id: commit.result.revisionId,
+		});
+		return { operationId, agentId: parsed.agentId, revisionId: commit.result.revisionId };
+	});
+}
+
+// ---------------------------------------------------------------------------
+// Restore
+// ---------------------------------------------------------------------------
+
+export type RequestAgentRestoreResult = Readonly<{
+	operationId: string;
+	agentId: AgentId;
+	revisionId: number;
+}>;
+
+/**
+ * The most recent recorded revision whose snapshot still names `agentId`, and that agent's own
+ * definition and role prompt within it — searched with a jsonb containment check rather than
+ * loaded and scanned bundle by bundle in application code, since the journal can be long. Null
+ * when no recorded snapshot ever configured this agent (should not happen for an agent that was
+ * ever `retiring`, whose own `remove_agent` commit is itself such a snapshot's parent — but an
+ * upgrade from a release before configuration history existed may have lost it; see ADR-024), or
+ * a found snapshot no longer parses (`ConfigSnapshotBundleSchema`).
+ */
+async function findLastConfiguredAgent(
+	uow: UnitOfWork,
+	agentId: string,
+): Promise<Readonly<{ agent: AgentConfig; rolePrompt: string }> | null> {
+	const result = await uow.tx.client.query<{ bundle: unknown }>(
+		`select s.bundle
+		   from config_revisions r
+		   join config_snapshots s on s.hash = r.snapshot_hash
+		  where s.bundle -> 'agents' @> $1::jsonb
+		  order by r.id desc
+		  limit 1`,
+		[JSON.stringify([{ id: agentId }])],
+	);
+	const row = result.rows[0];
+	if (row === undefined) {
+		return null;
+	}
+	const parsed = ConfigSnapshotBundleSchema.safeParse(row.bundle);
+	if (!parsed.success) {
+		return null;
+	}
+	const agent = parsed.data.agents.find((candidate) => candidate.id === agentId);
+	const rolePrompt = parsed.data.rolePrompts[agentId];
+	return agent === undefined || rolePrompt === undefined ? null : { agent, rolePrompt };
+}
+
+/**
+ * Restores a retired agent: re-adds its configuration from the last recorded snapshot that still
+ * had it (re-enabled), moving the lifecycle row from `retired` back to `pending` with a `restore`
+ * operation, in one transaction with the configuration commit exactly like `requestAgentCreate`.
+ * Refused when the agent is not `retired`, or when no historical configuration for it is still
+ * available (see `findLastConfiguredAgent`).
+ */
+export async function requestAgentRestore(
+	deps: ControlPlaneDeps,
+	input: RequestAgentRestoreInput,
+): Promise<RequestAgentRestoreResult> {
+	const parsed = parseOrRefuse(
+		RequestAgentRestoreInputSchema.safeParse(input),
+		"agent restore request",
+	);
+	return inTransaction(deps, async (uow) => {
+		const { db } = uow.tx;
+		const baseRevisionId = await lockGatewayControls(db);
+
+		if (parsed.idempotencyKey !== undefined) {
+			const [existing] = await db
+				.select()
+				.from(agentLifecycleOperations)
+				.where(eq(agentLifecycleOperations.idempotencyKey, parsed.idempotencyKey));
+			if (existing !== undefined) {
+				if (existing.kind !== "restore" || existing.agentId !== parsed.agentId) {
+					throw new AdminError(
+						`idempotency key '${parsed.idempotencyKey}' was already used for a different request`,
+					);
+				}
+				if (existing.configRevisionId === null) {
+					throw new AdminError(`operation '${existing.id}' has no recorded configuration revision`);
+				}
+				return {
+					operationId: existing.id,
+					agentId: existing.agentId,
+					revisionId: existing.configRevisionId,
+				};
+			}
+		}
+
+		const [lifecycle] = await db
+			.select()
+			.from(agentLifecycle)
+			.where(eq(agentLifecycle.agentId, parsed.agentId))
+			.for("update");
+		if (lifecycle === undefined) {
+			throw new AdminError(`agent '${parsed.agentId}' has no lifecycle record`);
+		}
+		if (lifecycle.status !== "retired") {
+			throw new AdminError(`agent '${parsed.agentId}' is '${lifecycle.status}', not retired`);
+		}
+
+		const historical = await findLastConfiguredAgent(uow, parsed.agentId);
+		if (historical === null) {
+			throw new AdminError(
+				`no historical configuration is still available for agent '${parsed.agentId}'`,
+			);
+		}
+
+		const agent: AgentConfig = { ...historical.agent, enabled: true };
+		const changeSet: ChangeSet = [{ type: "add_agent", agent, rolePrompt: historical.rolePrompt }];
+		const commit = await commitWithinLock(
+			uow,
+			baseRevisionId,
+			changeSet,
+			parsed.actor,
+			configRevisionSourceOf(parsed.source),
+		);
+
+		const operationId = randomUUID();
+		const generation = lifecycle.generation + 1;
+		await db.insert(agentLifecycleOperations).values({
+			id: operationId,
+			agentId: parsed.agentId,
+			kind: "restore",
+			requestedBy: parsed.actor,
+			source: parsed.source,
+			idempotencyKey: parsed.idempotencyKey ?? null,
+			configRevisionId: commit.result.revisionId,
+			generation,
+			state: "pending",
+			checkpoints: {},
+			createdAt: uow.now,
+			updatedAt: uow.now,
+		});
+		await db
+			.update(agentLifecycle)
+			.set({
+				status: "pending",
+				generation,
+				operationId,
+				statusChangedAt: uow.now,
+				retiredAt: null,
+			})
+			.where(eq(agentLifecycle.agentId, parsed.agentId));
+		await audit(uow, parsed.actor, "agent_lifecycle.restore", "agent", parsed.agentId, {
+			operation_id: operationId,
+			revision_id: commit.result.revisionId,
+		});
+		return { operationId, agentId: parsed.agentId, revisionId: commit.result.revisionId };
+	});
+}
+
+// ---------------------------------------------------------------------------
+// Operation state machine: markProvisioning / completeOperation / failOperation
+// ---------------------------------------------------------------------------
+
+/** Locks both rows (the operation, then its agent's lifecycle row — the same order every writer
+ * here uses) and refuses a stale call: one whose operation is no longer the one its agent's
+ * lifecycle row is currently pursuing, by id and by the generation it was issued for alike. */
+async function lockCurrentOperation(
+	db: Db,
+	operationId: string,
+): Promise<Readonly<{ operation: AgentLifecycleOperationRow; lifecycle: AgentLifecycleRow }>> {
+	const [operation] = await db
+		.select()
+		.from(agentLifecycleOperations)
+		.where(eq(agentLifecycleOperations.id, operationId))
+		.for("update");
+	if (operation === undefined) {
+		throw new AdminError(`lifecycle operation '${operationId}' does not exist`);
+	}
+	const [lifecycle] = await db
+		.select()
+		.from(agentLifecycle)
+		.where(eq(agentLifecycle.agentId, operation.agentId))
+		.for("update");
+	if (lifecycle === undefined) {
+		throw new AdminError(`agent '${operation.agentId}' has no lifecycle record`);
+	}
+	if (lifecycle.operationId !== operation.id || lifecycle.generation !== operation.generation) {
+		throw new StaleLifecycleOperationError(operationId);
+	}
+	return { operation, lifecycle };
+}
+
+function isTerminalOperationState(state: AgentLifecycleOperationRow["state"]): boolean {
+	return state === "succeeded" || state === "failed" || state === "cancelled";
+}
+
+/** The lifecycle status an operation's kind settles on once it succeeds. */
+function readyStatusOf(kind: AgentLifecycleOperationKind): AgentLifecycleStatus {
+	return kind === "retire" ? "retired" : "ready";
+}
+
+/**
+ * Marks a `pending` operation `running` and its agent `reconciling` (a `retire` operation leaves
+ * the agent `retiring`, already set by `requestAgentRetire`): the provisioner has started acting
+ * on it. Refused for an operation that is not its agent's current one (superseded), or not
+ * `pending`.
+ */
+export async function markProvisioning(
+	deps: ControlPlaneDeps,
+	operationId: string,
+	actor: string,
+): Promise<void> {
+	await inTransaction(deps, async (uow) => {
+		const { db } = uow.tx;
+		const { operation } = await lockCurrentOperation(db, operationId);
+		if (operation.state !== "pending") {
+			throw new AdminError(
+				`lifecycle operation '${operationId}' is '${operation.state}', not pending`,
+			);
+		}
+		await db
+			.update(agentLifecycleOperations)
+			.set({ state: "running", updatedAt: uow.now })
+			.where(eq(agentLifecycleOperations.id, operationId));
+		if (operation.kind !== "retire") {
+			await db
+				.update(agentLifecycle)
+				.set({ status: "reconciling", statusChangedAt: uow.now })
+				.where(eq(agentLifecycle.agentId, operation.agentId));
+		}
+		await audit(uow, actor, "agent_lifecycle.provisioning", "agent", operation.agentId, {
+			operation_id: operationId,
+		});
+	});
+}
+
+/**
+ * Marks an operation `succeeded` and its agent `ready` (`retired` for a `retire` operation),
+ * clearing `last_error`, and wakes the agent (`scheduleAgent`) so inbox work that arrived while it
+ * was not yet ready runs without waiting for the periodic sweep. Refused for a stale or already
+ * terminal operation.
+ */
+export async function completeOperation(
+	deps: ControlPlaneDeps,
+	operationId: string,
+	actor: string,
+	checkpoints?: AgentLifecycleCheckpoints,
+): Promise<void> {
+	await inTransaction(deps, async (uow) => {
+		const { db } = uow.tx;
+		const { operation, lifecycle } = await lockCurrentOperation(db, operationId);
+		if (isTerminalOperationState(operation.state)) {
+			throw new AdminError(`lifecycle operation '${operationId}' is already '${operation.state}'`);
+		}
+		await db
+			.update(agentLifecycleOperations)
+			.set({
+				state: "succeeded",
+				checkpoints: checkpoints ?? operation.checkpoints,
+				updatedAt: uow.now,
+				finishedAt: uow.now,
+			})
+			.where(eq(agentLifecycleOperations.id, operationId));
+		const status = readyStatusOf(operation.kind);
+		await db
+			.update(agentLifecycle)
+			.set({
+				status,
+				statusChangedAt: uow.now,
+				lastError: null,
+				retiredAt: status === "retired" ? uow.now : lifecycle.retiredAt,
+			})
+			.where(eq(agentLifecycle.agentId, operation.agentId));
+		await audit(uow, actor, "agent_lifecycle.completed", "agent", operation.agentId, {
+			operation_id: operationId,
+			kind: operation.kind,
+		});
+		if (status === "ready") {
+			await scheduleAgent(uow, operation.agentId);
+		}
+	});
+}
+
+/** Bounded, like every other stored lifecycle error (see `AgentLifecycleErrorSchema`). */
+const MAX_LIFECYCLE_ERROR_LENGTH = 2000;
+
+/**
+ * Marks an operation `failed` and its agent `failed`, recording `error` on both rows. Refused for
+ * a stale or already terminal operation.
+ */
+export async function failOperation(
+	deps: ControlPlaneDeps,
+	operationId: string,
+	actor: string,
+	error: string,
+): Promise<void> {
+	const bounded = error.slice(0, MAX_LIFECYCLE_ERROR_LENGTH);
+	await inTransaction(deps, async (uow) => {
+		const { db } = uow.tx;
+		const { operation } = await lockCurrentOperation(db, operationId);
+		if (isTerminalOperationState(operation.state)) {
+			throw new AdminError(`lifecycle operation '${operationId}' is already '${operation.state}'`);
+		}
+		await db
+			.update(agentLifecycleOperations)
+			.set({ state: "failed", error: bounded, updatedAt: uow.now, finishedAt: uow.now })
+			.where(eq(agentLifecycleOperations.id, operationId));
+		await db
+			.update(agentLifecycle)
+			.set({ status: "failed", statusChangedAt: uow.now, lastError: bounded })
+			.where(eq(agentLifecycle.agentId, operation.agentId));
+		await audit(uow, actor, "agent_lifecycle.failed", "agent", operation.agentId, {
+			operation_id: operationId,
+			kind: operation.kind,
+		});
+	});
+}
+
+/**
+ * Operations still `running`: a controller restarting resumes exactly these, since a provisioner
+ * that was midway through one when the process died leaves it here rather than `pending` or
+ * terminal.
+ */
+export async function listRunningLifecycleOperations(
+	deps: ControlPlaneDeps,
+): Promise<Readonly<AgentLifecycleOperationRow[]>> {
+	return inTransaction(deps, ({ tx }) =>
+		tx.db
+			.select()
+			.from(agentLifecycleOperations)
+			.where(eq(agentLifecycleOperations.state, "running"))
+			.orderBy(asc(agentLifecycleOperations.createdAt)),
+	);
+}
+
+// ---------------------------------------------------------------------------
+// Adoption backfill
+// ---------------------------------------------------------------------------
+
+/**
+ * Adopts every agent in the active configuration snapshot that has no `agent_lifecycle` row yet:
+ * `ready` when bootstrap already resolved its Mattermost identity (`mattermost_identities.mattermost_user_id`
+ * is set), `pending` otherwise — each with a `succeeded` `adopt` operation recording the active
+ * revision at adoption time. Idempotent and safe to call at every controller/CLI startup, exactly
+ * like `ensureConfigHistory`: an agent already adopted (including one later retired) is left
+ * untouched, and a database with no active configuration at all does nothing.
+ */
+export async function ensureAgentLifecycleAdoption(
+	deps: ControlPlaneDeps,
+	actor: string,
+): Promise<void> {
+	const revisionId = await activeConfigRevisionId(deps);
+	await inTransaction(deps, async (uow) => {
+		const { db } = uow.tx;
+		const { bundle } = await loadActiveBundle(db, revisionId);
+		if (bundle.agents.length === 0) {
+			return;
+		}
+		const ids = bundle.agents.map((agent) => agent.id);
+		const already = new Set(
+			(
+				await db
+					.select({ agentId: agentLifecycle.agentId })
+					.from(agentLifecycle)
+					.where(inArray(agentLifecycle.agentId, ids))
+			).map((row) => row.agentId),
+		);
+		const toAdopt = bundle.agents.filter((agent) => !already.has(agent.id));
+		if (toAdopt.length === 0) {
+			return;
+		}
+		for (const agent of toAdopt) {
+			// Adopted agents keep running exactly as they do now: their identity, if any, is still
+			// `mattermost bootstrap`'s to provision. Only an agent created through the lifecycle starts
+			// `pending`, waiting for the provisioning that create requested.
+			const status: AgentLifecycleStatus = "ready";
+			await db.insert(agentLifecycle).values({
+				agentId: agent.id,
+				status,
+				generation: 1,
+				operationId: null,
+				statusChangedAt: uow.now,
+				createdAt: uow.now,
+			});
+			const operationId = randomUUID();
+			await db.insert(agentLifecycleOperations).values({
+				id: operationId,
+				agentId: agent.id,
+				kind: "adopt",
+				requestedBy: actor,
+				source: "cli",
+				configRevisionId: revisionId,
+				generation: 1,
+				state: "succeeded",
+				checkpoints: {},
+				createdAt: uow.now,
+				updatedAt: uow.now,
+				finishedAt: uow.now,
+			});
+			await db
+				.update(agentLifecycle)
+				.set({ operationId })
+				.where(eq(agentLifecycle.agentId, agent.id));
+			await audit(uow, actor, "agent_lifecycle.adopt", "agent", agent.id, {
+				status,
+				operation_id: operationId,
+			});
+		}
+	});
+}

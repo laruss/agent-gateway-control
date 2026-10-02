@@ -29,6 +29,7 @@ import {
 	configBundleProblems,
 	configHistoryNeedsBackfill,
 	decideMemory,
+	ensureAgentLifecycleAdoption,
 	ensureConfigHistory,
 	ingestEvent,
 	killAll,
@@ -798,6 +799,8 @@ async function runSessionCommand(
 			// command past this point — not just `config apply` — sees an up-to-date base revision
 			// (a console or `gateway agents enable|disable` reads it through `prepareChange`).
 			await ensureConfigHistory(session.deps, actor());
+			// ADR-026: adopts every configured agent that has no `agent_lifecycle` row yet.
+			await ensureAgentLifecycleAdoption(session.deps, actor());
 		}
 		return await dispatchSessionCommand(session, command, args, out);
 	} finally {
