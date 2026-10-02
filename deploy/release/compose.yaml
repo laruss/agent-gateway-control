@@ -92,9 +92,19 @@ services:
       DATABASE_URL_FILE: /run/secrets/database_url
       MATTERMOST_URL: ${MATTERMOST_URL:-}
       SECRETS_DIR: /run/secrets
+      # ADR-026: its own, separate override for /run/bot-secrets/ references (resolveSecretPath,
+      # @agent-gateway/service) — SECRETS_DIR must never collapse a lifecycle-created agent's bot
+      # token path into the operator-managed secrets directory above.
+      BOT_SECRETS_DIR: /run/bot-secrets
+      # `gateway doctor`'s 'mattermost_provisioning' check (ADR-026): read-only here too, the same
+      # file `gateway mattermost admin-token set|rotate` writes through the mount below.
+      MATTERMOST_ADMIN_TOKEN_FILE: /run/secrets/mattermost_admin_token
     volumes:
       - ${GATEWAY_HOME}/secrets/controller:/run/secrets
       - ${GATEWAY_HOME}/secrets:/secrets
+      # ADR-026: the lifecycle provisioner's own directory, read-only here — bootstrap never
+      # writes a lifecycle-created agent's token; the controller is its only writer.
+      - ${GATEWAY_HOME}/secrets/controller-bots:/run/bot-secrets:ro
       - ${GATEWAY_HOME}/config:/config:ro
       - ${GATEWAY_HOME}/backups:/backups
     tmpfs:

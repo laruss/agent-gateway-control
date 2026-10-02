@@ -11,6 +11,7 @@ import {
 	listRunningLifecycleOperations,
 	loadAgentConfig,
 	loadDirectoryEntry,
+	loadMattermostIdentity,
 	loadMattermostSnapshot,
 	markProvisioning,
 	PROVISIONING_ADMIN_DIRECTORY_NAME,
@@ -229,8 +230,15 @@ async function processOperation(
 				throw error;
 			}
 			checkpoints = await checkpoint(deps, operation.id, checkpoints, { bot_user_id: botUserId });
-			// Bootstrap's own counterpart: the resolved account, recorded as soon as it is known,
-			// independent of whether the rest of provisioning finishes this tick.
+		}
+		// Bootstrap's own counterpart: the resolved account, recorded in `mattermost_identities`.
+		// Checked and replayed idempotently every pass — not only right after `botUserId` is first
+		// resolved above — so a crash between persisting the `bot_user_id` checkpoint and this write
+		// completing can never leave the operation to finish with no identity ever recorded (a null
+		// `mattermost_user_id` forever): the next pass sees the checkpoint, skips `ensureBot` again,
+		// but still finds the identity unset and writes it.
+		const identity = await loadMattermostIdentity(deps, operation.agentId);
+		if (identity?.userId !== botUserId) {
 			await setAgentBotUser(deps, operation.agentId, botUserId, actor);
 		}
 

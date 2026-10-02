@@ -1,8 +1,9 @@
-import type {
-	AgentConfig,
-	AgentId,
-	MattermostId,
-	OrganizationConfig,
+import {
+	type AgentConfig,
+	type AgentId,
+	BOT_SECRET_FILE_PREFIX,
+	type MattermostId,
+	type OrganizationConfig,
 } from "@agent-gateway/contracts";
 import { type ApiChannel, isElevatedMember } from "./api-schemas.ts";
 import type { AdminMattermostClient, MattermostClientOptions } from "./client.ts";
@@ -33,6 +34,13 @@ export type MattermostPlan = Readonly<{
 /**
  * Every bot of a configuration: the listener in all managed channels, each agent in its own.
  * `tokenPath` maps a configured secret reference to the file that holds it.
+ *
+ * A lifecycle-created agent (ADR-026) is skipped entirely: its token lives under
+ * `/run/bot-secrets/`, issued and owned by the controller's own provisioner, which checkpoints
+ * and resumes its own provisioning independently. Bootstrap and reconcile never resolved that
+ * path correctly from the CLI container to begin with (it has no reason to share the
+ * provisioner's directory), and even where it does, revoking or rewriting that token out from
+ * under the provisioner is exactly the conflict this plan must not create.
  */
 export function mattermostPlan(
 	organization: OrganizationConfig,
@@ -41,6 +49,9 @@ export function mattermostPlan(
 	retiredBots: MattermostPlan["retiredBots"] = [],
 ): MattermostPlan {
 	const { mattermost } = organization;
+	const bootstrapManaged = agents.filter(
+		(agent) => !agent.mattermost.token_secret_file.startsWith(BOT_SECRET_FILE_PREFIX),
+	);
 	return {
 		team: mattermost.team,
 		channels: mattermost.channels,
@@ -54,7 +65,7 @@ export function mattermostPlan(
 				channels: mattermost.channels,
 				tokenPath: tokenPath(mattermost.listener.token_secret_file),
 			},
-			...agents.map((agent) => ({
+			...bootstrapManaged.map((agent) => ({
 				agentId: agent.id,
 				username: agent.mattermost.username,
 				displayName: agent.display_name,

@@ -82,7 +82,9 @@ function createInput(id: string, overrides: Record<string, unknown> = {}) {
 		agent: {
 			id,
 			display_name: id,
-			mattermost: { username: id, token_secret_file: `/run/secrets/mm_${id}_token` },
+			// Never `token_secret_file`: a create request may not choose it (ADR-026); the service
+			// always generates `/run/bot-secrets/mm_<id>_token` itself.
+			mattermost: { username: id },
 			runtime: {
 				adapter: "mock" as const,
 				session_policy: "stateless" as const,
@@ -282,7 +284,7 @@ describe("agent lifecycle service (ADR-026)", () => {
 			requestAgentCreate(
 				deps,
 				createInput("epsilon", {
-					mattermost: { username: "delta", token_secret_file: "/run/secrets/mm_epsilon_token" },
+					mattermost: { username: "delta" },
 				}),
 			),
 		).rejects.toThrow(/username/);
@@ -562,15 +564,7 @@ describe("agent lifecycle service (ADR-026)", () => {
 		// interleaving a provisioner's own transition can hit against a concurrent retirement.
 		for (let i = 0; i < 20; i += 1) {
 			const agentId = `deadlock-${i}`;
-			const created = await requestAgentCreate(
-				deps,
-				createInput(agentId, {
-					mattermost: {
-						username: agentId,
-						token_secret_file: `/run/secrets/mm_deadlock_${i}_token`,
-					},
-				}),
-			);
+			const created = await requestAgentCreate(deps, createInput(agentId));
 			await markProvisioning(deps, created.operationId, "test");
 			const retiring = requestAgentRetire(deps, { agentId, actor: "test", source: "cli" });
 			await new Promise((resolve) => setTimeout(resolve, 5));

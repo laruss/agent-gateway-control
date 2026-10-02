@@ -11,6 +11,7 @@ import {
 	type ChangeSet,
 	type ConfigRevisionSource,
 	ConfigSnapshotBundleSchema,
+	defaultAgentPermissions,
 	type RequestAgentCreateInput,
 	RequestAgentCreateInputSchema,
 	type RequestAgentRestoreInput,
@@ -299,17 +300,25 @@ export async function requestAgentCreate(
 			);
 		}
 
+		// Never a client's choice (`AgentCreateMattermostInputSchema` already drops the field): a
+		// lifecycle-created agent's bot token path is always this one, generated server-side.
 		const mattermost: AgentConfig["mattermost"] = {
 			...parsed.agent.mattermost,
-			token_secret_file:
-				parsed.agent.mattermost.token_secret_file ?? defaultBotSecretFile(parsed.agent.id),
+			token_secret_file: defaultBotSecretFile(parsed.agent.id),
 		};
+		const permissions: AgentConfig["permissions"] =
+			parsed.agent.permissions ??
+			defaultAgentPermissions(
+				parsed.agent.id,
+				base.organization?.organization.finance_agent_id ?? null,
+			);
 		const agent: AgentConfig = {
 			...parsed.agent,
 			schema_version: 1,
 			enabled: true,
 			runtime,
 			mattermost,
+			permissions,
 		};
 		const changeSet: ChangeSet = [{ type: "add_agent", agent, rolePrompt: parsed.rolePrompt }];
 		const commit = await commitWithinLock(

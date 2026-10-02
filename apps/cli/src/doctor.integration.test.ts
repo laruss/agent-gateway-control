@@ -1,0 +1,132 @@
+import { randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+	applyConfig,
+	type ControlPlaneDeps,
+	recordWorkerStatus,
+	requestAgentCreate,
+} from "@agent-gateway/core";
+import { createPool, migrateSchema } from "@agent-gateway/db";
+import { DEVELOPMENT_VERSION, silentLogger } from "@agent-gateway/logging";
+import { createBoss, migrateQueues, transactionalJobSink } from "@agent-gateway/queue";
+import { startTestPostgres, type TestPostgres } from "@agent-gateway/testkit";
+import type pg from "pg";
+import type { PgBoss } from "pg-boss";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { doctor, type Session } from "./commands.ts";
+import { loadConfigDirectory } from "./config-files.ts";
+
+const repoRoot = fileURLToPath(new URL("../../..", import.meta.url));
+const EXAMPLES_DIR = join(repoRoot, "config/examples");
+
+type Check = Readonly<{ name: string; ok: boolean; detail: string }>;
+
+async function runDoctor(session: Session): Promise<Readonly<Check[]>> {
+	const printed: string[] = [];
+	await doctor(session, { print: (line) => printed.push(line) });
+	return (JSON.parse(printed[0] ?? "{}") as { checks: Check[] }).checks;
+}
+
+describe("gateway doctor: 'mattermost_provisioning' sees the admin token the same way gateway-cli's own container does (ADR-026)", () => {
+	let postgres: TestPostgres;
+	let pool: pg.Pool;
+	let boss: PgBoss;
+	let deps: ControlPlaneDeps;
+	let session: Session;
+	let tokenDir: string;
+	const previousEnv = process.env.MATTERMOST_ADMIN_TOKEN_FILE;
+
+	beforeAll(async () => {
+		postgres = await startTestPostgres();
+		pool = createPool(postgres.connectionString, 4);
+		await migrateSchema({
+			pool,
+			connectionString: postgres.connectionString,
+			release: DEVELOPMENT_VERSION,
+			migrateQueues: () => migrateQueues(postgres.connectionString),
+		});
+		boss = createBoss(postgres.connectionString, "client");
+		await boss.start();
+		deps = {
+			pool,
+			jobs: (tx) => transactionalJobSink(boss, tx.client),
+			clock: () => new Date(),
+			random: Math.random,
+			log: silentLogger,
+		};
+		session = { deps, boss, close: async () => undefined };
+
+		// The example configuration (it names the finance agent `validateConfigBundle` requires)
+		// plus one lifecycle create request left `pending`: exactly what leaves
+		// `mattermost_provisioning` an operation actually waiting on the admin token, rather than
+		// trivially 'ok' with nothing to provision.
+		await applyConfig(deps, loadConfigDirectory(EXAMPLES_DIR, repoRoot), "test");
+		await recordWorkerStatus(
+			deps,
+			"mock",
+			{
+				kind: "worker_status",
+				workerId: randomUUID(),
+				sequence: 1,
+				status: "ready",
+				runtimeVersion: "test",
+				detail: "",
+			},
+			new Date(),
+		);
+		await requestAgentCreate(deps, {
+			agent: {
+				id: "waiting-agent",
+				display_name: "Waiting Agent",
+				mattermost: { username: "waiting-agent" },
+				runtime: { adapter: "mock" },
+				prompts: { role_file: "prompts/waiting-agent.md" },
+				wake_rules: [],
+				concurrency: { while_running: "enqueue" },
+				memory: { private_namespace: "agents/waiting-agent", shared_namespaces: [] },
+			},
+			rolePrompt: "Role.",
+			actor: "test",
+			source: "cli",
+		});
+
+		tokenDir = mkdtempSync(join(tmpdir(), "gateway-doctor-"));
+	});
+
+	afterAll(async () => {
+		await boss?.stop({ graceful: false });
+		await pool?.end();
+		await postgres?.stop();
+		rmSync(tokenDir, { recursive: true, force: true });
+	});
+
+	afterEach(() => {
+		if (previousEnv === undefined) {
+			delete process.env.MATTERMOST_ADMIN_TOKEN_FILE;
+		} else {
+			process.env.MATTERMOST_ADMIN_TOKEN_FILE = previousEnv;
+		}
+	});
+
+	it("reports not ok, naming the waiting operation, when the admin token file is absent", async () => {
+		process.env.MATTERMOST_ADMIN_TOKEN_FILE = join(tokenDir, "mattermost_admin_token");
+		const checks = await runDoctor(session);
+		const check = checks.find((c) => c.name === "mattermost_provisioning");
+		expect(check).toMatchObject({ ok: false });
+		expect(check?.detail).toContain("no Mattermost admin token configured");
+		expect(check?.detail).toContain("1 operation(s) waiting");
+	});
+
+	it("reports ok once the same file gateway-cli and the controller both read is present", async () => {
+		const path = join(tokenDir, "mattermost_admin_token");
+		writeFileSync(path, "a-token\n");
+		process.env.MATTERMOST_ADMIN_TOKEN_FILE = path;
+		const checks = await runDoctor(session);
+		const check = checks.find((c) => c.name === "mattermost_provisioning");
+		expect(check).toMatchObject({ ok: true });
+		expect(check?.detail).toContain("admin token configured");
+	});
+});

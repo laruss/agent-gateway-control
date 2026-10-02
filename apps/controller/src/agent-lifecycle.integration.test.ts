@@ -61,7 +61,6 @@ describe("agent lifecycle scheduling gate (ADR-026)", () => {
 				display_name: "Lifecycle Test",
 				mattermost: {
 					username: agentId,
-					token_secret_file: "/run/secrets/mm_lifecycle_test_token",
 					allowed_channels: ["hq"],
 				},
 				runtime: { adapter: "mock", session_policy: "stateless", timeout_seconds: 20 },
@@ -122,7 +121,6 @@ describe("agent lifecycle scheduling gate (ADR-026)", () => {
 				display_name: "Lifecycle Retire",
 				mattermost: {
 					username: agentId,
-					token_secret_file: "/run/secrets/mm_lifecycle_retire_token",
 					allowed_channels: ["hq"],
 				},
 				runtime: { adapter: "mock", session_policy: "stateless", timeout_seconds: 20 },

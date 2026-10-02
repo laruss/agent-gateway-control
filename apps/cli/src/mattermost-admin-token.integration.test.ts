@@ -104,7 +104,14 @@ function startFakeMattermost() {
 					return json({}, 401);
 				}
 				const userId = createOrList[1] ?? "";
-				const ids = [...(tokensByUser.get(userId) ?? [])];
+				// Paged, like the real endpoint: a listing of more than one page's worth of tokens
+				// must take more than one request to see in full.
+				const page = Number(url.searchParams.get("page") ?? "0");
+				const perPage = Number(url.searchParams.get("per_page") ?? "60");
+				const ids = [...(tokensByUser.get(userId) ?? [])].slice(
+					page * perPage,
+					(page + 1) * perPage,
+				);
 				return json(ids.map((id) => ({ id, description: "agent-gateway-admin", is_active: true })));
 			}
 			if (url.pathname === "/api/v4/users/tokens/revoke" && request.method === "POST") {
@@ -125,9 +132,26 @@ function startFakeMattermost() {
 		},
 	});
 
+	/** Seeds `count` more revocable tokens on `userId`, standing in for a stray pile of old ones
+	 * (a crashed earlier rotate, say) — only their count and revocation matter here, never their
+	 * values, so `me()` never needs to look any of them up by value. */
+	const addTokens = (userId: string, count: number): void => {
+		for (let i = 0; i < count; i += 1) {
+			const tokenId = randomUUID();
+			const value = `extra-${randomUUID()}`;
+			tokens.set(tokenId, { value, userId });
+			accountByTokenValue.set(value, userId);
+			const ids = tokensByUser.get(userId) ?? new Set<string>();
+			ids.add(tokenId);
+			tokensByUser.set(userId, ids);
+		}
+	};
+
 	return {
 		baseUrl: `http://127.0.0.1:${server.port}`,
 		addAccount,
+		addTokens,
+		tokenCount: (userId: string): number => tokensByUser.get(userId)?.size ?? 0,
 		worksNow: (tokenValue: string) => accountByTokenValue.has(tokenValue),
 		stop: () => server.stop(true),
 	};
@@ -261,5 +285,36 @@ describe("gateway mattermost admin-token set|rotate (ADR-026)", () => {
 		expect(afterSecondRotate).not.toBe(afterFirstRotate);
 		expect(fake.worksNow(afterFirstRotate)).toBe(false);
 		expect(fake.worksNow(afterSecondRotate)).toBe(true);
+	});
+
+	it("revokes every old token even when the account has more than one page of them", async () => {
+		fake = startFakeMattermost();
+		const adminId = mmId("admin");
+		fake.addAccount("token-a", {
+			id: adminId,
+			username: "gateway-admin",
+			is_bot: false,
+			roles: "system_user system_admin",
+			delete_at: 0,
+		});
+		// 250 stray tokens plus `token-a`: more than one page at the real client's own per_page
+		// (200), so listing them all needs more than one request, and revoking them all needs more
+		// than the first page's worth of revoke calls.
+		fake.addTokens(adminId, 250);
+		expect(fake.tokenCount(adminId)).toBe(251);
+
+		const path = secretPath();
+		await mattermostAdminTokenSet(
+			{ baseUrl: fake.baseUrl, secretPath: path, reader: fakeReader(["token-a"]) },
+			() => undefined,
+		);
+
+		await mattermostAdminTokenRotate({ baseUrl: fake.baseUrl, secretPath: path }, () => undefined);
+
+		const newToken = readFileSync(path, "utf8").trim();
+		expect(fake.worksNow("token-a")).toBe(false);
+		expect(fake.worksNow(newToken)).toBe(true);
+		// Nothing left but the one just written: every stray token, on every page, was revoked.
+		expect(fake.tokenCount(adminId)).toBe(1);
 	});
 });

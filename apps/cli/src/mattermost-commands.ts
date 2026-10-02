@@ -49,10 +49,14 @@ async function versionedPlan(deps: ControlPlaneDeps, secretsDir: string | undefi
 	if (source === null) {
 		throw new MattermostCommandError("no active configuration; run 'gateway config apply' first");
 	}
+	// `mattermostPlan` already skips every lifecycle-created agent (its token is the provisioner's
+	// own, under bot-secrets); `botSecretsDirOf()` is passed regardless, so any reference this
+	// resolver does see under `/run/bot-secrets/` still maps into the gateway-cli container's own
+	// mount of that directory, never into `secretsDir`.
 	const plan = mattermostPlan(
 		source.organization,
 		source.agents,
-		(ref) => resolveSecretPath(ref, secretsDir),
+		(ref) => resolveSecretPath(ref, secretsDir, botSecretsDirOf()),
 		source.retired,
 	);
 	return { plan, version: source.version };
@@ -64,6 +68,13 @@ const BOOTSTRAP_RUNS = 3;
 function secretsDirOf(flagValue: string | null): string | undefined {
 	const dir = flagValue ?? readSetting("SECRETS_DIR");
 	return dir === undefined ? undefined : resolve(dir);
+}
+
+/** Where a `/run/bot-secrets/<name>` reference is looked up instead: `BOT_SECRETS_DIR`, defaulting
+ * to the mount itself (`/run/bot-secrets`) — distinct from `secretsDir`/`SECRETS_DIR`, which only
+ * ever overrides `/run/secrets/` (`resolveSecretPath`, `@agent-gateway/service`). */
+function botSecretsDirOf(): string {
+	return resolve(readSetting("BOT_SECRETS_DIR") ?? "/run/bot-secrets");
 }
 
 export type BootstrapArgs = Readonly<{
@@ -246,12 +257,20 @@ export async function mattermostAdminTokenRotate(
 		);
 	}
 	writeSecretFile(options.secretPath, created.token);
+	// `userAccessTokenIds` already pages through every token the account has; listed and revoked
+	// again, bounded, until only the one just written remains — the same margin `revokeAllTokens`
+	// (bootstrap's own retirement cleanup) leaves for a token appearing mid-revoke.
 	let revoked = 0;
-	for (const tokenId of await next.userAccessTokenIds(me.id)) {
-		if (tokenId !== created.id) {
+	for (let round = 0; round < 1000; round += 1) {
+		const remaining = (await next.userAccessTokenIds(me.id)).filter((id) => id !== created.id);
+		if (remaining.length === 0) {
+			print(`admin token rotated for account '${me.username}'; revoked ${revoked} old token(s)`);
+			return;
+		}
+		for (const tokenId of remaining) {
 			await next.revokeUserAccessToken(tokenId);
 			revoked += 1;
 		}
 	}
-	print(`admin token rotated for account '${me.username}'; revoked ${revoked} old token(s)`);
+	throw new MattermostCommandError(`could not revoke every old token of account '${me.username}'`);
 }

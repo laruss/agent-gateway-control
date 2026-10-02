@@ -490,6 +490,50 @@ describe("agent lifecycle provisioner (ADR-026)", () => {
 		expect(readFileSync(tokenPath, "utf8").trim()).toBe(admin.tokenValueOf(remainingToken));
 	});
 
+	it("resumes a crash between the bot_user_id checkpoint and the identity write: the agent still ends up with its bot recorded", async () => {
+		const admin = new FakeAdminClient(CHANNEL_IDS);
+		const created = await requestAgentCreate(deps, createInput("analyst", ["hq"]));
+
+		// Simulates a crash right after `bot_user_id` was checkpointed but before
+		// `mattermost_identities` was ever written: the bot exists, the checkpoint already names
+		// it, but the identity row this agent's config was created with still has no resolved
+		// account.
+		const bot = await admin.createBot({
+			username: "analyst",
+			display_name: "analyst",
+			description: "",
+		});
+		await markProvisioning(deps, created.operationId, "test");
+		await checkpointOperation(deps, created.operationId, { bot_user_id: bot.user_id });
+		const [before] = (
+			await pool.query(
+				"select mattermost_user_id from mattermost_identities where agent_id = 'analyst'",
+			)
+		).rows;
+		expect(before.mattermost_user_id).toBeNull();
+		// `createBot:analyst` was already called once, directly above, to seed the bot: the count
+		// from here is what matters — `ensureBot` must not run again now that a checkpoint names it.
+		const createBotCallsBefore = admin.calls.filter((c) => c.startsWith("createBot:")).length;
+
+		const { logger } = recordingLogger();
+		await pass(admin, logger);
+
+		const [operation] = (
+			await pool.query("select state from agent_lifecycle_operations where id = $1", [
+				created.operationId,
+			])
+		).rows;
+		expect(operation.state).toBe("succeeded");
+		// `ensureBot` is never called again: the checkpoint already named the account.
+		expect(admin.calls.filter((c) => c.startsWith("createBot:")).length).toBe(createBotCallsBefore);
+		const [identity] = (
+			await pool.query(
+				"select mattermost_user_id from mattermost_identities where agent_id = 'analyst'",
+			)
+		).rows;
+		expect(identity.mattermost_user_id).toBe(bot.user_id);
+	});
+
 	it("fails permanently when the bot's username is taken by a non-Gateway account", async () => {
 		const admin = new FakeAdminClient(CHANNEL_IDS);
 		admin.seedUser("analyst", { is_bot: false });

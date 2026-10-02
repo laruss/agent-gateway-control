@@ -20,22 +20,40 @@ export const SECRET_MOUNT = "/run/secrets/";
  * agents' bot tokens, generated server-side and never configured by a client. */
 export const BOT_SECRET_MOUNT = "/run/bot-secrets/";
 
-const SECRET_MOUNTS: Readonly<string[]> = [SECRET_MOUNT, BOT_SECRET_MOUNT];
-
 /**
  * The file behind a configured secret reference (`/run/secrets/<name>` or
- * `/run/bot-secrets/<name>`). With `secretsDir` (local development, bootstrap output) the same
- * name is looked up there instead, regardless of which mount it names: both are flat directories
- * of distinctly-named files, and development has no reason to keep them apart.
+ * `/run/bot-secrets/<name>`). `secretsDir` overrides where a `/run/secrets/` reference is looked
+ * up instead (local development, bootstrap output); `botSecretsDir` does the same for a
+ * `/run/bot-secrets/` one, separately — the two mounts are distinct directories in production
+ * (the controller's read-only, operator-managed secrets vs. its own read-write provisioned-token
+ * directory), so collapsing both into one override directory would resolve a lifecycle-created
+ * agent's token into the wrong place. Left unset, `botSecretsDir` defaults to `secretsDir`, so a
+ * single flattened directory standing in for both mounts (development and tests that never had
+ * two directories to begin with) still works without naming it twice.
  */
-export function resolveSecretPath(ref: string, secretsDir: string | undefined): string {
-	const mount = SECRET_MOUNTS.find((candidate) => ref.startsWith(candidate));
-	if (mount === undefined || basename(ref) !== ref.slice(mount.length)) {
+export function resolveSecretPath(
+	ref: string,
+	secretsDir: string | undefined,
+	botSecretsDir: string | undefined = secretsDir,
+): string {
+	if (ref.startsWith(SECRET_MOUNT)) {
+		return resolveWithinMount(ref, SECRET_MOUNT, secretsDir);
+	}
+	if (ref.startsWith(BOT_SECRET_MOUNT)) {
+		return resolveWithinMount(ref, BOT_SECRET_MOUNT, botSecretsDir);
+	}
+	throw new SettingError(
+		`secret reference '${ref}' is not a file under ${SECRET_MOUNT} or ${BOT_SECRET_MOUNT}`,
+	);
+}
+
+function resolveWithinMount(ref: string, mount: string, dir: string | undefined): string {
+	if (basename(ref) !== ref.slice(mount.length)) {
 		throw new SettingError(
 			`secret reference '${ref}' is not a file under ${SECRET_MOUNT} or ${BOT_SECRET_MOUNT}`,
 		);
 	}
-	return secretsDir === undefined ? ref : join(secretsDir, basename(ref));
+	return dir === undefined ? ref : join(dir, basename(ref));
 }
 
 /** Reads a secret file; an empty file is an error, never an empty credential. */

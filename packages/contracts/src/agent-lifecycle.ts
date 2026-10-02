@@ -145,28 +145,35 @@ export const AgentCreateRuntimeInputSchema = AgentRuntimeConfigSchema.partial({
 export type AgentCreateRuntimeInput = z.input<typeof AgentCreateRuntimeInputSchema>;
 
 /**
- * An agent's Mattermost identity as a create request supplies it: `token_secret_file` is optional
- * and, left unset, generated server-side under `/run/bot-secrets/` (ADR-026) — a lifecycle-created
- * agent's bot token file is never a client's to choose.
+ * An agent's Mattermost identity as a create request supplies it: `token_secret_file` is dropped
+ * entirely, never a field a caller may set. A lifecycle-created agent's bot token file is always
+ * generated server-side under `/run/bot-secrets/` (`defaultBotSecretFile`, ADR-026) — a client
+ * naming one of its own, say a controller secret it has no business touching, is refused outright
+ * (`z.strictObject`'s own unrecognized-key rejection), never silently overridden or ignored.
  */
-export const AgentCreateMattermostInputSchema = AgentMattermostConfigSchema.extend({
-	token_secret_file: SecretFileSchema.optional(),
+export const AgentCreateMattermostInputSchema = AgentMattermostConfigSchema.omit({
+	token_secret_file: true,
 });
 export type AgentCreateMattermostInput = z.input<typeof AgentCreateMattermostInputSchema>;
 
 /**
  * An agent definition as `requestAgentCreate` accepts it: the same shape as `AgentConfig` minus
  * `schema_version` (fixed) and `enabled` (always created enabled), with `runtime` optional for the
- * same reason and `mattermost.token_secret_file` optional (see `AgentCreateMattermostInputSchema`).
+ * same reason, `mattermost.token_secret_file` dropped (see `AgentCreateMattermostInputSchema`),
+ * and `permissions` optional — left unset, `requestAgentCreate` defaults it with
+ * `defaultAgentPermissions` (`config-bundle.ts`), the same rule `validateConfigBundle` enforces on
+ * every agent but the organization's own finance agent.
  */
 export const AgentCreateInputSchema = AgentConfigSchema.omit({
 	schema_version: true,
 	enabled: true,
 	runtime: true,
 	mattermost: true,
+	permissions: true,
 }).extend({
 	runtime: AgentCreateRuntimeInputSchema.optional(),
 	mattermost: AgentCreateMattermostInputSchema,
+	permissions: AgentConfigSchema.shape.permissions.optional(),
 });
 /** Before schema defaults are filled in (see `AgentCreateRuntimeInput`); this is the type every
  * `requestAgentCreate` caller actually builds. */

@@ -150,12 +150,32 @@ constrained in code to exactly the actions provisioning performs, never handed t
 - **Secrets.** The admin token is `secrets/controller/mattermost_admin_token`
   (`MATTERMOST_ADMIN_TOKEN_FILE`), read-only to the controller and written only by
   `gateway mattermost admin-token set|rotate`, which run through the CLI container's existing
-  read-write mount of that same directory. A lifecycle-created agent's own bot token is generated
-  server-side — never a path a client chooses — under a second, distinct directory,
-  `secrets/controller-bots` (`/run/bot-secrets` in the container), which the controller itself
-  mounts read-write: it is the only writer of the tokens it provisions there, as distinct from the
-  operator-managed secrets it only ever reads. Every token file is written atomically (a temporary
-  file in the same directory, `fsync`, then renamed over the target, mode 0600) and never logged.
+  read-write mount of that same directory; `gateway-cli` also reads `MATTERMOST_ADMIN_TOKEN_FILE`
+  (read-only, same file) so `gateway doctor`'s `mattermost_provisioning` check sees exactly what
+  the controller sees. A lifecycle-created agent's own bot token is generated server-side — never
+  a path a client chooses (rejected outright, not silently overridden, when a create request names
+  one; `AgentCreateMattermostInputSchema` carries no `token_secret_file` field at all) — under a
+  second, distinct directory, `secrets/controller-bots` (`/run/bot-secrets` in the container),
+  which the controller mounts read-write (it is the only writer of the tokens it provisions
+  there) and `gateway-cli` mounts read-only, its own override for that mount (`BOT_SECRETS_DIR`,
+  defaulting to `/run/bot-secrets`) always kept apart from `SECRETS_DIR`'s own override of
+  `/run/secrets/` (`resolveSecretPath`, `@agent-gateway/service`) — collapsing the two would
+  resolve a lifecycle-created agent's token into the wrong directory. Bundle validation reserves
+  the admin token's own path (`/run/secrets/mattermost_admin_token`) the same way it already
+  reserves the routing key's: no bot's `token_secret_file` may equal either. Every token file is
+  written atomically (a temporary file in the same directory, `fsync`, then renamed over the
+  target, mode 0600) and never logged.
+- **Bootstrap and reconcile never touch a lifecycle-created agent.** `gateway mattermost
+  bootstrap`/`reconcile` build their plan from every configured agent, but skip any whose
+  `mattermost.token_secret_file` lives under `/run/bot-secrets/`: that bot is the provisioner's
+  own to create, token and reconcile, through its own checkpoints (`agent_lifecycle_operations`,
+  `gateway agents operations`), never bootstrap's — a client-run CLI container sees only
+  `/run/secrets/` reliably (see above), and even where it also sees `/run/bot-secrets/`, revoking
+  or rewriting a token the provisioner is mid-way through issuing is exactly the conflict this
+  rule avoids. The rule reads the agent's own configuration (a `token_secret_file` prefix), not
+  its lifecycle row's operation history: equally correct here (every lifecycle-created agent's
+  token path is always under `/run/bot-secrets/`, and nothing else's ever is) and simpler to check
+  without an extra join.
 - **The provisioner.** A controller loop, alongside its other periodic work, takes
   `pending`/`running` `create`/`restore`/`reprovision` operations and drives each one through its
   steps — resolve or create the bot by username (refusing to adopt a stranger's account), issue it
@@ -165,6 +185,10 @@ constrained in code to exactly the actions provisioning performs, never handed t
   A controller restart resumes every `running` operation from its last checkpoint; a step already
   checkpointed is not repeated. With no admin token configured, the loop stays idle and every such
   operation simply stays `pending`, surfaced by `gateway doctor` rather than treated as a failure.
+  Recording the resolved account (`mattermost_identities`, bootstrap's own counterpart) is checked
+  and replayed every pass, not only the one that first resolves the bot: a crash between
+  persisting the `bot_user_id` checkpoint and that write completing must never let the operation
+  reach `completeOperation` with no identity ever recorded.
 - **Failure handling.** A step's failure is permanent — `failOperation`, with a redacted message,
   moving the agent to `failed` — only when a retry could never fix it: the bot's username is taken
   by an account that is not plausibly the Gateway's own, or the admin token is rejected or lacks
@@ -183,7 +207,10 @@ constrained in code to exactly the actions provisioning performs, never handed t
   only then is every other token the account has revoked — a crash between any two of those steps
   leaves a token that still works, never a provisioning path with no working credential at all, and
   a re-run after such a crash simply revokes whatever the interrupted attempt left stranded, since
-  nothing but the file itself says which token is current.
+  nothing but the file itself says which token is current. The account's tokens are listed a page
+  at a time until a page comes back short, so an account with more of them than one page holds is
+  still seen in full; revoking is itself listed and repeated, bounded, until only the newly written
+  token remains.
 
 Retirement's cleanup — cancelling an agent's runs, waits and approvals, deactivating its bot,
 revoking its token, reconciling channel memberships — is not part of this decision: it resumes

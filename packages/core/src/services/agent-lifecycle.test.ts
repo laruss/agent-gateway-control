@@ -123,7 +123,7 @@ describe("AgentCreateInput validation (ADR-026)", () => {
 			agent: {
 				id: "newagent",
 				display_name: "New Agent",
-				mattermost: { username: "newagent", token_secret_file: "/run/secrets/mm_newagent_token" },
+				mattermost: { username: "newagent" },
 				prompts: { role_file: "prompts/newagent.md" },
 				wake_rules: [],
 				concurrency: { while_running: "enqueue" },
@@ -156,7 +156,7 @@ describe("AgentCreateInput validation (ADR-026)", () => {
 
 	it("refuses a username with characters Mattermost does not allow", () => {
 		const parsed = RequestAgentCreateInputSchema.safeParse(
-			createInput({ mattermost: { username: "Not Valid!", token_secret_file: "/run/secrets/x" } }),
+			createInput({ mattermost: { username: "Not Valid!" } }),
 		);
 		expect(parsed.success).toBe(false);
 	});
@@ -170,12 +170,24 @@ describe("AgentCreateInput validation (ADR-026)", () => {
 		).toBe(false);
 	});
 
-	it("accepts mattermost.token_secret_file left unset: the provisioner generates it (ADR-026)", () => {
+	it("accepts mattermost with no token_secret_file: the provisioner generates it (ADR-026)", () => {
 		const parsed = RequestAgentCreateInputSchema.safeParse(
 			createInput({ mattermost: { username: "newagent" } }),
 		);
 		expect(parsed.success).toBe(true);
-		expect(parsed.success && parsed.data.agent.mattermost.token_secret_file).toBeUndefined();
+		expect(parsed.success && parsed.data.agent.mattermost).not.toHaveProperty("token_secret_file");
+	});
+
+	it("refuses a client-provided mattermost.token_secret_file outright (ADR-026): a lifecycle agent's bot token path is never a caller's to choose", () => {
+		const parsed = RequestAgentCreateInputSchema.safeParse(
+			createInput({
+				mattermost: {
+					username: "newagent",
+					token_secret_file: "/run/secrets/mattermost_admin_token",
+				},
+			}),
+		);
+		expect(parsed.success).toBe(false);
 	});
 });
 

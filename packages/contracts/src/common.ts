@@ -37,6 +37,12 @@ export const SecretFileSchema = z
 	);
 export type SecretFile = z.infer<typeof SecretFileSchema>;
 
+/** Prefix of a lifecycle-created agent's bot token file (ADR-026): generated server-side by the
+ * controller's own provisioner, under its read-write directory — never bootstrap's or reconcile's
+ * to resolve or touch (`mattermostPlan` skips any agent whose `token_secret_file` lives here; it
+ * is the provisioner's bot to manage). */
+export const BOT_SECRET_FILE_PREFIX = "/run/bot-secrets/";
+
 /** The controller's HMAC key for agent routing props; no bot token may live there. */
 export const ROUTING_KEY_SECRET_FILE: SecretFile = "/run/secrets/gateway_routing_key";
 

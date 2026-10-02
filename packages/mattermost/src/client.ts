@@ -238,14 +238,24 @@ export class MattermostClient {
 		}
 	}
 
-	/** Ids of the first page of an account's access tokens (values are never returned). */
+	/** Every id of an account's access tokens (values are never returned), paged until a page
+	 * comes back with fewer than `per_page`: an account with more tokens than one page holds
+	 * (a pile left by earlier crashed rotations, say) must still be seen in full, not just its
+	 * first page. */
 	async userAccessTokenIds(userId: MattermostId): Promise<Readonly<string[]>> {
-		const tokens = await this.call(
-			"GET",
-			`users/${userId}/tokens?page=0&per_page=200`,
-			z.array(z.looseObject({ id: z.string() })),
-		);
-		return tokens.map((token) => token.id);
+		const perPage = 200;
+		const ids: string[] = [];
+		for (let page = 0; ; page += 1) {
+			const tokens = await this.call(
+				"GET",
+				`users/${userId}/tokens?page=${page}&per_page=${perPage}`,
+				z.array(z.looseObject({ id: z.string() })),
+			);
+			ids.push(...tokens.map((token) => token.id));
+			if (tokens.length < perPage) {
+				return ids;
+			}
+		}
 	}
 
 	async revokeUserAccessToken(tokenId: string): Promise<void> {

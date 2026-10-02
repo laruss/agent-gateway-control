@@ -17,7 +17,7 @@ describe("secret files", () => {
 		expect(() => resolveSecretPath("/run/secrets/a/../b", undefined)).toThrow(SettingError);
 	});
 
-	it("maps bot-secrets references the same way, into the same directory", () => {
+	it("maps bot-secrets references the same way, into the same directory, when no bot-secrets override is given", () => {
 		expect(resolveSecretPath("/run/bot-secrets/mm_developer_token", undefined)).toBe(
 			"/run/bot-secrets/mm_developer_token",
 		);
@@ -25,6 +25,15 @@ describe("secret files", () => {
 			"/tmp/s/mm_developer_token",
 		);
 		expect(() => resolveSecretPath("/run/bot-secrets/a/../b", undefined)).toThrow(SettingError);
+	});
+
+	it("keeps a /run/secrets override and a /run/bot-secrets override apart when both are given: one never collapses into the other", () => {
+		expect(
+			resolveSecretPath("/run/bot-secrets/mm_developer_token", "/tmp/secrets", "/tmp/bot-secrets"),
+		).toBe("/tmp/bot-secrets/mm_developer_token");
+		expect(
+			resolveSecretPath("/run/secrets/mm_developer_token", "/tmp/secrets", "/tmp/bot-secrets"),
+		).toBe("/tmp/secrets/mm_developer_token");
 	});
 
 	it("writes owner-only files, replaces atomically and refuses symlinks", () => {

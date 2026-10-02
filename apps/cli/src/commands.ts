@@ -287,8 +287,11 @@ function flagsAll(args: Readonly<string[]>, name: string): Readonly<string[]> {
 /**
  * `gateway agents create`'s own arguments, turned into a `requestAgentCreate` input: reads the
  * role prompt file (a `prompts/<...>.md` path, relative to `root`) and assembles the rest from
- * flags, leaving `mattermost.token_secret_file` and `runtime` for the service to default. No
- * database or network access, so a test can call it directly with a `root` of its own.
+ * flags, leaving `mattermost.token_secret_file`, `runtime` and `permissions` for the service to
+ * default — `permissions` in particular needs the active organization's `finance_agent_id`
+ * (`defaultAgentPermissions`, `config-bundle.ts`) to know whether the new agent must deny
+ * `finance.*`, which this builder has no database access to read. No database or network access
+ * otherwise, so a test can call it directly with a `root` of its own.
  */
 export function buildAgentCreateRequest(
 	args: Readonly<string[]>,
@@ -324,7 +327,6 @@ export function buildAgentCreateRequest(
 			prompts: { role_file: rolePromptFile },
 			wake_rules: [{ event_type: "mattermost.agent.mentioned", target_agent_id: id }],
 			concurrency: { while_running: "enqueue" },
-			permissions: { tools_allow: [], tools_require_human_approval: [], tools_deny: [] },
 			memory: { private_namespace: `agents/${id}`, shared_namespaces: [] },
 		},
 		rolePrompt: readPromptFile(root, rolePromptFile),
@@ -411,7 +413,7 @@ async function migrate(out: Output): Promise<void> {
 	}
 }
 
-async function doctor(session: Session, out: Output): Promise<boolean> {
+export async function doctor(session: Session, out: Output): Promise<boolean> {
 	const { pool } = session.deps;
 	const checks: { name: string; ok: boolean; detail: string }[] = [];
 	await pool.query("select 1");
