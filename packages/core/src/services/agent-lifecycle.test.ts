@@ -70,6 +70,22 @@ describe("resolveCreateRuntime (ADR-026)", () => {
 		expect(resolveCreateRuntime(existing, undefined).model).toBeUndefined();
 	});
 
+	it("ignores a disabled codex agent's model when computing agreement", () => {
+		const existing = [
+			codexAgent("aa", "gpt-5-codex"),
+			{ ...codexAgent("bb", "gpt-5-codex-mini"), enabled: false },
+		];
+		expect(resolveCreateRuntime(existing, undefined)).toMatchObject({
+			adapter: "codex",
+			model: "gpt-5-codex",
+		});
+	});
+
+	it("leaves the model unset when the only codex agent with one set is disabled", () => {
+		const existing = [{ ...codexAgent("aa", "gpt-5-codex"), enabled: false }];
+		expect(resolveCreateRuntime(existing, undefined).model).toBeUndefined();
+	});
+
 	it("never consults existing codex agents' models for an explicitly different adapter", () => {
 		const existing = [codexAgent("aa", "gpt-5-codex")];
 		const runtime = resolveCreateRuntime(existing, { adapter: "mock" });

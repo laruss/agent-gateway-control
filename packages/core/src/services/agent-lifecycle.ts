@@ -25,12 +25,12 @@ import {
 	mattermostIdentities,
 	runtimeWorkers,
 } from "@agent-gateway/db";
-import { asc, eq, gt, inArray } from "drizzle-orm";
+import { redactForStorage } from "@agent-gateway/logging";
+import { and, asc, eq, gt, inArray } from "drizzle-orm";
 import type { z } from "zod";
-import { AdminError, inTransaction } from "./admin.ts";
+import { AdminError, ensureConfigHistoryIn, inTransaction } from "./admin.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
 import {
-	activeConfigRevisionId,
 	type CommitOutcome,
 	commitChangeIn,
 	loadActiveBundle,
@@ -101,7 +101,7 @@ export function resolveCreateRuntime(
 	if (model === undefined && adapter === "codex") {
 		const codexModels = new Set(
 			existingAgents
-				.filter((agent) => agent.runtime.adapter === "codex")
+				.filter((agent) => agent.enabled && agent.runtime.adapter === "codex")
 				.map((agent) => agent.runtime.model)
 				.filter((value): value is string => value !== undefined),
 		);
@@ -174,6 +174,26 @@ async function lockGatewayControls(db: Db): Promise<number | null> {
 		.where(eq(gatewayControls.id, 1))
 		.for("update");
 	return controls?.revision ?? null;
+}
+
+/**
+ * Cancels every `pending`/`running` operation `agentId` still has, right before a new operation
+ * replaces `agent_lifecycle.operation_id`: a create or restore that never finished provisioning
+ * would otherwise be stranded exactly where it was, forever matching `listRunningLifecycleOperations`
+ * (if `running`) although nothing its agent's lifecycle row does from here on is ever waiting on it
+ * again. Called with the agent's own `agent_lifecycle` row already locked (`for("update")`) by the
+ * caller, so lock order stays `gateway_controls` -> lifecycle row -> operation rows throughout.
+ */
+async function cancelNonterminalOperations(db: Db, agentId: AgentId, now: Date): Promise<void> {
+	await db
+		.update(agentLifecycleOperations)
+		.set({ state: "cancelled", updatedAt: now, finishedAt: now })
+		.where(
+			and(
+				eq(agentLifecycleOperations.agentId, agentId),
+				inArray(agentLifecycleOperations.state, ["pending", "running"]),
+			),
+		);
 }
 
 // ---------------------------------------------------------------------------
@@ -380,6 +400,10 @@ export async function requestAgentRetire(
 			parsed.reason,
 		);
 
+		// A create or restore still `pending`/`running` is superseded by this retire: it would
+		// otherwise be stranded there forever once `operation_id` below moves past it.
+		await cancelNonterminalOperations(db, parsed.agentId, uow.now);
+
 		const operationId = randomUUID();
 		const generation = lifecycle.generation + 1;
 		await db.insert(agentLifecycleOperations).values({
@@ -522,6 +546,11 @@ export async function requestAgentRestore(
 			parsed.actor,
 			configRevisionSourceOf(parsed.source),
 		);
+
+		// Defensive, like `requestAgentRetire`'s own call: a `retired` agent's last operation (its
+		// own `retire`) is already terminal in every reachable state, but a new operation supersedes
+		// whatever came before it here too, so nothing stays `pending`/`running` behind it.
+		await cancelNonterminalOperations(db, parsed.agentId, uow.now);
 
 		const operationId = randomUUID();
 		const generation = lifecycle.generation + 1;
@@ -685,8 +714,10 @@ export async function completeOperation(
 const MAX_LIFECYCLE_ERROR_LENGTH = 2000;
 
 /**
- * Marks an operation `failed` and its agent `failed`, recording `error` on both rows. Refused for
- * a stale or already terminal operation.
+ * Marks an operation `failed` and its agent `failed`, recording `error` on both rows. `error` is
+ * redacted (`redactForStorage`, the same helper runtime-health and approval failures already use)
+ * before it is bounded and persisted: a provisioner's own error text may quote a request or
+ * response that still carries a credential. Refused for a stale or already terminal operation.
  */
 export async function failOperation(
 	deps: ControlPlaneDeps,
@@ -694,7 +725,7 @@ export async function failOperation(
 	actor: string,
 	error: string,
 ): Promise<void> {
-	const bounded = error.slice(0, MAX_LIFECYCLE_ERROR_LENGTH);
+	const bounded = redactForStorage(error, MAX_LIFECYCLE_ERROR_LENGTH);
 	await inTransaction(deps, async (uow) => {
 		const { db } = uow.tx;
 		const { operation } = await lockCurrentOperation(db, operationId);
@@ -744,14 +775,42 @@ export async function listRunningLifecycleOperations(
  * revision at adoption time. Idempotent and safe to call at every controller/CLI startup, exactly
  * like `ensureConfigHistory`: an agent already adopted (including one later retired) is left
  * untouched, and a database with no active configuration at all does nothing.
+ *
+ * Takes the same `gateway_controls` row lock `commitChangeIn` takes (inserting the row first if
+ * missing), and backfills configuration history under it exactly like `ensureConfigHistory` does,
+ * before reading the active revision or any existing lifecycle row: two controllers or CLI
+ * sessions adopting at the same startup serialize on that lock rather than both seeing the same
+ * missing rows and racing each other's insert. The lifecycle insert is `on conflict do nothing`
+ * regardless, and only the rows it actually inserts get an `adopt` operation and an audit entry —
+ * belt and braces alongside the lock, not a substitute for it.
  */
 export async function ensureAgentLifecycleAdoption(
 	deps: ControlPlaneDeps,
 	actor: string,
 ): Promise<void> {
-	const revisionId = await activeConfigRevisionId(deps);
 	await inTransaction(deps, async (uow) => {
 		const { db } = uow.tx;
+		await db.insert(gatewayControls).values({ id: 1 }).onConflictDoNothing();
+		const [controls] = await db
+			.select({
+				version: gatewayControls.activeConfigVersion,
+				generation: gatewayControls.configGeneration,
+				revision: gatewayControls.activeConfigRevision,
+			})
+			.from(gatewayControls)
+			.where(eq(gatewayControls.id, 1))
+			.for("update");
+		if (controls === undefined) {
+			return;
+		}
+		const revisionId = await ensureConfigHistoryIn(uow, controls, actor);
+		if (revisionId !== controls.revision) {
+			await db
+				.update(gatewayControls)
+				.set({ activeConfigRevision: revisionId, updatedAt: uow.now })
+				.where(eq(gatewayControls.id, 1));
+		}
+
 		const { bundle } = await loadActiveBundle(db, revisionId);
 		if (bundle.agents.length === 0) {
 			return;
@@ -769,23 +828,31 @@ export async function ensureAgentLifecycleAdoption(
 		if (toAdopt.length === 0) {
 			return;
 		}
-		for (const agent of toAdopt) {
-			// Adopted agents keep running exactly as they do now: their identity, if any, is still
-			// `mattermost bootstrap`'s to provision. Only an agent created through the lifecycle starts
-			// `pending`, waiting for the provisioning that create requested.
-			const status: AgentLifecycleStatus = "ready";
-			await db.insert(agentLifecycle).values({
-				agentId: agent.id,
-				status,
-				generation: 1,
-				operationId: null,
-				statusChangedAt: uow.now,
-				createdAt: uow.now,
-			});
+
+		// Adopted agents keep running exactly as they do now: their identity, if any, is still
+		// `mattermost bootstrap`'s to provision. Only an agent created through the lifecycle starts
+		// `pending`, waiting for the provisioning that create requested.
+		const status: AgentLifecycleStatus = "ready";
+		const inserted = await db
+			.insert(agentLifecycle)
+			.values(
+				toAdopt.map((agent) => ({
+					agentId: agent.id,
+					status,
+					generation: 1,
+					operationId: null,
+					statusChangedAt: uow.now,
+					createdAt: uow.now,
+				})),
+			)
+			.onConflictDoNothing()
+			.returning({ agentId: agentLifecycle.agentId });
+
+		for (const { agentId } of inserted) {
 			const operationId = randomUUID();
 			await db.insert(agentLifecycleOperations).values({
 				id: operationId,
-				agentId: agent.id,
+				agentId,
 				kind: "adopt",
 				requestedBy: actor,
 				source: "cli",
@@ -800,8 +867,8 @@ export async function ensureAgentLifecycleAdoption(
 			await db
 				.update(agentLifecycle)
 				.set({ operationId })
-				.where(eq(agentLifecycle.agentId, agent.id));
-			await audit(uow, actor, "agent_lifecycle.adopt", "agent", agent.id, {
+				.where(eq(agentLifecycle.agentId, agentId));
+			await audit(uow, actor, "agent_lifecycle.adopt", "agent", agentId, {
 				status,
 				operation_id: operationId,
 			});

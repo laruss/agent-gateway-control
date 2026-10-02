@@ -396,6 +396,47 @@ describe("agent lifecycle service (ADR-026)", () => {
 		expect(lifecycle.last_error).toBe("the bot account could not be created");
 	});
 
+	it("failOperation redacts secrets out of the error before it is stored", async () => {
+		const created = await requestAgentCreate(deps, createInput("xi"));
+		await markProvisioning(deps, created.operationId, "test");
+		await failOperation(
+			deps,
+			created.operationId,
+			"test",
+			"bot creation failed: Authorization: Bearer abcdefghijklmnopqrstuvwxyz",
+		);
+
+		const [lifecycle] = (
+			await pool.query("select last_error from agent_lifecycle where agent_id = 'xi'")
+		).rows;
+		expect(lifecycle.last_error).not.toContain("abcdefghijklmnopqrstuvwxyz");
+
+		const [operation] = (
+			await pool.query("select error from agent_lifecycle_operations where id = $1", [
+				created.operationId,
+			])
+		).rows;
+		expect(operation.error).not.toContain("abcdefghijklmnopqrstuvwxyz");
+	});
+
+	it("retire cancels a still-running create operation, so it does not strand there forever", async () => {
+		const created = await requestAgentCreate(deps, createInput("pi"));
+		await markProvisioning(deps, created.operationId, "test");
+
+		await requestAgentRetire(deps, { agentId: "pi", actor: "test", source: "cli" });
+
+		const [createOp] = (
+			await pool.query("select state, finished_at from agent_lifecycle_operations where id = $1", [
+				created.operationId,
+			])
+		).rows;
+		expect(createOp.state).toBe("cancelled");
+		expect(createOp.finished_at).not.toBeNull();
+
+		const running = await listRunningLifecycleOperations(deps);
+		expect(running.map((row) => row.id)).not.toContain(created.operationId);
+	});
+
 	it("adopts existing agents exactly once, all ready, with or without a resolved identity", async () => {
 		await reset([agent("adopted-ready"), agent("adopted-pending")]);
 		await pool.query(
@@ -429,5 +470,37 @@ describe("agent lifecycle service (ADR-026)", () => {
 			)
 		).rows[0].n;
 		expect(operationCountSecond).toBe(operationCountFirst);
+	});
+
+	it("lets several concurrent adoptions race without error, exactly one adopt operation per agent", async () => {
+		await reset([agent("racer-a"), agent("racer-b")]);
+
+		const results = await Promise.allSettled([
+			ensureAgentLifecycleAdoption(deps, "test"),
+			ensureAgentLifecycleAdoption(deps, "test"),
+			ensureAgentLifecycleAdoption(deps, "test"),
+		]);
+		for (const result of results) {
+			expect(result.status).toBe("fulfilled");
+		}
+
+		// `finance` (every `reset()`'s own baseline agent) plus the two just configured here.
+		const rows = (
+			await pool.query(
+				`select agent_id, count(*)::int as n from agent_lifecycle_operations
+				  where kind = 'adopt' and agent_id in ('finance', 'racer-a', 'racer-b')
+				  group by agent_id`,
+			)
+		).rows;
+		expect(rows).toHaveLength(3);
+		for (const row of rows) {
+			expect(row.n).toBe(1);
+		}
+		const lifecycleCount = (
+			await pool.query(
+				"select count(*)::int as n from agent_lifecycle where agent_id in ('finance', 'racer-a', 'racer-b')",
+			)
+		).rows[0].n;
+		expect(lifecycleCount).toBe(3);
 	});
 });
