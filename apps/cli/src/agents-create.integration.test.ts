@@ -120,8 +120,8 @@ describe("gateway agents create: a minimal agent against the example config (fin
 		expect(created.agentId).toBe("analyst");
 
 		const [row] = (
-			await harness.pool.query<{ tools_deny: string[] }>(
-				"select config #> '{permissions,tools_deny}' as tools_deny from agents where id = $1",
+			await harness.pool.query<{ tools_allow: string[]; tools_deny: string[] }>(
+				"select config #> '{permissions,tools_allow}' as tools_allow, config #> '{permissions,tools_deny}' as tools_deny from agents where id = $1",
 				["analyst"],
 			)
 		).rows;
@@ -129,5 +129,10 @@ describe("gateway agents create: a minimal agent against the example config (fin
 		// 'finance.*'. A minimal create that never mentions permissions must still produce a valid
 		// bundle, not one `requestAgentCreate` itself would have rejected.
 		expect(row?.tools_deny).toEqual(["finance.*"]);
+		// The owner workflow is to create an agent and have it start working right away: a minimal
+		// create defaults to the one permission every example agent already carries
+		// (`defaultAgentPermissions`), not an agent that cannot reply until its permissions are
+		// edited by hand.
+		expect(row?.tools_allow).toEqual(["mattermost.post"]);
 	});
 });

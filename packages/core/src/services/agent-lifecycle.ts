@@ -804,7 +804,14 @@ export type RequestOperationRetryResult = Readonly<{
  *
  * A repeat with the same `idempotencyKey` replays the first call's own result rather than
  * re-validating — the same convention `requestAgentCreate`/`requestAgentRetire`/
- * `requestAgentRestore` already share.
+ * `requestAgentRestore` already share. Unlike those three (which commit a configuration change
+ * and so already serialize on the single `gateway_controls` row before their own recheck),
+ * this request has no configuration commit of its own to lock on: the agent's own `agent_lifecycle`
+ * row is locked first instead, and the idempotency key is rechecked only once that lock is held, so
+ * two concurrent retries racing on the same key cannot both miss each other's row — the second
+ * blocks on the lock until the first commits, then its own recheck finds what the first just wrote
+ * and replays it, rather than reading `failed`'s now-superseded state and refusing with a spurious
+ * "nothing to retry".
  */
 export async function requestOperationRetry(
 	deps: ControlPlaneDeps,
@@ -816,6 +823,15 @@ export async function requestOperationRetry(
 	);
 	return inTransaction(deps, async (uow) => {
 		const { db } = uow.tx;
+
+		const [lifecycle] = await db
+			.select()
+			.from(agentLifecycle)
+			.where(eq(agentLifecycle.agentId, parsed.agentId))
+			.for("update");
+		if (lifecycle === undefined) {
+			throw new AdminError(`agent '${parsed.agentId}' has no lifecycle record`);
+		}
 
 		if (parsed.idempotencyKey !== undefined) {
 			const [existing] = await db
@@ -832,14 +848,6 @@ export async function requestOperationRetry(
 			}
 		}
 
-		const [lifecycle] = await db
-			.select()
-			.from(agentLifecycle)
-			.where(eq(agentLifecycle.agentId, parsed.agentId))
-			.for("update");
-		if (lifecycle === undefined) {
-			throw new AdminError(`agent '${parsed.agentId}' has no lifecycle record`);
-		}
 		if (lifecycle.operationId === null) {
 			throw new AdminError(`agent '${parsed.agentId}' has no operation to retry`);
 		}

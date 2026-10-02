@@ -183,11 +183,13 @@ editing one — no `gateway mattermost bootstrap`/`reconcile` run, and no YAML f
   allowed channels, its role prompt text and, optionally, a runtime adapter/model — only adapters
   with a fresh, ready worker on this deployment right now are offered, never one `requestAgentCreate`
   would refuse outright. Creating an agent here never creates a worker container and never touches
-  Mattermost directly: it commits the agent's configuration (`enabled: true`, deny-by-default
-  permissions — the same `defaultAgentPermissions` the CLI's own `gateway agents create` falls back
-  to, so granting a tool like `mattermost.post` is a separate edit afterward, through the ordinary
-  preview/commit flow above) and queues a `create` operation for the controller's own background
-  provisioner, which creates the bot, issues its token, and joins it to the team and its channels.
+  Mattermost directly: it commits the agent's configuration (`enabled: true`, permissions defaulted
+  to `tools_allow: ["mattermost.post"]` and `tools_deny: ["finance.*"]` — the same
+  `defaultAgentPermissions` the CLI's own `gateway agents create` falls back to, so the new agent
+  can already reply in Mattermost the moment it is ready; granting it any further tool is a separate
+  edit afterward, through the ordinary preview/commit flow above) and queues a `create` operation for
+  the controller's own background provisioner, which creates the bot, issues its token, and joins it
+  to the team and its channels.
 - **Lifecycle status and progress.** The agent page shows its own status badge
   (`pending`/`reconciling`/`ready`/`failed`/`retiring`/`retired`) and, while an operation is
   `pending`/`reconciling`, a live checklist of its current operation's own checkpoints — resolving

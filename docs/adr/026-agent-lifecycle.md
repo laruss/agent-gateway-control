@@ -369,9 +369,10 @@ database write of its own:
   full static enum `GET /api/agents`'s own editor-facing `knownRuntimeAdapters` offers for an
   *existing* agent's Runtime tab (which must still show whatever it is already configured with,
   ready or not). Its own permissions are left to `requestAgentCreate`'s existing
-  `defaultAgentPermissions` fallback (deny-by-default, same as the CLI); granting a tool (including
-  `mattermost.post`, before the new bot can post anything at all) goes through the existing
-  preview/commit flow afterward, never a field this create request exposes directly.
+  `defaultAgentPermissions` fallback (`tools_allow: ["mattermost.post"]`, `tools_deny: ["finance.*"]`
+  unless it is the organization's own finance agent, same as the CLI) — the new bot can already post
+  in Mattermost the moment it is ready, never a field this create request exposes directly; granting
+  it any further tool still goes through the existing preview/commit flow afterward.
 - **`POST /api/agents/:id/retry`**, **`POST /api/agents/:id/retire`** (`{reason?,
   reassignFinanceTo?}`), **`POST /api/agents/:id/restore`** — thin bodies, each carrying only its
   own `idempotencyKey` and whatever `requestAgentRetire` itself needs; unlike `preview`/`commit`,

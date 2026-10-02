@@ -22,21 +22,24 @@ const FINANCE_TOOLS = "finance.*";
 const FINANCE_READ_ONLY_TOOL = "finance.read";
 
 /**
- * The permissions a new agent gets when a create request leaves `permissions` unset: empty allow
- * and approval lists, and `tools_deny` seeded with `finance.*` for every agent but the
- * organization's own finance agent (see `financeIssues` below, which `validateConfigBundle` would
- * otherwise refuse a bundle for). Shared by `requestAgentCreate` and the CLI's
- * `gateway agents create` so neither can drift from the rule the other enforces. `financeAgentId`
- * is `null` only when there is no active configuration yet (a brand-new deployment's first
- * create, before any organization was ever applied) — fails closed, the same as every other
- * agent: denied, never allowed, finance tools.
+ * The permissions a new agent gets when a create request leaves `permissions` unset:
+ * `tools_allow` seeded with `mattermost.post` alone (every example agent in
+ * `config/examples/agents/*.yaml` already carries it) — an agent that cannot even reply in
+ * Mattermost yet is not usable right after creation, and the owner's workflow is to create an
+ * agent and have it start working, not to open its Permissions tab first — an empty approval
+ * list, and `tools_deny` seeded with `finance.*` for every agent but the organization's own
+ * finance agent (see `financeIssues` below, which `validateConfigBundle` would otherwise refuse a
+ * bundle for). Shared by `requestAgentCreate` and the CLI's `gateway agents create` so neither can
+ * drift from the rule the other enforces. `financeAgentId` is `null` only when there is no active
+ * configuration yet (a brand-new deployment's first create, before any organization was ever
+ * applied) — fails closed, the same as every other agent: denied, never allowed, finance tools.
  */
 export function defaultAgentPermissions(
 	agentId: AgentId,
 	financeAgentId: AgentId | null,
 ): AgentPermissions {
 	return {
-		tools_allow: [],
+		tools_allow: ["mattermost.post"],
 		tools_require_human_approval: [],
 		tools_deny: agentId === financeAgentId ? [] : [FINANCE_TOOLS],
 	};

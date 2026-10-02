@@ -453,20 +453,10 @@ describe("agent lifecycle provisioner against a real server (ADR-026)", () => {
 			const bot = await mmApi("GET", `users/${botUserId}`, mm.adminToken);
 			expect(bot).toMatchObject({ username: agentId, is_bot: true });
 
-			// `requestAgentCreate` defaults a new agent's permissions deny-by-default
-			// (`defaultAgentPermissions`, `tools_allow: []`) the same way the CLI's own
-			// `gateway agents create` does; granting `mattermost.post` through the console's
-			// existing preview/commit flow is what actually lets its reply publish.
-			const detail = await getJson(`/api/agents/${agentId}`, session);
-			expect(detail.status).toBe(200);
-			const grantBaseRevisionId = (detail.body.agent as JsonObject).activeRevisionId;
-			const grant = await postJson(`/api/agents/${agentId}/commit`, session, {
-				baseRevisionId: grantBaseRevisionId,
-				changes: { permissions: { tools_allow: ["mattermost.post"] } },
-				idempotencyKey: randomUUID(),
-			});
-			expect(grant.status).toBe(200);
-
+			// `requestAgentCreate` defaults a new agent's permissions to `tools_allow:
+			// ["mattermost.post"]` (`defaultAgentPermissions`) the same way the CLI's own
+			// `gateway agents create` does, so it can reply right away — no permission grant through
+			// the console's preview/commit flow is needed before the mention below gets a reply.
 			const hqChannel = await resolveChannelId("hq");
 			const mention = await mmApi("POST", "posts", humanToken(), {
 				channel_id: hqChannel,

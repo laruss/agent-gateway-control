@@ -301,4 +301,167 @@ describe("AgentDetailPage", () => {
 		// Still on the detail page: the navigation was blocked, not merely confirmed later.
 		expect(screen.getByLabelText(/role prompt/i)).toBeInTheDocument();
 	});
+
+	it("shows the retired header and Restore once the live lifecycle query reports the retire finished, without a manual reload", async () => {
+		let retired = false;
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: string, init?: RequestInit) => {
+				const method = init?.method ?? "GET";
+				const path = new URL(input, "http://localhost").pathname;
+				if (path === "/api/session") {
+					return jsonResponse({
+						authenticated: true,
+						csrfToken: "t",
+						expiresAt: "2031-01-01T00:00:00.000Z",
+					});
+				}
+				if (path === "/api/status") {
+					return jsonResponse(statusSnapshot);
+				}
+				if (path === "/api/agents" && method === "GET") {
+					return jsonResponse(listFixture());
+				}
+				// Outside the active configuration snapshot: a retiring/retired agent's own detail 404s
+				// (`consoleShowAgent`), which is what sends `AgentDetailPage` to its lifecycle fallback.
+				if (path === `/api/agents/${AGENT_ID}` && method === "GET") {
+					return jsonResponse({ error: "not found" }, 404);
+				}
+				if (path === `/api/agents/${AGENT_ID}/lifecycle` && method === "GET") {
+					return jsonResponse({
+						status: retired ? "retired" : "retiring",
+						generation: 2,
+						lastError: null,
+						statusChangedAt: new Date().toISOString(),
+						retiredAt: retired ? new Date().toISOString() : null,
+						operations: [
+							{
+								id: "11111111-1111-4111-8111-111111111111",
+								kind: "retire",
+								state: retired ? "succeeded" : "running",
+								checkpoints: {},
+								error: null,
+								createdAt: new Date().toISOString(),
+								updatedAt: new Date().toISOString(),
+								finishedAt: retired ? new Date().toISOString() : null,
+							},
+						],
+					});
+				}
+				if (path === `/api/agents/${AGENT_ID}/channels` && method === "GET") {
+					return jsonResponse({ channels: [] });
+				}
+				throw new Error(`unexpected request: ${method} ${path}`);
+			}),
+		);
+
+		const queryClient = new QueryClient();
+		render(
+			<QueryClientProvider client={queryClient}>
+				<SessionProvider>
+					<MemoryRouter initialEntries={[`/agents/${AGENT_ID}`]}>
+						<Routes>
+							<Route path="/agents/:agentId" element={<AgentDetailPage />} />
+						</Routes>
+					</MemoryRouter>
+				</SessionProvider>
+			</QueryClientProvider>,
+		);
+
+		expect(await screen.findByText("retiring")).toBeInTheDocument();
+		expect(screen.queryByRole("button", { name: /restore/i })).not.toBeInTheDocument();
+
+		// The retire finishes in the background (another session, or the provisioner catching up) —
+		// nothing in this tab ever calls `onReload`. Only the lifecycle query's own refetch (shared
+		// with `LifecyclePanel`, per `useAgentLifecycle`'s query key) picks this up.
+		retired = true;
+		await queryClient.refetchQueries({ queryKey: ["agent-lifecycle", AGENT_ID] });
+
+		expect(await screen.findByText("retired")).toBeInTheDocument();
+		expect(screen.getByRole("button", { name: /restore/i })).toBeInTheDocument();
+	});
+
+	it("offers only agents still active in the configuration as a finance reassignment target, never a retiring or retired one", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: string, init?: RequestInit) => {
+				const method = init?.method ?? "GET";
+				const path = new URL(input, "http://localhost").pathname;
+				if (path === "/api/session") {
+					return jsonResponse({
+						authenticated: true,
+						csrfToken: "t",
+						expiresAt: "2031-01-01T00:00:00.000Z",
+					});
+				}
+				if (path === "/api/status") {
+					return jsonResponse(statusSnapshot);
+				}
+				if (path === "/api/agents" && method === "GET") {
+					const list: ConsoleAgentListResponse = {
+						agents: [
+							{
+								id: AGENT_ID,
+								displayName: "Director",
+								enabled: true,
+								state: "idle",
+								runtimeAdapter: "claude-code",
+								model: null,
+								channelCount: 2,
+								lastRun: null,
+								activeRevisionId: 7,
+								lifecycleStatus: "ready",
+							},
+							{
+								id: "scribe",
+								displayName: "Scribe",
+								enabled: true,
+								state: "idle",
+								runtimeAdapter: "claude-code",
+								model: null,
+								channelCount: 1,
+								lastRun: null,
+								activeRevisionId: 9,
+								lifecycleStatus: "ready",
+							},
+							{
+								id: "archivist",
+								displayName: "Archivist",
+								enabled: false,
+								state: "idle",
+								runtimeAdapter: "claude-code",
+								model: null,
+								channelCount: 0,
+								lastRun: null,
+								// Outside the active configuration snapshot (`requestAgentRetire` would refuse
+								// it as a `reassignFinanceTo` target): retiring/retired agents are still listed
+								// here (so they stay reachable for Restore), but must never be offered below.
+								activeRevisionId: null,
+								lifecycleStatus: "retiring",
+							},
+						],
+						knownChannels: ["hq", "research", "engineering"],
+						knownRuntimeAdapters: ["mock", "codex", "claude-code"],
+					};
+					return jsonResponse(list);
+				}
+				if (path === `/api/agents/${AGENT_ID}` && method === "GET") {
+					return jsonResponse({ ...detailFixture(), financeAgentId: AGENT_ID });
+				}
+				throw new Error(`unexpected request: ${method} ${path}`);
+			}),
+		);
+		renderDetail();
+		const user = userEvent.setup();
+
+		await user.click(await screen.findByRole("button", { name: /^retire$/i }));
+		expect(screen.getByText(/reassign the finance role to/i)).toBeInTheDocument();
+		// The retire dialog's own select for `reassignFinanceTo` is the only combobox it renders.
+		await user.click(screen.getByRole("combobox"));
+
+		expect(await screen.findByRole("option", { name: "scribe" })).toBeInTheDocument();
+		expect(screen.queryByRole("option", { name: "archivist" })).not.toBeInTheDocument();
+		// The agent being retired is never offered as its own reassignment target either.
+		expect(screen.queryByRole("option", { name: AGENT_ID })).not.toBeInTheDocument();
+	});
 });

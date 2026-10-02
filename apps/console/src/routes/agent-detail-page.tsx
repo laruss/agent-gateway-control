@@ -2,6 +2,7 @@ import type {
 	AgentPatch,
 	ConsoleAgentDetailResponse,
 	ConsoleAgentLifecycleResponse,
+	ConsoleAgentListResponse,
 } from "@agent-gateway/contracts";
 import { AlertCircle } from "lucide-react";
 import * as React from "react";
@@ -45,8 +46,19 @@ type LoadState =
 			status: "ok";
 			detail: ConsoleAgentDetailResponse;
 			knownAgentIds: Readonly<string[]>;
+			/** `knownAgentIds` narrowed to agents still active in the configuration
+			 * (`activeRevisionId` non-null): the choices `requestAgentRetire`'s own
+			 * `reassignFinanceTo` can actually accept — it rejects a retiring or already-retired one
+			 * (see `GET /api/agents`'s own `ConsoleAgentListItem.activeRevisionId`). */
+			activeAgentIds: Readonly<string[]>;
 	  }>
 	| Readonly<{ status: "retired"; lifecycle: ConsoleAgentLifecycleResponse }>;
+
+/** Agents still active in the configuration snapshot, for a reassignment select whose target
+ * `requestAgentRetire` would actually accept — never a retiring or already-retired one. */
+function activeAgentIdsOf(agents: ConsoleAgentListResponse["agents"]): Readonly<string[]> {
+	return agents.filter((agent) => agent.activeRevisionId !== null).map((agent) => agent.id);
+}
 
 /** A retiring or retired agent's lifecycle status, naming exactly the two states
  * {@link RetiredAgentView} knows how to render — any other status reaching a `404` here is an
@@ -84,7 +96,12 @@ export function AgentDetailPage(): React.ReactElement {
 		setState({ status: "loading" });
 		try {
 			const [detail, agents] = await Promise.all([fetchAgentDetail(agentId), fetchAgentsList()]);
-			setState({ status: "ok", detail, knownAgentIds: agents.agents.map((a) => a.id) });
+			setState({
+				status: "ok",
+				detail,
+				knownAgentIds: agents.agents.map((a) => a.id),
+				activeAgentIds: activeAgentIdsOf(agents.agents),
+			});
 		} catch (error) {
 			if (error instanceof ApiError && error.status === 404) {
 				// Outside the active configuration snapshot `consoleShowAgent` reads from: a
@@ -126,7 +143,12 @@ export function AgentDetailPage(): React.ReactElement {
 		try {
 			const [detail, agents] = await Promise.all([fetchAgentDetail(agentId), fetchAgentsList()]);
 			const { rebased, discardedFields } = rebaseDraft(previousAgent, detail.agent, draft);
-			setState({ status: "ok", detail, knownAgentIds: agents.agents.map((a) => a.id) });
+			setState({
+				status: "ok",
+				detail,
+				knownAgentIds: agents.agents.map((a) => a.id),
+				activeAgentIds: activeAgentIdsOf(agents.agents),
+			});
 			setDraft(rebased);
 			if (discardedFields.length > 0) {
 				toast.warning(
@@ -197,7 +219,12 @@ export function AgentDetailPage(): React.ReactElement {
 		return (
 			<RetiredAgentView
 				agentId={agentId}
-				lifecycle={state.lifecycle}
+				// The snapshot `load()` captured at 404 time (`state.lifecycle`) is only an initial
+				// fallback, for the moment before `lifecycle`'s own live query (polling per
+				// `useAgentLifecycle`, shared with `LifecyclePanel`) has data of its own: once it does,
+				// its freshest read wins, so a retire finishing (-> `retired`, Restore appearing) or
+				// failing shows up here without the owner having to trigger a reload themselves.
+				lifecycle={lifecycle.data ?? state.lifecycle}
 				onReload={() => void load()}
 			/>
 		);
@@ -296,7 +323,7 @@ export function AgentDetailPage(): React.ReactElement {
 				agentId={agent.id}
 				isSystemAgent={agent.permissions.observe_system === true}
 				isFinanceAgent={financeAgentId === agent.id}
-				otherAgentIds={state.knownAgentIds.filter((id) => id !== agent.id)}
+				otherAgentIds={state.activeAgentIds.filter((id) => id !== agent.id)}
 				onRetired={() => void load()}
 			/>
 

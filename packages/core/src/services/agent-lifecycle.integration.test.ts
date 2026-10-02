@@ -16,6 +16,7 @@ import {
 	listLifecycleOperations,
 	listRunningLifecycleOperations,
 	markProvisioning,
+	type RequestOperationRetryResult,
 	requestAgentCreate,
 	requestAgentRestore,
 	requestAgentRetire,
@@ -925,6 +926,45 @@ describe("agent lifecycle service (ADR-026)", () => {
 				)
 			).rows;
 			// The original `create` plus the one retry — the replayed call inserted nothing further.
+			expect(n).toBe(2);
+		});
+
+		it("two concurrent retries racing on the same idempotency key both get the first's result, never a spurious 422", async () => {
+			const created = await requestAgentCreate(deps, createInput("retry-concurrent"));
+			await markProvisioning(deps, created.operationId, "test");
+			await failOperation(
+				deps,
+				created.operationId,
+				"test",
+				"the bot account could not be created",
+			);
+
+			const idempotencyKey = randomUUID();
+			const retry = () =>
+				requestOperationRetry(deps, {
+					agentId: "retry-concurrent",
+					actor: "test",
+					source: "cli",
+					idempotencyKey,
+				});
+			const results = await Promise.allSettled([retry(), retry()]);
+			// Without the fix, the loser's own recheck (run before either side locks the lifecycle
+			// row) misses the winner's not-yet-committed row, then reads `failed`'s now-superseded
+			// state once it does get the lock and refuses with 422 ("nothing to retry") instead of
+			// replaying the winner's result.
+			const fulfilled = results.filter(
+				(result): result is PromiseFulfilledResult<RequestOperationRetryResult> =>
+					result.status === "fulfilled",
+			);
+			expect(fulfilled).toHaveLength(2);
+			expect(fulfilled[0]?.value).toEqual(fulfilled[1]?.value);
+
+			const [{ n }] = (
+				await pool.query(
+					"select count(*)::int as n from agent_lifecycle_operations where agent_id = 'retry-concurrent'",
+				)
+			).rows;
+			// The original `create` plus exactly one retry — the race never inserted a second.
 			expect(n).toBe(2);
 		});
 	});
