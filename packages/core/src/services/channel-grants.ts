@@ -15,8 +15,9 @@ import {
 	withTransaction,
 } from "@agent-gateway/db";
 import { and, eq, inArray, sql } from "drizzle-orm";
-import { grantedChannels } from "../channel-access.ts";
+import { agentChannelIds, grantedChannels } from "../channel-access.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
+import { lockLifecycleRows, queueMembershipReprovisioning } from "./management.ts";
 import { channelCursorIds } from "./mattermost-bridge.ts";
 import {
 	audit,
@@ -218,13 +219,55 @@ export async function grantChannel(
 	});
 }
 
-/**
- * Revokes an agent's grant in a channel (its bot left or was removed). The agent's pending work
- * from there is dropped where it is checked (routing, scheduling, the turn's authority,
- * delivery). True when the channel is still followed for others, false when nothing needs it
- * any more: its catch-up is deleted and the listener may leave.
+/** The tombstone + audit every grant revocation shares, whoever asked for it (`actor`): sets the
+ * grant `revoked` (so re-adding the bot later never silently re-grants it), ends the agent's
+ * sessions once, and audits. Returns the channel name revoked, or null when nothing was active to
+ * revoke (an already-revoked or never-granted channel — the caller's own transaction still goes
+ * on; this is not refused as an error, the same way a repeat of any other idempotent cleanup
+ * isn't). Called with the agent row already locked by the caller (`lockConfigExclusive` +
+ * `lockAgent`, in that order — or, for a retiring agent, the lock `requestAgentRetire` already
+ * holds).
  */
-export async function revokeChannelGrant(
+async function tombstoneGrant(
+	uow: UnitOfWork,
+	agentId: AgentId,
+	channelId: MattermostId,
+	reason: string,
+): Promise<string | null> {
+	const revoked = await uow.tx.db
+		.update(mattermostChannelGrants)
+		.set({
+			state: "revoked",
+			revokedReason: reason,
+			// Dated after the locks, like a grant.
+			revokedAt: uow.deps.clock(),
+			generation: sql`${mattermostChannelGrants.generation} + 1`,
+		})
+		.where(
+			and(
+				eq(mattermostChannelGrants.agentId, agentId),
+				eq(mattermostChannelGrants.channelId, channelId),
+				eq(mattermostChannelGrants.state, "active"),
+			),
+		)
+		.returning({ name: mattermostChannelGrants.channelName });
+	if (revoked.length === 0) {
+		return null;
+	}
+	await endSessions(uow, agentId);
+	return revoked[0]?.name ?? null;
+}
+
+/**
+ * Revokes an agent's grant in a channel, reactively: the membership synchronizer's own record
+ * that the bot already left the channel (by its own decision, or because Mattermost reports it is
+ * no longer a member) — never a call that itself removes anything from Mattermost, only the
+ * bookkeeping after the fact. The agent's pending work from there is dropped where it is checked
+ * (routing, scheduling, the turn's authority, delivery). True when the channel is still followed
+ * for others, false when nothing needs it any more: its catch-up is deleted and the listener may
+ * leave.
+ */
+export async function recordChannelGrantRevoked(
 	deps: ControlPlaneDeps,
 	agentId: AgentId,
 	channelId: MattermostId,
@@ -233,33 +276,101 @@ export async function revokeChannelGrant(
 	return inTransaction(deps, async (uow) => {
 		await lockConfigExclusive(uow);
 		await lockAgent(uow.tx.db, agentId);
-		const { db } = uow.tx;
-		const revoked = await db
-			.update(mattermostChannelGrants)
-			.set({
-				state: "revoked",
-				revokedReason: reason,
-				// Dated after the locks, like a grant.
-				revokedAt: uow.deps.clock(),
-				generation: sql`${mattermostChannelGrants.generation} + 1`,
-			})
-			.where(
-				and(
-					eq(mattermostChannelGrants.agentId, agentId),
-					eq(mattermostChannelGrants.channelId, channelId),
-					eq(mattermostChannelGrants.state, "active"),
-				),
-			)
-			.returning({ name: mattermostChannelGrants.channelName });
-		if (revoked.length > 0) {
-			await endSessions(uow, agentId);
+		const channelName = await tombstoneGrant(uow, agentId, channelId, reason);
+		if (channelName !== null) {
 			await audit(uow, "system", "mattermost.channel.revoked", "agent", agentId, {
 				channel_id: channelId,
-				channel_name: revoked[0]?.name ?? null,
+				channel_name: channelName,
 				reason,
 			});
 		}
 		return channelStillFollowed(uow, channelId);
+	});
+}
+
+/**
+ * Revokes every active grant an agent still has, in the caller's own transaction
+ * (`requestAgentRetire`, ADR-026): a retiring agent can never act again, including through a
+ * channel an owner or admin granted it directly, so every one of its grants is tombstoned right
+ * there — never left for the membership synchronizer to notice on its own schedule. The caller
+ * already holds whatever lock this needs (the agent's own row, locked before this is called, the
+ * same order every other writer here takes). Returns the channel ids revoked, for the caller's own
+ * audit entry.
+ */
+export async function revokeAllActiveGrantsIn(
+	uow: UnitOfWork,
+	agentId: AgentId,
+	reason: string,
+): Promise<Readonly<MattermostId[]>> {
+	const revoked = await uow.tx.db
+		.update(mattermostChannelGrants)
+		.set({
+			state: "revoked",
+			revokedReason: reason,
+			revokedAt: uow.deps.clock(),
+			generation: sql`${mattermostChannelGrants.generation} + 1`,
+		})
+		.where(
+			and(
+				eq(mattermostChannelGrants.agentId, agentId),
+				eq(mattermostChannelGrants.state, "active"),
+			),
+		)
+		.returning({ channelId: mattermostChannelGrants.channelId });
+	if (revoked.length > 0) {
+		await endSessions(uow, agentId);
+	}
+	return revoked.map((row) => row.channelId);
+}
+
+export type RevokeChannelGrantInput = Readonly<{
+	agentId: AgentId;
+	channelId: MattermostId;
+	actor: string;
+}>;
+
+/**
+ * Revokes an agent's grant by an owner's or operator's own decision (`gateway agents
+ * revoke-grant`): tombstones it the same way {@link recordChannelGrantRevoked} does, but also asks
+ * for the bot's actual removal — a lifecycle-owned, `ready` agent gets a `reprovision` operation
+ * queued (its own leaving-channels step re-checks live grants itself, ADR-026), so the provisioner
+ * acts on it without waiting for an unrelated configuration change; a bootstrap-managed agent has
+ * no such operation to queue, and is instead left to the membership synchronizer's own next pass,
+ * which removes a bot from a channel it no longer has a grant or configuration for. Locks the
+ * agent's `agent_lifecycle` row before its `agents` row (`lockLifecycleRows`, the global lock
+ * order every lifecycle writer keeps), so this can never deadlock against `completeOperation`.
+ */
+export async function revokeChannelGrant(
+	deps: ControlPlaneDeps,
+	input: RevokeChannelGrantInput,
+): Promise<boolean> {
+	return inTransaction(deps, async (uow) => {
+		await lockConfigExclusive(uow);
+		const { db } = uow.tx;
+		const lockedLifecycle = await lockLifecycleRows(db, [input.agentId]);
+		await lockAgent(db, input.agentId);
+		const channelName = await tombstoneGrant(
+			uow,
+			input.agentId,
+			input.channelId,
+			`revoked by ${input.actor}`,
+		);
+		if (channelName !== null) {
+			await audit(uow, input.actor, "mattermost.channel.revoked", "agent", input.agentId, {
+				channel_id: input.channelId,
+				channel_name: channelName,
+				reason: "revoke-grant",
+			});
+			await queueMembershipReprovisioning(
+				uow,
+				[input.agentId],
+				lockedLifecycle,
+				null,
+				input.actor,
+				"cli",
+			);
+		}
+		return channelStillFollowed(uow, input.channelId);
 	});
 }
 
@@ -372,5 +483,110 @@ export async function unneededChannels(
 			}
 		}
 		return result;
+	});
+}
+
+/**
+ * `agentId`'s channels right now: configured (`allowed_channels`, resolved by name) plus every
+ * channel it currently holds an active ADR-022 grant for — read fresh, not from any snapshot
+ * taken earlier in the same pass. The lifecycle provisioner's own `reprovision` leaving-channels
+ * step calls this immediately before each removal, rather than once at the start of its pass, so
+ * a grant made mid-pass is still honored (ADR-026).
+ */
+export async function loadAgentAllowedChannelIds(
+	deps: ControlPlaneDeps,
+	agentId: AgentId,
+): Promise<ReadonlySet<MattermostId>> {
+	return inTransaction(deps, async ({ tx }) => {
+		const [row] = await tx.db
+			.select({ config: agents.config })
+			.from(agents)
+			.where(eq(agents.id, agentId));
+		if (row === undefined) {
+			return new Set();
+		}
+		const access = await loadChannelAccess(tx.db);
+		return agentChannelIds({ id: agentId, config: row.config }, access);
+	});
+}
+
+/** Where one of an agent's channels comes from: named in its own `allowed_channels`, or given by
+ * an ADR-022 grant. A third provenance, `member-unauthorized` — the bot is a member Mattermost
+ * reports with neither — is live-only and not part of this (database-only) read model; `gateway
+ * agents channels <id>` adds it itself from what the server actually reports. */
+export type ChannelProvenance = "configured" | "granted";
+
+export type AgentChannelAssignment = Readonly<{
+	channelId: MattermostId;
+	channelName: string;
+	provenance: ChannelProvenance;
+	/** Set only for `granted`: who gave it, when, and the post it was decided from. */
+	grantedByUserId: MattermostId | null;
+	grantedAt: string | null;
+	evidencePostId: string | null;
+}>;
+
+/**
+ * An agent's channels with provenance (the assignments read model, ADR-026): every configured
+ * channel first, then every channel it holds an active grant for that is not also configured (a
+ * configured channel is refused as a grant target at grant time, so the two should never overlap
+ * in practice; this still never double-lists one). `gateway agents channels <id>` is its own CLI
+ * surface; a console page reads it later.
+ */
+export async function loadAgentChannelAssignments(
+	deps: ControlPlaneDeps,
+	agentId: AgentId,
+): Promise<Readonly<AgentChannelAssignment[]>> {
+	return inTransaction(deps, async ({ tx }) => {
+		const { db } = tx;
+		const [row] = await db
+			.select({ config: agents.config })
+			.from(agents)
+			.where(eq(agents.id, agentId));
+		const named = await loadTeamChannels(db);
+		const configured: AgentChannelAssignment[] = (
+			row?.config.mattermost.allowed_channels ?? []
+		).flatMap((name) => {
+			const channelId = named.get(name);
+			return channelId === undefined
+				? []
+				: [
+						{
+							channelId,
+							channelName: name,
+							provenance: "configured" as const,
+							grantedByUserId: null,
+							grantedAt: null,
+							evidencePostId: null,
+						},
+					];
+		});
+		const configuredIds = new Set(configured.map((assignment) => assignment.channelId));
+		const grants = await db
+			.select({
+				channelId: mattermostChannelGrants.channelId,
+				channelName: mattermostChannelGrants.channelName,
+				grantorUserId: mattermostChannelGrants.grantorUserId,
+				grantedAt: mattermostChannelGrants.grantedAt,
+				evidencePostId: mattermostChannelGrants.evidencePostId,
+			})
+			.from(mattermostChannelGrants)
+			.where(
+				and(
+					eq(mattermostChannelGrants.agentId, agentId),
+					eq(mattermostChannelGrants.state, "active"),
+				),
+			);
+		const granted: AgentChannelAssignment[] = grants
+			.filter((grant) => !configuredIds.has(grant.channelId))
+			.map((grant) => ({
+				channelId: grant.channelId,
+				channelName: grant.channelName,
+				provenance: "granted" as const,
+				grantedByUserId: grant.grantorUserId,
+				grantedAt: grant.grantedAt.toISOString(),
+				evidencePostId: grant.evidencePostId,
+			}));
+		return [...configured, ...granted];
 	});
 }

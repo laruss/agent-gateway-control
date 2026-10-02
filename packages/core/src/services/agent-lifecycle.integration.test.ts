@@ -22,6 +22,8 @@ import {
 } from "./agent-lifecycle.ts";
 import type { ControlPlaneDeps } from "./deps.ts";
 import { activeConfigRevisionId, commitChange } from "./management.ts";
+import { listMemory } from "./memory.ts";
+import { handleRunReport } from "./runs.ts";
 import { recordWorkerStatus } from "./runtime-health.ts";
 
 function organization(): OrganizationConfig {
@@ -247,6 +249,65 @@ describe("agent lifecycle service (ADR-026)", () => {
 				source: "console",
 			}),
 		).rejects.toThrow(/not created or restored through the lifecycle/);
+	});
+
+	it("config apply (the deprecated whole-bundle path) refuses the same /run/bot-secrets/ path, and queues a reprovision the same way a managed commit does", async () => {
+		const [{ config: financeConfig }] = (
+			await pool.query("select config from agents where id = 'finance'")
+		).rows;
+		const claimed: AgentConfig = {
+			...financeConfig,
+			mattermost: {
+				...financeConfig.mattermost,
+				token_secret_file: "/run/bot-secrets/mm_finance_token",
+			},
+		};
+		await expect(
+			applyConfig(
+				deps,
+				{
+					organization: organization(),
+					agents: [claimed],
+					constitution: "Be helpful.",
+					rolePrompts: { finance: "Role prompt for finance." },
+				},
+				"test",
+			),
+		).rejects.toThrow(/not created or restored through the lifecycle/);
+
+		const org = organization();
+		const extendedOrg = { ...org, mattermost: { ...org.mattermost, channels: ["hq", "research"] } };
+		const created = await requestAgentCreate(
+			deps,
+			createInput("apply-reprovision", {
+				mattermost: { username: "apply-reprovision", allowed_channels: ["hq"] },
+			}),
+		);
+		await markProvisioning(deps, created.operationId, "test");
+		await completeOperation(deps, created.operationId, "test");
+		const [{ config: appliedConfig }] = (
+			await pool.query("select config from agents where id = 'apply-reprovision'")
+		).rows;
+		const changed: AgentConfig = {
+			...appliedConfig,
+			mattermost: { ...appliedConfig.mattermost, allowed_channels: ["hq", "research"] },
+		};
+		await applyConfig(
+			deps,
+			{
+				organization: extendedOrg,
+				agents: [financeConfig, changed],
+				constitution: "Be helpful.",
+				rolePrompts: { finance: "Role prompt for finance.", "apply-reprovision": "Role prompt." },
+			},
+			"test",
+		);
+		const [queued] = (
+			await pool.query(
+				"select kind, state from agent_lifecycle_operations where agent_id = 'apply-reprovision' order by created_at desc limit 1",
+			)
+		).rows;
+		expect(queued).toMatchObject({ kind: "reprovision", state: "pending" });
 	});
 
 	it("an invalid agent definition leaves no trace: no revision, no agent row, no lifecycle row", async () => {
@@ -600,5 +661,303 @@ describe("agent lifecycle service (ADR-026)", () => {
 				}
 			}
 		}
+	});
+
+	it("a channel-config commit racing completeOperation of a reprovision never deadlocks (lock order: lifecycle row, then agent row)", async () => {
+		// A config writer that queues a `reprovision` locks the affected agents' lifecycle rows
+		// before it locks the `agents` table itself (`lockLifecycleRows`); `completeOperation` locks
+		// the lifecycle row, then (through `scheduleAgent`) the agent row. Getting the writer's own
+		// order backwards — as the very first version of this queuing did — risks exactly the
+		// deadlock the test above already covers for `retire`'s own two rows, one level further out.
+		for (let i = 0; i < 20; i += 1) {
+			const agentId = `reprovision-deadlock-${i}`;
+			const created = await requestAgentCreate(
+				deps,
+				createInput(agentId, { mattermost: { username: agentId, allowed_channels: ["hq"] } }),
+			);
+			await markProvisioning(deps, created.operationId, "test");
+			await completeOperation(deps, created.operationId, "test");
+
+			const [{ config }] = (await pool.query("select config from agents where id = $1", [agentId]))
+				.rows;
+			const emptied = { ...config, mattermost: { ...config.mattermost, allowed_channels: [] } };
+			await commitChange(deps, {
+				changeSet: [{ type: "update_agent", agent: emptied }],
+				baseRevisionId: await activeConfigRevisionId(deps),
+				actor: "owner",
+				source: "console",
+			});
+			const [reprovisionOp] = (
+				await pool.query(
+					"select id from agent_lifecycle_operations where agent_id = $1 and kind = 'reprovision' order by created_at desc limit 1",
+					[agentId],
+				)
+			).rows;
+			// Simulates the provisioner having already claimed this operation.
+			await markProvisioning(deps, reprovisionOp.id, "test");
+
+			const [{ config: config2 }] = (
+				await pool.query("select config from agents where id = $1", [agentId])
+			).rows;
+			const restored = {
+				...config2,
+				mattermost: { ...config2.mattermost, allowed_channels: ["hq"] },
+			};
+			const committing = commitChange(deps, {
+				changeSet: [{ type: "update_agent", agent: restored }],
+				baseRevisionId: await activeConfigRevisionId(deps),
+				actor: "owner",
+				source: "console",
+			});
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			const results = await Promise.allSettled([
+				committing,
+				completeOperation(deps, reprovisionOp.id, "test"),
+			]);
+			for (const result of results) {
+				if (result.status === "rejected") {
+					expect(isDeadlock(result.reason)).toBe(false);
+				}
+			}
+		}
+	});
+
+	describe("retirement cleanup", () => {
+		/** A minimal `events` row, enough to satisfy `agent_runs.trigger_event_id`'s own foreign key;
+		 * its content is never read by anything under test here. */
+		async function insertEvent(): Promise<string> {
+			const externalId = randomUUID();
+			const [row] = (
+				await pool.query(
+					`insert into events (specversion, external_id, source, type, time, correlation_id, trust_level, hop, payload, payload_hash)
+					 values ('1.0', $1, 'test', 'mattermost.agent.mentioned', now(), $1, 'trusted', 0, '{}'::jsonb, 'hash')
+					 returning id`,
+					[externalId],
+				)
+			).rows;
+			return row.id;
+		}
+
+		/** A run of `status` for `agentId`, wired to a fresh trigger event. */
+		async function insertRun(
+			agentId: string,
+			status: "queued" | "running" | "succeeded",
+		): Promise<string> {
+			const eventId = await insertEvent();
+			const idempotencyKey = randomUUID();
+			const [row] = (
+				await pool.query(
+					`insert into agent_runs (agent_id, trigger_event_id, idempotency_key, status, max_attempts, runtime_adapter, correlation_id, hop, timeout_at, timeout_seconds)
+					 values ($1, $2, $3, $4, 1, 'mock', $3, 0, now() + interval '1 hour', 3600)
+					 returning id`,
+					[agentId, eventId, idempotencyKey, status],
+				)
+			).rows;
+			return row.id;
+		}
+
+		async function setAgentState(agentId: string, state: string): Promise<void> {
+			await pool.query("update agents set state = $2 where id = $1", [agentId, state]);
+		}
+
+		it("cancels a queued run, so the worker never starts the stale turn", async () => {
+			const created = await requestAgentCreate(deps, createInput("queued-run"));
+			await markProvisioning(deps, created.operationId, "test");
+			await completeOperation(deps, created.operationId, "test");
+			const runId = await insertRun("queued-run", "queued");
+			await setAgentState("queued-run", "queued");
+
+			await requestAgentRetire(deps, { agentId: "queued-run", actor: "test", source: "cli" });
+
+			const [run] = (await pool.query("select status from agent_runs where id = $1", [runId])).rows;
+			expect(run.status).toBe("cancelled");
+			const [enabled] = (
+				await pool.query("select enabled, state from agents where id = 'queued-run'")
+			).rows;
+			expect(enabled).toMatchObject({ enabled: false, state: "disabled" });
+		});
+
+		it("cancels a running run the same way pausing does, so the worker stops the turn", async () => {
+			const created = await requestAgentCreate(deps, createInput("running-run"));
+			await markProvisioning(deps, created.operationId, "test");
+			await completeOperation(deps, created.operationId, "test");
+			const runId = await insertRun("running-run", "running");
+			await setAgentState("running-run", "running");
+
+			const retired = await requestAgentRetire(deps, {
+				agentId: "running-run",
+				actor: "test",
+				source: "cli",
+			});
+
+			const [run] = (await pool.query("select status from agent_runs where id = $1", [runId])).rows;
+			expect(run.status).toBe("cancelled");
+			const [lifecycle] = (
+				await pool.query("select status from agent_lifecycle where agent_id = 'running-run'")
+			).rows;
+			expect(lifecycle.status).toBe("retiring");
+			expect(retired.cancelledJobs).toEqual([]);
+		});
+
+		it("cancels a pending wait and a pending approval (its card is withdrawn like any other), and blocks a pending outbox item", async () => {
+			const created = await requestAgentCreate(deps, createInput("busy-agent"));
+			await markProvisioning(deps, created.operationId, "test");
+			await completeOperation(deps, created.operationId, "test");
+			const sourceRun = await insertRun("busy-agent", "succeeded");
+			const [wait] = (
+				await pool.query(
+					`insert into wait_subscriptions (agent_id, created_by_run_id, status, event_type, correlation_id, condition, timeout_at)
+					 values ('busy-agent', $1, 'active', 'mattermost.thread.reply', 'corr-1', '{}'::jsonb, now() + interval '1 hour')
+					 returning id`,
+					[sourceRun],
+				)
+			).rows;
+			const approvalRun = await insertRun("busy-agent", "succeeded");
+			const [approval] = (
+				await pool.query(
+					`insert into approval_requests (requested_by_agent_id, run_id, action_type, action_params, immutable_action_hash, action_summary, risk_level, status, allowed_approver_user_ids, nonce, expires_at)
+					 values ('busy-agent', $1, 'finance.pay', '{}'::jsonb, 'hash', 'summary', 'high', 'pending', '["owner0000000000000000000a"]'::jsonb, 'nonce', now() + interval '1 day')
+					 returning id`,
+					[approvalRun],
+				)
+			).rows;
+			const outboxRun = await insertRun("busy-agent", "succeeded");
+			const [outboxItem] = (
+				await pool.query(
+					`insert into outbox (kind, destination, payload, idempotency_key, status, max_attempts, run_id)
+					 values ('mattermost.post', 'channel/hq', '{}'::jsonb, $1, 'pending', 8, $2)
+					 returning id`,
+					[randomUUID(), outboxRun],
+				)
+			).rows;
+
+			await requestAgentRetire(deps, { agentId: "busy-agent", actor: "test", source: "cli" });
+
+			const [waitAfter] = (
+				await pool.query("select status from wait_subscriptions where id = $1", [wait.id])
+			).rows;
+			expect(waitAfter.status).toBe("cancelled");
+			const [approvalAfter] = (
+				await pool.query("select status from approval_requests where id = $1", [approval.id])
+			).rows;
+			expect(approvalAfter.status).toBe("cancelled");
+			const [outboxAfter] = (
+				await pool.query("select status, last_error_redacted from outbox where id = $1", [
+					outboxItem.id,
+				])
+			).rows;
+			expect(outboxAfter).toMatchObject({
+				status: "cancelled",
+				last_error_redacted: "agent_retired",
+			});
+		});
+
+		it("refuses to retire the organization's finance agent without reassigning the role, and succeeds with it", async () => {
+			await reset([agent("accountant")]);
+			await ensureAgentLifecycleAdoption(deps, "test");
+			await expect(
+				requestAgentRetire(deps, { agentId: "finance", actor: "test", source: "cli" }),
+			).rejects.toThrow(/finance agent/);
+
+			const retired = await requestAgentRetire(deps, {
+				agentId: "finance",
+				actor: "test",
+				source: "cli",
+				reassignFinanceTo: "accountant",
+			});
+			expect(await activeConfigRevisionId(deps)).toBe(retired.revisionId);
+			const [org] = (
+				await pool.query(
+					"select bundle -> 'organization' -> 'organization' ->> 'finance_agent_id' as finance_agent_id from config_snapshots s join config_revisions r on r.snapshot_hash = s.hash where r.id = $1",
+					[retired.revisionId],
+				)
+			).rows;
+			expect(org.finance_agent_id).toBe("accountant");
+		});
+
+		it("refuses reassignFinanceTo for an agent that is not the finance agent", async () => {
+			const created = await requestAgentCreate(deps, createInput("not-finance"));
+			await markProvisioning(deps, created.operationId, "test");
+			await completeOperation(deps, created.operationId, "test");
+
+			await expect(
+				requestAgentRetire(deps, {
+					agentId: "not-finance",
+					actor: "test",
+					source: "cli",
+					reassignFinanceTo: "finance",
+				}),
+			).rejects.toThrow(/reassignFinanceTo must not be given/);
+		});
+
+		it("a late run report for a retiring agent publishes no effect, dropped with an audit entry", async () => {
+			const created = await requestAgentCreate(deps, createInput("late-report"));
+			await markProvisioning(deps, created.operationId, "test");
+			await completeOperation(deps, created.operationId, "test");
+			const runId = await insertRun("late-report", "running");
+			await setAgentState("late-report", "running");
+			await requestAgentRetire(deps, { agentId: "late-report", actor: "test", source: "cli" });
+			// Simulates a report that was already in flight when retirement cancelled the run: back
+			// to `running`, as it would have still been had the worker's report beaten the
+			// cancellation by a hair, so only the lifecycle gate (not the run's own status) stands
+			// between this report and publishing an effect.
+			await pool.query("update agent_runs set status = 'running' where id = $1", [runId]);
+
+			const outcome = await handleRunReport(
+				deps,
+				{
+					kind: "failed",
+					runId,
+					attempt: 1,
+					agentId: "late-report",
+					runtimeVersion: "test",
+					error: { code: "runtime_permanent", retryable: false, detail: "late" },
+					usage: null,
+					session: null,
+				},
+				"mock",
+			);
+
+			expect(outcome).toBe("ignored_retired");
+			const [run] = (await pool.query("select status from agent_runs where id = $1", [runId])).rows;
+			// Never moved to `failed`/retried: the gate returned before any effect of the report.
+			expect(run.status).toBe("running");
+			const [audited] = (
+				await pool.query(
+					"select detail from audit_log where action = 'run.report.dropped_retired' and subject_id = $1",
+					[runId],
+				)
+			).rows;
+			expect(audited).toMatchObject({ detail: { kind: "failed", lifecycle_status: "retiring" } });
+		});
+
+		it("excludes a retired agent's private memory from listings, but keeps shared memory it wrote", async () => {
+			const created = await requestAgentCreate(deps, createInput("memory-agent"));
+			await markProvisioning(deps, created.operationId, "test");
+			await completeOperation(deps, created.operationId, "test");
+			const sourceRun = await insertRun("memory-agent", "succeeded");
+			await pool.query(
+				`insert into memory_items (namespace, key, content, source_run_id, status, visibility)
+				 values ('agents/memory-agent', 'secret', 'private content', $1, 'accepted', 'private')`,
+				[sourceRun],
+			);
+			await pool.query(
+				`insert into memory_items (namespace, key, content, source_run_id, status, visibility)
+				 values ('organization/shared', 'note', 'shared content', $1, 'accepted', 'shared')`,
+				[sourceRun],
+			);
+
+			await requestAgentRetire(deps, { agentId: "memory-agent", actor: "test", source: "cli" });
+
+			const all = await listMemory(deps, {
+				status: null,
+				namespace: null,
+				oldestFirst: false,
+				limit: 100,
+				offset: 0,
+			});
+			expect(all.some((item) => item.namespace === "agents/memory-agent")).toBe(false);
+			expect(all.some((item) => item.namespace === "organization/shared")).toBe(true);
+		});
 	});
 });

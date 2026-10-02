@@ -11,6 +11,8 @@ import {
 	loadMattermostPlanSource,
 	mattermostBootstrapStore,
 	requestAgentCreate,
+	requestAgentRestore,
+	requestAgentRetire,
 	runtimeHealth,
 } from "@agent-gateway/core";
 import { bootstrapMattermost, MattermostClient, mattermostPlan } from "@agent-gateway/mattermost";
@@ -220,6 +222,108 @@ describe("agent lifecycle provisioner against a real server (ADR-026)", () => {
 			},
 			60_000,
 			"the analyst's own bot replies in #hq",
+		);
+		expect(reply.user_id).toBe(botUserId);
+	});
+
+	it("retires the agent against the real server: bot deactivated, removed from its channels, its token rejected; restore brings it back to working", async () => {
+		const deps = gateway.deps();
+		const agentId = "analyst";
+		const identity = await loadMattermostIdentity(deps, agentId);
+		const botUserId = identity?.userId ?? null;
+		if (botUserId === null) {
+			throw new Error("unreachable: the analyst was already provisioned by the earlier test");
+		}
+		const tokenPath = resolveSecretPath(`/run/bot-secrets/mm_${agentId}_token`, secretsDir);
+		const tokenBeforeRetire = readSecretFile(tokenPath);
+		expect(
+			(await new MattermostClient({ baseUrl: mm.url, token: tokenBeforeRetire }).me()).id,
+		).toBe(botUserId);
+
+		await requestAgentRetire(deps, { agentId, actor: "e2e", source: "cli" });
+		await eventually(
+			async () =>
+				(
+					await gateway.pool.query<{ status: string }>(
+						"select status from agent_lifecycle where agent_id = $1",
+						[agentId],
+					)
+				).rows[0]?.status === "retired" || null,
+			60_000,
+			"the analyst's lifecycle becomes retired (the provisioner finished)",
+		);
+
+		const retiredBot = await mmApi("GET", `users/${botUserId}`, mm.adminToken);
+		expect(retiredBot.delete_at).not.toBe(0);
+		await expect(
+			new MattermostClient({ baseUrl: mm.url, token: tokenBeforeRetire }).me(),
+		).rejects.toThrow();
+		const team = await mmApi("GET", `teams/name/${TEAM}`, mm.adminToken);
+		const teamId = team.id;
+		if (typeof teamId !== "string") {
+			throw new Error("team has no id");
+		}
+		const channel = await mmApi("GET", `teams/${teamId}/channels/name/hq`, mm.adminToken);
+		const hqChannel = channel.id;
+		if (typeof hqChannel !== "string") {
+			throw new Error("channel has no id");
+		}
+		const members = await mmApi(
+			"GET",
+			`channels/${hqChannel}/members/${botUserId}`,
+			mm.adminToken,
+		).catch((error: unknown) => error);
+		expect(members).toBeInstanceOf(Error);
+
+		await requestAgentRestore(deps, { agentId, actor: "e2e", source: "cli" });
+		await eventually(
+			async () =>
+				(
+					await gateway.pool.query<{ status: string }>(
+						"select status from agent_lifecycle where agent_id = $1",
+						[agentId],
+					)
+				).rows[0]?.status === "ready" || null,
+			60_000,
+			"the analyst's lifecycle becomes ready again (restored)",
+		);
+		const tokenAfterRestore = readSecretFile(tokenPath);
+		expect(tokenAfterRestore).not.toBe(tokenBeforeRetire);
+		expect(
+			(await new MattermostClient({ baseUrl: mm.url, token: tokenAfterRestore }).me()).id,
+		).toBe(botUserId);
+		const restoredBot = await mmApi("GET", `users/${botUserId}`, mm.adminToken);
+		expect(restoredBot.delete_at).toBe(0);
+
+		const mention = await mmApi("POST", "posts", humanToken(), {
+			channel_id: hqChannel,
+			message: `@${agentId} are you still there?`,
+		});
+		const mentionId = mention.id;
+		if (typeof mentionId !== "string") {
+			throw new Error("mention post has no id");
+		}
+		const reply = await eventually(
+			async () => {
+				const list = await mmApi("GET", `channels/${hqChannel}/posts?per_page=10`, mm.adminToken);
+				const order = list.order;
+				const posts = list.posts;
+				if (!Array.isArray(order) || typeof posts !== "object" || posts === null) {
+					return null;
+				}
+				for (const id of order) {
+					if (typeof id !== "string" || id === mentionId) {
+						continue;
+					}
+					const post = (posts as Record<string, JsonObject>)[id];
+					if (post !== undefined && post.user_id === botUserId) {
+						return post;
+					}
+				}
+				return null;
+			},
+			60_000,
+			"the restored analyst replies in #hq",
 		);
 		expect(reply.user_id).toBe(botUserId);
 	});

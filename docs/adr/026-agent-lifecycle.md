@@ -226,11 +226,127 @@ constrained in code to exactly the actions provisioning performs, never handed t
   still seen in full; revoking is itself listed and repeated, bounded, until only the newly written
   token remains.
 
-Retirement's cleanup — cancelling an agent's runs, waits and approvals, deactivating its bot,
-revoking its token, reconciling channel memberships — is not part of this decision: it resumes
-through the same `agent_lifecycle`/`agent_lifecycle_operations` rows, via the same
-`markProvisioning`/`completeOperation`/`failOperation`, later work that changes what runs between
-`requestAgentRetire` and `completeOperation`, not the state machine itself.
+### Retirement's cleanup
+
+A retired agent can never act again. `requestAgentRetire` performs the Gateway-side half of that,
+in the same transaction as its `remove_agent` commit:
+
+- **Runs.** An active run (`queued`/`running`) is cancelled first, the same cancellation
+  `gateway agent pause` performs (its worker stops the turn; its inbox entries return to
+  `pending`, moving the agent through `paused` before the commit disables it — `disable` is a
+  valid state-machine transition only from `idle`/`waiting`/`failed`/`paused`, never from
+  `queued`/`running`).
+- **Waits, approvals and tool actions.** Exactly like any agent leaving the active configuration:
+  its active waits are cancelled, its pending approval requests withdrawn (the card is updated the
+  same way any other withdrawal already shows it — `sweepApprovals`, triggered right after the
+  transaction commits rather than waiting for the periodic sweep), its queued tool actions
+  cancelled, and its running ones asked to stop (`cancel_requested_at`). A late report for one
+  that does not stop in time, like a late run report, is dropped before publishing any effect.
+- **Channel grants (ADR-022).** Every grant the agent still holds is tombstoned in the same
+  transaction, not left for the membership synchronizer to notice on its own schedule: a retired
+  agent must lose access through a channel nobody thought to revoke by hand too, and re-adding its
+  bot to the same channel later must never silently re-grant it.
+- **Outbox.** Its own pending deliveries (`pending`/`sending`) are moved to a new `cancelled`
+  status, never sent as a retired agent, rather than left to fail against a deactivated bot or
+  expire on their own schedule.
+- **Late reports.** A run or tool report for an agent whose lifecycle status is `retiring` or
+  `retired` is dropped — audited, never applied — before it would publish an effect (a post, a
+  memory write, a wait or approval resolution): checked explicitly, by lifecycle status, not only
+  inferred from the run's own `cancelled` status, since a report can race the retire transaction
+  that set it.
+- **Private memory.** Unreadable from the moment the agent retires: no turn can load it (the
+  agent can never run again), and it is excluded from `gateway memory list` explicitly too, rather
+  than relying only on the first guarantee. Left to the existing retention to expire on its own
+  schedule — nothing here deletes it early. Shared memory the agent wrote and that was accepted
+  stays: it is organization-owned, not the retiring agent's.
+- **Kept.** Audit entries, identity rows, run history and already-sent messages are never touched.
+- **The finance agent.** Refused, before anything is written, when the retiring agent is the
+  organization's own `finance_agent_id`, unless the same request also names
+  `reassignFinanceTo` — a different, currently configured agent — committed as a
+  `set_finance_agent` change operation in the same change set as the `remove_agent`. Retiring the
+  finance agent without reassigning it would otherwise leave the configuration naming one that no
+  longer exists, something `validateConfigBundle` already refuses, but confusingly so; this names
+  the actual rule and gives one request to satisfy it.
+
+The Mattermost-side half is the provisioner's: a `retire` operation is now one more kind it drives
+(alongside `create`/`restore`/`reprovision`, through its own checkpoints —
+`tokens_revoked`, `bot_disabled`, `channels_left`, `token_file_deleted`), in the order
+`bootstrapMattermost`'s own retirement of a replaced bot already uses: every access token revoked
+and the bot account deactivated *first* (together, that ends all its access on their own), *then*
+every channel it is currently a member of left (cosmetic from that point on — a crash partway
+through leaves no working access behind, only channels still physically listing a deactivated,
+token-less bot until the next pass finishes the list), and finally, only for a lifecycle-created
+agent, its own `/run/bot-secrets/` token file removed (a bootstrap-managed agent's
+`/run/secrets/` file is never touched — the CLI owns it; this only revokes the token server-side
+and leaves the file for `gateway doctor` to report as stale). An agent retired before its
+identity was ever resolved (still `pending`) has nothing Mattermost-side to clean up at all. A
+step's failure is retried like provisioning any other operation; a permanent failure leaves the
+agent `retiring` with `last_error`, surfaced by `gateway doctor`, same as any other kind. A
+database rollback of the retire transaction alone never reactivates a Mattermost account that was
+already deactivated by a provisioner pass that ran, committed its checkpoints and then had its own
+database transaction (the lifecycle rows, not Mattermost) somehow undone by a later, unrelated
+operation — nothing in this system does that, but it is worth naming: Mattermost's own state is
+never inside any Gateway database transaction, so no Gateway rollback ever undoes it.
+
+### Restore
+
+`requestAgentRestore` was already described above (`retired` -> `pending`, re-adding the last
+recorded configuration that named the agent). Its own Mattermost-side provisioning needs no
+special casing: a `restore` operation is a `create`-shaped lifecycle operation (`PROVISIONING_KINDS`
+already includes it), and `ensureBot` already re-enables a disabled bot account it finds by
+username (`existing.delete_at > 0` -> `enableBot`) before returning its id — the same bot the
+retire step just deactivated. `ensureBotToken` likewise issues a fresh token unprompted: the
+retire step already revoked every token the account had, so the restore operation's own (freshly
+empty) checkpoints never find a working one to keep. The channel-joining loop re-adds it to every
+channel its restored configuration now names. No new code needed any of this; it falls out of
+`create`/`restore` already sharing one path through the provisioner.
+
+### Assignments: a read model with provenance
+
+An agent's channels come from two sources that account for them differently: `configured` (named
+in its own `mattermost.allowed_channels`) and `granted` (an ADR-022 grant an owner or system admin
+gave its bot directly — recorded with who granted it, when, and the post that is its evidence).
+`loadAgentChannelAssignments` reads both, database-only, for `gateway agents channels <id>`; a
+third provenance, `member-unauthorized` — the bot is a member Mattermost itself reports that is
+neither — is live-only (it needs what the server actually has) and is not part of this read
+model; a console page, or the CLI command itself, adds it from a live check the same way
+`gateway mattermost reconcile` already does. Revoking a grant directly
+(`gateway agents revoke-grant <id> <channel>`) tombstones it the same way retirement's own bulk
+revoke does, and additionally queues a `reprovision` operation for a lifecycle-owned, `ready`
+agent so the provisioner removes the bot from it without waiting for an unrelated configuration
+change; a bootstrap-managed agent has no such operation, and is left to the membership
+synchronizer's own next pass, which already removes a bot from a channel it has neither a grant
+nor a configuration entry for.
+
+### Lock order, across every writer that touches a lifecycle row
+
+`markProvisioning`, `completeOperation` and `failOperation` (via `lockCurrentOperation`) always
+lock an agent's `agent_lifecycle` row before its operation row. A configuration commit that queues
+a `reprovision` for a lifecycle-owned agent now keeps the same order relative to the `agents`
+table too: the lifecycle rows of every agent whose `allowed_channels` just changed are locked
+*before* the commit locks the `agents` table itself (`writeConfigRevisionIn`'s own "every existing
+agent row, locked in id order up front"), never after. Getting this backwards — as the first
+version of `reprovision` queuing did — risks a genuine deadlock (Postgres 40P01): a concurrent
+`completeOperation` for the very agent a commit is also touching locks the lifecycle row, then
+(through `scheduleAgent`) the agent row; a commit that locks the agent row first and the lifecycle
+row second, for the same agent, can wait on each other in a cycle. One global order —
+`gateway_controls`, then lifecycle row(s), then agent row(s), then operation rows — holds
+everywhere now: `requestAgentRetire`/`requestAgentRestore` already locked the lifecycle row before
+their own configuration commit; `commitChangeIn` and `applyConfig` (config apply) now do too,
+before either locks the `agents` table.
+
+Queuing a `reprovision` also decides, under the same lock, what a concurrent edit does to an
+operation already in flight: a `pending` one is left alone (the provisioner reads the agent's
+configuration only *after* it claims the operation, never before, so whatever is pending when it
+finally runs already covers every edit made up to that point); a `running` one is different — the
+provisioner already read its own, now possibly stale, copy before claiming it, with no way to
+safely revise that read mid-step — so it is cancelled and a fresh `pending` operation queued in
+its place, the same way a superseded `create`/`restore` is already cancelled rather than left
+stranded. The provisioner's own leaving-channels step (a `reprovision`'s own membership trim)
+re-reads which channels are still allowed immediately before each removal, not once at the start
+of its pass, since that loop calls Mattermost once per channel and may take a while: a grant made
+mid-pass must still be honored by the very removal decision it would have prevented, not only by
+the pass that runs after it.
 
 ## Alternatives
 

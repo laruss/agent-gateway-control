@@ -31,7 +31,15 @@ import {
 import { redactForStorage } from "@agent-gateway/logging";
 import { and, asc, desc, eq, gt, inArray } from "drizzle-orm";
 import type { z } from "zod";
-import { AdminError, ensureConfigHistoryIn, inTransaction } from "./admin.ts";
+import {
+	AdminError,
+	type CancelledJob,
+	ensureConfigHistoryIn,
+	inTransaction,
+	pauseInTransaction,
+} from "./admin.ts";
+import { sweepApprovals } from "./approvals.ts";
+import { revokeAllActiveGrantsIn } from "./channel-grants.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
 import {
 	type CommitOutcome,
@@ -41,7 +49,7 @@ import {
 } from "./management.ts";
 import { WORKER_STALE_MS } from "./runtime-health.ts";
 import { scheduleAgent } from "./scheduler.ts";
-import { audit, lifecycleOwnedAgentIds } from "./store.ts";
+import { audit, lifecycleOwnedAgentIds, lockAgent } from "./store.ts";
 
 type Db = UnitOfWork["tx"]["db"];
 type AgentLifecycleRow = typeof agentLifecycle.$inferSelect;
@@ -376,14 +384,35 @@ export type RequestAgentRetireResult = Readonly<{
 	operationId: string;
 	agentId: AgentId;
 	revisionId: number;
+	/** pg-boss jobs an active run's own cancellation made obsolete (the same convention
+	 * `pauseAgent`/`killAll` use): the worker already stops a cancelled run's turn on its own
+	 * (`agent_runs.status`), so a caller cancelling these too is an optimization, never a
+	 * correctness requirement. Empty when the agent had no active run to cancel. */
+	cancelledJobs: Readonly<CancelledJob[]>;
 }>;
 
 /**
- * Retires an agent: validates, then, in one transaction, commits a `remove_agent` change set and
- * moves the lifecycle row to `retiring` with a `retire` operation `pending`. The actual cleanup —
- * cancelling runs, waits and approvals, deactivating the bot — is later work; this only records
- * the desired state and an operation id for that work to resume and complete through
- * `markProvisioning`/`completeOperation`/`failOperation`.
+ * Retires an agent: the retired agent can never act again. In one transaction: a run in progress
+ * is cancelled first (the same cancellation `pauseAgent` performs — the state machine only allows
+ * `disable` from `idle`/`waiting`/`failed`/`paused`, never `queued`/`running`); a `remove_agent`
+ * change set is committed (which, through the same path any agent leaving the configuration
+ * already takes, cancels its waits and withdraws its pending approvals, queued tool actions and
+ * running tool actions' own cancellation request); every channel it was ever granted is
+ * tombstoned (ADR-022); its own pending outbox deliveries are blocked, never sent as a retired
+ * agent; and the lifecycle row moves to `retiring` with a `retire` operation `pending`, for the
+ * provisioner to resume and complete through `markProvisioning`/`completeOperation`/
+ * `failOperation` (deactivating the bot, revoking its tokens, leaving its channels).
+ *
+ * Refused, before anything is written, when `agentId` is the organization's own
+ * `finance_agent_id` and the request does not also name `reassignFinanceTo` (a different,
+ * currently configured agent): retiring the finance agent would otherwise leave the configuration
+ * naming one that no longer exists. When given, the reassignment commits as a `set_finance_agent`
+ * operation in the very same change set.
+ *
+ * Kept, by design: audit entries, identity rows, run history and already-sent messages. Left to
+ * the existing retention to expire on its own schedule: the agent's private memory, now
+ * unreadable (no turn can load it, and it is excluded from memory listings) but not deleted here —
+ * shared memory it wrote and that was accepted stays, organization-owned.
  */
 export async function requestAgentRetire(
 	deps: ControlPlaneDeps,
@@ -393,7 +422,7 @@ export async function requestAgentRetire(
 		RequestAgentRetireInputSchema.safeParse(input),
 		"agent retire request",
 	);
-	return inTransaction(deps, async (uow) => {
+	const result = await inTransaction(deps, async (uow) => {
 		const { db } = uow.tx;
 		const baseRevisionId = await lockGatewayControls(db);
 
@@ -415,6 +444,7 @@ export async function requestAgentRetire(
 					operationId: existing.id,
 					agentId: existing.agentId,
 					revisionId: existing.configRevisionId,
+					cancelledJobs: [],
 				};
 			}
 		}
@@ -431,7 +461,45 @@ export async function requestAgentRetire(
 			throw new AdminError(`agent '${parsed.agentId}' is already '${lifecycle.status}'`);
 		}
 
+		const { bundle: base } = await loadActiveBundle(db, baseRevisionId);
+		const financeAgentId = base.organization?.organization.finance_agent_id ?? null;
 		const changeSet: ChangeSet = [{ type: "remove_agent", agentId: parsed.agentId }];
+		if (financeAgentId === parsed.agentId) {
+			if (parsed.reassignFinanceTo === undefined) {
+				throw new AdminError(
+					`agent '${parsed.agentId}' is the organization's finance agent; retiring it requires ` +
+						"reassignFinanceTo naming another agent",
+				);
+			}
+			if (parsed.reassignFinanceTo === parsed.agentId) {
+				throw new AdminError("reassignFinanceTo must name a different agent");
+			}
+			if (!base.agents.some((agent) => agent.id === parsed.reassignFinanceTo)) {
+				throw new AdminError(
+					`reassignFinanceTo '${parsed.reassignFinanceTo}' is not a configured agent`,
+				);
+			}
+			changeSet.push({ type: "set_finance_agent", agentId: parsed.reassignFinanceTo });
+		} else if (parsed.reassignFinanceTo !== undefined) {
+			throw new AdminError(
+				`agent '${parsed.agentId}' is not the organization's finance agent; reassignFinanceTo must not be given`,
+			);
+		}
+
+		// A run in progress is cancelled first, exactly like `pauseAgent`: the state machine only
+		// allows `disable` (which the commit below drives, for any agent leaving the configuration)
+		// from `idle`/`waiting`/`failed`/`paused`, never from `queued`/`running`.
+		const agentRow = await lockAgent(db, parsed.agentId);
+		const cancelledJobs =
+			agentRow !== null && (agentRow.state === "queued" || agentRow.state === "running")
+				? await pauseInTransaction(
+						uow,
+						parsed.agentId,
+						parsed.actor,
+						`agent '${parsed.agentId}' retired by ${parsed.actor}`,
+					)
+				: [];
+
 		const commit = await commitWithinLock(
 			uow,
 			baseRevisionId,
@@ -440,6 +508,35 @@ export async function requestAgentRetire(
 			configRevisionSourceOf(parsed.source),
 			parsed.reason,
 		);
+
+		// Every channel it was ever granted directly (ADR-022) is tombstoned: a retired agent can
+		// never act again through one nobody thought to revoke by hand, and re-adding its bot to the
+		// same channel later must never silently re-grant it.
+		const revokedChannelIds = await revokeAllActiveGrantsIn(
+			uow,
+			parsed.agentId,
+			`agent_retired:${parsed.agentId}`,
+		);
+		if (revokedChannelIds.length > 0) {
+			await audit(uow, parsed.actor, "agent_lifecycle.grants_revoked", "agent", parsed.agentId, {
+				channel_ids: [...revokedChannelIds],
+			});
+		}
+
+		// Its own pending deliveries never go out as a retired agent: blocked here, rather than left
+		// to fail or expire on their own schedule.
+		const cancelledOutbox = await uow.tx.client.query(
+			`update outbox
+			    set status = 'cancelled', last_error_redacted = 'agent_retired'
+			  where status in ('pending', 'sending')
+			    and run_id in (select id from agent_runs where agent_id = $1)`,
+			[parsed.agentId],
+		);
+		if ((cancelledOutbox.rowCount ?? 0) > 0) {
+			await audit(uow, parsed.actor, "agent_lifecycle.outbox_cancelled", "agent", parsed.agentId, {
+				count: cancelledOutbox.rowCount,
+			});
+		}
 
 		// A create or restore still `pending`/`running` is superseded by this retire: it would
 		// otherwise be stranded there forever once `operation_id` below moves past it.
@@ -469,8 +566,22 @@ export async function requestAgentRetire(
 			operation_id: operationId,
 			revision_id: commit.result.revisionId,
 		});
-		return { operationId, agentId: parsed.agentId, revisionId: commit.result.revisionId };
+		return {
+			operationId,
+			agentId: parsed.agentId,
+			revisionId: commit.result.revisionId,
+			cancelledJobs,
+		};
 	});
+	// Outside the transaction, like `killAll`'s own: the agent's approval cards are updated
+	// (`sweepApprovals` posts "withdrawn" for whatever the commit above just cancelled) without
+	// waiting for the periodic sweep.
+	await sweepApprovals(deps).catch((error: unknown) => {
+		deps.log.warn("approvals not resolved after a retire; the sweep retries", {
+			error_message: error instanceof Error ? error.message : String(error),
+		});
+	});
+	return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -798,10 +909,15 @@ export async function completeOperation(
 const MAX_LIFECYCLE_ERROR_LENGTH = 2000;
 
 /**
- * Marks an operation `failed` and its agent `failed`, recording `error` on both rows. `error` is
- * redacted (`redactForStorage`, the same helper runtime-health and approval failures already use)
- * before it is bounded and persisted: a provisioner's own error text may quote a request or
- * response that still carries a credential. Refused for a stale or already terminal operation.
+ * Marks an operation `failed`, recording `error` on it and on its agent's `agent_lifecycle` row.
+ * `error` is redacted (`redactForStorage`, the same helper runtime-health and approval failures
+ * already use) before it is bounded and persisted: a provisioner's own error text may quote a
+ * request or response that still carries a credential. The agent itself moves to `failed` — except
+ * for a `retire` operation, which leaves it `retiring`: a retired agent's desired state never
+ * changes because its cleanup hit a permanent snag, and `retiring` is what names the specific
+ * attention it still needs (resume the cleanup by hand, or fix the underlying Mattermost problem),
+ * never the generic `failed` a stuck `create`/`restore`/`reprovision` already means. Refused for a
+ * stale or already terminal operation.
  */
 export async function failOperation(
 	deps: ControlPlaneDeps,
@@ -820,9 +936,10 @@ export async function failOperation(
 			.update(agentLifecycleOperations)
 			.set({ state: "failed", error: bounded, updatedAt: uow.now, finishedAt: uow.now })
 			.where(eq(agentLifecycleOperations.id, operationId));
+		const status: AgentLifecycleStatus = operation.kind === "retire" ? "retiring" : "failed";
 		await db
 			.update(agentLifecycle)
-			.set({ status: "failed", statusChangedAt: uow.now, lastError: bounded })
+			.set({ status, statusChangedAt: uow.now, lastError: bounded })
 			.where(eq(agentLifecycle.agentId, operation.agentId));
 		await audit(uow, actor, "agent_lifecycle.failed", "agent", operation.agentId, {
 			operation_id: operationId,

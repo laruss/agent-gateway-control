@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import {
 	type AgentConfig,
 	type AgentId,
+	type AgentLifecycleOperationKind,
+	type AgentLifecycleOperationState,
 	type AgentLifecycleSource,
 	BOT_SECRET_FILE_PREFIX,
 	type ChangeOperation,
@@ -27,7 +29,7 @@ import {
 	gatewayControls,
 } from "@agent-gateway/db";
 import { canonicalHash } from "@agent-gateway/events";
-import { desc, eq, inArray, or } from "drizzle-orm";
+import { asc, desc, eq, inArray, or } from "drizzle-orm";
 import {
 	AdminError,
 	type ConfigApplyInput,
@@ -298,6 +300,21 @@ function applyOperation(draft: ConfigDraftBundle, op: ChangeOperation): Operatio
 			const agents = [...draft.agents];
 			agents[index] = { ...current, enabled: op.enabled };
 			return { draft: { ...draft, agents }, problems: [] };
+		}
+		case "set_finance_agent": {
+			if (draft.organization === null) {
+				return { draft, problems: ["set_finance_agent: no organization is configured yet"] };
+			}
+			return {
+				draft: {
+					...draft,
+					organization: {
+						...draft.organization,
+						organization: { ...draft.organization.organization, finance_agent_id: op.agentId },
+					},
+				},
+				problems: [],
+			};
 		}
 	}
 }
@@ -691,7 +708,7 @@ function checkCommitChangeInput(
  * under the controller's own read-write directory could otherwise collide with, or silently steal,
  * a token the provisioner manages.
  */
-async function rejectUnownedBotSecretPaths(
+export async function rejectUnownedBotSecretPaths(
 	db: Db,
 	draftAgents: Readonly<AgentConfig[]>,
 	trustedAgentIds: ReadonlySet<AgentId>,
@@ -719,9 +736,10 @@ async function rejectUnownedBotSecretPaths(
 /** The nearest `AgentLifecycleSource` for a configuration commit's own `ConfigRevisionSource`: a
  * console edit stays `console`, an agent's own proposal stays `agent`, and every CLI-driven source
  * this journal has (`cli_apply`, `import`, `rollback`, `backfill`) maps to the lifecycle's own,
- * narrower `cli` — the reverse of `configRevisionSourceOf` (`agent-lifecycle.ts`), kept local here
- * since only this module's own auto-queued `reprovision` operations need it. */
-function agentLifecycleSourceOf(source: ConfigRevisionSource): AgentLifecycleSource {
+ * narrower `cli` — the reverse of `configRevisionSourceOf` (`agent-lifecycle.ts`). Exported so
+ * every committing path (`commitChangeIn`, `applyConfig`) maps its own source the same way before
+ * queuing a `reprovision`. */
+export function agentLifecycleSourceOf(source: ConfigRevisionSource): AgentLifecycleSource {
 	return source === "console" || source === "agent" ? source : "cli";
 }
 
@@ -732,64 +750,129 @@ function sameChannels(a: Readonly<string[]>, b: Readonly<string[]>): boolean {
 	return setA.size === setB.size && [...setA].every((name) => setB.has(name));
 }
 
+type AgentLifecycleRow = typeof agentLifecycle.$inferSelect;
+
 /**
- * Queues a `reprovision` operation for every lifecycle-owned, `ready` agent whose committed
- * `allowed_channels` just changed (console patch, CLI import — any path `commitChangeIn` commits):
- * the provisioner picks it up like any other pending operation, joining newly configured channels
- * and leaving channels no longer configured (ADR-026). Deduped: an agent whose current operation is
- * already a `pending` `reprovision` keeps it rather than queuing a second one — the provisioner
- * reads the agent's live configuration when it finally runs, so one pending operation already
- * covers every edit made before it starts. An agent not lifecycle-owned, or not currently `ready`
- * (still being created or restored, already retiring or retired, or failed), is left alone: its own
- * operation already owns reconciling its membership, or nothing here should touch it.
+ * Agent ids (sorted) whose `allowed_channels` differ between `before` and `after`: a config
+ * writer's own candidates for a `reprovision` operation (ADR-026). An agent not present in
+ * `before` (just added) is never a candidate: its own `create` operation already owns joining
+ * every channel it opens with, and one not present in `after` (just removed) is retiring, not
+ * reprovisioning.
  */
-async function queueMembershipReprovisioning(
+export function channelsChangedAgentIds(
+	before: Readonly<AgentConfig[]>,
+	after: Readonly<AgentConfig[]>,
+): Readonly<AgentId[]> {
+	const beforeById = new Map(before.map((agent) => [agent.id, agent]));
+	return after
+		.filter((agent) => {
+			const prior = beforeById.get(agent.id);
+			return (
+				prior !== undefined &&
+				!sameChannels(prior.mattermost.allowed_channels, agent.mattermost.allowed_channels)
+			);
+		})
+		.map((agent) => agent.id)
+		.sort();
+}
+
+/**
+ * Locks (`for update`) the `agent_lifecycle` rows of `agentIds`, in ascending id order — the
+ * global lock order every lifecycle writer keeps: `gateway_controls` (already held by the
+ * caller), then lifecycle row(s), then agent row(s), then operation rows. Called before a config
+ * writer locks the `agents` table itself (`writeConfigRevisionIn`'s own "every existing agent row,
+ * locked in id order up front"), so a concurrent `completeOperation` — which locks a lifecycle
+ * row, then that same agent's row via `scheduleAgent` — can never deadlock against it (both now
+ * take lifecycle-before-agent, never the reverse). An id with no lifecycle row at all (not yet
+ * adopted) is simply absent from the result.
+ */
+export async function lockLifecycleRows(
+	db: Db,
+	agentIds: Readonly<AgentId[]>,
+): Promise<ReadonlyMap<AgentId, AgentLifecycleRow>> {
+	if (agentIds.length === 0) {
+		return new Map();
+	}
+	const sorted = [...agentIds].sort();
+	const rows = await db
+		.select()
+		.from(agentLifecycle)
+		.where(inArray(agentLifecycle.agentId, sorted))
+		.orderBy(asc(agentLifecycle.agentId))
+		.for("update");
+	return new Map(rows.map((row) => [row.agentId, row]));
+}
+
+/**
+ * Queues a `reprovision` operation for every lifecycle-owned, `ready` agent named in `agentIds`
+ * (console patch, CLI import, `config apply`, or a single agent whose channel grant just changed
+ * — any caller that already locked its `agent_lifecycle` row, via {@link lockLifecycleRows}, before
+ * this is called): the provisioner picks it up like any other pending operation, joining newly
+ * configured channels and leaving channels no longer configured (ADR-026).
+ *
+ * Deduping and superseding, both decided under the operation row's own lock (the same order
+ * `markProvisioning`/`completeOperation` take: lifecycle row, then operation row, so this can
+ * never deadlock against them either): an agent whose current operation is already a `pending`
+ * `reprovision` keeps it rather than queuing a second one — the provisioner reads the agent's live
+ * configuration only after it claims the operation (`markProvisioning`), so one pending operation
+ * already covers every edit made before it starts. One that is already `running` is different: the
+ * provisioner claimed it, and whatever it read before claiming is now fixed for the rest of its own
+ * run, so a further edit cannot simply ride along — it is cancelled (like a superseded `create`
+ * `requestAgentRetire`/`requestAgentRestore` already cancel) and a fresh `pending` operation takes
+ * its place, so nothing is silently lost to an operation already mid-flight. An agent not
+ * lifecycle-owned, or not currently `ready` (still being created or restored, already retiring or
+ * retired, or failed), is left alone: its own operation already owns reconciling its membership, or
+ * nothing here should touch it.
+ */
+export async function queueMembershipReprovisioning(
 	uow: UnitOfWork,
-	base: ConfigDraftBundle,
-	draft: ConfigDraftBundle,
-	revisionId: number,
+	agentIds: Readonly<AgentId[]>,
+	locked: ReadonlyMap<AgentId, AgentLifecycleRow>,
+	revisionId: number | null,
 	actor: string,
-	source: ConfigRevisionSource,
+	source: AgentLifecycleSource,
 ): Promise<void> {
+	if (agentIds.length === 0) {
+		return;
+	}
 	const { db } = uow.tx;
-	const beforeById = new Map(base.agents.map((agent) => [agent.id, agent]));
-	for (const after of draft.agents) {
-		const before = beforeById.get(after.id);
-		if (
-			before === undefined ||
-			sameChannels(before.mattermost.allowed_channels, after.mattermost.allowed_channels)
-		) {
+	const owned = await lifecycleOwnedAgentIds(db, agentIds);
+	for (const agentId of agentIds) {
+		const lifecycle = locked.get(agentId);
+		if (lifecycle === undefined || lifecycle.status !== "ready" || !owned.has(agentId)) {
 			continue;
 		}
-		const [lifecycle] = await db
-			.select()
-			.from(agentLifecycle)
-			.where(eq(agentLifecycle.agentId, after.id))
-			.for("update");
-		if (lifecycle === undefined || lifecycle.status !== "ready") {
-			continue;
-		}
-		const owned = await lifecycleOwnedAgentIds(db, [after.id]);
-		if (!owned.has(after.id)) {
-			continue;
-		}
+		let current:
+			| { id: string; kind: AgentLifecycleOperationKind; state: AgentLifecycleOperationState }
+			| undefined;
 		if (lifecycle.operationId !== null) {
-			const [current] = await db
-				.select({ kind: agentLifecycleOperations.kind, state: agentLifecycleOperations.state })
+			[current] = await db
+				.select({
+					id: agentLifecycleOperations.id,
+					kind: agentLifecycleOperations.kind,
+					state: agentLifecycleOperations.state,
+				})
 				.from(agentLifecycleOperations)
-				.where(eq(agentLifecycleOperations.id, lifecycle.operationId));
-			if (current?.kind === "reprovision" && current.state === "pending") {
-				continue;
-			}
+				.where(eq(agentLifecycleOperations.id, lifecycle.operationId))
+				.for("update");
+		}
+		if (current?.kind === "reprovision" && current.state === "pending") {
+			continue;
+		}
+		if (current?.kind === "reprovision" && current.state === "running") {
+			await db
+				.update(agentLifecycleOperations)
+				.set({ state: "cancelled", updatedAt: uow.now, finishedAt: uow.now })
+				.where(eq(agentLifecycleOperations.id, current.id));
 		}
 		const operationId = randomUUID();
 		const generation = lifecycle.generation + 1;
 		await db.insert(agentLifecycleOperations).values({
 			id: operationId,
-			agentId: after.id,
+			agentId,
 			kind: "reprovision",
 			requestedBy: actor,
-			source: agentLifecycleSourceOf(source),
+			source,
 			configRevisionId: revisionId,
 			generation,
 			state: "pending",
@@ -800,8 +883,8 @@ async function queueMembershipReprovisioning(
 		await db
 			.update(agentLifecycle)
 			.set({ operationId, generation })
-			.where(eq(agentLifecycle.agentId, after.id));
-		await audit(uow, actor, "agent_lifecycle.reprovision", "agent", after.id, {
+			.where(eq(agentLifecycle.agentId, agentId));
+		await audit(uow, actor, "agent_lifecycle.reprovision", "agent", agentId, {
 			operation_id: operationId,
 			revision_id: revisionId,
 		});
@@ -941,6 +1024,12 @@ export async function commitChangeIn(
 		};
 	}
 
+	// Locked before `writeConfigRevisionIn` locks the `agents` table itself, so the global lock
+	// order (`gateway_controls` -> lifecycle row(s) -> agent row(s) -> operation rows) holds even
+	// though the actual queuing only happens after the write below (see `lockLifecycleRows`).
+	const channelsChangedIds = channelsChangedAgentIds(base.agents, draft.agents);
+	const lockedLifecycle = await lockLifecycleRows(db, channelsChangedIds);
+
 	const result = await writeConfigRevisionIn(uow, {
 		input: resolvedInput,
 		bundle,
@@ -955,11 +1044,11 @@ export async function commitChangeIn(
 	});
 	await queueMembershipReprovisioning(
 		uow,
-		base,
-		draft,
+		channelsChangedIds,
+		lockedLifecycle,
 		result.revisionId,
 		input.actor,
-		input.source,
+		agentLifecycleSourceOf(input.source),
 	);
 	return {
 		kind: "committed",

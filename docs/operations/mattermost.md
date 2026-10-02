@@ -121,7 +121,7 @@ The bot's token file is in `secrets/controller-bots/`, backed up and restored al
 of `$GATEWAY_HOME` (`docs/operations/home-server.md`); nothing needs to be reprovisioned after an
 ordinary restore. Only if that directory itself were ever lost without a backup would an agent's
 bot need a fresh token — created by hand in Mattermost and written to its
-`mattermost.token_secret_file`, or by retiring and restoring the agent once that cleanup exists.
+`mattermost.token_secret_file`, or by retiring and restoring the agent (below).
 
 ### Changing a lifecycle-created agent's channels
 
@@ -132,6 +132,69 @@ leave its bot to match. The provisioner picks it up like any other operation: it
 existing token, joins every channel the edit added, and leaves every channel the edit removed
 (except one an owner or admin granted the bot directly, which stays). The agent itself stays
 `ready` throughout — a membership-only change is never a reason to pause its scheduling.
+
+### Retiring and restoring an agent
+
+```bash
+bun run gateway agents retire data-analyst --reason "role no longer needed"
+bun run gateway agents operations --agent data-analyst
+```
+
+`agents retire` cancels an active run (the same cancellation `agents pause` performs), cancels
+its waits, withdraws its pending approvals and queued tool actions (and asks a running one to
+stop), revokes every channel it was ever granted directly, blocks its own pending Mattermost
+deliveries, and commits the configuration change that takes it out of scheduling — all before the
+Mattermost side even starts. The lifecycle moves to `retiring`, then the provisioner removes the
+bot from every channel it is in, revokes its access tokens, deactivates the account, and (for a
+lifecycle-created agent only — a bootstrap-managed one's `/run/secrets/...` file is never
+touched) deletes its local token file; the lifecycle becomes `retired`. A permanent failure
+leaves it `retiring` with `last_error`, surfaced by `gateway doctor`; **a database rollback alone
+never reactivates a Mattermost account that a provisioner pass already deactivated** — Mattermost
+is never inside a Gateway database transaction.
+
+Retiring the organization's configured finance agent is refused unless the same command also
+reassigns the role:
+
+```bash
+bun run gateway agents retire finance-bot --reassign-finance-to data-analyst
+```
+
+An agent id is never reused, so a retired agent's identity, audit trail and run history always
+stay its own. Its private memory becomes unreadable at once (excluded from `gateway memory list`
+too) and is left to the existing retention to expire on its own schedule; shared memory it wrote
+and that was accepted is organization-owned and stays.
+
+```bash
+bun run gateway agents restore data-analyst
+```
+
+`agents restore` re-adds the agent's last recorded configuration (`pending`, then provisioning
+again): the provisioner re-enables the same bot account, issues it a fresh token (its old ones
+were revoked on retirement), and rejoins its configured channels — the same steps a fresh
+`create` takes, since `restore` shares the provisioner's own path with it. Restore is refused
+when no historical configuration for the agent is still available (an upgrade from a release
+before the configuration journal existed).
+
+### Channel assignments and provenance
+
+```bash
+bun run gateway agents channels data-analyst
+```
+
+Lists the agent's channels with where each one comes from: `configured` (named in its own
+`allowed_channels`) or `granted` (an ADR-022 grant — by whom, when, and the post that is its
+evidence). Revoke a grant directly:
+
+```bash
+bun run gateway agents revoke-grant data-analyst research
+```
+
+This tombstones the grant (re-adding the bot to the same channel later never silently re-grants
+it) and removes the bot from the channel: at once, via a queued `reprovision` operation, for a
+lifecycle-created agent; on the membership synchronizer's own next pass (seconds away) for a
+bootstrap-managed one. A channel the bot is a member of that is neither configured nor granted
+(`member-unauthorized`) does not show up here — that is a live check against Mattermost itself,
+which `gateway mattermost reconcile` already performs.
 
 ## Giving an agent a channel
 

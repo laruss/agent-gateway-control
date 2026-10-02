@@ -18,6 +18,48 @@ All notable changes are documented here. The project follows Semantic Versioning
   `gateway agents operations [--agent <id>]` lists each operation's state, checkpoints and error.
   With no admin token configured, new agents simply wait, surfaced by `gateway doctor`. Existing
   bootstrap-created agents and `gateway mattermost bootstrap` itself are unchanged. (ADR-026)
+- Retiring an agent (`requestAgentRetire`) now cleans up fully, both in the Gateway and in
+  Mattermost (ADR-026). In the same transaction as its `remove_agent` configuration change: an
+  active run is cancelled (its worker stops the turn, exactly like pausing); its waits are
+  cancelled and its pending approvals, queued tool actions and running tool actions' own
+  cancellation are requested (the approval card is updated the same way any other withdrawal shows
+  it); every channel it was ever granted directly is revoked, so re-adding its bot later never
+  silently re-grants it; its pending Mattermost deliveries are blocked rather than sent as a
+  retired agent (a new `cancelled` outbox status). A late run or tool report for a retiring or
+  already-retired agent is dropped before publishing any effect (a post, a memory write, a wait),
+  audited either way. Retiring the organization's configured finance agent is refused unless the
+  same request also reassigns the role to another configured agent (`reassignFinanceTo`). Audit
+  entries, identity rows, run history and already-sent messages are kept; the agent's private
+  memory becomes unreadable (excluded from `gateway memory list` too) and is left to the existing
+  retention to expire, while shared memory it wrote and that was accepted stays, organization-
+  owned. A `retire` lifecycle operation is now executable by the provisioner: it removes the bot
+  from every channel, revokes its access tokens, deactivates it, and — only for a lifecycle-
+  created agent — removes its local token file (a bootstrap-managed agent's own file is left alone
+  and reported stale); a permanent failure leaves the agent `retiring` with `last_error` for
+  `gateway doctor` to surface. `requestAgentRestore` (already available) is now fully provisioned
+  again by the same background loop: the bot is re-enabled, a fresh token issued, and it rejoins
+  its channels.
+- An agent's channels now have a provenance read model: `configured` (named in its own
+  `allowed_channels`) or `granted` (an ADR-022 grant — by whom, when, which post is its evidence).
+  `gateway agents channels <id>` lists them; `gateway agents revoke-grant <id> <channel>` revokes
+  one directly, removing the bot from it through the lifecycle provisioner (a lifecycle-owned
+  agent) or the membership synchronizer's own next pass (a bootstrap-managed one).
+  `gateway agents retire <id>` and `gateway agents restore <id>` are now CLI commands too.
+
+### Fixed
+
+- `gateway config apply`'s whole-bundle replace now goes through the same checks a managed-
+  configuration commit (a console patch, a CLI import) already did: a `/run/bot-secrets/` token
+  path is refused for an agent that is not lifecycle-owned, and a lifecycle-owned, `ready` agent
+  whose `allowed_channels` changed gets a `reprovision` operation queued the same way. Queuing a
+  `reprovision` (from either path) now locks the affected agents' lifecycle rows before their
+  `agents` rows, matching the lock order `completeOperation` already takes, so the two can never
+  deadlock against each other; a config edit that lands while the provisioner is already mid-flight
+  on a `reprovision` now cancels that run and queues a fresh one, rather than risking the edit being
+  silently folded into — and lost by — an operation that already read a stale configuration. The
+  provisioner's own leaving-channels step now re-checks active grants immediately before each
+  channel removal, rather than once at the start of its pass, so a grant made mid-pass is still
+  honored.
 
 ## [0.5.0] - 2026-10-02
 

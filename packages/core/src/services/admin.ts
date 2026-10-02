@@ -1,6 +1,12 @@
+import { randomUUID } from "node:crypto";
 import {
 	type AgentConfig,
 	AgentConfigSchema,
+	type AgentId,
+	type AgentLifecycleOperationKind,
+	type AgentLifecycleOperationState,
+	type AgentLifecycleSource,
+	BOT_SECRET_FILE_PREFIX,
 	CONFIG_SNAPSHOT_FORMAT,
 	type ConfigRevisionSource,
 	type ConfigSnapshotBundle,
@@ -16,6 +22,8 @@ import {
 import {
 	type AgentState,
 	agentInbox,
+	agentLifecycle,
+	agentLifecycleOperations,
 	agentRuns,
 	agents,
 	approvalRequests,
@@ -46,6 +54,7 @@ import { type RuntimeHealth, runtimeHealth } from "./runtime-health.ts";
 import { type ScheduleResult, scheduleAgent } from "./scheduler.ts";
 import {
 	audit,
+	lifecycleOwnedAgentIds,
 	loadActiveConfig,
 	loadChannelAccess,
 	loadDirectory,
@@ -54,6 +63,8 @@ import {
 	toGatewayEvent,
 } from "./store.ts";
 import { cancelActiveWaits } from "./wait-store.ts";
+
+type Db = UnitOfWork["tx"]["db"];
 
 export async function inTransaction<T>(
 	deps: ControlPlaneDeps,
@@ -787,6 +798,165 @@ export async function writeConfigRevisionIn(
 	return { version, revisionId: revision.id, created, updated, disabled };
 }
 
+// ---------------------------------------------------------------------------
+// Shared with the managed-configuration service (`management.ts`'s own `commitChangeIn`): kept as
+// a second copy here, rather than imported, so neither module depends on the other (Biome refuses
+// an import cycle between them; `management.ts` already imports `writeConfigRevisionIn` from this
+// one). Every committing path — `applyConfig`'s whole-bundle replace and `commitChangeIn`'s
+// finer-grained operations — runs the same two checks before it writes: a lifecycle-owned-only
+// `/run/bot-secrets/` token path, and a `reprovision` queued for any lifecycle-owned, `ready`
+// agent whose `allowed_channels` just changed (ADR-026).
+// ---------------------------------------------------------------------------
+
+/**
+ * `/run/bot-secrets/` is the lifecycle provisioner's own directory (ADR-026): naming it in
+ * `token_secret_file` is refused for any agent that is not lifecycle-owned (its operation journal
+ * names a `create` or `restore`) or one `trustedAgentIds` names. See `management.ts`'s own copy
+ * for the full rationale (`rejectUnownedBotSecretPaths`); `applyConfig` never has a trusted id of
+ * its own, so it always calls this with an empty set.
+ */
+async function rejectUnownedBotSecretPathsIn(
+	db: Db,
+	draftAgents: Readonly<AgentConfig[]>,
+	trustedAgentIds: ReadonlySet<AgentId>,
+): Promise<Readonly<string[]>> {
+	const candidates = draftAgents.filter((agent) =>
+		agent.mattermost.token_secret_file.startsWith(BOT_SECRET_FILE_PREFIX),
+	);
+	if (candidates.length === 0) {
+		return [];
+	}
+	const owned = await lifecycleOwnedAgentIds(
+		db,
+		candidates.map((agent) => agent.id),
+	);
+	return candidates
+		.filter((agent) => !trustedAgentIds.has(agent.id) && !owned.has(agent.id))
+		.map(
+			(agent) =>
+				`agent ${agent.id}: token_secret_file '${agent.mattermost.token_secret_file}' is under ` +
+				"the lifecycle provisioner's own directory, but this agent was not created or restored " +
+				"through the lifecycle",
+		);
+}
+
+/** Whether `a` and `b` name the same channels, regardless of order. */
+function sameChannelsIn(a: Readonly<string[]>, b: Readonly<string[]>): boolean {
+	const setA = new Set(a);
+	const setB = new Set(b);
+	return setA.size === setB.size && [...setA].every((name) => setB.has(name));
+}
+
+/** Agent ids (sorted) whose `allowed_channels` differ between `before` and `after` — see
+ * `management.ts`'s own `channelsChangedAgentIds`. */
+function channelsChangedAgentIdsIn(
+	before: Readonly<AgentConfig[]>,
+	after: Readonly<AgentConfig[]>,
+): Readonly<string[]> {
+	const beforeById = new Map(before.map((agent) => [agent.id, agent]));
+	return after
+		.filter((agent) => {
+			const prior = beforeById.get(agent.id);
+			return (
+				prior !== undefined &&
+				!sameChannelsIn(prior.mattermost.allowed_channels, agent.mattermost.allowed_channels)
+			);
+		})
+		.map((agent) => agent.id)
+		.sort();
+}
+
+type AgentLifecycleRow = typeof agentLifecycle.$inferSelect;
+
+/** Locks (`for update`) the `agent_lifecycle` rows of `agentIds`, in ascending id order — see
+ * `management.ts`'s own `lockLifecycleRows` for the full lock-order rationale. */
+async function lockLifecycleRowsIn(
+	db: Db,
+	agentIds: Readonly<string[]>,
+): Promise<ReadonlyMap<string, AgentLifecycleRow>> {
+	if (agentIds.length === 0) {
+		return new Map();
+	}
+	const sorted = [...agentIds].sort();
+	const rows = await db
+		.select()
+		.from(agentLifecycle)
+		.where(inArray(agentLifecycle.agentId, sorted))
+		.orderBy(asc(agentLifecycle.agentId))
+		.for("update");
+	return new Map(rows.map((row) => [row.agentId, row]));
+}
+
+/** Queues a `reprovision` operation the same way `management.ts`'s own `queueMembershipReprovisioning`
+ * does (see its doc comment for the full dedup/supersede rationale); kept as a second copy here for
+ * the same reason as `rejectUnownedBotSecretPathsIn` above. */
+async function queueMembershipReprovisioningIn(
+	uow: UnitOfWork,
+	agentIds: Readonly<string[]>,
+	locked: ReadonlyMap<string, AgentLifecycleRow>,
+	revisionId: number | null,
+	actor: string,
+	source: AgentLifecycleSource,
+): Promise<void> {
+	if (agentIds.length === 0) {
+		return;
+	}
+	const { db } = uow.tx;
+	const owned = await lifecycleOwnedAgentIds(db, agentIds);
+	for (const agentId of agentIds) {
+		const lifecycle = locked.get(agentId);
+		if (lifecycle === undefined || lifecycle.status !== "ready" || !owned.has(agentId)) {
+			continue;
+		}
+		let current:
+			| { id: string; kind: AgentLifecycleOperationKind; state: AgentLifecycleOperationState }
+			| undefined;
+		if (lifecycle.operationId !== null) {
+			[current] = await db
+				.select({
+					id: agentLifecycleOperations.id,
+					kind: agentLifecycleOperations.kind,
+					state: agentLifecycleOperations.state,
+				})
+				.from(agentLifecycleOperations)
+				.where(eq(agentLifecycleOperations.id, lifecycle.operationId))
+				.for("update");
+		}
+		if (current?.kind === "reprovision" && current.state === "pending") {
+			continue;
+		}
+		if (current?.kind === "reprovision" && current.state === "running") {
+			await db
+				.update(agentLifecycleOperations)
+				.set({ state: "cancelled", updatedAt: uow.now, finishedAt: uow.now })
+				.where(eq(agentLifecycleOperations.id, current.id));
+		}
+		const operationId = randomUUID();
+		const generation = lifecycle.generation + 1;
+		await db.insert(agentLifecycleOperations).values({
+			id: operationId,
+			agentId,
+			kind: "reprovision",
+			requestedBy: actor,
+			source,
+			configRevisionId: revisionId,
+			generation,
+			state: "pending",
+			checkpoints: {},
+			createdAt: uow.now,
+			updatedAt: uow.now,
+		});
+		await db
+			.update(agentLifecycle)
+			.set({ operationId, generation })
+			.where(eq(agentLifecycle.agentId, agentId));
+		await audit(uow, actor, "agent_lifecycle.reprovision", "agent", agentId, {
+			operation_id: operationId,
+			revision_id: revisionId,
+		});
+	}
+}
+
 /**
  * Stores a validated configuration as the active version and upserts its agents: the whole-bundle
  * replace `config apply` has always performed, now written through {@link writeConfigRevisionIn}.
@@ -832,7 +1002,23 @@ export async function applyConfig(
 			},
 			actor,
 		);
-		return writeConfigRevisionIn(uow, {
+		// Every committing path behaves the same (ADR-026): a plain `config apply` is refused the
+		// lifecycle provisioner's own `/run/bot-secrets/` token path for an agent it does not own,
+		// exactly like `commitChangeIn` already refuses it for a console patch or a CLI import.
+		const botSecretProblems = await rejectUnownedBotSecretPathsIn(db, input.agents, new Set());
+		if (botSecretProblems.length > 0) {
+			throw new AdminError(`configuration is invalid:\n- ${botSecretProblems.join("\n- ")}`);
+		}
+		// Locked before `writeConfigRevisionIn` locks the `agents` table itself, the same order
+		// `commitChangeIn` keeps (see `lockLifecycleRowsIn`). An unlocked read: only the diff it
+		// informs needs to be current, not linearized with the write below (which locks the table
+		// for real right after).
+		const priorAgents = (await db.select({ config: agents.config }).from(agents)).map(
+			(row) => row.config,
+		);
+		const channelsChangedIds = channelsChangedAgentIdsIn(priorAgents, input.agents);
+		const lockedLifecycle = await lockLifecycleRowsIn(db, channelsChangedIds);
+		const result = await writeConfigRevisionIn(uow, {
 			input,
 			bundle,
 			version,
@@ -844,6 +1030,19 @@ export async function applyConfig(
 			idempotencyKey: null,
 			changeHash: null,
 		});
+		// A plain `config apply` queues a `reprovision` the same way a managed-configuration commit
+		// does, for any lifecycle-owned, `ready` agent whose `allowed_channels` just changed: neither
+		// path may leave the other as the only one that keeps a lifecycle-owned agent's Mattermost
+		// membership in sync with its configuration.
+		await queueMembershipReprovisioningIn(
+			uow,
+			channelsChangedIds,
+			lockedLifecycle,
+			result.revisionId,
+			actor,
+			"cli",
+		);
+		return result;
 	});
 }
 
@@ -1041,8 +1240,12 @@ export type CancelledJob = Readonly<{ queue: string; jobId: string }>;
 /**
  * Pauses an agent. A run in progress is cancelled and its inbox entries return to pending, so
  * no work is lost; the worker's late report is ignored because the run is no longer active.
+ * Exported for `requestAgentRetire` (`agent-lifecycle.ts`), which reuses this exact cancellation
+ * before committing a `remove_agent` change set: the state machine only allows `disable` from
+ * `idle`/`waiting`/`failed`/`paused`, never from `queued`/`running`, so an active run is cancelled
+ * (moving the agent to `paused`) first.
  */
-async function pauseInTransaction(
+export async function pauseInTransaction(
 	uow: UnitOfWork,
 	agentId: string,
 	actor: string,

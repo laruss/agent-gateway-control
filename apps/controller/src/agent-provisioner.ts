@@ -1,8 +1,8 @@
 import type {
 	AgentLifecycleCheckpoints,
 	AgentLifecycleOperationKind,
-	MattermostId,
 } from "@agent-gateway/contracts";
+import { BOT_SECRET_FILE_PREFIX } from "@agent-gateway/contracts";
 import {
 	type ControlPlaneDeps,
 	checkpointOperation,
@@ -10,6 +10,7 @@ import {
 	failOperation,
 	listPendingLifecycleOperations,
 	listRunningLifecycleOperations,
+	loadAgentAllowedChannelIds,
 	loadAgentConfig,
 	loadDirectoryEntry,
 	loadMattermostIdentity,
@@ -33,6 +34,7 @@ import {
 	tokenOwner,
 } from "@agent-gateway/mattermost";
 import {
+	deleteSecretFile,
 	readOptionalFileSetting,
 	readSecretFile,
 	resolveSecretPath,
@@ -40,16 +42,18 @@ import {
 	writeSecretFile,
 } from "@agent-gateway/service";
 
-/**
- * Lifecycle operation kinds this provisioner pursues: never `retire` (cancelling runs, waits and
- * approvals and deactivating a bot is other work's own) or `adopt` (written only `succeeded`, by
- * the startup backfill, never left `pending`/`running`).
- */
+/** Lifecycle operation kinds the main provisioning loop pursues: never `adopt` (written only
+ * `succeeded`, by the startup backfill, never left `pending`/`running`). `retire` is handled by
+ * its own loop (`RETIRE_KINDS`, `processRetireOperation`): its steps (revoking tokens, disabling
+ * the bot, leaving channels) are different enough from `create`/`restore`/`reprovision`'s own
+ * (resolving a bot, joining it) to keep separate rather than branching `processOperation` itself. */
 const PROVISIONING_KINDS: ReadonlyArray<AgentLifecycleOperationKind> = [
 	"create",
 	"restore",
 	"reprovision",
 ];
+
+const RETIRE_KINDS: ReadonlyArray<AgentLifecycleOperationKind> = ["retire"];
 
 export type AgentProvisionerOptions = Readonly<{
 	baseUrl: string;
@@ -173,6 +177,17 @@ export async function runProvisionerPass(
 		}
 		await processOperation(deps, admin, options, actor, operation, log, resolveTokenOwner);
 	}
+
+	const retiring = (await listRunningLifecycleOperations(deps)).filter((operation) =>
+		RETIRE_KINDS.includes(operation.kind),
+	);
+	const pendingRetires = await listPendingLifecycleOperations(deps, RETIRE_KINDS);
+	for (const operation of [...retiring, ...pendingRetires]) {
+		if (stopped()) {
+			return;
+		}
+		await processRetireOperation(deps, admin, options, actor, operation, log);
+	}
 }
 
 async function processOperation(
@@ -184,16 +199,22 @@ async function processOperation(
 	log: Logger,
 	resolveTokenOwner: typeof tokenOwner,
 ): Promise<void> {
-	const agentConfig = await loadAgentConfig(deps, operation.agentId);
-	const snapshot = await loadMattermostSnapshot(deps);
-	if (agentConfig === null || snapshot === null) {
+	// A cheap precheck, before ever claiming the operation: is there anything to provision yet at
+	// all. Re-read fresh right after claiming below — never this copy — since a config edit that
+	// committed between this read and the claim must still be reflected in what gets provisioned
+	// (the two are serialized by the same `agent_lifecycle` row lock, so the edit is guaranteed
+	// visible by the time the claim itself succeeds; this copy alone is not).
+	const precheck = await loadAgentConfig(deps, operation.agentId);
+	const precheckSnapshot = await loadMattermostSnapshot(deps);
+	if (precheck === null || precheckSnapshot === null) {
 		// The agent, or the whole active configuration, is not there to provision right now (a
 		// retire committed concurrently, say): left for the next tick, or for whatever superseded
 		// this operation to settle it.
 		return;
 	}
-	const teamId = await loadDirectoryEntry(deps, "team", snapshot.organization.mattermost.team);
-	if (teamId === null) {
+	if (
+		(await loadDirectoryEntry(deps, "team", precheckSnapshot.organization.mattermost.team)) === null
+	) {
 		log.info("agent provisioner: Mattermost team not resolved yet; waiting", {
 			agent_id: operation.agentId,
 		});
@@ -209,6 +230,24 @@ async function processOperation(
 			}
 			throw error;
 		}
+	}
+
+	// Reloaded after claiming (or confirming) the operation: a config edit that committed before
+	// the claim must be what this pass actually provisions, never a snapshot read before it.
+	const agentConfig = await loadAgentConfig(deps, operation.agentId);
+	const snapshot = await loadMattermostSnapshot(deps);
+	if (agentConfig === null || snapshot === null) {
+		log.warn("agent provisioner: agent or configuration vanished after claiming the operation", {
+			agent_id: operation.agentId,
+		});
+		return;
+	}
+	const teamId = await loadDirectoryEntry(deps, "team", snapshot.organization.mattermost.team);
+	if (teamId === null) {
+		log.info("agent provisioner: Mattermost team not resolved yet; waiting", {
+			agent_id: operation.agentId,
+		});
+		return;
 	}
 
 	let checkpoints = operation.checkpoints;
@@ -285,15 +324,15 @@ async function processOperation(
 
 		// A `reprovision` operation's own membership step (ADR-026): channels the committed change
 		// took away are left, except ones an owner or admin granted this agent's bot directly (an
-		// ADR-022 grant, which `snapshot`'s own per-agent `channelIds` already folds in alongside its
-		// configured channels — checked here, never assumed, since a grant made after the operation
-		// was queued must still be honored). `create`/`restore` never reach this with anything to
-		// leave: their bot has only ever joined what the loop above just joined it to.
+		// ADR-022 grant). Checked fresh immediately before each removal — never once from `snapshot`
+		// at the top of this pass — since this loop calls Mattermost once per channel and may take a
+		// while; a grant made mid-pass (even after the operation started) must still be honored, so
+		// the one read that decides a removal is never older than the removal itself.
+		// `create`/`restore` never reach this with anything to leave: their bot has only ever joined
+		// what the loop above just joined it to.
 		if (operation.kind === "reprovision") {
-			const allowed =
-				snapshot.agents.find((candidate) => candidate.id === operation.agentId)?.channelIds ??
-				new Set<MattermostId>();
 			for (const channel of await admin.userChannelsInTeam(botUserId, teamId)) {
+				const allowed = await loadAgentAllowedChannelIds(deps, operation.agentId);
 				if (isExtraChannel(channel, allowed)) {
 					await admin.removeChannelMember(channel.id, botUserId);
 				}
@@ -346,6 +385,113 @@ async function ensureBotToken(
 	await revokeAllTokens(admin, userId);
 	const created = await admin.createUserAccessToken(userId, TOKEN_DESCRIPTION);
 	writeSecretFile(resolvedPath, created.token);
+}
+
+/**
+ * Drives a `retire` operation's own Mattermost-side cleanup (ADR-026): every access token
+ * revoked, the bot account deactivated, every channel it is currently a member of left, and —
+ * only for a lifecycle-created agent's own `/run/bot-secrets/` file — that token file removed.
+ * Deactivation and token revocation happen first, like `bootstrapMattermost`'s own retirement of
+ * a replaced bot: once both are done the account has no access left at all, so a crash partway
+ * through the remaining, merely cosmetic channel removals can never leave a bot with access
+ * nobody meant it to keep. An agent whose identity was never resolved (retired while still
+ * `pending`) has nothing Mattermost-side to clean up at all.
+ */
+async function processRetireOperation(
+	deps: ControlPlaneDeps,
+	admin: AdminMattermostClient,
+	options: AgentProvisionerOptions,
+	actor: string,
+	operation: LifecycleOperation,
+	log: Logger,
+): Promise<void> {
+	if (operation.state === "pending") {
+		try {
+			await markProvisioning(deps, operation.id, actor);
+		} catch (error) {
+			if (error instanceof StaleLifecycleOperationError) {
+				return;
+			}
+			throw error;
+		}
+	}
+
+	let checkpoints = operation.checkpoints;
+	try {
+		const identity = await loadMattermostIdentity(deps, operation.agentId);
+		const botUserId = identity?.userId ?? null;
+		if (botUserId === null) {
+			await completeOperation(deps, operation.id, actor, checkpoints);
+			log.info("agent provisioner: agent retired (no Mattermost identity had been provisioned)", {
+				agent_id: operation.agentId,
+			});
+			return;
+		}
+
+		if (checkpoints.tokens_revoked !== true) {
+			await revokeAllTokens(admin, botUserId);
+			checkpoints = await checkpoint(deps, operation.id, checkpoints, { tokens_revoked: true });
+		}
+
+		if (checkpoints.bot_disabled !== true) {
+			const account = await admin.user(botUserId);
+			if (account.delete_at === 0) {
+				await admin.disableBot(botUserId);
+			}
+			checkpoints = await checkpoint(deps, operation.id, checkpoints, { bot_disabled: true });
+		}
+
+		const snapshot = await loadMattermostSnapshot(deps);
+		const teamId =
+			snapshot === null
+				? null
+				: await loadDirectoryEntry(deps, "team", snapshot.organization.mattermost.team);
+		if (teamId !== null) {
+			const left = new Set(checkpoints.channels_left ?? []);
+			for (const channel of await admin.userChannelsInTeam(botUserId, teamId)) {
+				if (left.has(channel.id)) {
+					continue;
+				}
+				try {
+					await admin.removeChannelMember(channel.id, botUserId);
+				} catch (error) {
+					// The team's default channel cannot be left by any member; the account is already
+					// deactivated and token-less, so this is cosmetic — reported, not retried forever.
+					if (!(error instanceof MattermostApiError) || error.status !== 400) {
+						throw error;
+					}
+					log.info(
+						"agent provisioner: could not remove the retired bot from a channel; continuing",
+						{
+							agent_id: operation.agentId,
+							channel_id: channel.id,
+						},
+					);
+				}
+				left.add(channel.id);
+				checkpoints = await checkpoint(deps, operation.id, checkpoints, {
+					channels_left: [...left],
+				});
+			}
+		}
+
+		// Only a lifecycle-created agent's own token file: never `/run/secrets/`, the CLI's own
+		// read-write mount for a bootstrap-managed agent (ADR-026) — that file is left exactly as
+		// it is, reported stale by `gateway doctor` rather than ever touched here.
+		if (checkpoints.token_file_deleted !== true) {
+			const agentConfig = await loadAgentConfig(deps, operation.agentId);
+			const ref = agentConfig?.mattermost.token_secret_file;
+			if (ref?.startsWith(BOT_SECRET_FILE_PREFIX)) {
+				deleteSecretFile(resolveSecretPath(ref, options.secretsDir));
+			}
+			checkpoints = await checkpoint(deps, operation.id, checkpoints, { token_file_deleted: true });
+		}
+
+		await completeOperation(deps, operation.id, actor, checkpoints);
+		log.info("agent provisioner: agent retired", { agent_id: operation.agentId });
+	} catch (error) {
+		await settleFailure(deps, operation, actor, error, log);
+	}
 }
 
 /**

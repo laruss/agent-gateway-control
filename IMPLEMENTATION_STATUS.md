@@ -2075,6 +2075,13 @@ Status: **done**
 | `gateway mattermost admin-token set` (hidden entry, validates `users/me`: non-bot, `system_admin`) and `admin-token rotate` (create-verify-switch-revoke: a new token for the same account, verified, switched, then every other token on the account revoked — correct after any number of interrupted retries, since nothing but the file says which token is current) | done | `apps/cli/src/mattermost-commands.ts`, `packages/mattermost/src/client.ts` (`createUserAccessToken` now returns its id too) |
 | `gateway agents create <id> --display-name ... --role-prompt-file ... [--channel ...] [--runtime ...] [--model ...]` (a thin wrapper over `requestAgentCreate`) and `gateway agents operations [--agent <id>]` | done | `apps/cli/src/commands.ts` |
 | `gateway mattermost bootstrap` unchanged; an agent it created keeps its own `/run/secrets/...` token path | done | `apps/cli/src/mattermost-commands.ts` (unchanged) |
+| Retirement cleanup: an active run cancelled, waits cancelled, approvals/tool actions withdrawn (card updated), every channel grant tombstoned, pending outbox deliveries blocked (`cancelled` status), all in the same transaction as `remove_agent`; the finance agent refused without `reassignFinanceTo` | done | `packages/core/src/services/agent-lifecycle.ts` (`requestAgentRetire`), `packages/core/src/services/channel-grants.ts` (`revokeAllActiveGrantsIn`), `packages/db/migrations/0026_outbox_cancelled_status.sql` |
+| Late run/tool reports for a `retiring`/`retired` agent publish no effect, dropped with an audit entry | done | `packages/core/src/services/runs.ts` (`handleRunReport`), `packages/core/src/services/approvals.ts` (`handleToolReport`) |
+| Private memory excluded from `gateway memory list`; shared memory the agent wrote stays | done | `packages/core/src/services/memory.ts` (`retiredPrivateNamespaces`) |
+| The provisioner executes `retire`: every token revoked, the bot deactivated, every channel left, a lifecycle-created agent's own token file removed (never a bootstrap-managed one); `restore` reuses `create`'s own steps unchanged (`ensureBot` already re-enables a disabled bot) | done | `apps/controller/src/agent-provisioner.ts` (`processRetireOperation`) |
+| Assignments read model (`configured`/`granted` provenance) and `gateway agents channels <id>` / `gateway agents revoke-grant <id> <channel>` / `gateway agents retire <id>` / `gateway agents restore <id>` | done | `packages/core/src/services/channel-grants.ts` (`loadAgentChannelAssignments`, `revokeChannelGrant`), `apps/cli/src/commands.ts` |
+| `config apply`'s whole-bundle replace runs the same `/run/bot-secrets/` ownership check and `reprovision` queuing a managed-configuration commit already did | done | `packages/core/src/services/admin.ts` (`applyConfig`) |
+| Queuing a `reprovision` locks affected agents' lifecycle rows before the `agents` table (matching `completeOperation`'s own order); a config edit during a running `reprovision` cancels it and queues a fresh one; the leaving-channels step re-checks grants immediately before each removal | done | `packages/core/src/services/management.ts` (`queueMembershipReprovisioning`, `lockLifecycleRows`), `apps/controller/src/agent-provisioner.ts` |
 
 Acceptance:
 
@@ -2092,6 +2099,19 @@ Acceptance:
   `admin-token rotate` leaves the old token rejected and the new one working.
 - [x] CLI integration coverage of `agents create`/`agents operations`, and `admin-token set`
   refusing a bot token or a non-admin account.
+- [x] Retiring an agent mid-queue, mid-run, with a pending wait, a pending approval and a pending
+  outbox item each cancels or blocks its own kind, auditing every one; a late run report after
+  retire publishes nothing; the finance agent's retirement is refused without `reassignFinanceTo`
+  and succeeds with it; a grant revoked on retire stays revoked even after the bot is re-added to
+  the channel.
+- [x] Against a real, dev Mattermost server: create through to `ready`, then retire — the bot is
+  deactivated, removed from its channels, its token rejected by the server; restore brings it back
+  to working.
+- [x] A fake-client provisioner suite covers `retire`'s own steps resuming from each checkpoint,
+  and a permanent failure leaving the agent `retiring` with `last_error`.
+- [x] A concurrent config edit and a running `reprovision` operation never deadlock and never lose
+  the edit: the edit either rides an operation still `pending`, or cancels one already `running` and
+  queues a fresh one that reads the edited configuration.
 
 Deliberate choices here ([ADR-026](docs/adr/026-agent-lifecycle.md)):
 
@@ -2105,10 +2125,25 @@ Deliberate choices here ([ADR-026](docs/adr/026-agent-lifecycle.md)):
   bootstrap (or an earlier provisioner pass) already resolved, waiting rather than failing when one
   is not there yet.
 - No retry-from-`failed` command ships with this phase: a permanent failure needs an operator to
-  fix the underlying problem (a stray account, an invalid admin token) and create the agent fresh,
-  or wait for the later work that adds retirement's own cleanup and a `reprovision` entry point.
+  fix the underlying problem (a stray account, an invalid admin token) and create the agent fresh.
 - `secrets/controller-bots` needs no change to `backup.sh`/`restore.sh`: both already archive and
   restore the whole of `$GATEWAY_HOME` (minus `backups/` itself), so the new directory is included
   and restored automatically, the same as every other secrets directory.
+- Retirement's channel-removal order follows `bootstrapMattermost`'s own retirement of a replaced
+  bot: tokens revoked and the bot deactivated *before* any channel is left, so a crash partway
+  through the (purely cosmetic, from that point on) channel list leaves no working access behind.
+- Restore needed no new provisioner code at all: `create`/`restore` already share one path through
+  the provisioner, and `ensureBot` already re-enabled a disabled bot it finds by username before
+  this phase: a restored agent is, to that function, indistinguishable from an existing bot
+  bootstrap would adopt.
+- The assignments read model's third provenance, `member-unauthorized`, is live-only (what
+  Mattermost itself currently reports) and so is not part of `loadAgentChannelAssignments`, which
+  reads only the database: a console page, or the CLI command itself, can add it the same way
+  `gateway mattermost reconcile` already computes its own live diff. The console page itself is
+  later work.
+- `gateway agents revoke-grant` queues a `reprovision` for a lifecycle-owned, `ready` agent so the
+  bot's removal does not wait for an unrelated configuration change; a bootstrap-managed agent has
+  no such operation, and is left to the membership synchronizer's own next pass (seconds away),
+  which already removes a bot from a channel it has neither a grant nor a configuration entry for.
 
 Not yet released; see the Changelog's `[Unreleased]` section.

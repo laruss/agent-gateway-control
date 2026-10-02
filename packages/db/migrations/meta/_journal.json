@@ -183,6 +183,13 @@
       "when": 1790900152781,
       "tag": "0025_agent_lifecycle_guards",
       "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1790926207561,
+      "tag": "0026_outbox_cancelled_status",
+      "breakpoints": true
     }
   ]
 }

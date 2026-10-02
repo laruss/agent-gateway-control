@@ -44,6 +44,7 @@ import {
 	listRuns,
 	listToolActions,
 	listWaits,
+	loadAgentChannelAssignments,
 	MAINTENANCE_STALE_MS,
 	MEMORY_REVIEW_STATUSES,
 	pauseAgent,
@@ -52,8 +53,11 @@ import {
 	redriveRun,
 	releaseKillSwitch,
 	requestAgentCreate,
+	requestAgentRestore,
+	requestAgentRetire,
 	resetGmailMailbox,
 	resumeAgent,
+	revokeChannelGrant,
 	runtimeHealth,
 	setAgentEnabled,
 	setDirectoryEntry,
@@ -185,6 +189,17 @@ export const USAGE = `gateway <command>
                                       its channel memberships; 'agents operations' follows along
   agents operations [--agent <id>]    lifecycle operations (create/retire/restore/reprovision),
                                       newest first: state, checkpoints and error, if any
+  agents retire <id> [--reason <text>] [--reassign-finance-to <id>]
+                                      cancels its runs/waits/approvals, revokes its channel
+                                      grants, blocks its pending deliveries, then asks the
+                                      provisioner to deactivate its bot; refused for the
+                                      organization's finance agent without --reassign-finance-to
+  agents restore <id>                 re-adds a retired agent's last configuration (pending ->
+                                      provisioning again); the provisioner re-enables its bot
+  agents channels <id>                its channels with provenance: configured vs granted
+                                      (by whom, when, evidence post) vs member-unauthorized
+  agents revoke-grant <id> <channel>  revokes a channel an owner or admin granted the agent's bot
+                                      directly; the bot is removed from it (provisioner/listener)
   runtimes list                       worker availability and runtime versions per adapter
   runs list [--agent <id>] | show <run-id> | cancel <run-id> | redrive <run-id>
   waits list
@@ -1098,6 +1113,55 @@ async function dispatchSessionCommand(
 		case "agents operations": {
 			const agentFlag = flag(args, "agent");
 			out.print(json(await listLifecycleOperations(deps, agentFlag ?? undefined)));
+			return 0;
+		}
+		case "agents retire": {
+			const agentId = arg(args, 2, "id");
+			const reasonFlag = flag(args, "reason");
+			const reassignFlag = flag(args, "reassign-finance-to");
+			const retired = await requestAgentRetire(deps, {
+				agentId,
+				actor: who,
+				source: "cli",
+				...(reasonFlag === null ? {} : { reason: reasonFlag }),
+				...(reassignFlag === null ? {} : { reassignFinanceTo: reassignFlag }),
+			});
+			await cancelJobs(boss, retired.cancelledJobs);
+			out.print(json(retired));
+			return 0;
+		}
+		case "agents restore":
+			out.print(
+				json(
+					await requestAgentRestore(deps, {
+						agentId: arg(args, 2, "id"),
+						actor: who,
+						source: "cli",
+					}),
+				),
+			);
+			return 0;
+		case "agents channels":
+			out.print(json(await loadAgentChannelAssignments(deps, arg(args, 2, "id"))));
+			return 0;
+		case "agents revoke-grant": {
+			const agentId = arg(args, 2, "id");
+			const channel = arg(args, 3, "channel");
+			const assignments = await loadAgentChannelAssignments(deps, agentId);
+			const match = assignments.find(
+				(assignment) => assignment.channelName === channel || assignment.channelId === channel,
+			);
+			if (match === undefined) {
+				throw new UsageError(`agent '${agentId}' has no channel '${channel}' to revoke`);
+			}
+			const stillFollowed = await revokeChannelGrant(deps, {
+				agentId,
+				channelId: match.channelId,
+				actor: who,
+			});
+			out.print(
+				json({ channelId: match.channelId, channelName: match.channelName, stillFollowed }),
+			);
 			return 0;
 		}
 		case "runs list":

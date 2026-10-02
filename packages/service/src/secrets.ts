@@ -115,3 +115,13 @@ export function writeSecretFile(path: string, value: string): void {
 	closeSync(fd);
 	renameSync(temporary, path);
 }
+
+/**
+ * Removes a secret file, idempotently (a repeat, or a file already gone, is not an error): the
+ * lifecycle provisioner's own retire step, for a lifecycle-created agent's `/run/bot-secrets/`
+ * token file, once its server-side token is already revoked (ADR-026). Never called for a
+ * `/run/secrets/` reference — that mount is an operator's own, read-only to the controller.
+ */
+export function deleteSecretFile(path: string): void {
+	rmSync(path, { force: true });
+}

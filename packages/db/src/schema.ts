@@ -91,7 +91,10 @@ export type InboxStatus = (typeof INBOX_STATUSES)[number];
 export const WAIT_STATUSES = ["active", "matched", "timed_out", "cancelled"] as const;
 export type WaitStatus = (typeof WAIT_STATUSES)[number];
 
-export const OUTBOX_STATUSES = ["pending", "sending", "sent", "dead"] as const;
+/** `cancelled` is a terminal status a delivery never reaches on its own: only a retired agent's
+ * still-pending items are moved there (ADR-026), never retried, distinct from `dead` (attempts
+ * exhausted — `redriveOutbox` can still give it a fresh set). */
+export const OUTBOX_STATUSES = ["pending", "sending", "sent", "dead", "cancelled"] as const;
 export type OutboxStatus = (typeof OUTBOX_STATUSES)[number];
 
 export const OUTBOX_KINDS = [

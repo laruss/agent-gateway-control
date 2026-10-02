@@ -1,11 +1,31 @@
-import { memoryItems } from "@agent-gateway/db";
-import { and, asc, desc, eq } from "drizzle-orm";
+import { agentLifecycle, agents, memoryItems } from "@agent-gateway/db";
+import { and, asc, desc, eq, inArray, notInArray } from "drizzle-orm";
 import { AdminError, inTransaction } from "./admin.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
 import { audit } from "./store.ts";
 
 export const MEMORY_REVIEW_STATUSES = ["proposed", "accepted", "rejected", "superseded"] as const;
 export type MemoryReviewStatus = (typeof MEMORY_REVIEW_STATUSES)[number];
+
+type Db = UnitOfWork["tx"]["db"];
+
+/**
+ * Every retiring or already-retired agent's own private namespace (`agents.config` keeps its last
+ * configuration even once disabled, ADR-024): such an agent can never run again from the moment
+ * retirement is requested, so its private memory can never be loaded into a turn from then on, but
+ * it is also kept out of this listing surface explicitly, rather than relying only on nothing ever
+ * reading it — the same "excluded from any listing/console read" ADR-026 asks for. Left to the
+ * existing retention to expire on its own schedule; shared memory the agent wrote and that was
+ * accepted is organization-owned and stays.
+ */
+async function retiredPrivateNamespaces(db: Db): Promise<ReadonlySet<string>> {
+	const rows = await db
+		.select({ config: agents.config })
+		.from(agents)
+		.innerJoin(agentLifecycle, eq(agentLifecycle.agentId, agents.id))
+		.where(inArray(agentLifecycle.status, ["retiring", "retired"]));
+	return new Set(rows.map((row) => row.config.memory.private_namespace));
+}
 
 /**
  * Serializes acceptances of one memory key until the transaction ends; the partial unique index
@@ -49,8 +69,9 @@ export type MemoryFilter = Readonly<{
 }>;
 
 export async function listMemory(deps: ControlPlaneDeps, filter: MemoryFilter) {
-	return inTransaction(deps, ({ tx }) =>
-		tx.db
+	return inTransaction(deps, async ({ tx }) => {
+		const excluded = [...(await retiredPrivateNamespaces(tx.db))];
+		return tx.db
 			.select({
 				id: memoryItems.id,
 				namespace: memoryItems.namespace,
@@ -66,6 +87,7 @@ export async function listMemory(deps: ControlPlaneDeps, filter: MemoryFilter) {
 				and(
 					filter.status === null ? undefined : eq(memoryItems.status, filter.status),
 					filter.namespace === null ? undefined : eq(memoryItems.namespace, filter.namespace),
+					excluded.length === 0 ? undefined : notInArray(memoryItems.namespace, excluded),
 				),
 			)
 			.orderBy(
@@ -73,8 +95,8 @@ export async function listMemory(deps: ControlPlaneDeps, filter: MemoryFilter) {
 				asc(memoryItems.id),
 			)
 			.limit(filter.limit)
-			.offset(filter.offset),
-	);
+			.offset(filter.offset);
+	});
 }
 
 /**

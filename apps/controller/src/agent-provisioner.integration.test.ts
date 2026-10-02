@@ -10,10 +10,14 @@ import {
 	type ControlPlaneDeps,
 	checkpointOperation,
 	commitChange,
+	ensureAgentLifecycleAdoption,
 	grantChannel,
 	markProvisioning,
 	recordWorkerStatus,
 	requestAgentCreate,
+	requestAgentRestore,
+	requestAgentRetire,
+	setAgentBotUser,
 	setDirectoryEntry,
 } from "@agent-gateway/core";
 import { createPool, migrateSchema } from "@agent-gateway/db";
@@ -25,7 +29,7 @@ import {
 	MattermostApiError,
 } from "@agent-gateway/mattermost";
 import { createBoss, migrateQueues, transactionalJobSink } from "@agent-gateway/queue";
-import { secretFileState } from "@agent-gateway/service";
+import { secretFileExists, secretFileState, writeSecretFile } from "@agent-gateway/service";
 import { startTestPostgres, type TestPostgres } from "@agent-gateway/testkit";
 import type pg from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -230,21 +234,27 @@ class FakeAdminClient {
 		return { user_id: id, username: bot.username, delete_at: 0 };
 	};
 
-	enableBot = async (userId: string): Promise<ApiBot> => {
+	/** Updates both maps together: a real server has one user record, not two independent copies,
+	 * so `enableBot`/`disableBot` must be visible to a later `userByUsername` lookup too (`ensureBot`
+	 * resolves an existing, possibly-disabled bot that way). */
+	private setDeleteAt(userId: string, deleteAt: number): ApiUser {
 		const user = this.usersById.get(userId);
 		if (user === undefined) {
 			throw new MattermostApiError(404, null, "bot not found");
 		}
-		this.usersById.set(userId, { ...user, delete_at: 0 });
+		const updated = { ...user, delete_at: deleteAt };
+		this.usersById.set(userId, updated);
+		this.usersByUsername.set(user.username, updated);
+		return updated;
+	}
+
+	enableBot = async (userId: string): Promise<ApiBot> => {
+		const user = this.setDeleteAt(userId, 0);
 		return { user_id: userId, username: user.username, delete_at: 0 };
 	};
 
 	disableBot = async (userId: string): Promise<ApiBot> => {
-		const user = this.usersById.get(userId);
-		if (user === undefined) {
-			throw new MattermostApiError(404, null, "bot not found");
-		}
-		this.usersById.set(userId, { ...user, delete_at: 1 });
+		const user = this.setDeleteAt(userId, 1);
 		return { user_id: userId, username: user.username, delete_at: 1 };
 	};
 
@@ -762,5 +772,281 @@ describe("agent lifecycle provisioner (ADR-026)", () => {
 			])
 		).rows;
 		expect(operation.state).toBe("pending");
+	});
+
+	describe("retire and restore (ADR-026)", () => {
+		it("retires an agent end to end: tokens revoked, bot deactivated, channels left, token file removed", async () => {
+			const admin = new FakeAdminClient(CHANNEL_IDS);
+			await requestAgentCreate(deps, createInput("analyst", ["hq", "research"]));
+			const { logger } = recordingLogger();
+			await pass(admin, logger);
+
+			const [{ mattermost_user_id: botUserId }] = (
+				await pool.query(
+					"select mattermost_user_id from mattermost_identities where agent_id = 'analyst'",
+				)
+			).rows;
+			expect(await admin.userAccessTokenIds(botUserId)).not.toHaveLength(0);
+			const tokenPath = join(secretsDir, "mm_analyst_token");
+			expect(secretFileExists(tokenPath)).toBe(true);
+
+			const retired = await requestAgentRetire(deps, {
+				agentId: "analyst",
+				actor: "test",
+				source: "cli",
+			});
+			await pass(admin, logger);
+
+			const [lifecycle] = (
+				await pool.query(
+					"select status, retired_at from agent_lifecycle where agent_id = 'analyst'",
+				)
+			).rows;
+			expect(lifecycle.status).toBe("retired");
+			expect(lifecycle.retired_at).not.toBeNull();
+			const [operation] = (
+				await pool.query(
+					"select state, checkpoints from agent_lifecycle_operations where id = $1",
+					[retired.operationId],
+				)
+			).rows;
+			expect(operation.state).toBe("succeeded");
+			expect(operation.checkpoints).toMatchObject({
+				tokens_revoked: true,
+				bot_disabled: true,
+				token_file_deleted: true,
+			});
+			expect(await admin.user(botUserId)).toMatchObject({ delete_at: 1 });
+			expect(await admin.userAccessTokenIds(botUserId)).toHaveLength(0);
+			expect(admin.channelMembers.get(CHANNEL_IDS.hq)?.has(botUserId)).toBe(false);
+			expect(admin.channelMembers.get(CHANNEL_IDS.research)?.has(botUserId)).toBe(false);
+			expect(secretFileExists(tokenPath)).toBe(false);
+		});
+
+		it("resumes retirement after a transient failure, without repeating an already-checkpointed step", async () => {
+			const admin = new FakeAdminClient(CHANNEL_IDS);
+			await requestAgentCreate(deps, createInput("analyst", ["hq", "research"]));
+			const { logger } = recordingLogger();
+			await pass(admin, logger);
+			const [{ mattermost_user_id: botUserId }] = (
+				await pool.query(
+					"select mattermost_user_id from mattermost_identities where agent_id = 'analyst'",
+				)
+			).rows;
+
+			admin.failures.set("removeChannelMember:research", new Error("mattermost unavailable"));
+			const retired = await requestAgentRetire(deps, {
+				agentId: "analyst",
+				actor: "test",
+				source: "cli",
+			});
+			await pass(admin, logger);
+
+			let [operation] = (
+				await pool.query(
+					"select state, checkpoints from agent_lifecycle_operations where id = $1",
+					[retired.operationId],
+				)
+			).rows;
+			expect(operation.state).toBe("running");
+			expect(operation.checkpoints).toMatchObject({ tokens_revoked: true, bot_disabled: true });
+			expect(operation.checkpoints.channels_left).toEqual([CHANNEL_IDS.hq]);
+			// Already harmless (deactivated, token-less) even though the retire has not finished: the
+			// remaining channel removals are cosmetic from here on.
+			expect(await admin.userAccessTokenIds(botUserId)).toHaveLength(0);
+
+			await pass(admin, logger);
+			[operation] = (
+				await pool.query(
+					"select state, checkpoints from agent_lifecycle_operations where id = $1",
+					[retired.operationId],
+				)
+			).rows;
+			expect(operation.state).toBe("succeeded");
+			expect(operation.checkpoints.channels_left).toEqual(
+				expect.arrayContaining([CHANNEL_IDS.hq, CHANNEL_IDS.research]),
+			);
+			// `tokens_revoked`/`bot_disabled` never repeated across the two passes.
+			expect(admin.calls.filter((c) => c === `removeChannelMember:research`).length).toBe(2); // one failed, one succeeded
+		});
+
+		it("fails retirement permanently when the admin token cannot even read the bot account", async () => {
+			const admin = new FakeAdminClient(CHANNEL_IDS);
+			await requestAgentCreate(deps, createInput("analyst", ["hq"]));
+			const { logger } = recordingLogger();
+			await pass(admin, logger);
+
+			// `user` (the `bot_disabled` step's own read) is not keyed per-id in `FakeAdminClient`'s
+			// `failures` map; patched directly for this one case instead.
+			admin.user = async () => {
+				throw new MattermostApiError(403, "permission_denied", "GET /api/v4/users: HTTP 403");
+			};
+			await requestAgentRetire(deps, { agentId: "analyst", actor: "test", source: "cli" });
+			await pass(admin, logger);
+
+			const [lifecycle] = (
+				await pool.query(
+					"select status, last_error from agent_lifecycle where agent_id = 'analyst'",
+				)
+			).rows;
+			expect(lifecycle.status).toBe("retiring");
+			expect(lifecycle.last_error).toMatch(/403/);
+		});
+
+		it("never touches a bootstrap-managed agent's own token file, only reports it stale by leaving it alone", async () => {
+			// The "finance" agent (`beforeEach`) is adopted, not lifecycle-owned: its token file is a
+			// plain `/run/secrets/...` reference, the operator's own, never the provisioner's
+			// `/run/bot-secrets/` directory. It is also the organization's configured finance agent,
+			// so retiring it reassigns the role to a second, lifecycle-created agent in the same
+			// request.
+			await ensureAgentLifecycleAdoption(deps, "test");
+			const admin = new FakeAdminClient(CHANNEL_IDS);
+			await requestAgentCreate(deps, createInput("backup-finance", ["hq"]));
+			const bot = await admin.createBot({
+				username: "finance",
+				display_name: "finance",
+				description: "",
+			});
+			await setAgentBotUser(deps, "finance", bot.user_id, "test");
+			await admin.createUserAccessToken(bot.user_id, "agent-gateway");
+			const bootstrapToken = join(secretsDir, "mm_finance_token");
+			writeSecretFile(bootstrapToken, "bootstrap-managed-token-value");
+
+			await requestAgentRetire(deps, {
+				agentId: "finance",
+				actor: "test",
+				source: "cli",
+				reassignFinanceTo: "backup-finance",
+			});
+			const { logger } = recordingLogger();
+			await pass(admin, logger);
+
+			const [lifecycle] = (
+				await pool.query("select status from agent_lifecycle where agent_id = 'finance'")
+			).rows;
+			expect(lifecycle.status).toBe("retired");
+			expect(await admin.user(bot.user_id)).toMatchObject({ delete_at: 1 });
+			expect(await admin.userAccessTokenIds(bot.user_id)).toHaveLength(0);
+			// The operator's own file: left exactly as it was, never deleted.
+			expect(secretFileExists(bootstrapToken)).toBe(true);
+		});
+
+		it("restore re-enables the same bot, issues a fresh token and rejoins its channels", async () => {
+			const admin = new FakeAdminClient(CHANNEL_IDS);
+			await requestAgentCreate(deps, createInput("analyst", ["hq", "research"]));
+			const { logger } = recordingLogger();
+			await pass(admin, logger);
+			const [{ mattermost_user_id: botUserId }] = (
+				await pool.query(
+					"select mattermost_user_id from mattermost_identities where agent_id = 'analyst'",
+				)
+			).rows;
+			const tokenPath = join(secretsDir, "mm_analyst_token");
+			const tokenBeforeRetire = readFileSync(tokenPath, "utf8").trim();
+
+			await requestAgentRetire(deps, { agentId: "analyst", actor: "test", source: "cli" });
+			await pass(admin, logger);
+			expect(await admin.user(botUserId)).toMatchObject({ delete_at: 1 });
+			expect(secretFileExists(tokenPath)).toBe(false);
+
+			const restored = await requestAgentRestore(deps, {
+				agentId: "analyst",
+				actor: "test",
+				source: "cli",
+			});
+			await pass(admin, logger);
+
+			const [lifecycle] = (
+				await pool.query("select status from agent_lifecycle where agent_id = 'analyst'")
+			).rows;
+			expect(lifecycle.status).toBe("ready");
+			const [operation] = (
+				await pool.query("select state from agent_lifecycle_operations where id = $1", [
+					restored.operationId,
+				])
+			).rows;
+			expect(operation.state).toBe("succeeded");
+			// The very same bot account, re-enabled rather than recreated.
+			expect(await admin.user(botUserId)).toMatchObject({ delete_at: 0 });
+			expect(secretFileExists(tokenPath)).toBe(true);
+			expect(readFileSync(tokenPath, "utf8").trim()).not.toBe(tokenBeforeRetire);
+			expect(admin.channelMembers.get(CHANNEL_IDS.hq)?.has(botUserId)).toBe(true);
+			expect(admin.channelMembers.get(CHANNEL_IDS.research)?.has(botUserId)).toBe(true);
+		});
+
+		it("a config edit that lands while a reprovision is already running cancels it and queues a fresh one, never losing the edit", async () => {
+			const admin = new FakeAdminClient(CHANNEL_IDS);
+			await requestAgentCreate(deps, createInput("analyst", ["hq"]));
+			const { logger } = recordingLogger();
+			await pass(admin, logger);
+
+			const [{ config: config1 }] = (
+				await pool.query("select config from agents where id = 'analyst'")
+			).rows;
+			const afterFirstEdit: AgentConfig = {
+				...config1,
+				mattermost: { ...config1.mattermost, allowed_channels: ["hq", "research"] },
+			};
+			await commitChange(deps, {
+				changeSet: [{ type: "update_agent", agent: afterFirstEdit }],
+				baseRevisionId: await activeConfigRevisionId(deps),
+				actor: "owner",
+				source: "console",
+			});
+			const [firstOp] = (
+				await pool.query(
+					"select id from agent_lifecycle_operations where agent_id = 'analyst' and kind = 'reprovision' order by created_at desc limit 1",
+				)
+			).rows;
+			// Simulates the provisioner having already claimed this operation on a previous tick,
+			// reading `["hq", "research"]` as the configuration to provision — before the second edit
+			// below ever happens.
+			await markProvisioning(deps, firstOp.id, "test");
+
+			const [{ config: config2 }] = (
+				await pool.query("select config from agents where id = 'analyst'")
+			).rows;
+			const afterSecondEdit: AgentConfig = {
+				...config2,
+				mattermost: { ...config2.mattermost, allowed_channels: ["research"] },
+			};
+			await commitChange(deps, {
+				changeSet: [{ type: "update_agent", agent: afterSecondEdit }],
+				baseRevisionId: await activeConfigRevisionId(deps),
+				actor: "owner",
+				source: "console",
+			});
+
+			const [cancelledFirst] = (
+				await pool.query("select state from agent_lifecycle_operations where id = $1", [firstOp.id])
+			).rows;
+			expect(cancelledFirst.state).toBe("cancelled");
+			const [secondOp] = (
+				await pool.query(
+					"select id, state from agent_lifecycle_operations where agent_id = 'analyst' and kind = 'reprovision' order by created_at desc limit 1",
+				)
+			).rows;
+			expect(secondOp.id).not.toBe(firstOp.id);
+			expect(secondOp.state).toBe("pending");
+
+			await pass(admin, logger);
+
+			const [{ mattermost_user_id: botUserId }] = (
+				await pool.query(
+					"select mattermost_user_id from mattermost_identities where agent_id = 'analyst'",
+				)
+			).rows;
+			// The edit made while the first (now-cancelled) operation was running is not lost: the
+			// fresh operation that replaced it reads the fully current configuration (channels
+			// narrowed to just "research"), not the one the cancelled operation had read.
+			expect(admin.channelMembers.get(CHANNEL_IDS.hq)?.has(botUserId)).toBe(false);
+			expect(admin.channelMembers.get(CHANNEL_IDS.research)?.has(botUserId)).toBe(true);
+			const [finished] = (
+				await pool.query("select state from agent_lifecycle_operations where id = $1", [
+					secondOp.id,
+				])
+			).rows;
+			expect(finished.state).toBe("succeeded");
+		});
 	});
 });

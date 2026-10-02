@@ -101,6 +101,9 @@ export const ChangeOperationSchema = z.discriminatedUnion("type", [
 	}),
 	z.strictObject({ type: z.literal("remove_agent"), agentId: AgentIdSchema }),
 	z.strictObject({ type: z.literal("set_constitution"), constitution: z.string().min(1) }),
+	/** Reassigns the organization's finance role to a different agent (`requestAgentRetire`'s own
+	 * `reassignFinanceTo`, committed in the same change set as the `remove_agent` it accompanies). */
+	z.strictObject({ type: z.literal("set_finance_agent"), agentId: AgentIdSchema }),
 ]);
 export type ChangeOperation = z.infer<typeof ChangeOperationSchema>;
 export type ChangeOperationType = ChangeOperation["type"];

@@ -83,6 +83,14 @@ export const AgentLifecycleCheckpointsSchema = z.strictObject({
 	token_ref: SecretFileSchema.optional(),
 	team_joined: z.boolean().optional(),
 	channels_joined: z.array(MattermostNameSchema).max(32).optional(),
+	/** `retire`'s own steps: every token revoked server-side, the bot account disabled, every
+	 * channel it was a member of (by id, since a `retire` operation lists them live rather than
+	 * from a configured name list) left, and its local token file (lifecycle-owned agents only)
+	 * removed. */
+	tokens_revoked: z.boolean().optional(),
+	bot_disabled: z.boolean().optional(),
+	channels_left: z.array(MattermostIdSchema).max(64).optional(),
+	token_file_deleted: z.boolean().optional(),
 });
 export type AgentLifecycleCheckpoints = z.infer<typeof AgentLifecycleCheckpointsSchema>;
 
@@ -194,6 +202,14 @@ export const RequestAgentRetireInputSchema = z.strictObject({
 	source: AgentLifecycleSourceSchema,
 	idempotencyKey: IdempotencyKeySchema.optional(),
 	reason: ConfigRevisionReasonSchema.optional(),
+	/**
+	 * Required, and naming a different, currently configured agent, when `agentId` is the
+	 * organization's own `finance_agent_id`: retiring the finance agent is refused unless the same
+	 * request reassigns the role, committed as part of the same change set (`set_finance_agent`,
+	 * `@agent-gateway/contracts`'s own `ChangeOperation`) so the configuration is never left
+	 * naming a finance agent that no longer exists.
+	 */
+	reassignFinanceTo: AgentIdSchema.optional(),
 });
 export type RequestAgentRetireInput = z.input<typeof RequestAgentRetireInputSchema>;
 

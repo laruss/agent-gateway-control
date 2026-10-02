@@ -40,6 +40,7 @@ import {
 	audit,
 	isKillSwitchOn,
 	loadActiveConfig,
+	loadAgentLifecycleStatus,
 	loadAgents,
 	loadOwnerUserIds,
 	lockAgent,
@@ -403,6 +404,18 @@ export async function handleToolReport(
 			return "ignored";
 		}
 		if (action.attempt !== report.attempt) {
+			return "ignored";
+		}
+		// A retiring or already-retired agent publishes no further effects: its queued actions were
+		// already cancelled and its running ones already asked to stop (`requestAgentRetire`); a
+		// late report for one that did not stop in time is dropped here too, never posted to the
+		// card or resolved as if the agent were still there to resume (ADR-026).
+		const lifecycleStatus = await loadAgentLifecycleStatus(tx.db, action.agentId);
+		if (lifecycleStatus === "retiring" || lifecycleStatus === "retired") {
+			await audit(uow, "system", "tool_action.report_dropped_retired", "tool_action", action.id, {
+				reported: report.kind,
+				lifecycle_status: lifecycleStatus,
+			});
 			return "ignored";
 		}
 		if (report.kind === "refused") {
