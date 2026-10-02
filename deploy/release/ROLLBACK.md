@@ -98,6 +98,12 @@ either in place breaks nothing.
 
 Once (a)-(d) are done, continue with the database-only steps below.
 
+## Rolling back from 0.5.0 to 0.4.0
+
+No database step: 0.4.0 ignores `console_sessions` and serves its own HTTP Basic page with the
+same password hash. Configuration changed in the console stays in the projections 0.4.0 reads.
+`CONSOLE_ORIGIN` in `gateway.env` is ignored by 0.4.0 and may stay.
+
 ## Rolling back past configuration history (to 0.3.0 or earlier, ADR-024)
 
 0.3.0 and earlier know nothing of `config_snapshots`/`config_revisions`: they read and write only

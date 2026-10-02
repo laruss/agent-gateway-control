@@ -57,6 +57,11 @@
       "version": "0.4.0",
       "head": "0021_config_revision_acks",
       "pgboss_schema": 42
+    },
+    {
+      "version": "0.5.0",
+      "head": "0023_console_csrf_derived",
+      "pgboss_schema": 42
     }
   ]
 }

@@ -2058,3 +2058,4 @@ Deliberate choices here ([ADR-025](docs/adr/025-management-console.md)):
   controlled inputs, not a multi-field validated form, so the lighter existing pattern (plain
   `useState`, the same the sign-in page already uses) fit better than a new dependency.
 
+Released as 0.5.0 (migrations `0022_console_sessions` and `0023_console_csrf_derived`, both expand; head `0023_console_csrf_derived`, pg-boss schema 42).
