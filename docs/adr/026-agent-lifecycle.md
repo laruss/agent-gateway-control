@@ -248,7 +248,14 @@ in the same transaction as its `remove_agent` commit:
   bot to the same channel later must never silently re-grant it.
 - **Outbox.** Its own pending deliveries (`pending`/`sending`) are moved to a new `cancelled`
   status, never sent as a retired agent, rather than left to fail against a deactivated bot or
-  expire on their own schedule.
+  expire on their own schedule. A `cancelled` item ages out of content retention on the same rule
+  as a `dead` one (`outbox_dead_days`): it is never redriven either, and is otherwise forgotten by
+  every other retention step.
+- **Runtime sessions.** Its stored provider session (`runtime_sessions`) is ended unconditionally,
+  the same call a changed channel grant already makes (`endAgentRuntimeSessions`) — not only as a
+  side effect of the channel grants just tombstoned above, which may have been none at all: a
+  restored agent must never resume a pre-retirement conversation thread merely because its own
+  `session_policy` is `resumable-if-available`.
 - **Late reports.** A run or tool report for an agent whose lifecycle status is `retiring` or
   `retired` is dropped — audited, never applied — before it would publish an effect (a post, a
   memory write, a wait or approval resolution): checked explicitly, by lifecycle status, not only
@@ -279,7 +286,14 @@ token-less bot until the next pass finishes the list), and finally, only for a l
 agent, its own `/run/bot-secrets/` token file removed (a bootstrap-managed agent's
 `/run/secrets/` file is never touched — the CLI owns it; this only revokes the token server-side
 and leaves the file for `gateway doctor` to report as stale). An agent retired before its
-identity was ever resolved (still `pending`) has nothing Mattermost-side to clean up at all. A
+identity was ever resolved (still genuinely `pending`, nothing ever provisioned) has nothing
+Mattermost-side to clean up at all — but a resolved identity that was never *recorded* is not the
+same thing: a `create`/`restore` operation can checkpoint `bot_user_id` and then be superseded by
+this very retire, or simply crash, before `setAgentBotUser` ever wrote it. Retirement recovers that
+id from the superseded operation's own checkpoints (they survive being cancelled) before ever
+concluding there is nothing to do, and only as a last resort falls back to looking the account up
+by the agent's configured username — never adopting one that is not plausibly the Gateway's own
+plain bot, the same check `ensureBot` itself applies before ever creating or adopting one. A
 step's failure is retried like provisioning any other operation; a permanent failure leaves the
 agent `retiring` with `last_error`, surfaced by `gateway doctor`, same as any other kind. A
 database rollback of the retire transaction alone never reactivates a Mattermost account that was
@@ -300,6 +314,19 @@ retire step already revoked every token the account had, so the restore operatio
 empty) checkpoints never find a working one to keep. The channel-joining loop re-adds it to every
 channel its restored configuration now names. No new code needed any of this; it falls out of
 `create`/`restore` already sharing one path through the provisioner.
+
+One thing restore itself does change: the agent's `token_secret_file` always migrates to the
+provisioner's own, server-generated `defaultBotSecretFile` path, as part of the very same
+`add_agent` change set the restore commits (never a separate step — config and lifecycle stay
+consistent). This matters for an agent that was adopted (bootstrap-managed) before it was ever
+retired: its historical configuration still names its old `/run/secrets/...` file, read-only to
+the controller, whose token the retire step above already revoked server-side. Restoring that
+reference unchanged would leave `ensureBotToken` unable to write the fresh token the provisioner
+issues — stuck `reconciling` forever, and by then also skipped by `gateway mattermost bootstrap`
+for having become lifecycle-owned. The old `/run/secrets/...` file is simply stale from here on:
+nothing reads or deletes it; `gateway doctor` has no way to tell it apart from one still in use, so
+an operator who no longer needs it removes it by hand. A lifecycle-created agent's own path is
+already `defaultBotSecretFile`, so the migration changes nothing for it.
 
 ### Assignments: a read model with provenance
 

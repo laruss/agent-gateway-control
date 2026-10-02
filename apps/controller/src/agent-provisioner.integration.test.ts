@@ -823,6 +823,76 @@ describe("agent lifecycle provisioner (ADR-026)", () => {
 			expect(secretFileExists(tokenPath)).toBe(false);
 		});
 
+		it("recovers the bot id from a superseded create operation's own checkpoint when the identity was never recorded, instead of skipping cleanup", async () => {
+			const admin = new FakeAdminClient(CHANNEL_IDS);
+			const created = await requestAgentCreate(deps, createInput("analyst", ["hq"]));
+			// The same crash the create-side test above injects (bot_user_id checkpointed, but
+			// `setAgentBotUser` never ran) — except this time the agent is retired before the create
+			// ever gets a chance to finish resolving its own identity.
+			const bot = await admin.createBot({
+				username: "analyst",
+				display_name: "analyst",
+				description: "",
+			});
+			await markProvisioning(deps, created.operationId, "test");
+			await checkpointOperation(deps, created.operationId, { bot_user_id: bot.user_id });
+			const [identityBefore] = (
+				await pool.query(
+					"select mattermost_user_id from mattermost_identities where agent_id = 'analyst'",
+				)
+			).rows;
+			expect(identityBefore.mattermost_user_id).toBeNull();
+
+			await requestAgentRetire(deps, { agentId: "analyst", actor: "test", source: "cli" });
+			const [supersededCreate] = (
+				await pool.query("select state from agent_lifecycle_operations where id = $1", [
+					created.operationId,
+				])
+			).rows;
+			expect(supersededCreate.state).toBe("cancelled");
+			const { logger } = recordingLogger();
+			await pass(admin, logger);
+
+			// Never concluded "no Mattermost identity had been provisioned": the bot is actually
+			// cleaned up, not left enabled with a working token.
+			expect(await admin.user(bot.user_id)).toMatchObject({ delete_at: 1 });
+			expect(await admin.userAccessTokenIds(bot.user_id)).toHaveLength(0);
+			const [lifecycle] = (
+				await pool.query("select status from agent_lifecycle where agent_id = 'analyst'")
+			).rows;
+			expect(lifecycle.status).toBe("retired");
+			// The identity is backfilled too, now that the bot id is known.
+			const [identityAfter] = (
+				await pool.query(
+					"select mattermost_user_id from mattermost_identities where agent_id = 'analyst'",
+				)
+			).rows;
+			expect(identityAfter.mattermost_user_id).toBe(bot.user_id);
+		});
+
+		it("falls back to looking the bot up by its configured username when even its create operation's checkpoints never named it", async () => {
+			const admin = new FakeAdminClient(CHANNEL_IDS);
+			await requestAgentCreate(deps, createInput("analyst", ["hq"]));
+			// The bot exists in Mattermost (an interrupted create got this far), but nothing in the
+			// database ever named it: no checkpoint, no identity.
+			const bot = await admin.createBot({
+				username: "analyst",
+				display_name: "analyst",
+				description: "",
+			});
+
+			await requestAgentRetire(deps, { agentId: "analyst", actor: "test", source: "cli" });
+			const { logger } = recordingLogger();
+			await pass(admin, logger);
+
+			expect(await admin.user(bot.user_id)).toMatchObject({ delete_at: 1 });
+			expect(await admin.userAccessTokenIds(bot.user_id)).toHaveLength(0);
+			const [lifecycle] = (
+				await pool.query("select status from agent_lifecycle where agent_id = 'analyst'")
+			).rows;
+			expect(lifecycle.status).toBe("retired");
+		});
+
 		it("resumes retirement after a transient failure, without repeating an already-checkpointed step", async () => {
 			const admin = new FakeAdminClient(CHANNEL_IDS);
 			await requestAgentCreate(deps, createInput("analyst", ["hq", "research"]));

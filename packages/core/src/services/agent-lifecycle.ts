@@ -39,7 +39,7 @@ import {
 	pauseInTransaction,
 } from "./admin.ts";
 import { sweepApprovals } from "./approvals.ts";
-import { revokeAllActiveGrantsIn } from "./channel-grants.ts";
+import { endAgentRuntimeSessions, revokeAllActiveGrantsIn } from "./channel-grants.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
 import {
 	type CommitOutcome,
@@ -398,7 +398,9 @@ export type RequestAgentRetireResult = Readonly<{
  * change set is committed (which, through the same path any agent leaving the configuration
  * already takes, cancels its waits and withdraws its pending approvals, queued tool actions and
  * running tool actions' own cancellation request); every channel it was ever granted is
- * tombstoned (ADR-022); its own pending outbox deliveries are blocked, never sent as a retired
+ * tombstoned (ADR-022); its stored provider session is ended unconditionally
+ * (`endAgentRuntimeSessions`), so a later restore can never resume a pre-retirement conversation
+ * thread; its own pending outbox deliveries are blocked, never sent as a retired
  * agent; and the lifecycle row moves to `retiring` with a `retire` operation `pending`, for the
  * provisioner to resume and complete through `markProvisioning`/`completeOperation`/
  * `failOperation` (deactivating the bot, revoking its tokens, leaving its channels).
@@ -523,6 +525,12 @@ export async function requestAgentRetire(
 			});
 		}
 
+		// Ended unconditionally, not only as a side effect of the grants just revoked above (which
+		// may have been none at all): a restored agent must never resume a pre-retirement
+		// conversation thread (`resumable-if-available`, `runtime_sessions`) — the retire transaction
+		// is the one place that can guarantee this before the agent ever becomes schedulable again.
+		await endAgentRuntimeSessions(uow, parsed.agentId);
+
 		// Its own pending deliveries never go out as a retired agent: blocked here, rather than left
 		// to fail or expire on their own schedule.
 		const cancelledOutbox = await uow.tx.client.query(
@@ -631,10 +639,19 @@ async function findLastConfiguredAgent(
 
 /**
  * Restores a retired agent: re-adds its configuration from the last recorded snapshot that still
- * had it (re-enabled), moving the lifecycle row from `retired` back to `pending` with a `restore`
- * operation, in one transaction with the configuration commit exactly like `requestAgentCreate`.
- * Refused when the agent is not `retired`, or when no historical configuration for it is still
- * available (see `findLastConfiguredAgent`).
+ * had it (re-enabled, its token reference migrated to the lifecycle provisioner's own
+ * `/run/bot-secrets/` path — see below), moving the lifecycle row from `retired` back to `pending`
+ * with a `restore` operation, in one transaction with the configuration commit exactly like
+ * `requestAgentCreate`. Refused when the agent is not `retired`, or when no historical
+ * configuration for it is still available (see `findLastConfiguredAgent`).
+ *
+ * The migration matters for an agent that was adopted (bootstrap-managed) before it was ever
+ * retired: its historical configuration still names its old `/run/secrets/...` file, read-only to
+ * the controller and whose token `requestAgentRetire` already revoked server-side. Restoring it
+ * unchanged would leave `ensureBotToken` unable to write the fresh token the provisioner issues,
+ * stuck `reconciling` forever, now also skipped by `gateway mattermost bootstrap` for being
+ * lifecycle-owned. Migrating to `defaultBotSecretFile` sidesteps all of that; the old
+ * `/run/secrets/...` file is simply stale from here on (`docs/operations/mattermost.md`).
  */
 export async function requestAgentRestore(
 	deps: ControlPlaneDeps,
@@ -689,7 +706,22 @@ export async function requestAgentRestore(
 			);
 		}
 
-		const agent: AgentConfig = { ...historical.agent, enabled: true };
+		// The token reference always migrates to the provisioner's own, server-generated path, never
+		// kept as historical.agent.mattermost.token_secret_file named it: for an agent restored from
+		// a bootstrap-managed (adopted) configuration, that path is still the operator's read-only
+		// `/run/secrets/...` file, whose token the retire step just revoked server-side — a restore
+		// (a `create`-shaped operation) writes a fresh token through `ensureBotToken`, which cannot
+		// write there. The old file is simply stale from here on (documented in ADR-026 and
+		// `docs/operations/mattermost.md`), never read or deleted by this service. A lifecycle-created
+		// agent's own path is already this one, so the migration is a no-op for it.
+		const agent: AgentConfig = {
+			...historical.agent,
+			enabled: true,
+			mattermost: {
+				...historical.agent.mattermost,
+				token_secret_file: defaultBotSecretFile(parsed.agentId),
+			},
+		};
 		const changeSet: ChangeSet = [{ type: "add_agent", agent, rolePrompt: historical.rolePrompt }];
 		const commit = await commitWithinLock(
 			uow,
@@ -697,6 +729,13 @@ export async function requestAgentRestore(
 			changeSet,
 			parsed.actor,
 			configRevisionSourceOf(parsed.source),
+			undefined,
+			// Trusted the same way `requestAgentCreate` trusts its own new agent id (see
+			// `commitWithinLock`'s own doc comment): this restore is what is about to make the agent
+			// lifecycle-owned, via the `restore` operation row inserted right after this commit
+			// returns, which does not exist yet this same transaction for `rejectUnownedBotSecretPaths`
+			// to see.
+			new Set([parsed.agentId]),
 		);
 
 		// Defensive, like `requestAgentRetire`'s own call: a `retired` agent's last operation (its

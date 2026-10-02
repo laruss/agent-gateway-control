@@ -1,6 +1,8 @@
 import type {
+	AgentId,
 	AgentLifecycleCheckpoints,
 	AgentLifecycleOperationKind,
+	MattermostId,
 } from "@agent-gateway/contracts";
 import { BOT_SECRET_FILE_PREFIX } from "@agent-gateway/contracts";
 import {
@@ -8,6 +10,7 @@ import {
 	checkpointOperation,
 	completeOperation,
 	failOperation,
+	listLifecycleOperations,
 	listPendingLifecycleOperations,
 	listRunningLifecycleOperations,
 	loadAgentAllowedChannelIds,
@@ -26,6 +29,7 @@ import {
 	type AdminMattermostClient,
 	BootstrapError,
 	ensureBot,
+	findPlausibleGatewayBot,
 	isExtraChannel,
 	MattermostApiError,
 	MattermostClient,
@@ -388,14 +392,45 @@ async function ensureBotToken(
 }
 
 /**
+ * Recovers a retiring agent's bot id when `mattermost_identities` never recorded one: a
+ * create/restore operation can checkpoint `bot_user_id` and then be superseded by this very retire
+ * (`cancelNonterminalOperations`, `agent-lifecycle.ts`) — or simply crash — before `setAgentBotUser`
+ * ever wrote it, leaving a bot, and a working token, that nothing here would otherwise ever find:
+ * retirement would wrongly conclude there is no Mattermost cleanup needed and leave both in place.
+ * Checked first against every operation this agent ever had (newest first): a superseded
+ * operation's checkpoints survive being cancelled, so the `create`/`restore` this retire just
+ * superseded, or an earlier one, still names the account if it ever got that far. Only as a last
+ * resort is the account looked up by `username` (the agent's own last known configuration) —
+ * never adopting one that is not plausibly the Gateway's own bot (`findPlausibleGatewayBot`).
+ */
+async function recoverRetiringBotUserId(
+	deps: ControlPlaneDeps,
+	admin: AdminMattermostClient,
+	agentId: AgentId,
+	username: string | undefined,
+): Promise<MattermostId | null> {
+	const operations = await listLifecycleOperations(deps, agentId);
+	for (const op of operations) {
+		if (
+			(op.kind === "create" || op.kind === "restore") &&
+			op.checkpoints.bot_user_id !== undefined
+		) {
+			return op.checkpoints.bot_user_id;
+		}
+	}
+	return username === undefined ? null : findPlausibleGatewayBot(admin, username);
+}
+
+/**
  * Drives a `retire` operation's own Mattermost-side cleanup (ADR-026): every access token
  * revoked, the bot account deactivated, every channel it is currently a member of left, and —
  * only for a lifecycle-created agent's own `/run/bot-secrets/` file — that token file removed.
  * Deactivation and token revocation happen first, like `bootstrapMattermost`'s own retirement of
  * a replaced bot: once both are done the account has no access left at all, so a crash partway
  * through the remaining, merely cosmetic channel removals can never leave a bot with access
- * nobody meant it to keep. An agent whose identity was never resolved (retired while still
- * `pending`) has nothing Mattermost-side to clean up at all.
+ * nobody meant it to keep. An agent whose identity was never resolved, and whose bot id cannot be
+ * recovered either (`recoverRetiringBotUserId`) — retired while still genuinely `pending`, nothing
+ * ever provisioned — has nothing Mattermost-side to clean up at all.
  */
 async function processRetireOperation(
 	deps: ControlPlaneDeps,
@@ -419,7 +454,21 @@ async function processRetireOperation(
 	let checkpoints = operation.checkpoints;
 	try {
 		const identity = await loadMattermostIdentity(deps, operation.agentId);
-		const botUserId = identity?.userId ?? null;
+		let botUserId = identity?.userId ?? null;
+		if (botUserId === null) {
+			const agentConfig = await loadAgentConfig(deps, operation.agentId);
+			botUserId = await recoverRetiringBotUserId(
+				deps,
+				admin,
+				operation.agentId,
+				agentConfig?.mattermost.username,
+			);
+			if (botUserId !== null) {
+				// Recorded now, the same write a crash between the `bot_user_id` checkpoint and this
+				// would otherwise have skipped entirely: never left silently blank once recovered.
+				await setAgentBotUser(deps, operation.agentId, botUserId, actor);
+			}
+		}
 		if (botUserId === null) {
 			await completeOperation(deps, operation.id, actor, checkpoints);
 			log.info("agent provisioner: agent retired (no Mattermost identity had been provisioned)", {

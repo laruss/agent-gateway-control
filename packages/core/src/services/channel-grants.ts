@@ -208,7 +208,7 @@ export async function grantChannel(
 				.values({ ...start, updatedAt: uow.now })
 				.onConflictDoNothing({ target: sourceCursors.sourceId });
 		}
-		await endSessions(uow, input.agentId);
+		await endAgentRuntimeSessions(uow, input.agentId);
 		await audit(uow, "system", "mattermost.channel.granted", "agent", input.agentId, {
 			channel_id: input.channelId,
 			channel_name: input.channelName,
@@ -254,7 +254,7 @@ async function tombstoneGrant(
 	if (revoked.length === 0) {
 		return null;
 	}
-	await endSessions(uow, agentId);
+	await endAgentRuntimeSessions(uow, agentId);
 	return revoked[0]?.name ?? null;
 }
 
@@ -318,7 +318,7 @@ export async function revokeAllActiveGrantsIn(
 		)
 		.returning({ channelId: mattermostChannelGrants.channelId });
 	if (revoked.length > 0) {
-		await endSessions(uow, agentId);
+		await endAgentRuntimeSessions(uow, agentId);
 	}
 	return revoked.map((row) => row.channelId);
 }
@@ -400,10 +400,14 @@ export async function markGrantChecked(
 }
 
 /**
- * Ends the agent's stored provider sessions: their transcripts hold what earlier turns saw, and
- * a changed grant (a channel taken away, or given again with a newer floor) must not resume it.
+ * Ends the agent's stored provider sessions: their transcripts hold what earlier turns saw, and a
+ * changed grant (a channel taken away, or given again with a newer floor) must not resume it.
+ * Exported for `requestAgentRetire` (`agent-lifecycle.ts`, ADR-026), which ends a retiring agent's
+ * sessions unconditionally, regardless of whether it had any channel grant to revoke: a restored
+ * agent must never pick up a pre-retirement session (`resumable-if-available`, `runtime_sessions`),
+ * the same guarantee a changed grant already gets here.
  */
-async function endSessions({ tx }: UnitOfWork, agentId: AgentId): Promise<void> {
+export async function endAgentRuntimeSessions({ tx }: UnitOfWork, agentId: AgentId): Promise<void> {
 	await tx.db
 		.update(runtimeSessions)
 		.set({ status: "revoked" })

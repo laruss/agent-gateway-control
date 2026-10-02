@@ -456,6 +456,43 @@ describe("agent lifecycle service (ADR-026)", () => {
 		expect(await activeConfigRevisionId(deps)).toBe(restored.revisionId);
 	});
 
+	it("restore migrates an adopted (bootstrap-managed) agent's token reference to the lifecycle provisioner's own path", async () => {
+		// `finance` (from `reset()`) is bootstrap-managed: `agent("finance")` gives it the operator's
+		// own `/run/secrets/mm_finance_token`, never touched by `requestAgentCreate`. Adopted, then
+		// retired (which revokes that token server-side, ADR-026) and restored.
+		await reset([agent("accountant")]);
+		await ensureAgentLifecycleAdoption(deps, "test");
+		const retired = await requestAgentRetire(deps, {
+			agentId: "finance",
+			actor: "test",
+			source: "cli",
+			reassignFinanceTo: "accountant",
+		});
+		await markProvisioning(deps, retired.operationId, "test");
+		await completeOperation(deps, retired.operationId, "test");
+
+		const restored = await requestAgentRestore(deps, {
+			agentId: "finance",
+			actor: "test",
+			source: "cli",
+		});
+
+		// Never the historical `/run/secrets/mm_finance_token`: restoring it unchanged would leave
+		// the provisioner unable to write a fresh token to a path the controller only mounts
+		// read-only (the old file is simply stale from here on, documented in ADR-026). Migrated as
+		// part of the very same change set the restore commits, so config and lifecycle agree from
+		// the start.
+		const [{ config }] = (await pool.query("select config from agents where id = 'finance'")).rows;
+		expect(config.mattermost.token_secret_file).toBe("/run/bot-secrets/mm_finance_token");
+		const [identity] = (
+			await pool.query(
+				"select token_secret_ref from mattermost_identities where agent_id = 'finance'",
+			)
+		).rows;
+		expect(identity.token_secret_ref).toBe("/run/bot-secrets/mm_finance_token");
+		expect(await activeConfigRevisionId(deps)).toBe(restored.revisionId);
+	});
+
 	it("refuses to complete an operation a later request already superseded", async () => {
 		const created = await requestAgentCreate(deps, createInput("lambda"));
 		// Supersedes the create operation: a new `retire` operation and generation.
@@ -850,6 +887,28 @@ describe("agent lifecycle service (ADR-026)", () => {
 				status: "cancelled",
 				last_error_redacted: "agent_retired",
 			});
+		});
+
+		it("ends the agent's stored runtime session even when it never had a channel grant to revoke, so a later restore cannot resume it", async () => {
+			const created = await requestAgentCreate(deps, createInput("session-agent"));
+			await markProvisioning(deps, created.operationId, "test");
+			await completeOperation(deps, created.operationId, "test");
+			await pool.query(
+				`insert into runtime_sessions (agent_id, adapter, provider_session_ref, runtime_version, status)
+				 values ('session-agent', 'mock', 'transcript-1', 'mock/1', 'active')`,
+			);
+
+			// No channel grant ever existed for this agent: `revokeAllActiveGrantsIn` alone (gated on
+			// `revoked.length > 0`) would never reach the session, which is exactly the gap this test
+			// guards against.
+			await requestAgentRetire(deps, { agentId: "session-agent", actor: "test", source: "cli" });
+
+			const [session] = (
+				await pool.query(
+					"select status from runtime_sessions where agent_id = 'session-agent' and adapter = 'mock'",
+				)
+			).rows;
+			expect(session.status).toBe("revoked");
 		});
 
 		it("refuses to retire the organization's finance agent without reassigning the role, and succeeds with it", async () => {

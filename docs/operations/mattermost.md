@@ -142,7 +142,8 @@ bun run gateway agents operations --agent data-analyst
 
 `agents retire` cancels an active run (the same cancellation `agents pause` performs), cancels
 its waits, withdraws its pending approvals and queued tool actions (and asks a running one to
-stop), revokes every channel it was ever granted directly, blocks its own pending Mattermost
+stop), revokes every channel it was ever granted directly, ends its stored runtime session so a
+later restore never resumes a pre-retirement conversation, blocks its own pending Mattermost
 deliveries, and commits the configuration change that takes it out of scheduling — all before the
 Mattermost side even starts. The lifecycle moves to `retiring`, then the provisioner removes the
 bot from every channel it is in, revokes its access tokens, deactivates the account, and (for a
@@ -174,6 +175,13 @@ were revoked on retirement), and rejoins its configured channels — the same st
 `create` takes, since `restore` shares the provisioner's own path with it. Restore is refused
 when no historical configuration for the agent is still available (an upgrade from a release
 before the configuration journal existed).
+
+Restoring also migrates `token_secret_file` to the provisioner's own `/run/bot-secrets/mm_<id>_token`,
+even for an agent that was originally bootstrap-managed (adopted, then later retired): its old
+`/run/secrets/...` file is read-only to the controller, and its token was already revoked above, so
+restoring the old reference unchanged would leave the agent stuck `reconciling` with no way to
+write a fresh one. That old `/run/secrets/...` file is simply stale after this — nothing reads or
+deletes it; remove it by hand once you no longer need it.
 
 ### Channel assignments and provenance
 

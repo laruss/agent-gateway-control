@@ -320,6 +320,27 @@ export async function ensureBot(
 }
 
 /**
+ * Looks up an existing account by `username`, without creating or adopting anything: the
+ * lifecycle provisioner's own last resort for recovering a retiring agent's bot id when neither its
+ * recorded identity nor its own create/restore operation's checkpoints ever named one (ADR-026) —
+ * a crash between checkpointing `bot_user_id` and `setAgentBotUser` recording it can leave both
+ * empty even though the bot, and a working token, already exist. Null for anything that is not
+ * plausibly the Gateway's own plain bot — no account at all, a regular user, or a bot with elevated
+ * system roles — the same plausibility `ensureBot` itself checks before ever creating or adopting
+ * one: this is never a stranger's account to sweep up.
+ */
+export async function findPlausibleGatewayBot(
+	admin: Pick<AdminMattermostClient, "userByUsername">,
+	username: string,
+): Promise<MattermostId | null> {
+	const existing = await admin.userByUsername(username);
+	if (existing === null || !existing.is_bot || !isPlainSystemRoles(existing.roles)) {
+		return null;
+	}
+	return existing.id;
+}
+
+/**
  * Creates or checks everything the Gateway needs in Mattermost: resolves the team, the managed
  * channels and the owners (which must exist), creates missing bots (plain members, never
  * admins), adds them to the team and their channels and removes them from other managed
