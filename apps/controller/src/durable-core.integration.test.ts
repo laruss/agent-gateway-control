@@ -1412,16 +1412,32 @@ describe("durable core with the mock runtime", () => {
 
 	it("preserves queued work across a restart of controller and worker", async () => {
 		await idle("developer");
-		await gateway.stopWorker();
 		const event = humanPost("@developer after restart", ["developer"]);
-		await ingestEvent(gateway.deps(), event);
-		await gateway.stopController();
-
-		const queued = await runsFor(event.id);
-		expect(queued.map((r) => r.status)).toEqual(["queued"]);
-
-		await gateway.startController();
-		await gateway.startWorker();
+		try {
+			await gateway.stopWorker();
+			await ingestEvent(gateway.deps(), event);
+			// Scheduling an event into a queued run is not part of `ingestEvent` finishing: a
+			// concurrent schedule sweep can momentarily hold the agent lock first. Poll for the run
+			// the same way every other durability assertion in this file does, and only then take
+			// the controller down — once it is stopped, nothing will ever schedule the event.
+			const queued = await eventually(
+				async () => {
+					const runs = await runsFor(event.id);
+					return runs.length > 0 ? runs : null;
+				},
+				30_000,
+				"run queued before restart",
+			);
+			expect(queued.map((r) => r.status)).toEqual(["queued"]);
+			await gateway.stopController();
+		} finally {
+			// However the test ends, leave the gateway as every other test expects to find it: a
+			// failure here must not cascade into every test that runs after this one.
+			await gateway.stopController().catch(() => undefined);
+			await gateway.startController();
+			await gateway.stopWorker().catch(() => undefined);
+			await gateway.startWorker();
+		}
 		const run = await finishedRun(event.id, "run after restart");
 		expect(run).toMatchObject({ status: "succeeded", outcome: "idle" });
 	});
