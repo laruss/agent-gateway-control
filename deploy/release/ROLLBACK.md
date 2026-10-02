@@ -98,6 +98,19 @@ either in place breaks nothing.
 
 Once (a)-(d) are done, continue with the database-only steps below.
 
+## Rolling back from 0.6.0 to 0.5.0
+
+- Settle lifecycle operations first: `gateway agents operations` lists none `pending` or
+  `running`.
+- 0.5.0 ignores the lifecycle tables and does not mount `secrets/controller-bots`, so an agent
+  created by 0.6.0 (its `token_secret_file` under `/run/bot-secrets/`) cannot post under 0.5.0.
+  Retire it before rolling back, or copy its token file into `secrets/controller` and point its
+  `token_secret_file` at `/run/secrets/<file>` with `gateway config import`.
+- Agents retired by 0.6.0 are absent from the active configuration and stay absent under 0.5.0.
+  A database rollback never reactivates a Mattermost bot that 0.6.0 deactivated.
+- Deliveries cancelled by a retirement keep status `cancelled`: 0.5.0 never sends them and does
+  not expire their content; 0.6.0 does once upgraded again.
+
 ## Rolling back from 0.5.0 to 0.4.0
 
 No database step: 0.4.0 ignores `console_sessions` and serves its own HTTP Basic page with the

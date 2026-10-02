@@ -116,6 +116,22 @@ becomes a management UI:
 - Edits made in the console's Agents hub are configuration revisions with source `console`
   (`gateway config history`), the same as `config import`.
 
+## Upgrading to 0.6.0
+
+0.6.0 adds migrations `0024_agent_lifecycle` to `0027_lifecycle_retry_of`, all expand: the steps
+above apply unchanged. Agents can now be created, retired and restored from the console or the
+CLI ([ADR-026](../../docs/adr/026-agent-lifecycle.md)):
+
+- `init-home.sh` (part of the steps above) creates `secrets/controller-bots` (mode 0700, owner
+  10001); the controller mounts it read-write at `/run/bot-secrets` for the bot tokens it issues.
+- Existing agents are adopted as `ready` on first start; their bots, tokens and token paths under
+  `/run/secrets` stay as they are.
+- Creating, retiring and restoring agents needs a dedicated, non-bot Mattermost system-admin
+  account and its personal access token, entered once with `gateway mattermost admin-token set`
+  ([docs/operations/mattermost.md](../../docs/operations/mattermost.md)). Without it everything
+  else works, and `gateway doctor` reports lifecycle operations as waiting. Rotate the token with
+  `gateway mattermost admin-token rotate` at least every 90 days.
+
 ## Upgrading past 0.3.0: configuration history
 
 Starting with the release after 0.3.0, configuration is also kept as immutable snapshots and an

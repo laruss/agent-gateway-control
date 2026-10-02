@@ -66,6 +66,11 @@
       "version": "0.5.0",
       "head": "0023_console_csrf_derived",
       "pgboss_schema": 42
+    },
+    {
+      "version": "0.6.0",
+      "head": "0027_lifecycle_retry_of",
+      "pgboss_schema": 42
     }
   ]
 }
