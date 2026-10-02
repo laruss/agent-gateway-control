@@ -7,8 +7,10 @@ import {
 	CONSOLE_PASSWORD_HASH_SECRET_FILE,
 	GatewayEventSchema,
 	GmailMailboxIdSchema,
+	MATTERMOST_ADMIN_TOKEN_SECRET_FILE,
 	MattermostIdSchema,
 	QUEUES,
+	type RequestAgentCreateInput,
 	RuntimeAdapterIdSchema,
 	reportQueue,
 	runDeadLetterQueue,
@@ -36,6 +38,7 @@ import {
 	listAgents,
 	listApprovals,
 	listGmailMailboxes,
+	listLifecycleOperations,
 	listMemory,
 	listOutbox,
 	listRuns,
@@ -48,6 +51,7 @@ import {
 	redriveOutbox,
 	redriveRun,
 	releaseKillSwitch,
+	requestAgentCreate,
 	resetGmailMailbox,
 	resumeAgent,
 	runtimeHealth,
@@ -81,6 +85,7 @@ import {
 import { runtimeDoctor } from "@agent-gateway/runtime-sdk";
 import {
 	intSetting,
+	readOptionalFileSetting,
 	readSetting,
 	requireSetting,
 	resolveSecretPath,
@@ -97,14 +102,19 @@ import {
 	configImport,
 	configRollback,
 } from "./config-commands.ts";
-import { loadConfigDirectory } from "./config-files.ts";
+import { loadConfigDirectory, readPromptFile } from "./config-files.ts";
 import {
 	consolePasswordSet,
 	nodeHiddenReader,
 	revokeConsoleSessionsAfterRotation,
 } from "./console-commands.ts";
 import { gmailAuthorize } from "./gmail-commands.ts";
-import { mattermostBootstrap, mattermostReconcile } from "./mattermost-commands.ts";
+import {
+	mattermostAdminTokenRotate,
+	mattermostAdminTokenSet,
+	mattermostBootstrap,
+	mattermostReconcile,
+} from "./mattermost-commands.ts";
 
 export class UsageError extends Error {
 	constructor(message: string) {
@@ -167,6 +177,14 @@ export const USAGE = `gateway <command>
                                       recommitting its own content alone is a no-op
   directory set <channel|user|team> <name> <mattermost-id>
   agents list | show <id> | enable <id> | disable <id> | pause <id> | resume <id>
+  agents create <id> --display-name <name> --role-prompt-file <prompts/....md>
+                [--channel <name>]... [--root .] [--runtime <adapter>] [--model <id>]
+                                      provision a new agent's Mattermost bot automatically (no
+                                      bootstrap needed): commits its configuration and starts the
+                                      lifecycle provisioner, which creates the bot, its token and
+                                      its channel memberships; 'agents operations' follows along
+  agents operations [--agent <id>]    lifecycle operations (create/retire/restore/reprovision),
+                                      newest first: state, checkpoints and error, if any
   runtimes list                       worker availability and runtime versions per adapter
   runs list [--agent <id>] | show <run-id> | cancel <run-id> | redrive <run-id>
   waits list
@@ -188,6 +206,16 @@ export const USAGE = `gateway <command>
                                       MATTERMOST_URL and a temporary MATTERMOST_ADMIN_TOKEN)
   mattermost reconcile [--secrets-dir <dir>]
                                       check tokens, bot accounts and memberships
+  mattermost admin-token set [--secrets-dir <dir>]
+                                      hidden entry: store a personal access token of a dedicated,
+                                      non-bot Mattermost system-admin account (validated: must
+                                      have the 'system_admin' role) for the lifecycle provisioner
+                                      to create agent bots with, without a temporary admin token
+  mattermost admin-token rotate [--secrets-dir <dir>]
+                                      create-verify-switch-revoke: issue a new personal access
+                                      token for the same account, verify it, switch to it, then
+                                      revoke every other token on the account (do this every 90
+                                      days; needs MATTERMOST_URL and the current admin token)
   gmail authorize --out <file> [--port <n>] [--pubsub]
                                       consent for the Gmail connector (read mail; --pubsub also
                                       pulls its notifications); stores the refresh token in
@@ -239,6 +267,70 @@ function flag(args: Readonly<string[]>, name: string): string | null {
 		throw new UsageError(`--${name} needs a value`);
 	}
 	return value;
+}
+
+/** Every value of a flag given more than once (`--channel hq --channel research`), in order. */
+function flagsAll(args: Readonly<string[]>, name: string): Readonly<string[]> {
+	const values: string[] = [];
+	for (const [index, token] of args.entries()) {
+		if (token === `--${name}`) {
+			const value = args[index + 1];
+			if (value === undefined || value.startsWith("--")) {
+				throw new UsageError(`--${name} needs a value`);
+			}
+			values.push(value);
+		}
+	}
+	return values;
+}
+
+/**
+ * `gateway agents create`'s own arguments, turned into a `requestAgentCreate` input: reads the
+ * role prompt file (a `prompts/<...>.md` path, relative to `root`) and assembles the rest from
+ * flags, leaving `mattermost.token_secret_file` and `runtime` for the service to default. No
+ * database or network access, so a test can call it directly with a `root` of its own.
+ */
+export function buildAgentCreateRequest(
+	args: Readonly<string[]>,
+	root: string,
+	actor: string,
+): RequestAgentCreateInput {
+	const id = arg(args, 2, "id");
+	const displayName = flag(args, "display-name");
+	if (displayName === null) {
+		throw new UsageError("missing --display-name <name>");
+	}
+	const rolePromptFile = flag(args, "role-prompt-file");
+	if (rolePromptFile === null) {
+		throw new UsageError(
+			"missing --role-prompt-file <path> (a 'prompts/<...>.md' path, relative to --root)",
+		);
+	}
+	const runtimeFlag = flag(args, "runtime");
+	const modelFlag = flag(args, "model");
+	const runtime =
+		runtimeFlag === null && modelFlag === null
+			? undefined
+			: {
+					...(runtimeFlag === null ? {} : { adapter: RuntimeAdapterIdSchema.parse(runtimeFlag) }),
+					...(modelFlag === null ? {} : { model: modelFlag }),
+				};
+	return {
+		agent: {
+			id,
+			display_name: displayName,
+			mattermost: { username: id, allowed_channels: [...flagsAll(args, "channel")] },
+			...(runtime === undefined ? {} : { runtime }),
+			prompts: { role_file: rolePromptFile },
+			wake_rules: [{ event_type: "mattermost.agent.mentioned", target_agent_id: id }],
+			concurrency: { while_running: "enqueue" },
+			permissions: { tools_allow: [], tools_require_human_approval: [], tools_deny: [] },
+			memory: { private_namespace: `agents/${id}`, shared_namespaces: [] },
+		},
+		rolePrompt: readPromptFile(root, rolePromptFile),
+		actor,
+		source: "cli",
+	};
 }
 
 /** Development: every agent on the mock runtime, keeping everything else as configured. */
@@ -413,6 +505,22 @@ async function doctor(session: Session, out: Output): Promise<boolean> {
 				held.length === 0
 					? `no hold on ${budgets.day}`
 					: `held on ${budgets.day}: ${held.map((agent) => `@${agent.agentId}`).join(", ")}`,
+		});
+		// The lifecycle provisioner (ADR-026) is idle with no admin token configured: a
+		// `create`/`restore`/`reprovision` operation stays `pending` indefinitely until one is set.
+		const adminTokenConfigured = readOptionalFileSetting("MATTERMOST_ADMIN_TOKEN") !== undefined;
+		const waiting = await pool.query<{ n: number }>(
+			`select count(*)::int as n from agent_lifecycle_operations
+			  where state in ('pending', 'running') and kind in ('create', 'restore', 'reprovision')`,
+		);
+		const waitingCount = waiting.rows[0]?.n ?? 0;
+		checks.push({
+			name: "mattermost_provisioning",
+			ok: adminTokenConfigured || waitingCount === 0,
+			detail: adminTokenConfigured
+				? `admin token configured; ${waitingCount} operation(s) in progress`
+				: `no Mattermost admin token configured; ${waitingCount} operation(s) waiting ` +
+					"('gateway mattermost admin-token set')",
 		});
 		// `doctor` never runs `ensureConfigHistory` itself (it is read-only), so right after a
 		// forward upgrade the journal's latest entry can still look exactly as it did before the
@@ -728,6 +836,31 @@ export async function runCommand(args: Readonly<string[]>, out: Output): Promise
 		}
 		return 0;
 	}
+	if (group === "mattermost" && action === "admin-token" && args[2] === "set") {
+		const secretsDirFlag = flag(args, "secrets-dir") ?? readSetting("SECRETS_DIR");
+		const secretsDir = secretsDirFlag === undefined ? undefined : resolve(secretsDirFlag);
+		await mattermostAdminTokenSet(
+			{
+				baseUrl: requireSetting("MATTERMOST_URL"),
+				secretPath: resolveSecretPath(MATTERMOST_ADMIN_TOKEN_SECRET_FILE, secretsDir),
+				reader: nodeHiddenReader(),
+			},
+			out.print,
+		);
+		return 0;
+	}
+	if (group === "mattermost" && action === "admin-token" && args[2] === "rotate") {
+		const secretsDirFlag = flag(args, "secrets-dir") ?? readSetting("SECRETS_DIR");
+		const secretsDir = secretsDirFlag === undefined ? undefined : resolve(secretsDirFlag);
+		await mattermostAdminTokenRotate(
+			{
+				baseUrl: requireSetting("MATTERMOST_URL"),
+				secretPath: resolveSecretPath(MATTERMOST_ADMIN_TOKEN_SECRET_FILE, secretsDir),
+			},
+			out.print,
+		);
+		return 0;
+	}
 	if (group === "runtime" && action === "doctor") {
 		const adapter = RuntimeAdapterIdSchema.parse(arg(args, 2, "adapter"));
 		const report = await runtimeDoctor(createRuntimeAdapter(adapter), {
@@ -952,6 +1085,19 @@ async function dispatchSessionCommand(
 		case "agents resume":
 			out.print(await resumeAgent(deps, arg(args, 2, "id"), who));
 			return 0;
+		case "agents create": {
+			const created = await requestAgentCreate(
+				deps,
+				buildAgentCreateRequest(args, resolve(flag(args, "root") ?? "."), who),
+			);
+			out.print(json(created));
+			return 0;
+		}
+		case "agents operations": {
+			const agentFlag = flag(args, "agent");
+			out.print(json(await listLifecycleOperations(deps, agentFlag ?? undefined)));
+			return 0;
+		}
 		case "runs list":
 			out.print(json(await listRuns(deps, flag(args, "agent"))));
 			return 0;

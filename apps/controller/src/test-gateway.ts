@@ -148,6 +148,7 @@ export async function startTestGateway(options: TestGatewayOptions = {}): Promis
 				pollingIntervalSeconds: 0.5,
 				reconcileIntervalMs: 1000,
 				runtimeStableMs: 500,
+				agentProvisionerPollIntervalMs: 500,
 				...(real === null ? {} : { mattermost: real }),
 			});
 		},

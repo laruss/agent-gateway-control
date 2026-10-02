@@ -36,7 +36,9 @@ export {
 	type ActiveConfig,
 	enqueueOutbox,
 	loadActiveConfig,
+	loadProvisioningAdminUserId,
 	type OutboxDraft,
+	PROVISIONING_ADMIN_DIRECTORY_NAME,
 	raiseAlert,
 } from "./services/store.ts";
 export * from "./services/system-status.ts";

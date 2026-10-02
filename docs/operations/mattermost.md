@@ -60,6 +60,69 @@ the controller container only; workers get none of these files. In local develop
 (`bun run dev`) the worker runs as the same user in the same working tree and could read
 them: use throwaway development bots only.
 
+## Automated agent provisioning (no bootstrap needed)
+
+Bootstrap above sets up the team, the channels, the owners and the listener bot once, with a
+temporary admin token. Creating an agent afterwards does not need that temporary token, or a
+`gateway mattermost bootstrap` run, again: the controller provisions the new agent's bot itself,
+using a long-lived personal access token of a dedicated, non-bot Mattermost system-admin
+account ([ADR-026](../adr/026-agent-lifecycle.md)) — a credential kept in the controller's own
+secrets, never handed to a model, constrained in code to exactly the bot-provisioning actions
+below.
+
+### One-time setup
+
+1. In Mattermost (as an existing system admin, or the first account on the server), create a
+   dedicated user for this, e.g. `gateway-admin`, give it the **System Admin** role, and make sure
+   **Enable Personal Access Tokens** is on (`MM_SERVICESETTINGS_ENABLEUSERACCESSTOKENS=true`, the
+   same setting bootstrap needs). This account is never a bot (Mattermost bots cannot create other
+   bots) and is never one of the `owner_mattermost_usernames` an agent's approvals already trust —
+   keep it out of that list.
+2. As `gateway-admin`, create a personal access token (Profile, Security, Personal Access Tokens).
+3. Store it in the controller's secrets, from an interactive shell (hidden entry; the token is
+   never printed, logged or committed):
+
+   ```bash
+   bun run gateway mattermost admin-token set --secrets-dir secrets
+   ```
+
+   This validates the token (`users/me`: a non-bot account with the `system_admin` role) and
+   writes it to `<secrets-dir>/mattermost_admin_token`, mounted read-only into the controller at
+   `/run/secrets/mattermost_admin_token` (`MATTERMOST_ADMIN_TOKEN_FILE`). The controller's
+   provisioner picks it up on its own next pass — no restart needed.
+
+With no admin token configured yet, `create`/`restore`/`reprovision` operations simply stay
+`pending`; `gateway doctor`'s `mattermost_provisioning` check names this plainly rather than
+failing them.
+
+### Creating an agent
+
+```bash
+bun run gateway agents create data-analyst \
+  --display-name "Data Analyst" \
+  --role-prompt-file prompts/agents/data-analyst.md \
+  --channel hq --channel research
+bun run gateway agents operations --agent data-analyst
+```
+
+`agents create` commits the agent's configuration and records a `create` operation; the
+provisioner then creates the bot (refusing to adopt an existing account that is not plausibly its
+own — a regular user, or a bot with elevated roles — with "username taken"), issues it a token
+under `/run/bot-secrets/mm_<id>_token` (generated, never a path you choose), adds it to the team
+and to each channel in `--channel`, and records its account the same way bootstrap does. Each step
+is checkpointed as it completes, so a controller restart mid-way resumes exactly where it left
+off, and a lost token response is recreated rather than reused. Once every step is done the agent
+becomes `ready` and a waiting mention runs at once. `agents operations` shows each operation's
+state, checkpoints and error, if any; a permanent failure (the username really is taken, or the
+admin token is rejected) needs an operator's attention — everything else (a slow or unreachable
+Mattermost) retries on its own.
+
+The bot's token file is in `secrets/controller-bots/`, backed up and restored along with the rest
+of `$GATEWAY_HOME` (`docs/operations/home-server.md`); nothing needs to be reprovisioned after an
+ordinary restore. Only if that directory itself were ever lost without a backup would an agent's
+bot need a fresh token — created by hand in Mattermost and written to its
+`mattermost.token_secret_file`, or by retiring and restoring the agent once that cleanup exists.
+
 ## Giving an agent a channel
 
 An owner (`owner_mattermost_usernames`) or a system admin adds the agent's bot to a channel in
@@ -139,3 +202,16 @@ a sync after a failure is pending.
   existing bot account it adopts for the first time.
 - **Routing key:** replace the file and restart the controller. Agent posts signed with the
   old key that were not yet synced are rejected and alerted; there is no dual-key window.
+- **The provisioning admin token:** Mattermost access tokens do not expire on their own, so rotate
+  it by hand, every 90 days:
+
+  ```bash
+  bun run gateway mattermost admin-token rotate --secrets-dir secrets
+  ```
+
+  Create-verify-switch-revoke (ADR-026): it creates a new personal access token for the same
+  `gateway-admin` account, verifies it authenticates as that account, writes it over the current
+  file — the controller's provisioner reads it on its next pass, no restart needed — and only then
+  revokes every other token the account has. A crash between any two of those steps leaves a token
+  that still works; re-running the command finishes it (it revokes every token that is not the one
+  it just wrote, however many stray ones a crashed earlier attempt left behind).

@@ -29,6 +29,10 @@ export type BridgeDirectory = Readonly<{
 	/** Where approval cards are posted; replies in their threads may decide. Null until resolved. */
 	approvalsChannelId: MattermostId | null;
 	agents: Readonly<BridgeAgent[]>;
+	/** The dedicated Mattermost admin account the lifecycle provisioner uses (ADR-026), once
+	 * resolved; null before then. Control-plane infrastructure, not a conversational participant:
+	 * its posts route exactly like the listener's own (see `normalizePost`). */
+	adminUserId: MattermostId | null;
 }>;
 
 /**
@@ -52,7 +56,7 @@ export type NormalizeContext = Readonly<{
 	now: Date;
 }>;
 
-export type SkipReason = "unmanaged_channel" | "system_post" | "listener_post";
+export type SkipReason = "unmanaged_channel" | "system_post" | "listener_post" | "admin_post";
 export type RejectReason = "unsigned_agent_post" | "replayed_agent_post";
 
 export type Normalized =
@@ -260,6 +264,12 @@ export function normalizePost(
 	}
 	if (post.user_id === ctx.listenerUserId) {
 		return { kind: "skip", reason: "listener_post" };
+	}
+	if (ctx.directory.adminUserId !== null && post.user_id === ctx.directory.adminUserId) {
+		// The provisioning admin account (ADR-026) is control-plane infrastructure, never a
+		// conversational participant: a post by it (should one ever happen) never wakes an agent
+		// and is never recorded as an instruction, exactly like the listener's own posts.
+		return { kind: "skip", reason: "admin_post" };
 	}
 	const who = author(post, change, ctx);
 	if ("rejected" in who) {

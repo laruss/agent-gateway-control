@@ -11,6 +11,7 @@ import {
 } from "@agent-gateway/core";
 import {
 	bootstrapMattermost,
+	MattermostClient,
 	mattermostPlan,
 	reconcileMattermost,
 	StaleConfigurationError,
@@ -24,6 +25,7 @@ import {
 	secretFileState,
 	writeSecretFile,
 } from "@agent-gateway/service";
+import type { HiddenLineReader } from "./console-commands.ts";
 
 export class MattermostCommandError extends Error {
 	constructor(message: string) {
@@ -157,4 +159,99 @@ export async function mattermostReconcile(
 	}
 	print(`Mattermost problems:\n- ${problems.join("\n- ")}`);
 	return false;
+}
+
+/** The description every personal access token `admin-token set|rotate` issues or looks for
+ * carries: not a secret, just a marker distinct from a bot's own tokens (`TOKEN_DESCRIPTION`). */
+const ADMIN_TOKEN_DESCRIPTION = "agent-gateway-admin";
+
+export type MattermostAdminTokenSetOptions = Readonly<{
+	baseUrl: string;
+	/** The controller secret file, already resolved against the secrets directory in effect. */
+	secretPath: string;
+	reader: HiddenLineReader;
+}>;
+
+/**
+ * `gateway mattermost admin-token set`: hidden entry of a personal access token an operator
+ * already created in Mattermost for a dedicated, non-bot system-admin account (ADR-026) —
+ * validated (`users/me`: a non-bot account with the `system_admin` role) and written atomically,
+ * 0600, into the controller's secrets directory. Refuses anything but an interactive terminal, and
+ * never prints the token; only the account's own username confirms which one was just set.
+ */
+export async function mattermostAdminTokenSet(
+	options: MattermostAdminTokenSetOptions,
+	print: (line: string) => void,
+): Promise<void> {
+	if (!options.reader.isTTY) {
+		throw new MattermostCommandError("stdin is not a terminal; run this from an interactive shell");
+	}
+	const token = await options.reader.readLine("Mattermost admin token: ");
+	if (token.length === 0) {
+		throw new MattermostCommandError("the token must not be empty");
+	}
+	const me = await new MattermostClient({ baseUrl: options.baseUrl, token }).me();
+	if (me.is_bot) {
+		throw new MattermostCommandError(
+			`'${me.username}' is a bot account; Mattermost bots cannot create other bots, so the ` +
+				"admin token must belong to a dedicated, non-bot human-managed account",
+		);
+	}
+	if (!me.roles.split(/\s+/).includes("system_admin")) {
+		throw new MattermostCommandError(`'${me.username}' does not have the 'system_admin' role`);
+	}
+	writeSecretFile(options.secretPath, token);
+	print(`admin token set for account '${me.username}'`);
+}
+
+export type MattermostAdminTokenRotateOptions = Readonly<{
+	baseUrl: string;
+	secretPath: string;
+}>;
+
+/**
+ * `gateway mattermost admin-token rotate`: create-verify-switch-revoke (ADR-026). With the
+ * current token, creates a new personal access token for the same account, verifies it
+ * authenticates as that account, writes it over the current file (the crash boundary: from here
+ * the new token is the one in use), then revokes every other token the account has — the current
+ * one (just superseded) and, if an earlier rotation crashed after writing its own new token but
+ * before this step, every token stranded by that crash too. A token's value is never readable
+ * back from Mattermost, so "every other token" (not a specifically remembered old id) is how this
+ * stays correct however many times it was interrupted before.
+ */
+export async function mattermostAdminTokenRotate(
+	options: MattermostAdminTokenRotateOptions,
+	print: (line: string) => void,
+): Promise<void> {
+	const state = secretFileState(options.secretPath);
+	if (state !== "private") {
+		throw new MattermostCommandError(
+			state === "missing"
+				? "no admin token is set yet; run 'gateway mattermost admin-token set' first"
+				: `admin token file '${options.secretPath}' is ${state === "symlink" ? "a symlink" : "readable by others"}; replace it and run 'admin-token set' again`,
+		);
+	}
+	const current = readSecretFile(options.secretPath);
+	const client = new MattermostClient({ baseUrl: options.baseUrl, token: current });
+	const me = await client.me();
+	const created = await client.createUserAccessToken(me.id, ADMIN_TOKEN_DESCRIPTION);
+	// Every call from here on authenticates with the new token, never the one about to be
+	// revoked: revoking the old token (and any other stray one) must never invalidate the
+	// credential still doing the revoking.
+	const next = new MattermostClient({ baseUrl: options.baseUrl, token: created.token });
+	const verified = await next.me();
+	if (verified.id !== me.id) {
+		throw new MattermostCommandError(
+			"the newly created token did not verify against the same account; nothing was changed",
+		);
+	}
+	writeSecretFile(options.secretPath, created.token);
+	let revoked = 0;
+	for (const tokenId of await next.userAccessTokenIds(me.id)) {
+		if (tokenId !== created.id) {
+			await next.revokeUserAccessToken(tokenId);
+			revoked += 1;
+		}
+	}
+	print(`admin token rotated for account '${me.username}'; revoked ${revoked} old token(s)`);
 }

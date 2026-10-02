@@ -96,21 +96,31 @@ export const AgentPermissionsSchema = z
 	});
 export type AgentPermissions = z.infer<typeof AgentPermissionsSchema>;
 
+/**
+ * An agent's Mattermost identity as its configuration names it: the bot username (the bot user id
+ * itself is resolved by bootstrap or the lifecycle provisioner, never configured) and its
+ * channels. Named and exported so `AgentCreateMattermostInputSchema`
+ * (`agent-lifecycle.ts`) can vary it slightly — a create request leaves `token_secret_file`
+ * unset for the provisioner to generate — without duplicating the rest of the shape.
+ */
+export const AgentMattermostConfigSchema = z.strictObject({
+	/** Bot username, equal to the agent id; the bot user id is resolved by bootstrap. */
+	username: MattermostNameSchema,
+	token_secret_file: SecretFileSchema,
+	/**
+	 * Channels given in the configuration. Optional: an owner or system admin can also give a
+	 * channel by adding the bot there in Mattermost (ADR-022).
+	 */
+	allowed_channels: z.array(MattermostNameSchema).max(32).default([]),
+});
+export type AgentMattermostConfig = z.infer<typeof AgentMattermostConfigSchema>;
+
 export const AgentConfigSchema = z.strictObject({
 	schema_version: z.literal(1),
 	id: AgentIdSchema,
 	display_name: AgentDisplayNameSchema,
 	enabled: z.boolean(),
-	mattermost: z.strictObject({
-		/** Bot username, equal to the agent id; the bot user id is resolved by bootstrap. */
-		username: MattermostNameSchema,
-		token_secret_file: SecretFileSchema,
-		/**
-		 * Channels given in the configuration. Optional: an owner or system admin can also give a
-		 * channel by adding the bot there in Mattermost (ADR-022).
-		 */
-		allowed_channels: z.array(MattermostNameSchema).max(32).default([]),
-	}),
+	mattermost: AgentMattermostConfigSchema,
 	runtime: AgentRuntimeConfigSchema,
 	prompts: z.strictObject({
 		role_file: PromptPathSchema,

@@ -293,6 +293,24 @@ export async function loadOwnerUserIds(db: Db): Promise<MattermostId[]> {
 	return [...new Set(ids)];
 }
 
+/**
+ * A reserved directory name no real Mattermost account can ever resolve to (`#` is outside
+ * `MattermostNameSchema`'s charset, which every configured owner or bot username is validated
+ * against): the dedicated provisioning admin account's own user id, recorded from its token
+ * (`users/me`) whenever the lifecycle provisioner runs. Posts by this account route exactly like
+ * the listener's own — never a wake-up, never an approval (ADR-026) — because it is control-plane
+ * infrastructure the Gateway calls Mattermost with, not a conversational participant; it is never
+ * resolved under its real username the way an owner or a bot is, so it is excluded from
+ * `loadOwnerUserIds` above by construction, as long as it is never also listed as an owner.
+ */
+export const PROVISIONING_ADMIN_DIRECTORY_NAME = "#provisioning-admin";
+
+/** The provisioning admin account's own user id, or null before the provisioner has resolved one
+ * (no admin token configured yet, or the controller has not started since one was). */
+export async function loadProvisioningAdminUserId(db: Db): Promise<MattermostId | null> {
+	return (await loadDirectory(db, "user")).get(PROVISIONING_ADMIN_DIRECTORY_NAME) ?? null;
+}
+
 type EventRow = typeof events.$inferSelect;
 
 /** Rebuilds the envelope of a stored event; stored events were validated on ingest. */

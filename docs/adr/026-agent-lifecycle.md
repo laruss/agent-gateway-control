@@ -137,24 +137,59 @@ database with no active configuration at all does nothing. History before this r
 reconstructed beyond what the active configuration and `mattermost_identities` already hold, the
 same honesty ADR-024 already commits to for configuration history.
 
-### What later work adds
+### Automated Mattermost provisioning
 
-Automated provisioning needs a Mattermost credential the Gateway does not have today: Mattermost
-documents that bots cannot create other bots, so an agent's own bot token can never bootstrap the
-next one, and the admin token `gateway mattermost bootstrap` uses today is a human's temporary
-loan, revoked right after. The decision this ADR commits to for that later work is a **dedicated,
-non-bot Mattermost system-admin account**, created once by the owner, whose personal access token
-is stored read-only in controller secrets — broad account authority, constrained in code to
-exactly the actions provisioning performs, never handed to a model. Because Mattermost access
-tokens do not expire on their own, the token is rotated on a fixed schedule through
-create-verify-switch-revoke: a new token is created and verified to work before the old one is
-switched out of use, and only then is the old one revoked — a crash between any two of those steps
-leaves a token that still works, never a provisioning path with no working credential at all.
+Automated provisioning needs a Mattermost credential the Gateway did not have before this:
+Mattermost documents that bots cannot create other bots, so an agent's own bot token can never
+bootstrap the next one, and the admin token `gateway mattermost bootstrap` uses is a human's
+temporary loan, revoked right after. The credential is a **dedicated, non-bot Mattermost
+system-admin account**, created once by the owner (`docs/operations/mattermost.md`), whose
+personal access token is stored read-only in controller secrets — broad account authority,
+constrained in code to exactly the actions provisioning performs, never handed to a model:
+
+- **Secrets.** The admin token is `secrets/controller/mattermost_admin_token`
+  (`MATTERMOST_ADMIN_TOKEN_FILE`), read-only to the controller and written only by
+  `gateway mattermost admin-token set|rotate`, which run through the CLI container's existing
+  read-write mount of that same directory. A lifecycle-created agent's own bot token is generated
+  server-side — never a path a client chooses — under a second, distinct directory,
+  `secrets/controller-bots` (`/run/bot-secrets` in the container), which the controller itself
+  mounts read-write: it is the only writer of the tokens it provisions there, as distinct from the
+  operator-managed secrets it only ever reads. Every token file is written atomically (a temporary
+  file in the same directory, `fsync`, then renamed over the target, mode 0600) and never logged.
+- **The provisioner.** A controller loop, alongside its other periodic work, takes
+  `pending`/`running` `create`/`restore`/`reprovision` operations and drives each one through its
+  steps — resolve or create the bot by username (refusing to adopt a stranger's account), issue it
+  an access token, add it to the team and its configured channels, record its resolved account the
+  way bootstrap already does — persisting a checkpoint in `agent_lifecycle_operations.checkpoints`
+  right after each external step and never holding a database transaction across a Mattermost call.
+  A controller restart resumes every `running` operation from its last checkpoint; a step already
+  checkpointed is not repeated. With no admin token configured, the loop stays idle and every such
+  operation simply stays `pending`, surfaced by `gateway doctor` rather than treated as a failure.
+- **Failure handling.** A step's failure is permanent — `failOperation`, with a redacted message,
+  moving the agent to `failed` — only when a retry could never fix it: the bot's username is taken
+  by an account that is not plausibly the Gateway's own, or the admin token is rejected or lacks
+  permission. Anything else (an unreachable or momentarily failing Mattermost) is left for the
+  loop's next pass; a token response lost between being created and being written is recovered by
+  revoking every token the bot has that is not the one now in its file and issuing a fresh one.
+- **Admin account exclusion.** The admin account is resolved from its own token (`users/me`) and
+  excluded from routing exactly like the listener bot: a post by it, should one ever happen, never
+  wakes an agent and is recorded without addressing anyone. It is never one of
+  `owner_mattermost_usernames`, so it already cannot decide an approval through that path; keeping
+  it out of that list is the owner's own responsibility (documented, not enforced in code, since
+  nothing marks an owner username as "this one is also the admin account").
+- **Rotation.** Mattermost access tokens do not expire on their own, so the admin token is rotated
+  by hand on a fixed schedule (every 90 days) through create-verify-switch-revoke: a new token is
+  created for the same account and verified to work before the current file is switched to it, and
+  only then is every other token the account has revoked — a crash between any two of those steps
+  leaves a token that still works, never a provisioning path with no working credential at all, and
+  a re-run after such a crash simply revokes whatever the interrupted attempt left stranded, since
+  nothing but the file itself says which token is current.
+
 Retirement's cleanup — cancelling an agent's runs, waits and approvals, deactivating its bot,
-revoking its token, reconciling channel memberships — resumes through the same `agent_lifecycle`/
-`agent_lifecycle_operations` rows this decision defines, via `markProvisioning`/`completeOperation`/
-`failOperation`: that later work changes what runs between `requestAgentRetire` and
-`completeOperation`, not the state machine itself.
+revoking its token, reconciling channel memberships — is not part of this decision: it resumes
+through the same `agent_lifecycle`/`agent_lifecycle_operations` rows, via the same
+`markProvisioning`/`completeOperation`/`failOperation`, later work that changes what runs between
+`requestAgentRetire` and `completeOperation`, not the state machine itself.
 
 ## Alternatives
 
@@ -184,9 +219,9 @@ revoking its token, reconciling channel memberships — resumes through the same
   agent of that adapter uses.
 - A configuration commit and a provisioning transition are independent failures: a console or CLI
   create can commit its configuration change and then crash before any provisioning work starts,
-  leaving the agent `pending` indefinitely until something (a retry, later work's own supervisor)
-  notices and calls `markProvisioning` again. This decision defines the rows that make that
-  recovery possible; it does not itself add the supervisor.
+  leaving the agent `pending` until the provisioner's own next pass notices the operation it left
+  `pending` and calls `markProvisioning` itself (no admin token configured leaves it `pending`
+  rather than failed, which is its own kind of "notices and does nothing yet").
 - `agent_lifecycle_operations` grows without bound, like the configuration journal and the audit
   log; nothing here adds its own retention pass.
 - A release before this one does not know these tables exist (ADR-020's expand-migration

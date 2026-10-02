@@ -17,6 +17,16 @@ describe("secret files", () => {
 		expect(() => resolveSecretPath("/run/secrets/a/../b", undefined)).toThrow(SettingError);
 	});
 
+	it("maps bot-secrets references the same way, into the same directory", () => {
+		expect(resolveSecretPath("/run/bot-secrets/mm_developer_token", undefined)).toBe(
+			"/run/bot-secrets/mm_developer_token",
+		);
+		expect(resolveSecretPath("/run/bot-secrets/mm_developer_token", "/tmp/s")).toBe(
+			"/tmp/s/mm_developer_token",
+		);
+		expect(() => resolveSecretPath("/run/bot-secrets/a/../b", undefined)).toThrow(SettingError);
+	});
+
 	it("writes owner-only files, replaces atomically and refuses symlinks", () => {
 		const dir = mkdtempSync(join(tmpdir(), "gateway-secrets-"));
 		const path = join(dir, "nested", "token");

@@ -2059,3 +2059,56 @@ Deliberate choices here ([ADR-025](docs/adr/025-management-console.md)):
   `useState`, the same the sign-in page already uses) fit better than a new dependency.
 
 Released as 0.5.0 (migrations `0022_console_sessions` and `0023_console_csrf_derived`, both expand; head `0023_console_csrf_derived`, pg-boss schema 42).
+
+## Phase 14 - Automated Mattermost provisioning and admin-token rotation
+
+Status: **done**
+
+| Item | State | Evidence |
+|------|-------|----------|
+| `secrets/controller-bots` (mode 0700, owner 10001), mounted read-write into the controller at `/run/bot-secrets`, distinct from the read-only `/run/secrets`; `SecretFileSchema` accepts both mounts | done | `deploy/release/bin/init-home.sh`, `deploy/release/compose.yaml`, `packages/contracts/src/common.ts` |
+| `MATTERMOST_ADMIN_TOKEN_FILE` read from the controller's existing read-only secrets mount; the lifecycle provisioner stays idle with none configured, surfaced by `gateway doctor`'s `mattermost_provisioning` check rather than failing anything | done | `deploy/release/compose.yaml`, `apps/controller/src/agent-provisioner.ts`, `apps/cli/src/commands.ts` |
+| A create request's `mattermost.token_secret_file` is optional; left unset, `requestAgentCreate` generates `/run/bot-secrets/mm_<id>_token` itself — never a path a client chooses | done | `packages/contracts/src/agent-lifecycle.ts`, `packages/core/src/services/agent-lifecycle.ts` (`defaultBotSecretFile`) |
+| The provisioner: a controller loop alongside `reconcile`/`retain` that takes `pending`/`running` `create`/`restore`/`reprovision` operations and drives each one's steps (resolve or create the bot by username, issue and write its token, add it to the team and its configured channels, record its account), checkpointing after every external step and never holding a transaction across a Mattermost call; resumes `running` operations from their checkpoint after a restart | done | `apps/controller/src/agent-provisioner.ts`, `checkpointOperation`/`listPendingLifecycleOperations` in `packages/core/src/services/agent-lifecycle.ts` |
+| Failure classification: a username taken by an account that is not plausibly the Gateway's own, or a rejected/insufficient admin token, fail the operation (`failOperation`, redacted); anything else is retried on the next pass; a lost token response is recovered by revoking every token the bot has that is not the one in its file and issuing a fresh one | done | `apps/controller/src/agent-provisioner.ts` |
+| The provisioning admin account is resolved from its own token (`users/me`) every pass and excluded from routing exactly like the listener bot: a post by it never wakes an agent | done | `packages/core/src/services/store.ts` (`PROVISIONING_ADMIN_DIRECTORY_NAME`), `packages/mattermost/src/normalize.ts` (`admin_post` skip reason) |
+| `gateway mattermost admin-token set` (hidden entry, validates `users/me`: non-bot, `system_admin`) and `admin-token rotate` (create-verify-switch-revoke: a new token for the same account, verified, switched, then every other token on the account revoked — correct after any number of interrupted retries, since nothing but the file says which token is current) | done | `apps/cli/src/mattermost-commands.ts`, `packages/mattermost/src/client.ts` (`createUserAccessToken` now returns its id too) |
+| `gateway agents create <id> --display-name ... --role-prompt-file ... [--channel ...] [--runtime ...] [--model ...]` (a thin wrapper over `requestAgentCreate`) and `gateway agents operations [--agent <id>]` | done | `apps/cli/src/commands.ts` |
+| `gateway mattermost bootstrap` unchanged; an agent it created keeps its own `/run/secrets/...` token path | done | `apps/cli/src/mattermost-commands.ts` (unchanged) |
+
+Acceptance:
+
+- [x] Each provisioning step is idempotent and checkpointed; a fake-client unit suite covers
+  resuming after a failure following each step without duplicating work, a lost token response
+  (the old token revoked, a new one written), a username taken by a non-Gateway account (permanent
+  failure), no admin token configured (idle, surfaced by doctor), and that no secret ever reaches
+  a log or a stored error (the existing redaction helpers).
+- [x] Retiring an agent and completing one of its operations concurrently, many times over, never
+  deadlocks (Postgres 40P01): `lockCurrentOperation` locks the agent's lifecycle row before its
+  operation row, the same order `requestAgentRetire` already took.
+- [x] Against a real, dev Mattermost 11.7 server: `requestAgentCreate` through to a `ready`
+  agent — the provisioner creates its bot, token and memberships without any bootstrap run — and a
+  mention in a channel wakes it (mock runtime), its reply posted by the newly created bot.
+  `admin-token rotate` leaves the old token rejected and the new one working.
+- [x] CLI integration coverage of `agents create`/`agents operations`, and `admin-token set`
+  refusing a bot token or a non-admin account.
+
+Deliberate choices here ([ADR-026](docs/adr/026-agent-lifecycle.md)):
+
+- The provisioner reuses `ensureBot`'s existing semantics (refuse a non-bot account or one with
+  elevated roles) rather than tracking "which bot did the Gateway itself create": Mattermost's API
+  gives no way to ask a bot account who made it, and a lifecycle-created agent's username is
+  already reserved in the Gateway's own database before any Mattermost call happens, so a plain bot
+  already there under that exact name is, in practice, the provisioner's own earlier attempt.
+- Team and channel resolution is not duplicated here: `allowed_channels` is already validated as a
+  subset of `organization.mattermost.channels`, so the provisioner only reads the directory entries
+  bootstrap (or an earlier provisioner pass) already resolved, waiting rather than failing when one
+  is not there yet.
+- No retry-from-`failed` command ships with this phase: a permanent failure needs an operator to
+  fix the underlying problem (a stray account, an invalid admin token) and create the agent fresh,
+  or wait for the later work that adds retirement's own cleanup and a `reprovision` entry point.
+- `secrets/controller-bots` needs no change to `backup.sh`/`restore.sh`: both already archive and
+  restore the whole of `$GATEWAY_HOME` (minus `backups/` itself), so the new directory is included
+  and restored automatically, the same as every other secrets directory.
+
+Not yet released; see the Changelog's `[Unreleased]` section.

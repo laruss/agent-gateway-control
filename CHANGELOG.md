@@ -4,6 +4,21 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## [Unreleased]
 
+### Added
+
+- Creating an agent no longer needs `gateway mattermost bootstrap` with a temporary admin token.
+  A dedicated, non-bot Mattermost system-admin account's personal access token, stored read-only
+  in the controller's secrets (`gateway mattermost admin-token set`, validated against Mattermost;
+  `gateway mattermost admin-token rotate` for its own create-verify-switch-revoke rotation, every
+  90 days), lets the controller provision a new agent's bot itself: a background provisioner
+  resolves or creates the bot, issues it an access token (written to a server-generated file under
+  a new, controller-owned secrets directory — never a path a client chooses), adds it to the team
+  and its configured channels, and records its account, resuming from a checkpoint after any
+  restart. `gateway agents create <id> --display-name ... --role-prompt-file ...` starts this;
+  `gateway agents operations [--agent <id>]` lists each operation's state, checkpoints and error.
+  With no admin token configured, new agents simply wait, surfaced by `gateway doctor`. Existing
+  bootstrap-created agents and `gateway mattermost bootstrap` itself are unchanged. (ADR-026)
+
 ## [0.5.0] - 2026-10-02
 
 ### Added

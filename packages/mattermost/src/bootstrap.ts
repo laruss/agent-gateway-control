@@ -5,6 +5,7 @@ import type {
 	OrganizationConfig,
 } from "@agent-gateway/contracts";
 import { type ApiChannel, isElevatedMember } from "./api-schemas.ts";
+import type { AdminMattermostClient, MattermostClientOptions } from "./client.ts";
 import { MattermostApiError, MattermostClient } from "./client.ts";
 
 /** A bot the Gateway runs: the listener, or one per agent. */
@@ -202,13 +203,18 @@ export class StaleConfigurationError extends BootstrapError {
 	}
 }
 
-const TOKEN_DESCRIPTION = "agent-gateway";
+/** The description every token the Gateway issues for a bot carries (bootstrap's and the
+ * lifecycle provisioner's alike): not a secret, just a marker a listing can show a human. */
+export const TOKEN_DESCRIPTION = "agent-gateway";
 
 /**
  * Revokes every access token of an account. The listing is paged; revoking empties the first
  * page, so it is read again until nothing is left.
  */
-async function revokeAllTokens(admin: MattermostClient, userId: MattermostId): Promise<void> {
+export async function revokeAllTokens(
+	admin: AdminMattermostClient,
+	userId: MattermostId,
+): Promise<void> {
 	for (let round = 0; round < 1000; round += 1) {
 		const ids = await admin.userAccessTokenIds(userId);
 		if (ids.length === 0) {
@@ -239,9 +245,19 @@ function isExtraChannel(channel: ApiChannel, allowed: ReadonlySet<MattermostId>)
 	);
 }
 
-async function tokenOwner(baseUrl: string, token: string): Promise<MattermostId | null> {
+/** The account a token belongs to, or null when it is rejected (401): whether a stored token
+ * still works and for whom, without assuming which account that should be. Reused by the
+ * lifecycle provisioner to decide whether a bot's existing token file still has a working
+ * credential before replacing it (ADR-026). `makeClient` builds the one-off client that
+ * authenticates as `token`; overridden in tests with a fake, never a real one. */
+export async function tokenOwner(
+	baseUrl: string,
+	token: string,
+	makeClient: (options: MattermostClientOptions) => Pick<MattermostClient, "me"> = (options) =>
+		new MattermostClient(options),
+): Promise<MattermostId | null> {
 	try {
-		return (await new MattermostClient({ baseUrl, token }).me()).id;
+		return (await makeClient({ baseUrl, token }).me()).id;
 	} catch (error) {
 		if (error instanceof MattermostApiError && error.status === 401) {
 			return null;
@@ -250,7 +266,17 @@ async function tokenOwner(baseUrl: string, token: string): Promise<MattermostId 
 	}
 }
 
-async function ensureBot(admin: MattermostClient, bot: BotSpec): Promise<MattermostId> {
+/**
+ * Resolves a bot's account by username, creating it when nothing there yet has that name:
+ * reused by both bootstrap (every configured bot, in bulk) and the lifecycle provisioner (one
+ * agent at a time, ADR-026). Refuses to adopt a username that is not plausibly the Gateway's own
+ * plain bot — a regular user account, or a bot with elevated system roles — rather than silently
+ * taking over a stranger's account.
+ */
+export async function ensureBot(
+	admin: AdminMattermostClient,
+	bot: Readonly<Pick<BotSpec, "username" | "displayName">>,
+): Promise<MattermostId> {
 	const existing = await admin.userByUsername(bot.username);
 	if (existing === null) {
 		const created = await admin.createBot({
@@ -453,7 +479,10 @@ export async function bootstrapMattermost(options: BootstrapOptions): Promise<vo
 			}
 		}
 		if (replaceToken) {
-			tokens.write(bot.tokenPath, await admin.createUserAccessToken(userId, TOKEN_DESCRIPTION));
+			tokens.write(
+				bot.tokenPath,
+				(await admin.createUserAccessToken(userId, TOKEN_DESCRIPTION)).token,
+			);
 		}
 		if (bot.agentId === null) {
 			await store.setUser(bot.username, userId);

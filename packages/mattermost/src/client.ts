@@ -252,12 +252,16 @@ export class MattermostClient {
 		await this.call("POST", "users/tokens/revoke", null, { token_id: tokenId });
 	}
 
-	/** Creates a personal access token for `userId`; the value is returned once, never logged. */
-	async createUserAccessToken(userId: MattermostId, description: string): Promise<string> {
-		const created = await this.call("POST", `users/${userId}/tokens`, ApiUserAccessTokenSchema, {
-			description,
-		});
-		return created.token;
+	/**
+	 * Creates a personal access token for `userId`; the token value is returned once (never
+	 * logged), alongside its own id — not secret, and the only way to find this exact token again
+	 * later (a listing never returns values; see `userAccessTokenIds`).
+	 */
+	async createUserAccessToken(
+		userId: MattermostId,
+		description: string,
+	): Promise<Readonly<{ id: string; token: string }>> {
+		return this.call("POST", `users/${userId}/tokens`, ApiUserAccessTokenSchema, { description });
 	}
 
 	/** Resolves 404 (and 403 for things the token may not see) to null. */
@@ -332,6 +336,28 @@ export class MattermostClient {
 		return parsed.data;
 	}
 }
+
+/**
+ * The subset of `MattermostClient` an admin token's own calls need (`ensureBot`/`revokeAllTokens`/
+ * `tokenOwner` in `bootstrap.ts`, and the lifecycle provisioner): narrow enough that a test's fake
+ * admin client can satisfy it as a plain object, without subclassing a class that has private
+ * fields (a real `MattermostClient` instance already satisfies it, structurally, as any wider type
+ * would).
+ */
+export type AdminMattermostClient = Pick<
+	MattermostClient,
+	| "me"
+	| "user"
+	| "userByUsername"
+	| "createBot"
+	| "enableBot"
+	| "disableBot"
+	| "addTeamMember"
+	| "addChannelMember"
+	| "userAccessTokenIds"
+	| "revokeUserAccessToken"
+	| "createUserAccessToken"
+>;
 
 function safeJson(text: string): JsonValue | undefined {
 	try {

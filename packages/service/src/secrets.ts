@@ -12,16 +12,28 @@ import {
 import { basename, dirname, join } from "node:path";
 import { SettingError } from "./settings.ts";
 
-/** Where configuration expects secret files (Docker/Compose secrets). */
+/** Where configuration expects secret files (Docker/Compose secrets): the controller's own
+ * read-only mount, managed by the operator (bootstrap-created agents, the admin token, ...). */
 export const SECRET_MOUNT = "/run/secrets/";
 
+/** The controller's read-write mount for tokens it provisions itself (ADR-026): lifecycle-created
+ * agents' bot tokens, generated server-side and never configured by a client. */
+export const BOT_SECRET_MOUNT = "/run/bot-secrets/";
+
+const SECRET_MOUNTS: Readonly<string[]> = [SECRET_MOUNT, BOT_SECRET_MOUNT];
+
 /**
- * The file behind a configured secret reference (`/run/secrets/<name>`). With `secretsDir`
- * (local development, bootstrap output) the same name is looked up there instead.
+ * The file behind a configured secret reference (`/run/secrets/<name>` or
+ * `/run/bot-secrets/<name>`). With `secretsDir` (local development, bootstrap output) the same
+ * name is looked up there instead, regardless of which mount it names: both are flat directories
+ * of distinctly-named files, and development has no reason to keep them apart.
  */
 export function resolveSecretPath(ref: string, secretsDir: string | undefined): string {
-	if (!ref.startsWith(SECRET_MOUNT) || basename(ref) !== ref.slice(SECRET_MOUNT.length)) {
-		throw new SettingError(`secret reference '${ref}' is not a file under ${SECRET_MOUNT}`);
+	const mount = SECRET_MOUNTS.find((candidate) => ref.startsWith(candidate));
+	if (mount === undefined || basename(ref) !== ref.slice(mount.length)) {
+		throw new SettingError(
+			`secret reference '${ref}' is not a file under ${SECRET_MOUNT} or ${BOT_SECRET_MOUNT}`,
+		);
 	}
 	return secretsDir === undefined ? ref : join(secretsDir, basename(ref));
 }

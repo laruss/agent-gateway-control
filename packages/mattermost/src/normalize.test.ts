@@ -36,6 +36,7 @@ const ctx: NormalizeContext = {
 			{ id: "developer", userId: DEV_BOT, channelIds: new Set([HQ]) },
 			{ id: "finance", userId: FIN_BOT, channelIds: new Set([HQ, FIN]) },
 		],
+		adminUserId: null,
 	},
 	listenerUserId: LISTENER,
 	authorIsBot: false,
@@ -298,6 +299,20 @@ describe("post normalization", () => {
 			kind: "skip",
 			reason: "listener_post",
 		});
+	});
+
+	it("skips the provisioning admin account's own posts, even one that mentions an agent (ADR-026)", () => {
+		const ADMIN = "adminaccount000000000000aa";
+		const withAdmin = { ...ctx, directory: { ...ctx.directory, adminUserId: ADMIN } };
+		expect(
+			normalizePost(
+				post({ user_id: ADMIN, message: "@finance please help" }),
+				"created",
+				withAdmin,
+			),
+		).toEqual({ kind: "skip", reason: "admin_post" });
+		// Unresolved (no admin token configured yet): never matches anyone, including this id.
+		expect(normalizePost(post({ user_id: ADMIN }), "created", ctx).kind).not.toBe("skip");
 	});
 
 	it("derives the changes a synced post stands for", () => {

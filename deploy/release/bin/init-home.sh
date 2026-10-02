@@ -13,6 +13,10 @@ install -d -m 0711 "$home/secrets"
 for dir in controller worker-codex worker-claude-code worker-mock gmail tool-runner; do
 	install -d -m 0700 -o 10001 -g 10001 "$home/secrets/$dir"
 done
+# ADR-026: the lifecycle provisioner's own writable directory, distinct from secrets/controller
+# (operator-managed, read-only to the controller) — it generates and writes lifecycle-created
+# agents' bot tokens here itself, at /run/bot-secrets.
+install -d -m 0700 -o 10001 -g 10001 "$home/secrets/controller-bots"
 install -d -m 0700 -o 70 -g 70 "$home/secrets/postgres"
 password_file="$home/secrets/postgres/postgres_password"
 if [ ! -s "$password_file" ]; then

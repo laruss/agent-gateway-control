@@ -12,6 +12,7 @@ import {
 	completeOperation,
 	ensureAgentLifecycleAdoption,
 	failOperation,
+	listLifecycleOperations,
 	listRunningLifecycleOperations,
 	markProvisioning,
 	requestAgentCreate,
@@ -213,6 +214,19 @@ describe("agent lifecycle service (ADR-026)", () => {
 		expect(await activeConfigRevisionId(deps)).toBe(created.revisionId);
 	});
 
+	it("generates a bot-secrets token file for a create request that leaves it unset", async () => {
+		const input = createInput("betagen");
+		const mattermost = { username: "betagen" };
+		await requestAgentCreate(deps, { ...input, agent: { ...input.agent, mattermost } });
+
+		const [identity] = (
+			await pool.query("select token_secret_ref from mattermost_identities where agent_id = $1", [
+				"betagen",
+			])
+		).rows;
+		expect(identity.token_secret_ref).toBe("/run/bot-secrets/mm_betagen_token");
+	});
+
 	it("an invalid agent definition leaves no trace: no revision, no agent row, no lifecycle row", async () => {
 		const revisionsBefore = (await pool.query("select count(*)::int as n from config_revisions"))
 			.rows[0].n;
@@ -384,6 +398,25 @@ describe("agent lifecycle service (ADR-026)", () => {
 		expect(running.find((row) => row.id === created.operationId)?.state).toBe("running");
 	});
 
+	it("lists operations newest first, scoped to an agent when asked (gateway agents operations)", async () => {
+		const first = await requestAgentCreate(deps, createInput("muopsa"));
+		const second = await requestAgentCreate(deps, createInput("muopsb"));
+
+		const scoped = await listLifecycleOperations(deps, "muopsa");
+		expect(scoped.map((op) => op.id)).toEqual([first.operationId]);
+		expect(scoped[0]).toMatchObject({
+			agentId: "muopsa",
+			kind: "create",
+			state: "pending",
+			checkpoints: {},
+			error: null,
+		});
+
+		const everything = await listLifecycleOperations(deps);
+		const ids = everything.map((op) => op.id);
+		expect(ids.indexOf(second.operationId)).toBeLessThan(ids.indexOf(first.operationId));
+	});
+
 	it("failOperation marks the agent failed with a recorded error", async () => {
 		const created = await requestAgentCreate(deps, createInput("nu"));
 		await markProvisioning(deps, created.operationId, "test");
@@ -502,5 +535,56 @@ describe("agent lifecycle service (ADR-026)", () => {
 			)
 		).rows[0].n;
 		expect(lifecycleCount).toBe(3);
+	});
+
+	/** Whether `error`, or anything in its `cause` chain, is Postgres's own "deadlock detected":
+	 * drizzle wraps the driver's error as `cause` of its own `Failed query: ...`, so the deadlock
+	 * text is never in the top-level message. */
+	function isDeadlock(error: unknown): boolean {
+		for (let current: unknown = error; current instanceof Error; current = current.cause) {
+			if (/deadlock detected/i.test(current.message)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	it("retire racing a concurrent operation transition never deadlocks (lock order: lifecycle row, then operation rows)", async () => {
+		// `requestAgentRetire` locks the agent's lifecycle row, then — still under that lock, after
+		// the heavier `commitChangeIn` work — its operation rows (`cancelNonterminalOperations`);
+		// `lockCurrentOperation` (`markProvisioning`/`completeOperation`/`failOperation`) must lock
+		// the same two rows in the same order, or the two can deadlock (Postgres 40P01): one holds
+		// the lifecycle row waiting for the operation row the other already holds, which is in turn
+		// waiting for the lifecycle row. `completeOperation` alone reaches its first lock in one
+		// round trip against retire's three (`gateway_controls`, then the lifecycle row), so a
+		// plain, simultaneous race never lands inside that window — retire needs a small head start
+		// to still be holding the lifecycle row when `completeOperation` reaches for it, exactly the
+		// interleaving a provisioner's own transition can hit against a concurrent retirement.
+		for (let i = 0; i < 20; i += 1) {
+			const agentId = `deadlock-${i}`;
+			const created = await requestAgentCreate(
+				deps,
+				createInput(agentId, {
+					mattermost: {
+						username: agentId,
+						token_secret_file: `/run/secrets/mm_deadlock_${i}_token`,
+					},
+				}),
+			);
+			await markProvisioning(deps, created.operationId, "test");
+			const retiring = requestAgentRetire(deps, { agentId, actor: "test", source: "cli" });
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			const results = await Promise.allSettled([
+				retiring,
+				completeOperation(deps, created.operationId, "test"),
+			]);
+			for (const result of results) {
+				if (result.status === "rejected") {
+					// Either side of the race may lose (the operation was superseded) — anything but a
+					// deadlock.
+					expect(isDeadlock(result.reason)).toBe(false);
+				}
+			}
+		}
 	});
 });

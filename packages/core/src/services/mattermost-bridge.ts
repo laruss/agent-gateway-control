@@ -27,6 +27,7 @@ import {
 	loadActiveConfig,
 	loadChannelAccess,
 	loadDirectory,
+	loadProvisioningAdminUserId,
 	lockConfigShared,
 	NEW_POST_EVENT_TYPES,
 	raiseAlert,
@@ -58,6 +59,9 @@ export type MattermostSnapshot = Readonly<{
 	/** Resolved managed channels, id to name; unresolved names are missing. */
 	channels: ReadonlyMap<MattermostId, string>;
 	agents: Readonly<BridgeAgentRecord[]>;
+	/** The provisioning admin account's own id, or null before it is resolved (ADR-026): its posts
+	 * route like the listener's own, never a wake-up or an approval. */
+	adminUserId: MattermostId | null;
 }>;
 
 /**
@@ -122,6 +126,7 @@ async function snapshotIn({ tx }: UnitOfWork): Promise<MattermostSnapshot | null
 				userId: row.userId ?? null,
 				channelIds: agentChannelIds({ id: row.id, config: row.config }, access),
 			})),
+			adminUserId: await loadProvisioningAdminUserId(tx.db),
 		};
 	}
 }
@@ -268,6 +273,20 @@ export async function loadMattermostIdentity(
 	return row === undefined
 		? null
 		: { agentId: row.agentId, userId: row.mattermostUserId, tokenSecretRef: row.tokenSecretRef };
+}
+
+/** An agent's own stored configuration (its current row, whether or not it is in the active
+ * bundle): the lifecycle provisioner's one read of `username`/`display_name`/`allowed_channels`
+ * for a `create`/`restore`/`reprovision` operation, by the id the operation already names. */
+export async function loadAgentConfig(
+	deps: ControlPlaneDeps,
+	agentId: AgentId,
+): Promise<AgentConfig | null> {
+	const [row] = await poolDb(deps)
+		.select({ config: agents.config })
+		.from(agents)
+		.where(eq(agents.id, agentId));
+	return row?.config ?? null;
 }
 
 /** Records the bot account bootstrap resolved for an agent. */

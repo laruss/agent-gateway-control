@@ -4,6 +4,7 @@ import {
 	type AgentCreateInput,
 	type AgentId,
 	type AgentLifecycleCheckpoints,
+	type AgentLifecycleOperation,
 	type AgentLifecycleOperationKind,
 	type AgentLifecycleSource,
 	type AgentLifecycleStatus,
@@ -17,6 +18,7 @@ import {
 	type RequestAgentRetireInput,
 	RequestAgentRetireInputSchema,
 	type RuntimeAdapterId,
+	type SecretFile,
 } from "@agent-gateway/contracts";
 import {
 	agentLifecycle,
@@ -26,7 +28,7 @@ import {
 	runtimeWorkers,
 } from "@agent-gateway/db";
 import { redactForStorage } from "@agent-gateway/logging";
-import { and, asc, eq, gt, inArray } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray } from "drizzle-orm";
 import type { z } from "zod";
 import { AdminError, ensureConfigHistoryIn, inTransaction } from "./admin.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
@@ -110,6 +112,19 @@ export function resolveCreateRuntime(
 	return model === undefined
 		? { adapter, profile, session_policy, timeout_seconds }
 		: { adapter, profile, session_policy, timeout_seconds, model };
+}
+
+/**
+ * The bot token file a lifecycle-created agent gets when its create request leaves
+ * `mattermost.token_secret_file` unset: `/run/bot-secrets/mm_<id>_token`, the agent id's hyphens
+ * replaced by underscores (`SecretFileSchema` allows only `[a-z0-9_]` after the mount). Clients
+ * never choose this path (see `AgentCreateMattermostInputSchema`); the controller's own
+ * provisioner is the only writer of the file it names, in the read-write directory the controller
+ * mounts for exactly this (ADR-026) — distinct from the read-only `/run/secrets/` an operator
+ * manages for bootstrap-created agents.
+ */
+export function defaultBotSecretFile(agentId: AgentId): SecretFile {
+	return `/run/bot-secrets/mm_${agentId.replace(/-/g, "_")}_token`;
 }
 
 /** Attempts a lifecycle request's own configuration commit may need: see `commitWithinLock`. */
@@ -284,7 +299,18 @@ export async function requestAgentCreate(
 			);
 		}
 
-		const agent: AgentConfig = { ...parsed.agent, schema_version: 1, enabled: true, runtime };
+		const mattermost: AgentConfig["mattermost"] = {
+			...parsed.agent.mattermost,
+			token_secret_file:
+				parsed.agent.mattermost.token_secret_file ?? defaultBotSecretFile(parsed.agent.id),
+		};
+		const agent: AgentConfig = {
+			...parsed.agent,
+			schema_version: 1,
+			enabled: true,
+			runtime,
+			mattermost,
+		};
 		const changeSet: ChangeSet = [{ type: "add_agent", agent, rolePrompt: parsed.rolePrompt }];
 		const commit = await commitWithinLock(
 			uow,
@@ -590,13 +616,36 @@ export async function requestAgentRestore(
 // Operation state machine: markProvisioning / completeOperation / failOperation
 // ---------------------------------------------------------------------------
 
-/** Locks both rows (the operation, then its agent's lifecycle row — the same order every writer
- * here uses) and refuses a stale call: one whose operation is no longer the one its agent's
- * lifecycle row is currently pursuing, by id and by the generation it was issued for alike. */
+/**
+ * Locks the agent's lifecycle row, then the operation row — the same order every other writer
+ * here takes (`gateway_controls` if held, then the lifecycle row, then operation rows):
+ * `requestAgentRetire`/`requestAgentRestore` already lock the lifecycle row before
+ * `cancelNonterminalOperations` touches operation rows, and this function used to lock the
+ * operation first instead, which could deadlock (Postgres 40P01) against a concurrent retire of
+ * the same agent. The initial, unlocked lookup only finds which agent's lifecycle row to lock
+ * first; the operation itself is locked and rechecked afterwards. Refuses a stale call: one whose
+ * operation is no longer the one its agent's lifecycle row is currently pursuing, by id and by the
+ * generation it was issued for alike.
+ */
 async function lockCurrentOperation(
 	db: Db,
 	operationId: string,
 ): Promise<Readonly<{ operation: AgentLifecycleOperationRow; lifecycle: AgentLifecycleRow }>> {
+	const [found] = await db
+		.select({ agentId: agentLifecycleOperations.agentId })
+		.from(agentLifecycleOperations)
+		.where(eq(agentLifecycleOperations.id, operationId));
+	if (found === undefined) {
+		throw new AdminError(`lifecycle operation '${operationId}' does not exist`);
+	}
+	const [lifecycle] = await db
+		.select()
+		.from(agentLifecycle)
+		.where(eq(agentLifecycle.agentId, found.agentId))
+		.for("update");
+	if (lifecycle === undefined) {
+		throw new AdminError(`agent '${found.agentId}' has no lifecycle record`);
+	}
 	const [operation] = await db
 		.select()
 		.from(agentLifecycleOperations)
@@ -604,14 +653,6 @@ async function lockCurrentOperation(
 		.for("update");
 	if (operation === undefined) {
 		throw new AdminError(`lifecycle operation '${operationId}' does not exist`);
-	}
-	const [lifecycle] = await db
-		.select()
-		.from(agentLifecycle)
-		.where(eq(agentLifecycle.agentId, operation.agentId))
-		.for("update");
-	if (lifecycle === undefined) {
-		throw new AdminError(`agent '${operation.agentId}' has no lifecycle record`);
 	}
 	if (lifecycle.operationId !== operation.id || lifecycle.generation !== operation.generation) {
 		throw new StaleLifecycleOperationError(operationId);
@@ -660,6 +701,33 @@ export async function markProvisioning(
 		await audit(uow, actor, "agent_lifecycle.provisioning", "agent", operation.agentId, {
 			operation_id: operationId,
 		});
+	});
+}
+
+/**
+ * Merges `checkpoints` into a `running` operation's own, without changing its state: the
+ * provisioner's own record of one external step it just completed, written right after that step
+ * and before the next one — never inside the same transaction as the Mattermost call that step
+ * made — so a crash is resumed from exactly where it left off (ADR-026). Refused for a stale
+ * operation (superseded) or one that is not `running`, like every other writer of this row.
+ */
+export async function checkpointOperation(
+	deps: ControlPlaneDeps,
+	operationId: string,
+	checkpoints: AgentLifecycleCheckpoints,
+): Promise<void> {
+	await inTransaction(deps, async (uow) => {
+		const { db } = uow.tx;
+		const { operation } = await lockCurrentOperation(db, operationId);
+		if (operation.state !== "running") {
+			throw new AdminError(
+				`lifecycle operation '${operationId}' is '${operation.state}', not running`,
+			);
+		}
+		await db
+			.update(agentLifecycleOperations)
+			.set({ checkpoints: { ...operation.checkpoints, ...checkpoints }, updatedAt: uow.now })
+			.where(eq(agentLifecycleOperations.id, operationId));
 	});
 }
 
@@ -762,6 +830,70 @@ export async function listRunningLifecycleOperations(
 			.where(eq(agentLifecycleOperations.state, "running"))
 			.orderBy(asc(agentLifecycleOperations.createdAt)),
 	);
+}
+
+/**
+ * Operations of `kinds` still `pending`, oldest first: new work a provisioner has not started yet
+ * (`listRunningLifecycleOperations` is its own counterpart for resuming work interrupted mid-way).
+ * Restricted to `kinds` because not every operation that is ever `pending` is that provisioner's
+ * to pursue — a Mattermost provisioner takes `create`/`restore`/`reprovision`, never `retire`
+ * (whose cleanup is other work's own) or `adopt` (written only `succeeded`, by the startup
+ * backfill, never left `pending`).
+ */
+export async function listPendingLifecycleOperations(
+	deps: ControlPlaneDeps,
+	kinds: Readonly<AgentLifecycleOperationKind[]>,
+): Promise<Readonly<AgentLifecycleOperationRow[]>> {
+	return inTransaction(deps, ({ tx }) =>
+		tx.db
+			.select()
+			.from(agentLifecycleOperations)
+			.where(
+				and(
+					eq(agentLifecycleOperations.state, "pending"),
+					inArray(agentLifecycleOperations.kind, kinds),
+				),
+			)
+			.orderBy(asc(agentLifecycleOperations.createdAt)),
+	);
+}
+
+/** Bounds `gateway agents operations`' own listing; the journal itself keeps every row. */
+const MAX_LISTED_OPERATIONS = 100;
+
+/**
+ * Lifecycle operations, newest first, for an owner to read (`gateway agents operations`):
+ * every kind and state, not only what a provisioner still has to act on. Scoped to `agentId` when
+ * given.
+ */
+export async function listLifecycleOperations(
+	deps: ControlPlaneDeps,
+	agentId?: AgentId,
+): Promise<Readonly<AgentLifecycleOperation[]>> {
+	const rows = await inTransaction(deps, ({ tx }) =>
+		tx.db
+			.select()
+			.from(agentLifecycleOperations)
+			.where(agentId === undefined ? undefined : eq(agentLifecycleOperations.agentId, agentId))
+			.orderBy(desc(agentLifecycleOperations.createdAt))
+			.limit(MAX_LISTED_OPERATIONS),
+	);
+	return rows.map((row) => ({
+		id: row.id,
+		agentId: row.agentId,
+		kind: row.kind,
+		requestedBy: row.requestedBy,
+		source: row.source,
+		idempotencyKey: row.idempotencyKey,
+		configRevisionId: row.configRevisionId,
+		generation: row.generation,
+		state: row.state,
+		checkpoints: row.checkpoints,
+		error: row.error,
+		createdAt: row.createdAt.toISOString(),
+		updatedAt: row.updatedAt.toISOString(),
+		finishedAt: row.finishedAt === null ? null : row.finishedAt.toISOString(),
+	}));
 }
 
 // ---------------------------------------------------------------------------

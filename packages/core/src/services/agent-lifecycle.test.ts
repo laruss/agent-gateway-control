@@ -1,7 +1,7 @@
 import type { AgentConfig } from "@agent-gateway/contracts";
 import { AgentConfigSchema, RequestAgentCreateInputSchema } from "@agent-gateway/contracts";
 import { describe, expect, it } from "vitest";
-import { resolveCreateRuntime } from "./agent-lifecycle.ts";
+import { defaultBotSecretFile, resolveCreateRuntime } from "./agent-lifecycle.ts";
 
 function codexAgent(id: string, model?: string): AgentConfig {
 	return AgentConfigSchema.parse({
@@ -168,5 +168,20 @@ describe("AgentCreateInput validation (ADR-026)", () => {
 		expect(
 			RequestAgentCreateInputSchema.safeParse(createInput({ schema_version: 1 })).success,
 		).toBe(false);
+	});
+
+	it("accepts mattermost.token_secret_file left unset: the provisioner generates it (ADR-026)", () => {
+		const parsed = RequestAgentCreateInputSchema.safeParse(
+			createInput({ mattermost: { username: "newagent" } }),
+		);
+		expect(parsed.success).toBe(true);
+		expect(parsed.success && parsed.data.agent.mattermost.token_secret_file).toBeUndefined();
+	});
+});
+
+describe("defaultBotSecretFile (ADR-026)", () => {
+	it("generates a bot-secrets path under /run/bot-secrets/, hyphens turned into underscores", () => {
+		expect(defaultBotSecretFile("newagent")).toBe("/run/bot-secrets/mm_newagent_token");
+		expect(defaultBotSecretFile("data-analyst")).toBe("/run/bot-secrets/mm_data_analyst_token");
 	});
 });

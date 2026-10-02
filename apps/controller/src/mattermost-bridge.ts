@@ -78,6 +78,7 @@ async function bridgeDirectory(deps: ControlPlaneDeps): Promise<BridgeDirectory 
 		channels: snapshot.channels,
 		approvalsChannelId,
 		agents: snapshot.agents,
+		adminUserId: snapshot.adminUserId,
 	};
 }
 
