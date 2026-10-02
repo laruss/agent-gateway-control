@@ -563,7 +563,17 @@ export async function bootstrapMattermost(options: BootstrapOptions): Promise<vo
 		let removed = 0;
 		for (const channel of await admin.userChannelsInTeam(userId, team.id)) {
 			if (isExtraChannel(channel, allowed)) {
-				await admin.removeChannelMember(channel.id, userId);
+				try {
+					await admin.removeChannelMember(channel.id, userId);
+				} catch (error) {
+					// The live membership synchronizer (ADR-022) may have already removed this same,
+					// no-longer-allowed membership on its own schedule, between this read of
+					// `userChannelsInTeam` and this removal: the state bootstrap wants (the bot out
+					// of the channel) already holds, so a 404 here is not a failure.
+					if (!(error instanceof MattermostApiError) || error.status !== 404) {
+						throw error;
+					}
+				}
 				removed += 1;
 				continue;
 			}

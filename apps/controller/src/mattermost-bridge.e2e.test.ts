@@ -327,13 +327,19 @@ describe("Mattermost bridge against a real server", () => {
 		expect(bootstrapReport).toHaveLength(bots);
 		expect(bootstrapReport.every((line) => line.includes("token kept"))).toBe(true);
 
-		// A membership outside the bot's channels is found, and bootstrap removes it.
-		await mmApi("POST", `channels/${channel("finance")}/members`, mm.adminToken, {
-			user_id: await botUserId("developer"),
+		// A membership outside the bot's channels is found, and bootstrap removes it. Blocked
+		// against the live membership synchronizer (it polls every second here) the same way the
+		// admin-rights check below is: the admin who added this bot is also an owner-equivalent add
+		// under ADR-022, and without the block the synchronizer could grant the channel before this
+		// checks it is still an unmanaged, unauthorized membership.
+		await withGrantsBlocked(async () => {
+			await mmApi("POST", `channels/${channel("finance")}/members`, mm.adminToken, {
+				user_id: await botUserId("developer"),
+			});
+			expect(await reconcile()).toEqual([
+				"developer: member of channel 'finance' it is not allowed in",
+			]);
 		});
-		expect(await reconcile()).toEqual([
-			"developer: member of channel 'finance' it is not allowed in",
-		]);
 		await bootstrap(deps);
 		expect(await reconcile()).toEqual([]);
 
