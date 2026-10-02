@@ -1,0 +1,1 @@
+ALTER TABLE "console_sessions" ALTER COLUMN "csrf_token_hash" DROP NOT NULL;

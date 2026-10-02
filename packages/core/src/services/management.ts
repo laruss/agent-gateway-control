@@ -62,7 +62,7 @@ function byAgentId(a: AgentConfig, b: AgentConfig): number {
  * validate). A valid draft's hash is identical to `canonicalHash(configSnapshotBundle(...))` of
  * the same content: the same field order and the same agent sort.
  */
-function previewHash(draft: ConfigDraftBundle): string {
+export function previewHash(draft: ConfigDraftBundle): string {
 	return canonicalHash({
 		organization: draft.organization,
 		agents: [...draft.agents].sort(byAgentId),
@@ -541,6 +541,52 @@ export async function prepareChange(
 			problems,
 		};
 	});
+}
+
+/**
+ * The same preview `prepareChange` computes, against a base bundle the caller has already loaded
+ * (its own `baseRevisionId`/hash) instead of re-reading whatever is live right now. A caller that
+ * has already confirmed its own base is still the active revision — and so must keep validating
+ * against exactly that snapshot, never a live state that may have moved on since — uses this
+ * instead of `prepareChange`: the console's disable-with-fallback-to-`remove_agent` resolution
+ * (`resolveEnabledChangeSet`) and its plain change-set validation both rely on this to keep a
+ * change set's validity a pure function of (`baseRevisionId`, the patch), which is what lets an
+ * idempotent retry replay safely rather than recomputing a plan that could disagree with its own
+ * first attempt purely because an unrelated, intervening change had moved live state on by the
+ * time the retry ran (see `commitChange`'s own idempotency check). The one DB read this still
+ * performs — `liveEnabledDiverges`, for `noop` — is advisory only (whether anything would actually
+ * need writing), never load-bearing for `problems`, so a race against it threatens nothing this
+ * determinism depends on.
+ */
+export async function previewChangeSetAgainst(
+	deps: ControlPlaneDeps,
+	baseRevisionId: number | null,
+	base: ConfigDraftBundle,
+	baseHash: string | null,
+	changeSet: ChangeSetInput,
+): Promise<ChangePreview> {
+	const shape = ChangeSetSchema.safeParse(changeSet);
+	if (!shape.success) {
+		return {
+			baseRevisionId,
+			baseHash,
+			newHash: baseHash ?? previewHash(base),
+			noop: false,
+			diff: configDiff(base, base),
+			problems: shape.error.issues.map(
+				(issue) => `changeSet: ${issue.path.join(".")}: ${issue.message}`,
+			),
+		};
+	}
+	const { draft, problems: opProblems } = applyChangeSet(base, shape.data);
+	const problems = [...opProblems, ...draftBundleProblems(draft)];
+	const newHash = previewHash(draft);
+	const noop =
+		problems.length === 0 &&
+		baseHash !== null &&
+		baseHash === newHash &&
+		!(await inTransaction(deps, ({ tx }) => liveEnabledDiverges(tx.db, enabledById(draft.agents))));
+	return { baseRevisionId, baseHash, newHash, noop, diff: configDiff(base, draft), problems };
 }
 
 /** The active configuration changed since `baseRevisionId`; retry against `currentRevisionId`. */

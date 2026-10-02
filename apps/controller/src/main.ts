@@ -13,6 +13,7 @@ import {
 	startHealthServer,
 } from "@agent-gateway/service";
 import { withPendingApprovalCards } from "./approval-cards.ts";
+import { assertConsoleOrigin } from "./console-auth.ts";
 import { resolveConsolePasswordHash, startConsoleServer } from "./console-server.ts";
 import { collectConsoleStatus, createConsoleStatusCache } from "./console-status.ts";
 import { type ControllerOptions, startController } from "./controller.ts";
@@ -20,7 +21,11 @@ import { loopbackApprovalCardDeliverer, loopbackPostDeliverer } from "./loopback
 import { bridgeDeliverers, type MattermostBridgeOptions } from "./mattermost-bridge.ts";
 
 const environment = readSetting("GATEWAY_ENV") ?? "unset";
-const log = createLogger({ service: "controller", version: serviceVersion(), environment });
+const log = createLogger({
+	service: "controller",
+	version: serviceVersion(),
+	environment,
+});
 
 /**
  * Outbox delivery mode, required explicitly:
@@ -45,15 +50,30 @@ if (delivery !== "mattermost" && environment !== "development" && environment !=
 }
 
 /**
- * The owner's console (ADR-023) is off unless explicitly turned on, and its password hash is
- * read and validated here, before the controller or health listener starts: a missing, exposed
- * or unreadable hash file must fail the whole process closed, never start everything else and
- * skip only the console, and never start a listener that would end up serving unauthenticated.
+ * The owner's console (ADR-023, ADR-025) is off unless explicitly turned on, and its password
+ * hash is read and validated here, before the controller or health listener starts: a missing,
+ * exposed or unreadable hash file must fail the whole process closed, never start everything
+ * else and skip only the console, and never start a listener that would end up serving
+ * unauthenticated.
  */
 const consoleEnabled = readSetting("CONSOLE_ENABLED") === "true";
 const consolePasswordHash = consoleEnabled
 	? resolveConsolePasswordHash(readSetting("SECRETS_DIR"))
 	: null;
+/** Exact `Origin` every console login and mutation must carry (ADR-025); read and validated here,
+ * alongside the password hash, before anything the console serves starts. */
+const consoleOrigin = consoleEnabled ? assertConsoleOrigin(requireSetting("CONSOLE_ORIGIN")) : null;
+/**
+ * The console's CSRF token is derived from the session token with this key (ADR-025), under its
+ * own HMAC label (`deriveCsrfToken`) — not stored anywhere, so there is nothing to rotate or
+ * invalidate across tabs. Reusing the routing key avoids a secret file of its own; read here,
+ * independent of `OUTBOX_DELIVERY`, since the console does not depend on the Mattermost bridge
+ * being the delivery mode this process runs with.
+ */
+const consoleCsrfKey = consoleEnabled ? requireSetting("GATEWAY_ROUTING_KEY") : null;
+if (consoleCsrfKey !== null) {
+	assertRoutingKey(consoleCsrfKey);
+}
 
 function bridgeOptions(): MattermostBridgeOptions {
 	const routingKey = requireSetting("GATEWAY_ROUTING_KEY");
@@ -81,7 +101,10 @@ const deliverers: ControllerOptions["deliverers"] = (deps) => {
 };
 
 const metrics = new MetricsRegistry();
-registerProcessMetrics(metrics, { service: "controller", version: serviceVersion() });
+registerProcessMetrics(metrics, {
+	service: "controller",
+	version: serviceVersion(),
+});
 const databaseUrl = requireSetting("DATABASE_URL");
 const deployment = await claimDeployment(log, databaseUrl);
 const controller = await startController({
@@ -104,18 +127,32 @@ log.info("health endpoints listening", { port: health.port });
 const consoleAddress = consoleEnabled
 	? (await lookup(readSetting("CONSOLE_HOST") ?? "127.0.0.1", { family: 4 })).address
 	: null;
+/** The built console SPA's directory; defaults (inside `startConsoleServer`) to the path the
+ * release image bakes it into. Overridden in development and tests to point at a local build or
+ * a fixture. */
+const consoleStaticDir = readSetting("CONSOLE_STATIC_DIR");
 const ownerConsole =
-	consoleAddress !== null && consolePasswordHash !== null
+	consoleAddress !== null &&
+	consolePasswordHash !== null &&
+	consoleOrigin !== null &&
+	consoleCsrfKey !== null
 		? startConsoleServer({
 				port: intSetting("CONSOLE_PORT", 8084),
 				hostname: consoleAddress,
 				passwordHash: consolePasswordHash,
+				origin: consoleOrigin,
+				csrfKey: consoleCsrfKey,
+				deps: controller.deps,
 				cache: createConsoleStatusCache((now) => collectConsoleStatus(controller.deps.pool, now)),
 				log,
+				...(consoleStaticDir === undefined ? {} : { staticDir: consoleStaticDir }),
 			})
 		: null;
 if (ownerConsole !== null) {
-	log.info("console listening", { address: consoleAddress, port: ownerConsole.port });
+	log.info("console listening", {
+		address: consoleAddress,
+		port: ownerConsole.port,
+	});
 }
 
 onShutdown(log, async () => {

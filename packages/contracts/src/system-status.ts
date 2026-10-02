@@ -11,9 +11,10 @@ import { GatewayEventTypeSchema } from "./event.ts";
 
 /**
  * A state, status, queue name, alert key or error code: Gateway-made identifiers, never free
- * text. The charset leaves no room for markup or prose.
+ * text. The charset leaves no room for markup or prose. Exported for `console-status.ts`, which
+ * reuses this same shape for the console's own run/task status, outcome and error code fields.
  */
-const TokenSchema = z.string().regex(/^[A-Za-z0-9._:@/-]{1,200}$/);
+export const TokenSchema = z.string().regex(/^[A-Za-z0-9._:@/-]{1,200}$/);
 
 const CountSchema = z.int().min(0);
 
@@ -21,8 +22,9 @@ const CountSchema = z.int().min(0);
  * Provider model id, typed as broadly as `RuntimeUsageSchema.model` and `RunRuntimeSchema.model`
  * type it elsewhere in the contracts (turn.ts, jobs.ts): a bounded string, not `TokenSchema`'s
  * restrictive charset, which a legitimate model name (spaces, `+`, parentheses) could fail.
+ * Exported for `console-status.ts`'s `ConsoleContext.model`.
  */
-const ModelNameSchema = z.string().min(1).max(255);
+export const ModelNameSchema = z.string().min(1).max(255);
 
 /** Runtime CLI version string, as `RuntimeSessionHandleSchema.runtimeVersion` types it elsewhere. */
 const RuntimeVersionSchema = z.string().min(1).max(128);

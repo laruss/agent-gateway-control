@@ -1,6 +1,9 @@
 # ADR-023. The owner's console and the operator agent's system status
 
-- Status: Accepted
+- Status: Accepted, partially superseded by [ADR-025](025-management-console.md) (authentication:
+  session cookies, CSRF and exact Origin instead of HTTP Basic; the console stops being
+  read-only). Everything else here — the operator agent, `observe_system`, turn input version 2,
+  the metadata/content boundary and the context measurements — is unaffected.
 - Date: 2026-09-30
 
 ## Context

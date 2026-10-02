@@ -1902,3 +1902,159 @@ Deliberate choices in this phase ([ADR-024](docs/adr/024-managed-configuration.m
   to the operator.
 
 Released as 0.4.0 (migrations `0018_config_history` to `0021_config_revision_acks`, all expand; head `0021_config_revision_acks`, pg-boss schema 42).
+
+## Phase 13 - Authenticated management console and agent editor
+
+Status: **done**
+
+### Session authentication and mutation protections
+
+Status: **done**
+
+| Item | State | Evidence |
+|------|-------|----------|
+| `console_sessions`: hashed token, `password_hash_fingerprint`, sliding 30-minute idle timeout (touched at most once a minute), 12-hour absolute expiry, a 20-session active cap evicting the oldest; the CSRF token is derived from the session token on every check, never stored (`csrf_token_hash` kept, nullable, unused) | done | `packages/db/migrations/0022_console_sessions.sql`, `0023_console_csrf_derived.sql`, `packages/core/src/services/console-sessions.ts`, `apps/controller/src/console-auth.ts` |
+| `POST/GET/DELETE /api/session`; every other `/api/*` route needs a valid session, every mutation needs the exact `CONSOLE_ORIGIN` and a matching CSRF header; HTTP Basic removed | done | `apps/controller/src/console-server.ts`, `console-auth.ts` |
+| `CONSOLE_ORIGIN` setting, validated at start alongside the password hash | done | `apps/controller/src/main.ts`, `deploy/release/compose.yaml`, `deploy/release/gateway.env.example` |
+| `gateway console password set` revokes every active session directly when it can reach the database, on top of the fingerprint check that invalidates them on the next controller restart regardless | done | `apps/cli/src/commands.ts`, `packages/service/src/console-auth.ts` |
+| Expired/revoked session cleanup hooked into the existing retention pass | done | `packages/core/src/services/retention.ts` |
+
+Acceptance:
+
+- [x] Login always mints a fresh session; a client-supplied cookie is never consulted (session
+  fixation is not possible).
+- [x] Idle timeout, absolute expiry, logout and a password rotation each invalidate a session;
+  verified against an injected clock, not real sleeps.
+- [x] A missing or foreign `Origin`, `Sec-Fetch-Site: cross-site`, and a missing, wrong or
+  cross-session CSRF token are each refused on login and/or on a mutation as appropriate.
+- [x] An unauthenticated `/api/status` returns `401`; no password, token or cookie value appears
+  in a log line or an error body.
+
+Deliberate choices here ([ADR-025](docs/adr/025-management-console.md)):
+
+- The CSRF token is derived from the session's own raw token and a controller-held key
+  (`GATEWAY_ROUTING_KEY`, reused under its own HMAC label), never stored: there is nothing to
+  rotate, so a second tab's own `GET /api/session` never invalidates the first tab's copy — the
+  problem the original rotating, hash-stored design had.
+- Session validation and `Origin`/CSRF checks never consult `X-Forwarded-*`: only the connection
+  Caddy actually made to the listener counts.
+
+### The React console (SPA), replacing the server-rendered page
+
+Status: **done**
+
+| Item | State | Evidence |
+|------|-------|----------|
+| `apps/console` (bun workspace): React 19, TypeScript, Vite, Tailwind CSS v4, shadcn/ui (`style: radix-nova`); `components.json` checked in | done | `apps/console/package.json`, `apps/console/components.json` |
+| Shared response types: `ConsoleStatus`/`ConsoleSnapshot` and everything under them are now Zod schemas in `@agent-gateway/contracts`, re-exported from `@agent-gateway/core`; the console parses every response against them at the fetch boundary | done | `packages/contracts/src/console-status.ts`, `apps/console/src/lib/api-client.ts` |
+| Pages: sign-in (JSON `POST /api/session`, CSRF token held in memory, recovered via `GET /api/session` on reload), overview (every section the old page showed, polling `/api/status` every 15 s via TanStack Query), the Agents hub (below), placeholders for Skills/Instruments & utils, sign-out | done | `apps/console/src/routes/` |
+| A typed API client adding `X-CSRF-Token` on mutations, same-origin credentials, and turning a `401` into the one error kind the session layer reacts to; `403`/`409` surfaced as their own distinct, typed outcomes | done | `apps/console/src/lib/api-client.ts`, `apps/console/src/lib/session-context.tsx` |
+| `bun run console:build` (`vite build`, hashed assets, no source maps, no inline script); `bun run console:dev` (Vite dev server, proxying `/api/*` to a running controller) | done | `apps/console/vite.config.ts`, root `package.json` |
+| The console's own `tsc` project (`apps/console/tsconfig.app.json`/`tsconfig.node.json`, DOM lib + JSX + the `@/*` alias), checked separately from the backend's (`tsc -b apps/console`, since a browser program and `@types/bun`'s globals do not mix in one `tsc` invocation); Biome lints and formats it, with Tailwind v4's CSS syntax enabled in the CSS parser | done | `tsconfig.json`, `package.json`'s `fix`/`check`/`typecheck` scripts, `biome.json` |
+| Vitest unit tests for the console (React Testing Library + happy-dom) in the existing `unit` project | done | `apps/console/src/**/*.test.tsx` |
+| The controller serves the built assets (`/assets/*` immutable-cached, any other non-`/api/*` path as the SPA fallback), path-traversal- and symlink-safe, missing-build-tolerant (plain 503 for the UI, `/api/*` unaffected); the server-rendered dashboard, its stand-in sign-in form, and `console-render.ts` are removed | done | `apps/controller/src/console-static.ts`, `console-server.ts` |
+| A strict CSP with no inline script anywhere and no `unsafe-eval` (`style-src-elem` alone allows `unsafe-inline`, narrowly, for Radix's own scroll-lock `<style>` element), verified against the real built app in a browser | done | `apps/controller/src/console-http.ts`, ADR-025 |
+| The release image builds the console in its own Docker stage (dev dependencies included) and copies only the built static output into the runtime image; the production install stays dependency-free of it | done | `deploy/images/Dockerfile` |
+
+Acceptance:
+
+- [x] `bun run console:build` produces hashed, source-map-free assets with no inline script in
+  `index.html`.
+- [x] The overview page renders every section (agent states, tasks, waits, context measurements,
+  recent runs, queues, alerts, budgets, footer) from a fixture status payload, including the
+  stale and unavailable snapshot states.
+- [x] Sign-in (success, wrong password, rate-limited) and the CSRF header on mutations are
+  covered by component tests against a mocked `fetch`; a `401` on the status poll flips the
+  session to signed-out.
+- [x] The controller refuses path traversal and a symlink escaping the static root, serves
+  `/assets/*` immutably cached and every other non-`/api/*` path as the SPA fallback, never
+  falls back to HTML for an unknown `/api/*` path, and serves a plain 503 for the UI (API
+  intact) when the build is missing.
+- [x] Loaded in a real browser: signs in, shows the overview, signs out, with zero CSP
+  violations reported.
+- [x] `osv-scanner` reports no license outside the allowlist and no unexempted vulnerability
+  across every new dependency.
+
+Deliberate choices here ([ADR-025](docs/adr/025-management-console.md)):
+
+- React Router over TanStack Router: four top-level pages do not need file-based route
+  generation; the controller's own SPA fallback is what makes every deep link work regardless.
+- TanStack Query for the status poll specifically (its stale/error/pending state and
+  `refetchInterval` are exactly what that one endpoint needs), a small typed fetch wrapper
+  underneath it for everything else (same-origin credentials, the CSRF header, shared-schema
+  parsing) — not Query for every call.
+- The console's own `tsc` program is checked separately from the backend's rather than widening
+  the backend's `lib`/`types` to include the DOM and Vite's ambient types, which would risk
+  colliding with `@types/bun`'s own globals across the entire rest of the monorepo.
+- Radix UI's inline `element.style` calls are CSSOM manipulation, not an HTML `style` attribute
+  or a `<style>` element, so `style-src`/`style-src-attr` needed no loosening; Radix's scroll
+  lock (every modal popover: `Dialog`, `AlertDialog`, `Select`) genuinely does insert a `<style>`
+  element, so `style-src-elem` alone gets `'unsafe-inline'` — confirmed by a real CSP violation
+  before this directive was added, and its absence after, not assumed either way.
+
+### The Agents hub: viewing and editing existing agents
+
+Status: **done** (creating and deleting an agent, and the Skills/Instruments & utils hubs, remain)
+
+| Item | State | Evidence |
+|------|-------|----------|
+| Management API: `GET /api/agents`/`GET /api/agents/:id` (read models over the active snapshot), `POST /api/agents/:id/preview`/`commit` (a bounded `AgentPatch` DTO translated into `update_agent`/`set_role_prompt`/`set_agent_enabled` change operations), `GET /api/config/revisions`/`GET /api/config/revisions/:id/diff` | done | `packages/contracts/src/console-management.ts`, `packages/core/src/services/console-management.ts`, `apps/controller/src/console-management.ts` |
+| `commit`'s outcomes: `200` (including an idempotency-key replay), `409` with the current revision id on a stale base, `422` with problems for anything invalid (caught at preview time or only at commit time, e.g. a run-in-progress disable protection) | done | `packages/core/src/services/console-management.ts` |
+| Every console commit carries `source: "console"`, `actor: "console:owner"` — distinguishable in `gateway config history` with no change to that command | done | `apps/cli/src/config-commands.ts` (unchanged), `packages/core/src/services/console-management.ts` |
+| The Agents list page (table: state, runtime/model, channel count, last run) and the agent editor (`/agents/:id`: Overview, Instructions, Runtime, Assignments, Permissions, History tabs) | done | `apps/console/src/routes/agents-list-page.tsx`, `agent-detail-page.tsx`, `agent-detail/*.tsx` |
+| Save flow: a local draft (dirty fields only), a "Review changes" dialog showing the server's diff and an "impact" list requiring explicit confirmation before applying, a fresh idempotency key per apply, 409/422 handled with a reload-and-rebase or inline problems respectively | done | `apps/console/src/routes/agent-detail/review-dialog.tsx`, `rebase-draft.ts` |
+| New shadcn/ui components (table, tabs, select, switch, dialog, alert-dialog, sonner, scroll-area, textarea already or newly present) and a small app-level tag-list input for tool patterns and channels | done | `apps/console/src/components/ui/*.tsx`, `apps/console/src/components/tag-list-input.tsx` |
+| The Agents hub's two page components are code-split (`React.lazy`), loaded only once opened | done | `apps/console/src/App.tsx` |
+
+Acceptance:
+
+- [x] Listing, showing, previewing and committing an agent change are covered by a controller
+  integration test against a real PostgreSQL, including a stale base refused at preview time and
+  at commit time alike (`409`), the full scenario of a load followed by a `commitChange` (as a
+  CLI apply would make it) to the same agent leaving nothing overwritten, two concurrent edits
+  (the second gets `409`), an idempotency-key replay (including one retried after an unrelated,
+  intervening change to the same agent), clearing `runtime.model` back to its default, a retained
+  agent whose own configuration no longer validates falling back to `remove_agent` in both preview
+  and commit, that same agent excluded from the list, invalid bodies (an unknown field, an
+  oversized role prompt, a protected field) at `400`, unauthenticated/missing-CSRF/foreign-Origin
+  at `401`/`403`, and a disable of a running agent surfacing its protection error at `422`.
+- [x] A committed role-prompt change is visible in the `agents` projection immediately (the same
+  column the scheduler's turn context reads from).
+- [x] Console component tests cover the save flow end to end against a mocked `fetch`: editing
+  the role prompt, the preview dialog showing its diff, applying with the editor's own loaded base
+  revision (never one read back from the preview response) and a fresh idempotency key, the 409
+  and 422 paths, and the unsaved-changes guard (a confirm dialog on the page's own "back to
+  Agents" action; `beforeunload` for the tab itself — this app's router is a plain declarative
+  one, not a data router, so a blanket `useBlocker` is not available).
+- [x] Loaded in a real browser: sign in, open an agent, edit the role prompt, review and apply
+  the change, see the new revision in its History tab, zero CSP violations.
+
+Deliberate choices here ([ADR-025](docs/adr/025-management-console.md)):
+
+- The patch DTO exposes only the fields the editor's tabs offer (display name, enabled, role
+  prompt, runtime, wake rules, allowed channels, the three tool lists, `observe_system`) — never
+  the whole `AgentConfig` shape, and never the Mattermost identity, memory or concurrency, which
+  have no tab yet.
+- Preview and commit both require the request's `baseRevisionId` to equal the revision actually
+  active right now — the editor's own loaded view — refusing a mismatch with `409` and the
+  current revision id rather than computing a plan or a diff against the live state as if the
+  stale view were still current. Preview builds its plan from the agent's current live definition
+  once that equality is confirmed (matching `prepareChange`'s own always-against-the-live-revision
+  contract); commit instead builds it from the snapshot `baseRevisionId` itself names — immutable
+  and content-addressed, so a retry under the same idempotency key (the same `baseRevisionId`, the
+  same patch) always recomputes the identical change set regardless of what the live configuration
+  has become since, which is what lets `commitChange`'s own idempotency check replay it correctly
+  instead of seeing "the same key, a different change set" purely because an unrelated field had
+  moved on.
+- An agent's History tab scans the most recent 20 revisions for ones that touched it (one diff
+  fetch per revision) rather than adding a per-agent history endpoint; older history stays
+  reachable through `gateway config history`/`diff`.
+- The Agents hub's list reads the active configuration snapshot, the same source
+  `consoleShowAgent` reads a single agent's detail from, rather than the `agents` projection table
+  directly: a row retained, disabled, outside the active snapshot (the disable-with-fallback-to-
+  `remove_agent` path below) is consistently absent from both, instead of listed but 404ing when
+  opened.
+- `react-hook-form`/shadcn's `form` component was not added: every tab is a handful of plain
+  controlled inputs, not a multi-field validated form, so the lighter existing pattern (plain
+  `useState`, the same the sign-in page already uses) fit better than a new dependency.
+

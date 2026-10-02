@@ -34,3 +34,23 @@ nameIsRegex = true
 ecosystem = "npm"
 license.ignore = true
 reason = "MPL-2.0, dev-only (vitest -> vite), unmodified and not distributed"
+
+# tslib (0BSD, the zero-clause BSD license: public-domain-equivalent, strictly more permissive
+# than MIT) is pulled in transitively by Radix UI's own focus and scroll-lock helpers
+# (react-remove-scroll, aria-hidden, use-sidecar and friends, via the console's `radix-ui`
+# dependency) and by Tailwind's CSS engine's WebAssembly fallback
+# (@tailwindcss/oxide-wasm32-wasi), never the native platform binary this repo actually installs.
+[[PackageOverrides]]
+name = "tslib"
+ecosystem = "npm"
+license.ignore = true
+reason = "0BSD (public-domain-equivalent, more permissive than MIT): a transitive helper of Radix UI and Tailwind's oxide engine"
+
+# entities (BSD-2-Clause) is pulled in by happy-dom alone, the console's test-only DOM
+# environment (apps/console): development-only, never bundled into the built SPA or shipped in
+# any image.
+[[PackageOverrides]]
+name = "entities"
+ecosystem = "npm"
+license.ignore = true
+reason = "BSD-2-Clause, dev-only (happy-dom, the console's test DOM environment), never bundled or distributed"

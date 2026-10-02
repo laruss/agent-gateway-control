@@ -941,3 +941,38 @@ export const schemaCertifications = pgTable(
 	},
 	(t) => [primaryKey({ columns: [t.release, t.fingerprint] })],
 );
+
+/**
+ * The owner's console session cookies (ADR-025): `token_hash` is the sha256 of the random token
+ * the cookie carries — the raw value is never stored. `csrf_token_hash` is unused: the CSRF token
+ * is derived from the session's own raw token on every check instead, never stored at all (see
+ * the column's own comment below). `password_hash_fingerprint` is a sha256 of the Argon2id hash
+ * file's own content at session creation; a password rotation
+ * changes that content, so every session bound to the old hash stops matching it on its next
+ * request even without a database write (`gateway console password set` also revokes rows
+ * directly when it has database access). A session is valid only while `revoked_at` is null,
+ * `expires_at` is in the future (the fixed 12-hour absolute lifetime) and `last_seen_at` is within
+ * the 30-minute idle window; `last_seen_at` itself advances at most once a minute to bound write
+ * amplification from an otherwise-idle, actively-polling tab.
+ */
+export const consoleSessions = pgTable(
+	"console_sessions",
+	{
+		id: uuid("id").primaryKey().defaultRandom(),
+		tokenHash: text("token_hash").notNull(),
+		/** Unused since the console's CSRF token became derived, not stored (ADR-025): kept
+		 * nullable, and never written, so a release before that change rolls back to a schema it
+		 * still fully understands. */
+		csrfTokenHash: text("csrf_token_hash"),
+		passwordHashFingerprint: text("password_hash_fingerprint").notNull(),
+		createdAt: createdAt(),
+		lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).notNull().defaultNow(),
+		expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+		revokedAt: timestamp("revoked_at", { withTimezone: true }),
+		revokedReason: text("revoked_reason"),
+	},
+	(t) => [
+		uniqueIndex("console_sessions_token_hash").on(t.tokenHash),
+		index("console_sessions_active").on(t.revokedAt, t.expiresAt),
+	],
+);

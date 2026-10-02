@@ -1,5 +1,9 @@
 {
   "extends": "./tsconfig.base.json",
   "include": ["apps/**/*.ts", "packages/**/*.ts", "scripts/**/*.ts", "*.ts"],
-  "exclude": ["**/node_modules", "**/dist"]
+  // apps/console has its own project (tsconfig.app.json/tsconfig.node.json, built with
+  // `tsc -b apps/console`): a browser app needs the DOM lib and a Vite-only `types` list, neither
+  // of which belongs in this program alongside `@types/bun`'s own globals (the two conflict when
+  // combined in one `tsc` invocation), so it is its own, separately-checked program instead.
+  "exclude": ["**/node_modules", "**/dist", "apps/console"]
 }

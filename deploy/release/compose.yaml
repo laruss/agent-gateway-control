@@ -123,6 +123,9 @@ services:
       CONSOLE_ENABLED: ${CONSOLE_ENABLED:-false}
       CONSOLE_HOST: gateway-console
       CONSOLE_PORT: "8084"
+      # The exact Origin every console login and mutation must carry (ADR-025): the home
+      # server's own Caddy site, never derived from a forwarded header.
+      CONSOLE_ORIGIN: ${CONSOLE_ORIGIN:-https://gateway.local}
     volumes:
       - ${GATEWAY_HOME}/secrets/controller:/run/secrets:ro
     tmpfs:

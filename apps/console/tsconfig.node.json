@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "lib": ["ESNext"],
+    "noEmit": false,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "outDir": "./.tsbuild/node",
+    "tsBuildInfoFile": "./.tsbuild/node.tsbuildinfo"
+  },
+  "include": ["vite.config.ts"]
+}

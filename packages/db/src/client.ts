@@ -16,8 +16,32 @@ export type Transaction = Readonly<{
 
 export const MIGRATIONS_FOLDER = fileURLToPath(new URL("../migrations", import.meta.url));
 
-export function createPool(connectionString: string, max = 10): pg.Pool {
-	return new pg.Pool({ connectionString, max });
+/** Optional, narrower limits for a short-lived caller that must not hang or hold a connection
+ * open on a stuck query (a CLI command, say) — unlike {@link SERVICE_DATABASE_LIMITS}, which a
+ * long-running service always applies, these are opt-in per {@link createPool} call. */
+export type PoolTimeouts = Readonly<{
+	/** Bounds `pool.connect()`/`pool.query()`'s own connection attempt; an unreachable or
+	 * black-holed server fails within this instead of hanging indefinitely. */
+	connectionTimeoutMs?: number;
+	/** Bounds each statement server-side (`SET statement_timeout`). */
+	statementTimeoutMs?: number;
+	/** Bounds each query client-side: a server that stops answering mid-query fails within this,
+	 * which a server-side timeout cannot guarantee. */
+	queryTimeoutMs?: number;
+}>;
+
+export function createPool(connectionString: string, max = 10, timeouts?: PoolTimeouts): pg.Pool {
+	return new pg.Pool({
+		connectionString,
+		max,
+		...(timeouts?.connectionTimeoutMs === undefined
+			? {}
+			: { connectionTimeoutMillis: timeouts.connectionTimeoutMs }),
+		...(timeouts?.statementTimeoutMs === undefined
+			? {}
+			: { statement_timeout: timeouts.statementTimeoutMs }),
+		...(timeouts?.queryTimeoutMs === undefined ? {} : { query_timeout: timeouts.queryTimeoutMs }),
+	});
 }
 
 /**

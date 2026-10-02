@@ -17,11 +17,25 @@ export type SessionPolicy = z.infer<typeof SessionPolicySchema>;
 export const WhileRunningPolicySchema = z.enum(["enqueue", "enqueue-and-coalesce"]);
 export type WhileRunningPolicy = z.infer<typeof WhileRunningPolicySchema>;
 
+/**
+ * An agent's display name, shared by `AgentConfigSchema.display_name` and every console DTO that
+ * reads or writes it (`console-management.ts`'s list/detail responses and `AgentPatchSchema`): one
+ * bound, so a name a write accepts is always one a later read can parse back.
+ */
+export const AgentDisplayNameSchema = z.string().min(1).max(64);
+
+/**
+ * Provider model id, shared by `AgentRuntimeConfigSchema.model` and every console DTO that reads
+ * or writes it (`console-management.ts`'s list/detail responses and `AgentRuntimePatchSchema`):
+ * one bound, so a model a write accepts is always one a later read can parse back. Left empty in
+ * examples and set at deployment.
+ */
+export const AgentModelSchema = z.string().min(1).max(255);
+
 export const AgentRuntimeConfigSchema = z.strictObject({
 	adapter: RuntimeAdapterIdSchema,
 	profile: z.string().min(1).default("default"),
-	/** Provider model id; left empty in examples and set at deployment. */
-	model: z.string().min(1).optional(),
+	model: AgentModelSchema.optional(),
 	session_policy: SessionPolicySchema,
 	timeout_seconds: z.int().min(10).max(86_400),
 });
@@ -85,7 +99,7 @@ export type AgentPermissions = z.infer<typeof AgentPermissionsSchema>;
 export const AgentConfigSchema = z.strictObject({
 	schema_version: z.literal(1),
 	id: AgentIdSchema,
-	display_name: z.string().min(1).max(64),
+	display_name: AgentDisplayNameSchema,
 	enabled: z.boolean(),
 	mattermost: z.strictObject({
 		/** Bot username, equal to the agent id; the bot user id is resolved by bootstrap. */

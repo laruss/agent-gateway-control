@@ -3,6 +3,7 @@ import { OrganizationRetentionSchema } from "@agent-gateway/contracts";
 import { withTransaction } from "@agent-gateway/db";
 import { redactForStorage } from "@agent-gateway/logging";
 import type pg from "pg";
+import { cleanupExpiredConsoleSessions } from "./console-sessions.ts";
 import type { ControlPlaneDeps } from "./deps.ts";
 import { loadActiveConfig } from "./store.ts";
 
@@ -198,6 +199,11 @@ export async function applyRetention(
 			stop,
 		);
 	}
+	// Console session hygiene (ADR-025) is not part of the organization's configurable content
+	// retention: expired and revoked rows carry no content to redact, so they are simply deleted,
+	// piggybacking on this same periodic, lockable, recorded pass instead of a schedule of their
+	// own.
+	result.console_sessions = await cleanupExpiredConsoleSessions(deps.pool, new Date(now));
 	return result;
 }
 

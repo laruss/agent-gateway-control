@@ -4,6 +4,44 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## [Unreleased]
 
+### Added
+
+- The owner's console gains server-side sessions (ADR-025): a database-backed session cookie
+  (`__Host-gw_session`; 30-minute idle timeout, 12-hour absolute lifetime, at most 20 active
+  sessions at once), a CSRF token derived from the session on every check (never stored, so a
+  second tab's own session check can never invalidate the first tab's token) required on every
+  mutation, and a new `CONSOLE_ORIGIN` setting every login and mutation must match exactly. A
+  sign-in page replaces the browser's HTTP Basic dialog; `gateway console password set` now also
+  revokes every active session when it can reach the database.
+- The owner's console is now a React single-page app (`apps/console`: React 19, Vite, Tailwind
+  CSS v4, shadcn/ui, TanStack Query, React Router; ADR-025's frontend section), replacing the
+  server-rendered dashboard and its stand-in sign-in form. It covers everything the old page
+  showed (agent states, tasks, recent runs, queues, alerts, budgets, context measurements,
+  stale/unavailable states) and adds navigation for the Agents, Skills and Instruments & utils
+  hubs. Served under a strict CSP with no inline script anywhere and no `unsafe-eval`
+  (`script-src 'self'; style-src 'self'; style-src-elem 'self' 'unsafe-inline'` — the last for
+  Radix's own scroll-lock `<style>` element, never an inline `style` attribute); built in its own
+  Docker stage with only the static output copied into the release image. `bun run console:build`
+  builds it, `bun run console:dev` runs it against a local controller.
+- The Agents hub (`/agents`): a list of every configured agent (state, runtime and model, channel
+  count, last run) and an editor for an existing one (creating or deleting an agent is still a
+  YAML + `gateway config apply`/`import` operation), with one tab per group of fields — Overview
+  (display name, enabled), Instructions (role prompt), Runtime (adapter, model, session policy,
+  timeout), Assignments (allowed channels, wake rules), Permissions (the three tool-pattern lists,
+  `observe_system`) and History (the revisions that touched this agent, each with its own diff).
+  Edits accumulate in a local draft; "Review changes" previews the exact diff and an "impact" list
+  of destructive or authority-reducing consequences (disabling the agent, removing a channel, a
+  tool grant, a deny rule or a human-approval requirement, removing `observe_system`) *and*
+  authority-increasing ones just as much (enabling the agent, adding a channel, granting a tool or
+  `observe_system`) that must be acknowledged before applying. New management
+  API (`GET/POST /api/agents*`, `GET /api/config/revisions*`) translates the editor's bounded
+  patch DTO into the same `prepareChange`/`commitChange` change operations (ADR-024) every other
+  configuration surface uses, committing with `source: console` and `actor: console:owner` —
+  visible in `gateway config history` exactly like any other revision. A stale base is a `409`
+  naming the current revision; a business-rule problem (including a run-in-progress protection) is
+  a `422` with the server's own message; a repeated idempotency key replays its first commit's
+  result.
+
 ### Fixed
 
 - Channel grants (ADR-022): a grant is recorded before the listener joins the channel, so
@@ -11,6 +49,69 @@ All notable changes are documented here. The project follows Semantic Versioning
   channel whose grant was already decided; the listener's membership of every granted channel is
   re-checked on each pass, after the grant is re-validated, so a transient failure or a restart
   between granting and joining heals itself.
+- The console's sign-out no longer signs the owner out locally on a failed `DELETE /api/session`
+  (a 403, a 500, a network error): the session cookie is still valid in that case, so the UI now
+  keeps the signed-in state and lets the caller show a retryable error instead of lying about
+  being signed out.
+- A direct `/sign-in` load's startup session check could resolve "unauthenticated" after a
+  sign-in submitted in the meantime had already won, undoing it; a sign-in now supersedes that
+  startup check's own, by-then-stale result.
+- The overview page's "could not load" banner no longer hides the last-known status snapshot
+  when a poll fails after an earlier one succeeded; the retained data and its timestamp are shown
+  together with the failure, and the data-less error view appears only when nothing has ever
+  loaded.
+- The Agents hub's optimistic concurrency was defeated: the editor committed a change with the
+  revision the *preview response* reported rather than the one it had actually loaded, and preview
+  itself always computed against the live configuration regardless of a stale base — together, a
+  commit between opening the editor and applying a change was silently reverted instead of
+  refused. Preview and commit alike now refuse a non-current base with `409`; "Reload and try
+  again" re-fetches the agent and rebases the draft onto it, keeping every edit whose own field
+  did not also change upstream and discarding (with a visible notice) one that did.
+- A commit retried under the same idempotency key after an unrelated, intervening change to the
+  same agent could be refused as "the same key, a different change set": the retry recomputed its
+  plan against the agent's now-different *live* state rather than the request's own claimed base,
+  so an unrelated field the patch never touched could still shift the computed change set between
+  the two attempts. The plan is now built from the agent's definition at `baseRevisionId` itself
+  (immutable, content-addressed), which a retry always repeats identically, letting it replay
+  correctly regardless of what has happened to the live configuration meanwhile.
+- Disabling a retained agent whose own stored configuration no longer validates (ADR-024's
+  disable-with-fallback-to-`remove_agent`) always failed from the console with a `422`: the
+  fallback that `gateway agent disable` already has was never reachable through
+  `commitAgentPatch`, which rejected the plain disable's own validation problems before the
+  fallback ran. Preview now computes and shows the fallback too ("removes the agent from the
+  configuration" in `impact`), and commit executes it.
+- The Agents hub's list included an agent retained, disabled, outside the active configuration,
+  whose own detail route already 404s; it is now left out of the list for the same reason.
+- `runtime.model` could not be cleared back to the runtime adapter's own default from the console:
+  clearing the field sent nothing at all (`undefined` is dropped by `JSON.stringify`), which the
+  server reads as "unchanged". The patch contract's `runtime.model` now accepts an explicit `null`
+  meaning "remove the override".
+- A wake rule's target-agent picker kept the previous target when "(no specific target)" was
+  selected, instead of actually clearing it.
+- A `401` from the Agents hub's list, its editor or its preview/commit calls left the console
+  showing an error while the sidebar still said "signed in"; every request now reports its own
+  `401` to the same session layer the status poll already did, falling back to the sign-in screen
+  consistently.
+- A stale startup session check still overwrote the CSRF token a concurrent sign-in had already
+  captured (the state-level race this was already fixed for above; the token itself was a
+  separate clobber that survived it), and sign-out cleared the held token even when the server
+  refused the logout (a `403`/`5xx`), leaving a signed-in tab unable to make another mutation
+  until it reloaded. Both are now guarded the same way the session state itself already was.
+- A mutation refused with a `403` naming an invalid CSRF token (another tab signed in anew, or the
+  controller's routing key rotated) now refreshes the token from one session check and retries
+  the same request once, instead of failing immediately.
+- `CONSOLE_ORIGIN` accepted any `http://` value, including one pointed at a real host, even though
+  the session cookie is `__Host-`/`Secure` and so needs TLS everywhere but a loopback address; it
+  is now refused at start unless the host is `localhost`/`127.0.0.1`.
+- `ConsoleAgentDetailSchema`'s role prompt field required at least one character, but the server
+  legitimately returns an empty one for an agent that has never had a role prompt set — the
+  detail page failed to open for it. Empty is now accepted.
+- The release image's production dependency install picked up React, Radix UI, Vite, Tailwind,
+  TanStack Query and the console's other frontend dependencies (declared under `dependencies`
+  rather than `devDependencies`, so a workspace-wide `bun install --production` installed them
+  too, even though nothing in the runtime image ever imports or runs them — only `apps/console`'s
+  separately built, static `dist/` output ships). They are now `devDependencies`, as the frontend
+  build step already assumed.
 
 ## [0.4.0] - 2026-10-01
 

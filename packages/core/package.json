@@ -18,6 +18,8 @@
     "zod": "4.6.5"
   },
   "devDependencies": {
+    "@agent-gateway/queue": "workspace:*",
+    "@agent-gateway/testkit": "workspace:*",
     "@types/pg": "8.23.1"
   }
 }

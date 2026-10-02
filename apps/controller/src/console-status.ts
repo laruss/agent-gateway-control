@@ -1,3 +1,4 @@
+import type { ConsoleSnapshot } from "@agent-gateway/contracts";
 import { type ConsoleStatus, loadActiveConfig, loadConsoleStatus } from "@agent-gateway/core";
 import { withTransaction } from "@agent-gateway/db";
 import type pg from "pg";
@@ -52,14 +53,16 @@ export type ConsoleStatusCollector = (now: Date) => Promise<ConsoleStatus>;
  * What a console request is handed: a fresh collection, one kept past its cache window because
  * the next one failed or ran too long (still labeled with its own, older, time), or — only
  * before any collection has ever succeeded — nothing at all. Never an empty, healthy-looking
- * system in place of a real failure (ADR-023).
+ * system in place of a real failure (ADR-023). `ConsoleSnapshot` itself is
+ * `@agent-gateway/contracts`' own schema (`console-status.ts`), re-exported here so this
+ * module's own callers keep importing it from here; the console frontend parses the same
+ * `/api/status` JSON against that schema at the fetch boundary.
  */
-export type ConsoleSnapshot =
-	| Readonly<{ state: "ok"; asOf: string; status: ConsoleStatus }>
-	| Readonly<{ state: "stale"; asOf: string; status: ConsoleStatus; error: string }>
-	| Readonly<{ state: "unavailable"; error: string }>;
+export type { ConsoleSnapshot };
 
-export type ConsoleStatusCache = Readonly<{ get: () => Promise<ConsoleSnapshot> }>;
+export type ConsoleStatusCache = Readonly<{
+	get: () => Promise<ConsoleSnapshot>;
+}>;
 
 export type ConsoleStatusCacheOptions = Readonly<{
 	clock?: () => Date;
@@ -95,7 +98,11 @@ export function createConsoleStatusCache(
 	let pending: PendingCollection | null = null;
 
 	function start(now: Date): PendingCollection {
-		const entry: PendingCollection = { at: now.getTime(), promise: collector(now), settled: false };
+		const entry: PendingCollection = {
+			at: now.getTime(),
+			promise: collector(now),
+			settled: false,
+		};
 		entry.promise.then(
 			(status) => {
 				entry.settled = true;
@@ -123,7 +130,11 @@ export function createConsoleStatusCache(
 					: start(now);
 			try {
 				const status = await withDeadline(entry.promise, deadlineMs);
-				return { state: "ok", asOf: (lastGood?.at ?? now).toISOString(), status };
+				return {
+					state: "ok",
+					asOf: (lastGood?.at ?? now).toISOString(),
+					status,
+				};
 			} catch (error) {
 				const message = collectionErrorMessage(error);
 				return lastGood === null
