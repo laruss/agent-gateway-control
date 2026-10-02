@@ -901,6 +901,37 @@ async function rejectLifecycleOwnedRemovalsIn(
 		);
 }
 
+/** Refuses a commit that adds (or re-adds) an agent id whose lifecycle is `retiring`/`retired` —
+ * see `management.ts`'s own `rejectRetiredAgentReadditions` for the full rationale; kept as a
+ * second copy here for the same reason as `rejectUnownedBotSecretPathsIn` above. `config apply`
+ * never has a trusted id of its own, so it always calls this with an empty set. */
+async function rejectRetiredAgentReadditionsIn(
+	db: Db,
+	before: Readonly<AgentConfig[]>,
+	after: Readonly<AgentConfig[]>,
+	trustedAgentIds: ReadonlySet<AgentId>,
+): Promise<Readonly<string[]>> {
+	const beforeIds = new Set(before.map((agent) => agent.id));
+	const addedIds = after
+		.map((agent) => agent.id)
+		.filter((id) => !beforeIds.has(id) && !trustedAgentIds.has(id));
+	if (addedIds.length === 0) {
+		return [];
+	}
+	const rows = await db
+		.select({ agentId: agentLifecycle.agentId, status: agentLifecycle.status })
+		.from(agentLifecycle)
+		.where(inArray(agentLifecycle.agentId, addedIds));
+	return rows
+		.filter((row) => row.status === "retiring" || row.status === "retired")
+		.map(
+			(row) =>
+				`agent ${row.agentId} is lifecycle-owned and '${row.status}'; adding it to the ` +
+				"configuration this way would leave it enabled but never provisioned — use " +
+				`'gateway agents restore ${row.agentId}' instead`,
+		);
+}
+
 /**
  * The organization behind `revisionId` (`null`: no revision has ever been recorded, or its
  * snapshot is somehow missing — the empty-database state `loadActiveBundle` itself treats as "no
@@ -1085,10 +1116,21 @@ export async function applyConfig(
 		// Locked before `writeConfigRevisionIn` locks the `agents` table itself, the same order
 		// `commitChangeIn` keeps (see `lockLifecycleRowsIn`). An unlocked read: only the diff it
 		// informs needs to be current, not linearized with the write below (which locks the table
-		// for real right after).
-		const priorAgents = (await db.select({ config: agents.config }).from(agents)).map(
-			(row) => row.config,
-		);
+		// for real right after). Scoped to the currently *active* version, never every row the table
+		// still holds: `agents` retains a removed (or retired) agent's own last configuration rather
+		// than deleting its row (ADR-024), so an unscoped read would make a retired agent look
+		// already "there" to `rejectRetiredAgentReadditionsIn`'s own before/after diff below, even
+		// though it is not part of the active configuration at all — exactly the reintroduction that
+		// check exists to refuse.
+		const priorAgents =
+			controls?.version === undefined || controls.version === null
+				? []
+				: (
+						await db
+							.select({ config: agents.config })
+							.from(agents)
+							.where(eq(agents.configVersion, controls.version))
+					).map((row) => row.config);
 		// `config apply` never has a trusted removal id of its own (see `rejectLifecycleOwnedRemovalsIn`):
 		// an agent's retirement always runs through `requestAgentRetire`, never a whole-bundle replace.
 		const removalProblems = await rejectLifecycleOwnedRemovalsIn(
@@ -1099,6 +1141,18 @@ export async function applyConfig(
 		);
 		if (removalProblems.length > 0) {
 			throw new AdminError(`configuration is invalid:\n- ${removalProblems.join("\n- ")}`);
+		}
+		// Every committing path behaves the same way (ADR-026): a plain `config apply` is refused a
+		// retired agent reintroduced this way too, exactly like `commitChangeIn` already refuses it
+		// for a console patch, a CLI import or a rollback.
+		const readditionProblems = await rejectRetiredAgentReadditionsIn(
+			db,
+			priorAgents,
+			input.agents,
+			new Set(),
+		);
+		if (readditionProblems.length > 0) {
+			throw new AdminError(`configuration is invalid:\n- ${readditionProblems.join("\n- ")}`);
 		}
 		const priorOrganization = await loadOrganizationIn(db, parentRevisionId);
 		const channelsChangedIds = organizationTeamChangedIn(priorOrganization, input.organization)

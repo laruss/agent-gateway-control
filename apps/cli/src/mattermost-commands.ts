@@ -247,6 +247,10 @@ export async function mattermostAdminTokenSet(
 	const next = new MattermostClient({ baseUrl: options.baseUrl, token: created.token });
 	const verified = await next.me();
 	if (verified.id !== me.id) {
+		// Revoked before throwing: a token minted but never written to the file must never be left
+		// stranded, working, on the account — the same margin every other step here leaves none of
+		// its own credentials unaccounted for.
+		await next.revokeUserAccessToken(created.id);
 		throw new MattermostCommandError(
 			"the newly minted token did not verify against the same account; nothing was changed",
 		);
@@ -306,6 +310,8 @@ export async function mattermostAdminTokenRotate(
 	const next = new MattermostClient({ baseUrl: options.baseUrl, token: created.token });
 	const verified = await next.me();
 	if (verified.id !== me.id) {
+		// Revoked before throwing: see `mattermostAdminTokenSet`'s own identical guard.
+		await next.revokeUserAccessToken(created.id);
 		throw new MattermostCommandError(
 			"the newly created token did not verify against the same account; nothing was changed",
 		);

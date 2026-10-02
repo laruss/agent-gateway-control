@@ -24,7 +24,12 @@ import {
 	StaleLifecycleOperationError,
 } from "./agent-lifecycle.ts";
 import type { ControlPlaneDeps } from "./deps.ts";
-import { activeConfigRevisionId, commitChange, commitChangeIn } from "./management.ts";
+import {
+	activeConfigRevisionId,
+	commitChange,
+	commitChangeIn,
+	loadActiveBundle,
+} from "./management.ts";
 import { listMemory } from "./memory.ts";
 import { handleRunReport } from "./runs.ts";
 import { recordWorkerStatus } from "./runtime-health.ts";
@@ -1781,6 +1786,149 @@ describe("agent lifecycle service (ADR-026)", () => {
 				)
 			).rows;
 			expect(session.status).toBe("revoked");
+		});
+	});
+
+	describe("a retired agent cannot be re-added to configuration outside its own restore (ADR-026)", () => {
+		it("refuses a managed commit (add_agent) that re-adds a retired agent id", async () => {
+			const created = await requestAgentCreate(deps, createInput("readd-managed"));
+			await markProvisioning(deps, created.operationId, "test");
+			await completeOperation(deps, created.operationId, "test");
+			const retired = await requestAgentRetire(deps, {
+				agentId: "readd-managed",
+				actor: "test",
+				source: "cli",
+			});
+			await markProvisioning(deps, retired.operationId, "test");
+			await completeOperation(deps, retired.operationId, "test");
+			const [lifecycle] = (
+				await pool.query("select status from agent_lifecycle where agent_id = 'readd-managed'")
+			).rows;
+			expect(lifecycle.status).toBe("retired");
+
+			await expect(
+				commitChange(deps, {
+					changeSet: [
+						{
+							type: "add_agent",
+							agent: agent("readd-managed"),
+							rolePrompt: "Role prompt for readd-managed.",
+						},
+					],
+					baseRevisionId: await activeConfigRevisionId(deps),
+					actor: "owner",
+					source: "console",
+				}),
+			).rejects.toThrow(/gateway agents restore readd-managed/);
+
+			// Still disabled: the rejected commit never re-enabled it (`agents` retains a retired
+			// agent's own last configuration rather than deleting its row, ADR-024 — present, but
+			// never active).
+			const [row] = (await pool.query("select enabled from agents where id = 'readd-managed'"))
+				.rows;
+			expect(row.enabled).toBe(false);
+		});
+
+		it("refuses a whole-bundle config apply that reintroduces a retired agent id", async () => {
+			const created = await requestAgentCreate(deps, createInput("readd-apply"));
+			await markProvisioning(deps, created.operationId, "test");
+			await completeOperation(deps, created.operationId, "test");
+			const retired = await requestAgentRetire(deps, {
+				agentId: "readd-apply",
+				actor: "test",
+				source: "cli",
+			});
+			await markProvisioning(deps, retired.operationId, "test");
+			await completeOperation(deps, retired.operationId, "test");
+
+			const [{ config: financeConfig }] = (
+				await pool.query("select config from agents where id = 'finance'")
+			).rows;
+			await expect(
+				applyConfig(
+					deps,
+					{
+						organization: organization(),
+						agents: [financeConfig, agent("readd-apply")],
+						constitution: "Be helpful.",
+						rolePrompts: { finance: "Role prompt for finance.", "readd-apply": "Role prompt." },
+					},
+					"test",
+				),
+			).rejects.toThrow(/gateway agents restore readd-apply/);
+		});
+
+		it("refuses a rollback to a revision whose snapshot still names a since-retired agent, naming the restore command instead", async () => {
+			const created = await requestAgentCreate(deps, createInput("readd-rollback"));
+			await markProvisioning(deps, created.operationId, "test");
+			await completeOperation(deps, created.operationId, "test");
+			// The revision to "roll back" to: still names the agent, while it was ready.
+			const liveRevisionId = await activeConfigRevisionId(deps);
+			const { bundle: liveBundle } = await inTransaction(deps, ({ tx }) =>
+				loadActiveBundle(tx.db, liveRevisionId),
+			);
+
+			const retired = await requestAgentRetire(deps, {
+				agentId: "readd-rollback",
+				actor: "test",
+				source: "cli",
+			});
+			await markProvisioning(deps, retired.operationId, "test");
+			await completeOperation(deps, retired.operationId, "test");
+
+			if (liveBundle.organization === null) {
+				throw new Error("unreachable: a committed revision always has an organization");
+			}
+			await expect(
+				commitChange(deps, {
+					changeSet: [
+						{
+							type: "replace_bundle",
+							bundle: {
+								organization: liveBundle.organization,
+								agents: [...liveBundle.agents],
+								constitution: liveBundle.constitution,
+								rolePrompts: liveBundle.rolePrompts,
+							},
+						},
+					],
+					baseRevisionId: await activeConfigRevisionId(deps),
+					actor: "owner",
+					source: "rollback",
+				}),
+			).rejects.toThrow(/gateway agents restore readd-rollback/);
+
+			const [lifecycle] = (
+				await pool.query("select status from agent_lifecycle where agent_id = 'readd-rollback'")
+			).rows;
+			expect(lifecycle.status).toBe("retired");
+		});
+
+		it("requestAgentRestore's own add_agent is unaffected (it is the sanctioned way to do this)", async () => {
+			const created = await requestAgentCreate(deps, createInput("readd-restore"));
+			await markProvisioning(deps, created.operationId, "test");
+			await completeOperation(deps, created.operationId, "test");
+			const retired = await requestAgentRetire(deps, {
+				agentId: "readd-restore",
+				actor: "test",
+				source: "cli",
+			});
+			await markProvisioning(deps, retired.operationId, "test");
+			await completeOperation(deps, retired.operationId, "test");
+
+			const restored = await requestAgentRestore(deps, {
+				agentId: "readd-restore",
+				actor: "test",
+				source: "cli",
+			});
+			const [lifecycle] = (
+				await pool.query("select status from agent_lifecycle where agent_id = 'readd-restore'")
+			).rows;
+			expect(lifecycle.status).toBe("pending");
+			const [row] = (await pool.query("select enabled from agents where id = 'readd-restore'"))
+				.rows;
+			expect(row.enabled).toBe(true);
+			expect(restored.agentId).toBe("readd-restore");
 		});
 	});
 });

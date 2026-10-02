@@ -88,7 +88,14 @@ export const AgentLifecycleCheckpointsSchema = z.strictObject({
 	 * scoped to the team they were recorded against) are redone for the now-current team rather
 	 * than skipped as already done for one the agent is no longer meant to be in. */
 	team: MattermostNameSchema.optional(),
-	channels_joined: z.array(MattermostNameSchema).max(32).optional(),
+	/** Channel ids this pass itself confirmed joined (already a member, or just added) —
+	 * a progress marker only, reset at the start of every pass, never read
+	 * back to decide whether a channel still needs joining (that is always a live check against
+	 * Mattermost, never this). Bounded the same way `allowed_channels` itself is (at most 32
+	 * configured channels per agent), so a single pass's own, deduplicated set can never exceed it —
+	 * unlike the name-keyed array this replaces, which could accumulate past the cap across two
+	 * stale reads of a changing configuration and fail to parse back out of storage. */
+	channels_joined: z.array(MattermostIdSchema).max(32).optional(),
 	/** `retire`'s own steps: every token revoked server-side, the bot account disabled, every
 	 * channel it was a member of (by id, since a `retire` operation lists them live rather than
 	 * from a configured name list) left, and its local token file (lifecycle-owned agents only)
@@ -97,6 +104,13 @@ export const AgentLifecycleCheckpointsSchema = z.strictObject({
 	bot_disabled: z.boolean().optional(),
 	channels_left: z.array(MattermostIdSchema).max(64).optional(),
 	token_file_deleted: z.boolean().optional(),
+	/** Set instead of resolving a bot id when retirement finds a plain bot at the agent's own
+	 * configured username whose owner is neither the current provisioning admin nor any admin this
+	 * Gateway has ever recorded (`loadKnownProvisioningAdminIds`): its Mattermost-side cleanup is
+	 * skipped either way (never adopts an unproven account), but this is worth an operator's own
+	 * look (`gateway doctor`), since this Gateway's own admin-rotation history — had any of it been
+	 * lost — could in principle have vindicated the same bot instead of leaving it skipped. */
+	owner_unverified: z.boolean().optional(),
 });
 export type AgentLifecycleCheckpoints = z.infer<typeof AgentLifecycleCheckpointsSchema>;
 

@@ -30,6 +30,7 @@ import {
 	loadProvisioningAdminUserId,
 	lockConfigShared,
 	NEW_POST_EVENT_TYPES,
+	PROVISIONING_ADMIN_DIRECTORY_NAME,
 	raiseAlert,
 } from "./store.ts";
 
@@ -568,6 +569,40 @@ export async function loadDirectoryEntry(
 		.from(mattermostDirectory)
 		.where(and(eq(mattermostDirectory.kind, kind), eq(mattermostDirectory.name, name)));
 	return row?.id ?? null;
+}
+
+/**
+ * Every Mattermost account id this Gateway has ever recorded as its own provisioning admin
+ * (ADR-026): the current one (`#provisioning-admin`'s own directory entry, which this also
+ * includes) plus every id a prior `directory.set` ever audited for that same name — an admin
+ * account rotated away from (`gateway mattermost admin-token set` pointed at a different account,
+ * not merely a token rotation of the same one) is still this Gateway's own as far as a bot it
+ * created on its behalf is concerned, so retirement's own recovery path
+ * (`findPlausibleGatewayBot`, `@agent-gateway/mattermost`) does not mistake a bot owned by an
+ * earlier admin account for an unrelated integration's merely because the admin account has since
+ * moved on. Empty only when the provisioner has never resolved an admin account at all.
+ */
+export async function loadKnownProvisioningAdminIds(
+	deps: ControlPlaneDeps,
+): Promise<ReadonlySet<MattermostId>> {
+	const rows = await poolDb(deps)
+		.select({ detail: auditLog.detail })
+		.from(auditLog)
+		.where(
+			and(
+				eq(auditLog.action, "directory.set"),
+				eq(auditLog.subjectType, "user"),
+				eq(auditLog.subjectId, PROVISIONING_ADMIN_DIRECTORY_NAME),
+			),
+		);
+	const ids = new Set<MattermostId>();
+	for (const row of rows) {
+		const id = row.detail.mattermost_id;
+		if (typeof id === "string") {
+			ids.add(id);
+		}
+	}
+	return ids;
 }
 
 /** Cursor ids of one Mattermost channel's catch-up. */

@@ -129,7 +129,9 @@ describe("LifecyclePanel", () => {
 							id: "33333333-3333-4333-8333-333333333335",
 							kind: "reprovision",
 							state: "running",
-							checkpoints: { channels_joined: ["hq"] },
+							// A channel id (ADR-026), never a name: `channels_joined`
+							// is this pass's own progress marker, reset every pass, by id.
+							checkpoints: { channels_joined: ["hqchanne1000000000000000aa"] },
 							error: null,
 							createdAt: new Date().toISOString(),
 							updatedAt: new Date().toISOString(),

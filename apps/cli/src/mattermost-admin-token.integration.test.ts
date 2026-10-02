@@ -75,6 +75,13 @@ function startFakeMattermost() {
 	const json = (body: unknown, status = 200) =>
 		new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
+	// Set by a test to simulate a server bug/race where the very next minted token ends up usable
+	// by a *different* account than the one it was requested for — the one case
+	// `mattermostAdminTokenSet`/`mattermostAdminTokenRotate` must catch (`verified.id !== me.id`) and
+	// must revoke rather than leave stranded. Consumed once, like `failures` elsewhere in this repo's
+	// own fakes.
+	let rigNextTokenOwner: string | null = null;
+
 	const server = Bun.serve({
 		port: 0,
 		fetch: async (request) => {
@@ -94,17 +101,19 @@ function startFakeMattermost() {
 				if (caller === undefined) {
 					return json({}, 401);
 				}
-				const userId = createOrList[1] ?? "";
+				const requestedUserId = createOrList[1] ?? "";
+				const owner = rigNextTokenOwner ?? requestedUserId;
+				rigNextTokenOwner = null;
 				const body = (await request.json()) as { description?: string };
 				const tokenId = randomUUID();
 				const value = `tok-${randomUUID()}`;
 				const description = body.description ?? DEFAULT_DESCRIPTION;
-				tokens.set(tokenId, { value, userId, description });
-				accountByTokenValue.set(value, userId);
-				const ids = tokensByUser.get(userId) ?? new Set<string>();
+				tokens.set(tokenId, { value, userId: owner, description });
+				accountByTokenValue.set(value, owner);
+				const ids = tokensByUser.get(owner) ?? new Set<string>();
 				ids.add(tokenId);
-				tokensByUser.set(userId, ids);
-				return json({ id: tokenId, token: value, user_id: userId, description });
+				tokensByUser.set(owner, ids);
+				return json({ id: tokenId, token: value, user_id: owner, description });
 			}
 			if (createOrList !== null && request.method === "GET") {
 				if (caller === undefined) {
@@ -172,6 +181,9 @@ function startFakeMattermost() {
 		addTokens,
 		tokenCount: (userId: string): number => tokensByUser.get(userId)?.size ?? 0,
 		worksNow: (tokenValue: string) => accountByTokenValue.has(tokenValue),
+		rigNextTokenOwner: (userId: string): void => {
+			rigNextTokenOwner = userId;
+		},
 		stop: () => server.stop(true),
 	};
 }
@@ -444,5 +456,75 @@ describe("gateway mattermost admin-token set|rotate (ADR-026)", () => {
 		expect(fake.worksNow(newToken)).toBe(true);
 		// The unrelated token, plus the newly written one: the stray Gateway-tagged token is gone.
 		expect(fake.tokenCount(adminId)).toBe(2);
+	});
+
+	it("admin-token set revokes a freshly minted token that fails to verify against the same account, rather than leaving it stranded", async () => {
+		fake = startFakeMattermost();
+		const adminId = mmId("admin");
+		fake.addAccount("admin-token-value", {
+			id: adminId,
+			username: "gateway-admin",
+			is_bot: false,
+			roles: "system_user system_admin",
+			delete_at: 0,
+		});
+		// A different, unrelated account the freshly minted token ends up usable by instead — the
+		// one case nothing here ever expects: the created token's own `users/me` resolves to this
+		// account, not the one it was requested for.
+		const mallory = mmId("mallory");
+		fake.addAccount("mallory-seed-token", {
+			id: mallory,
+			username: "mallory",
+			is_bot: false,
+			roles: "system_user",
+			delete_at: 0,
+		});
+		expect(fake.tokenCount(mallory)).toBe(1);
+		fake.rigNextTokenOwner(mallory);
+
+		const path = secretPath();
+		await expect(
+			mattermostAdminTokenSet(
+				{ baseUrl: fake.baseUrl, secretPath: path, reader: fakeReader(["admin-token-value"]) },
+				() => undefined,
+			),
+		).rejects.toThrow(MattermostCommandError);
+
+		expect(secretFileState(path)).toBe("missing");
+		// The pasted token is untouched (nothing was changed) — and the poisoned token minted for
+		// "mallory" was revoked right away, not left stranded, working, on her account.
+		expect(fake.worksNow("admin-token-value")).toBe(true);
+		expect(fake.tokenCount(mallory)).toBe(1);
+	});
+
+	it("admin-token rotate revokes a freshly created token that fails to verify against the same account, rather than leaving it stranded", async () => {
+		fake = startFakeMattermost();
+		const adminId = mmId("admin");
+		fake.addAccount("admin-token-value", {
+			id: adminId,
+			username: "gateway-admin",
+			is_bot: false,
+			roles: "system_user system_admin",
+			delete_at: 0,
+		});
+		const mallory = mmId("mallory");
+		fake.addAccount("mallory-seed-token", {
+			id: mallory,
+			username: "mallory",
+			is_bot: false,
+			roles: "system_user",
+			delete_at: 0,
+		});
+		const path = secretPath();
+		writeSecretFile(path, "admin-token-value");
+
+		fake.rigNextTokenOwner(mallory);
+		await expect(
+			mattermostAdminTokenRotate({ baseUrl: fake.baseUrl, secretPath: path }, () => undefined),
+		).rejects.toThrow(MattermostCommandError);
+
+		expect(readFileSync(path, "utf8").trim()).toBe("admin-token-value");
+		expect(fake.worksNow("admin-token-value")).toBe(true);
+		expect(fake.tokenCount(mallory)).toBe(1);
 	});
 });

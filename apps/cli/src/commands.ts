@@ -585,6 +585,25 @@ export async function doctor(session: Session, out: Output): Promise<boolean> {
 				`${failedLifecycleCount} agent(s) with a failed lifecycle operation` +
 				(failedLifecycleCount === 0 ? "" : " ('gateway agents retry <id>')"),
 		});
+		// A retiring agent's own Mattermost-side cleanup was skipped because a plain bot at its
+		// configured username matched no admin account this Gateway has on record — but with no
+		// rotation history at all to check it against, so it could not be confirmed a stranger's
+		// either (`owner_unverified`, ADR-026). The agent is still correctly `retired` either way;
+		// this only flags that the skip itself is worth a human look.
+		const ambiguousRetirements = await pool.query<{ n: number }>(
+			`select count(*)::int as n
+			   from agent_lifecycle al
+			   join agent_lifecycle_operations op on op.id = al.operation_id
+			  where op.kind = 'retire' and op.checkpoints ->> 'owner_unverified' = 'true'`,
+		);
+		const ambiguousRetirementCount = ambiguousRetirements.rows[0]?.n ?? 0;
+		checks.push({
+			name: "lifecycle_retire_ownership",
+			ok: ambiguousRetirementCount === 0,
+			detail:
+				`${ambiguousRetirementCount} retired agent(s) whose own bot's ownership could not be ` +
+				"confirmed either way (no provisioning-admin rotation history on record)",
+		});
 		// `doctor` never runs `ensureConfigHistory` itself (it is read-only), so right after a
 		// forward upgrade the journal's latest entry can still look exactly as it did before the
 		// upgrade even though the live projections have already drifted (see

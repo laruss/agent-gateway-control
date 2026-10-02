@@ -54,7 +54,13 @@ import {
 } from "./management.ts";
 import { WORKER_STALE_MS } from "./runtime-health.ts";
 import { scheduleAgent } from "./scheduler.ts";
-import { audit, lifecycleOwnedAgentIds, loadActiveConfig, lockAgent } from "./store.ts";
+import {
+	audit,
+	lifecycleOwnedAgentIds,
+	loadActiveConfig,
+	loadChannelAccess,
+	lockAgent,
+} from "./store.ts";
 
 type Db = UnitOfWork["tx"]["db"];
 type AgentLifecycleRow = typeof agentLifecycle.$inferSelect;
@@ -167,6 +173,10 @@ async function commitWithinLock(
 	 * its own `agent_lifecycle` row has not moved to `retiring` yet this same transaction (see
 	 * `rejectLifecycleOwnedRemovals`). */
 	trustedRemovalAgentIds?: ReadonlySet<AgentId>,
+	/** `requestAgentRestore`'s own agent id: trusted to add a `retired` agent back to the
+	 * configuration even though its own `agent_lifecycle` row has not moved off `retired` yet this
+	 * same transaction (see `rejectRetiredAgentReadditions`). */
+	trustedReadditionAgentIds?: ReadonlySet<AgentId>,
 ): Promise<CommittedOutcome> {
 	let base = baseRevisionId;
 	for (let attempt = 1; attempt <= MAX_LIFECYCLE_COMMIT_ATTEMPTS; attempt += 1) {
@@ -182,6 +192,7 @@ async function commitWithinLock(
 			changeSet,
 			trustedBotSecretAgentIds,
 			trustedRemovalAgentIds,
+			trustedReadditionAgentIds,
 		);
 		if (outcome.kind === "committed") {
 			return outcome;
@@ -837,6 +848,12 @@ export async function requestAgentRestore(
 			// returns, which does not exist yet this same transaction for `rejectUnownedBotSecretPaths`
 			// to see.
 			new Set([parsed.agentId]),
+			// No trusted removal: this commit only ever adds the agent back.
+			undefined,
+			// Likewise for `rejectRetiredAgentReadditions`: this agent's own lifecycle row still reads
+			// `retired` at this point (the update to `pending` happens right after this commit
+			// returns), so without this, this restore's own `add_agent` would refuse itself.
+			new Set([parsed.agentId]),
 		);
 
 		// Defensive, like `requestAgentRetire`'s own call: a `retired` agent's last operation (its
@@ -952,6 +969,18 @@ export async function requestOperationRetry(
 				// never a `create`/`restore`/`retire` request's own, which never sets it — or a key one
 				// of those other requests already used is wrongly "replayed" as if this retry had made
 				// it.
+				//
+				// `retryOf` itself is migration 0027: a retry queued by an upgraded-in-place deployment
+				// before that migration ran carries `retry_of` NULL forever (an identity column, never
+				// rewritten after insert) even though it genuinely was one — indistinguishable here from
+				// a `create`/`restore`/`retire` request's own row, since `kind` alone already cannot
+				// tell them apart either (the reason this check exists at all). Reusing such a row's own
+				// idempotency key after upgrading past 0027 is refused by this same check, a one-time
+				// behaviour change for exactly that key (documented in CHANGELOG.md/UPGRADE.md): a fresh
+				// retry call with it queues a new operation instead of replaying the old one, which is
+				// still safe (never two operations actually running at once — `requestOperationRetry`
+				// itself refuses unless the agent's current operation is `failed`) but is not the silent
+				// replay an unchanged deployment would have given the exact same call.
 				const [current] =
 					lifecycle.operationId === null
 						? []
@@ -1178,9 +1207,9 @@ export async function checkpointOperation(
 	});
 }
 
-/** True for two name sets with exactly the same members, order aside. */
-function sameNameSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
-	return a.size === b.size && [...a].every((name) => b.has(name));
+/** True for two sets of ids (or names) with exactly the same members, order aside. */
+function sameIdSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+	return a.size === b.size && [...a].every((id) => b.has(id));
 }
 
 /**
@@ -1234,14 +1263,33 @@ export async function completeOperation(
 				.from(agents)
 				.where(eq(agents.id, operation.agentId));
 			const activeConfig = await loadActiveConfig(db);
-			const joinedChannels = new Set(finalCheckpoints.channels_joined ?? []);
-			const currentChannels = new Set(agentRow?.config.mattermost.allowed_channels ?? []);
+			const joinedChannelIds = new Set(finalCheckpoints.channels_joined ?? []);
+			// Resolved the same way the provisioner itself resolves a configured name to a channel id
+			// (the Mattermost bridge's own directory, read here through `loadChannelAccess`): a name
+			// this very edit added, and that the bridge has not resolved yet, cannot be turned into an
+			// id to compare at all — counted as a mismatch regardless (`unresolvedChannel`), never
+			// silently dropped from the comparison, so this fence still queues a `reprovision` for it
+			// rather than leave it unjoined forever once it is. `activeConfig`'s organization
+			// (independent of the per-agent `agents` row below) is what decides a team change.
+			const access = await loadChannelAccess(db);
+			const configuredChannelNames = agentRow?.config.mattermost.allowed_channels ?? [];
+			let unresolvedChannel = false;
+			const currentChannelIds = new Set<string>();
+			for (const name of configuredChannelNames) {
+				const id = access.named.get(name);
+				if (id === undefined) {
+					unresolvedChannel = true;
+				} else {
+					currentChannelIds.add(id);
+				}
+			}
 			const teamChanged =
 				finalCheckpoints.team !== undefined &&
 				activeConfig !== null &&
 				finalCheckpoints.team !== activeConfig.organization.mattermost.team;
 			const channelsChanged =
-				agentRow !== undefined && !sameNameSet(joinedChannels, currentChannels);
+				agentRow !== undefined &&
+				(unresolvedChannel || !sameIdSet(joinedChannelIds, currentChannelIds));
 			if (agentRow !== undefined && (teamChanged || channelsChanged)) {
 				const reprovisionId = randomUUID();
 				nextGeneration = lifecycle.generation + 1;

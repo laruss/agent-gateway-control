@@ -778,6 +778,47 @@ export async function rejectLifecycleOwnedRemovals(
 		);
 }
 
+/**
+ * Refuses a commit that adds (or re-adds) an agent id whose lifecycle is `retiring`/`retired` any
+ * way but `requestAgentRestore`'s own `add_agent` (ADR-026): a config import or rollback to a
+ * revision that still names a retired agent, or any other `add_agent`/`replace_bundle` naming that
+ * id, must not revive it in the active configuration outside the lifecycle's own path — doing so
+ * leaves it `enabled: true` while its lifecycle row is still `retiring`/`retired` (the scheduler
+ * refuses to run it either way, `requireAgentLifecycleReady`, but the owner's actual
+ * `requestAgentRestore` call then fails with "already exists", since `add_agent`'s own check
+ * refuses a configuration that already lists the id — restoring it the sanctioned way becomes
+ * impossible until the bad commit is undone). `trustedAgentIds` is `requestAgentRestore`'s own
+ * agent id, trusted the same way `rejectUnownedBotSecretPaths` trusts a fresh `create`'s: its
+ * lifecycle row still reads `retired` at the point this runs (the restore's own update to `pending`
+ * happens only after its commit returns), so without this it would refuse its own request.
+ */
+export async function rejectRetiredAgentReadditions(
+	db: Db,
+	before: Readonly<AgentConfig[]>,
+	after: Readonly<AgentConfig[]>,
+	trustedAgentIds: ReadonlySet<AgentId>,
+): Promise<Readonly<string[]>> {
+	const beforeIds = new Set(before.map((agent) => agent.id));
+	const addedIds = after
+		.map((agent) => agent.id)
+		.filter((id) => !beforeIds.has(id) && !trustedAgentIds.has(id));
+	if (addedIds.length === 0) {
+		return [];
+	}
+	const rows = await db
+		.select({ agentId: agentLifecycle.agentId, status: agentLifecycle.status })
+		.from(agentLifecycle)
+		.where(inArray(agentLifecycle.agentId, addedIds));
+	return rows
+		.filter((row) => row.status === "retiring" || row.status === "retired")
+		.map(
+			(row) =>
+				`agent ${row.agentId} is lifecycle-owned and '${row.status}'; adding it to the ` +
+				"configuration this way would leave it enabled but never provisioned — use " +
+				`'gateway agents restore ${row.agentId}' instead`,
+		);
+}
+
 /** The nearest `AgentLifecycleSource` for a configuration commit's own `ConfigRevisionSource`: a
  * console edit stays `console`, an agent's own proposal stays `agent`, and every CLI-driven source
  * this journal has (`cli_apply`, `import`, `rollback`, `backfill`) maps to the lifecycle's own,
@@ -978,6 +1019,13 @@ export async function commitChangeIn(
 	 * `rejectLifecycleOwnedRemovals`.
 	 */
 	trustedRemovalAgentIds: ReadonlySet<AgentId> = new Set(),
+	/**
+	 * `requestAgentRestore`'s own agent id: trusted to add a `retired` agent back to the
+	 * configuration even though its `agent_lifecycle` row has not moved off `retired` yet this same
+	 * transaction (that update happens right after this commit returns). Never set by
+	 * `commitChange`; see `rejectRetiredAgentReadditions`.
+	 */
+	trustedReadditionAgentIds: ReadonlySet<AgentId> = new Set(),
 ): Promise<CommitOutcome> {
 	const { db } = uow.tx;
 	await db.insert(gatewayControls).values({ id: 1 }).onConflictDoNothing();
@@ -1071,6 +1119,15 @@ export async function commitChangeIn(
 	);
 	if (removalProblems.length > 0) {
 		throw new AdminError(`configuration is invalid:\n- ${removalProblems.join("\n- ")}`);
+	}
+	const readditionProblems = await rejectRetiredAgentReadditions(
+		db,
+		base.agents,
+		draft.agents,
+		trustedReadditionAgentIds,
+	);
+	if (readditionProblems.length > 0) {
+		throw new AdminError(`configuration is invalid:\n- ${readditionProblems.join("\n- ")}`);
 	}
 	const resolvedInput: ConfigApplyInput = {
 		organization: draft.organization,

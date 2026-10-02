@@ -186,7 +186,47 @@ All notable changes are documented here. The project follows Semantic Versioning
   retry's own operation always carries the kind it retried, never a kind of its own) — a key one of
   those other requests already used could be wrongly "replayed" as a retry. Each retry-created
   operation now records which failed operation it retried (`retry_of`); a key is replayed only when
-  the row it finds is actually one.
+  the row it finds is actually one. Reusing a key first used by a retry queued before this release
+  (`retry_of` added by this same release's migration; such a row keeps it `NULL` forever) is a
+  one-time exception: it is no longer replayed and instead queues a fresh operation — still safe (an
+  agent's own current operation can only ever be retried once it is `failed`), just not a silent
+  replay of the exact call that key first made.
+- The lifecycle provisioner's own membership reconciliation (`create`/`restore`/`reprovision`) is
+  redesigned to converge on live Mattermost state every pass instead of trusting its own checkpoints
+  to say what still needs doing, closing several ways it could get stuck or drift: an old team's
+  cleanup depending on a directory lookup the bridge itself clears on team resolution (so it never
+  ran); an in-memory "stale team" flag that a crash lost, leaving the bot never actually joined to a
+  team change nor ever leaving the old one; a team change queuing a reprovision whose own empty
+  checkpoints never recognized the team as stale; and a channel checkpoint keyed by name that could
+  accumulate past its own stored-shape limit across two reads of a changing configuration and fail
+  to read back at all. The bot's live team and channel memberships are now listed and reconciled
+  directly on every pass (join what is configured and missing, leave what is neither configured nor
+  actively granted, in the configured team and every other one alike); checkpoints are kept only as
+  progress markers for `gateway agents operations` and `completeOperation`'s own end-of-run fence,
+  reset at the start of every pass, by channel id rather than name.
+- An existing Gateway-owned bot's `team_admin`/`channel_admin` membership roles (granted by hand in
+  Mattermost, or left over from an earlier manual change) were never reset by the lifecycle
+  provisioner the way `gateway mattermost bootstrap` already resets them for a bootstrap-managed
+  bot. The provisioner now normalizes a lifecycle-owned bot's own team and channel membership roles
+  back to a plain member the same way, before ever declaring the agent ready.
+- A rollback, import or any other whole-bundle `add_agent`/`replace_bundle` commit could re-add an
+  agent id whose lifecycle was still `retiring`/`retired`, leaving the configuration enabled for an
+  agent nothing had actually provisioned — and leaving `gateway agents restore` itself failing
+  "already exists" the moment an operator then tried to restore it the sanctioned way. Every
+  committing path now refuses this the same way it already refuses dropping a lifecycle-owned agent
+  outside `gateway agents retire`, naming `gateway agents restore` instead; `requestAgentRestore`'s
+  own commit is unaffected (it is the one sanctioned way to do this).
+- Retirement's own last-resort bot recovery refused a Gateway-owned bot whose `owner_id` named an
+  earlier provisioning admin account, after an operator rotated `gateway mattermost admin-token set`
+  to a different one: cleanup was skipped as if the bot were an unrelated integration's, even though
+  this Gateway created it. It now accepts any admin account id this Gateway has ever recorded for
+  itself, not only the current one; a bot that still matches none of them skips cleanup the same way
+  (never adopts an unproven account) but now logs a visible warning and a `gateway doctor`-visible
+  checkpoint, since this Gateway's own admin-rotation history, had any of it been lost, could in
+  principle have vindicated the very same bot.
+- `gateway mattermost admin-token set`/`rotate` left a freshly minted token on the account,
+  unrevoked and unused, when it failed to verify against the same account it was just created for
+  (the one case nothing was supposed to have changed). Both now revoke it before raising the error.
 
 ## [0.5.0] - 2026-10-02
 

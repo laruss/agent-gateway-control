@@ -71,7 +71,15 @@ An agent id is never reused. `requestAgentCreate` refuses an id that already has
 `agent_lifecycle` row in any status, including `retired`: a retired agent's bot, its audit trail
 and its memory stay attributed to exactly the id that earned them, never silently inherited by an
 unrelated later agent of the same name. A Mattermost username already used by another agent's
-identity is refused the same way, whether or not that agent is still active.
+identity is refused the same way, whether or not that agent is still active. Every other committing
+path that could still add an id back to the active configuration — a rollback or import's
+`replace_bundle`, a plain `add_agent` — refuses one whose lifecycle is `retiring`/`retired` the same
+way a commit already refuses *removing* a lifecycle-owned agent outside `requestAgentRetire`
+(`rejectRetiredAgentReadditions`, the mirror of `rejectLifecycleOwnedRemovals`): naming
+`gateway agents restore` instead of silently enabling a configuration nothing has actually
+provisioned, and leaving that very restore failing "already exists" once it is finally tried.
+`requestAgentRestore`'s own commit is the one trusted exception, the same way `requestAgentCreate`'s
+own commit is trusted against `rejectUnownedBotSecretPaths`.
 
 ### One operation journal
 
@@ -218,39 +226,58 @@ constrained in code to exactly the actions provisioning performs, never handed t
   current, lifecycle-owned, `ready` agent the same way, team membership being exactly as much this
   step's own concern as a channel is; an agent still `pending`/`reconciling` (a `create`/`restore`
   still provisioning it) is left alone either way — its own operation already owns reconciling its
-  membership once, from whatever the configuration is by the time it reaches that step. Newly
-  configured channels are joined from a reload taken immediately before the operation completes, not
-  only from the configuration it started with, so an edit adding one lands no matter when it commits
-  during the run; a channel the same edit took away, or a team the organization's own Mattermost team
-  changed to, cannot be caught the same way (an addition is simply joined when found; there is
-  nothing equivalent to "notice a removal" in a loop that only ever adds) — `completeOperation`
-  itself closes that gap instead, still holding the same `agent_lifecycle` row lock every config
+  membership once, from whatever the configuration is by the time it reaches that step.
+
+  Every `create`/`restore`/`reprovision` operation converges the bot's team and channel membership
+  onto desired state computed fresh from **live** Mattermost state on every pass, rather than from
+  its own checkpoints — crash-safe without a cleanup checkpoint of its own, since nothing is ever
+  decided from one: the bot's current teams are listed (`users/{id}/teams`); the configured team is
+  joined if missing, and every other team the bot is a live member of is left outright
+  (`removeTeamMember`, the same way `bootstrapMattermost`'s own "one team only" step already does,
+  without leaving the old team's channels first — Mattermost ends a user's membership in every
+  channel of a team the moment it ends their membership in the team itself) — an ADR-022 grant is
+  never consulted for a team being left this way, only for the configured one, since a grant only
+  ever means anything within the team the organization actually manages. The bot's current channels
+  in the configured team are then listed; every configured channel it is not already a member of is
+  joined, and every channel it is a member of that is neither configured nor actively granted
+  (ADR-022, checked fresh immediately before each removal, never once at the start of the pass, so a
+  grant made mid-pass is still honored) is left — the same convergence for every operation kind, so
+  a channel a committed edit took away mid-flight is left exactly like one a `reprovision` already
+  removes, and one the same edit added is joined the same way, with no separate "join only" step.
+  `team_joined`/`channels_joined` (channel ids, deduplicated, bounded the same way
+  `allowed_channels` itself is) are written purely as this pass's own progress markers — reset at
+  the start of every pass, read by nothing deciding whether a step still needs doing, only by
+  `completeOperation`'s own fence, below, and by `gateway agents operations`. Finally, the bot's own
+  team and channel membership roles are normalized back to a plain member wherever an existing
+  membership somehow carries more (`team_admin`/`channel_admin` — granted by hand in Mattermost, or
+  left over from an earlier manual change), the same role normalization `bootstrapMattermost`
+  already applies to a bulk-managed bot, before the operation is ever allowed to declare the agent
+  ready.
+
+  A channel not yet resolved in the Mattermost bridge's own directory (brand new, say) is left for a
+  later pass to pick up once it resolves, the same as before; `completeOperation` itself closes the
+  remaining gap — a config edit, or a team change, committed between the provisioner's own last
+  fresh read and this very call — still holding the same `agent_lifecycle` row lock every config
   writer takes before queuing a `reprovision` (`lockLifecycleRows`): for a `create`/`restore`, it
-  compares the agent's current `allowed_channels` and the organization's current team against what
-  the operation's own checkpoints record having actually joined, and queues a `reprovision` in the
-  same transaction on any difference, rather than leaving the agent `ready` with a membership nothing
-  would otherwise ever revisit. A concurrent commit touching this same agent cannot slip past this
-  check either way: it must lock the same row first, so it either already happened (and this read
-  sees it) or waits for this transaction to finish (and finds the agent already `ready`, queuing its
-  own `reprovision` the ordinary way). Checkpoints are themselves scoped to the team they were
-  recorded against (`team`, alongside `team_joined`): an operation resumed after the organization's
-  team changed mid-run sees its own `team_joined`/`channels_joined` checkpoints as stale rather than
-  already done, rejoins the now-current team and its channels, and — the same way a `reprovision`
-  already leaves a channel no longer configured — leaves the old team's own channels (except one an
-  owner or admin granted the bot directly) and the team itself, one team only being as much a plain
-  member's own invariant as a bot's channels are. The queued operation is later driven by the provisioner like any other: keep the bot's
-  existing token if it still works (verified with it, `users/me`, before ever reissuing), join
-  every channel now configured, and leave every channel no longer configured, except one an owner
-  or admin granted the bot directly (ADR-022) — checked from the grant records, never assumed, so
-  a grant made after the operation was queued still holds. Unlike `create`/`restore`, a
-  `reprovision` operation never moves its agent out of `ready` — on any of its transitions, a
-  permanent failure included: `markProvisioning` leaves the agent `ready` while the operation runs,
-  `completeOperation` leaves it `ready` once it finishes, and `failOperation` leaves it `ready` too
-  (recording `last_error` and the failed operation itself, still visible and retryable) rather than
-  the generic `failed` a stuck `create`/`restore` means — a membership-only change is never a
-  reason to pause scheduling, whatever became of it. `requestOperationRetry` keeps the same rule: a
-  failed `reprovision`'s retry leaves the agent `ready` throughout, never passing it through
-  `pending` the way a retried `create`/`restore` does.
+  compares the agent's current `allowed_channels` (resolved to channel ids the same way the
+  provisioner itself resolves them) and the organization's current team against what the operation's
+  own checkpoints record having actually joined, and queues a `reprovision` in the same transaction
+  on any difference — a configured channel name the bridge has not resolved yet counts as a
+  difference too, never silently dropped from the comparison — rather than leaving the agent `ready`
+  with a membership nothing would otherwise ever revisit. A concurrent commit touching this same
+  agent cannot slip past this check either way: it must lock the same row first, so it either
+  already happened (and this read sees it) or waits for this transaction to finish (and finds the
+  agent already `ready`, queuing its own `reprovision` the ordinary way). The queued operation is
+  later driven by the provisioner like any other: keep the bot's existing token if it still works
+  (verified with it, `users/me`, before ever reissuing), then the same live convergence above. Unlike
+  `create`/`restore`, a `reprovision` operation never moves its agent out of `ready` — on any of its
+  transitions, a permanent failure included: `markProvisioning` leaves the agent `ready` while the
+  operation runs, `completeOperation` leaves it `ready` once it finishes, and `failOperation` leaves
+  it `ready` too (recording `last_error` and the failed operation itself, still visible and
+  retryable) rather than the generic `failed` a stuck `create`/`restore` means — a membership-only
+  change is never a reason to pause scheduling, whatever became of it. `requestOperationRetry` keeps
+  the same rule: a failed `reprovision`'s retry leaves the agent `ready` throughout, never passing it
+  through `pending` the way a retried `create`/`restore` does.
 - **Failure handling.** A step's failure is permanent — `failOperation`, with a redacted message,
   moving the agent to `failed` (or leaving a `reprovision`'s own agent `ready`, just above) — only
   when a retry could never fix it: the bot's username is taken by an account that is not plausibly
@@ -363,7 +390,16 @@ this very retire, or simply crash, before `setAgentBotUser` ever wrote it. Retir
 id from the superseded operation's own checkpoints (they survive being cancelled) before ever
 concluding there is nothing to do, and only as a last resort falls back to looking the account up
 by the agent's configured username — never adopting one that is not plausibly the Gateway's own
-plain bot, the same check `ensureBot` itself applies before ever creating or adopting one. A
+plain bot, the same check `ensureBot` itself applies before ever creating or adopting one, except
+that the account's own `owner_id` is checked against every admin account this Gateway has ever
+recorded for itself (the current one, plus every one a prior `directory.set` on
+`#provisioning-admin` ever audited), not only the current one: a bot this Gateway created under an
+admin account an operator has since rotated away from (`gateway mattermost admin-token set`
+pointed at a different account) is still recognized as its own. An `owner_id` that matches none of
+them still skips cleanup (never adopts an unproven account), but logs a visible warning and a
+checkpoint (`owner_unverified`) `gateway doctor` surfaces, rather than the quiet log this skip used
+to get unconditionally — this Gateway's own admin-rotation history, had any of it been lost, could
+in principle have vindicated the very same bot. A
 step's failure is retried like provisioning any other operation; a permanent failure leaves the
 agent `retiring` with `last_error`, surfaced by `gateway doctor`, same as any other kind. A
 database rollback of the retire transaction alone never reactivates a Mattermost account that was

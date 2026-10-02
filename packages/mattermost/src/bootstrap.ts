@@ -353,26 +353,30 @@ export async function ensureBot(
  * system roles — the same plausibility `ensureBot` itself checks before ever creating or adopting
  * one.
  *
- * A plain bot's own `owner_id` must also name this Gateway's own admin account, exactly the
- * ownership guard `ensureBot` applies to a fresh `create`'s own username-only resolution (never
- * only `knownUserId`, since the whole point of this recovery path is that no identity was ever
- * recorded): a username collision with an unrelated integration's own plain bot must never be
- * mistaken for this agent's own account merely because nothing else claims the name. Retiring an
- * agent whose own `create` genuinely failed on "username taken" must not revoke a stranger's bot's
- * tokens and disable it — skipped instead (the caller has nothing Mattermost-side left to clean up
- * for this agent, and logs why).
+ * A plain bot's own `owner_id` must also name one of `knownAdminIds` — the provisioning admin
+ * account the Gateway uses right now, or one it used before an operator rotated to a different
+ * account (`gateway mattermost admin-token set` pointed at a new account, not merely a token
+ * rotation of the same one) — exactly the ownership guard `ensureBot` applies to a fresh `create`'s
+ * own username-only resolution (never only `knownUserId`, since the whole point of this recovery
+ * path is that no identity was ever recorded): a username collision with an unrelated integration's
+ * own plain bot must never be mistaken for this agent's own account merely because nothing else
+ * claims the name. Retiring an agent whose own `create` genuinely failed on "username taken" must
+ * not revoke a stranger's bot's tokens and disable it — skipped instead (the caller has nothing
+ * Mattermost-side left to clean up for this agent, logs the skip visibly rather than quietly, and
+ * records it on a checkpoint `gateway doctor` surfaces, since this Gateway's own admin-rotation
+ * history — had any of it been lost — could in principle have vindicated the very same bot).
  */
 export async function findPlausibleGatewayBot(
 	admin: Pick<AdminMattermostClient, "userByUsername" | "getBot">,
 	username: string,
-	adminUserId: MattermostId,
+	knownAdminIds: ReadonlySet<MattermostId>,
 ): Promise<MattermostId | null> {
 	const existing = await admin.userByUsername(username);
 	if (existing === null || !existing.is_bot || !isPlainSystemRoles(existing.roles)) {
 		return null;
 	}
 	const record = await admin.getBot(existing.id);
-	if (record?.owner_id !== adminUserId) {
+	if (record === null || !knownAdminIds.has(record.owner_id)) {
 		return null;
 	}
 	return existing.id;

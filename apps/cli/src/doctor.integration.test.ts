@@ -7,6 +7,7 @@ import {
 	activeConfigRevisionId,
 	applyConfig,
 	type ControlPlaneDeps,
+	checkpointOperation,
 	commitChange,
 	completeOperation,
 	failOperation,
@@ -240,5 +241,48 @@ describe("gateway doctor: 'mattermost_provisioning' sees the admin token the sam
 		const check = checks.find((c) => c.name === "lifecycle_failures");
 		expect(check).toMatchObject({ ok: false });
 		expect(check?.detail).toContain("1 agent(s)");
+	});
+
+	it("reports a retirement whose bot's ownership could not be confirmed either way (owner_unverified, ADR-026)", async () => {
+		await requestAgentCreate(deps, {
+			agent: {
+				id: "unverified-agent",
+				display_name: "Unverified Agent",
+				mattermost: { username: "unverified-agent" },
+				runtime: { adapter: "mock" },
+				prompts: { role_file: "prompts/unverified-agent.md" },
+				wake_rules: [],
+				concurrency: { while_running: "enqueue" },
+				memory: { private_namespace: "agents/unverified-agent", shared_namespaces: [] },
+			},
+			rolePrompt: "Role.",
+			actor: "test",
+			source: "cli",
+		});
+		const [{ operation_id: createOperationId }] = (
+			await pool.query("select operation_id from agent_lifecycle where agent_id = $1", [
+				"unverified-agent",
+			])
+		).rows;
+		await markProvisioning(deps, createOperationId, "test");
+		await completeOperation(deps, createOperationId, "test");
+
+		// Simulates the provisioner's own retire recovery finding a plain bot at this agent's own
+		// username that matches no provisioning admin account on record at all (`owner_unverified`):
+		// cleanup is skipped (never adopted on a guess), but flagged here for an operator's own look.
+		const retired = await requestAgentRetire(deps, {
+			agentId: "unverified-agent",
+			actor: "test",
+			source: "cli",
+		});
+		await markProvisioning(deps, retired.operationId, "test");
+		await checkpointOperation(deps, retired.operationId, { owner_unverified: true });
+		await completeOperation(deps, retired.operationId, "test");
+
+		process.env.MATTERMOST_ADMIN_TOKEN_FILE = join(tokenDir, "mattermost_admin_token");
+		const checks = await runDoctor(session);
+		const check = checks.find((c) => c.name === "lifecycle_retire_ownership");
+		expect(check).toMatchObject({ ok: false });
+		expect(check?.detail).toContain("1 retired agent(s)");
 	});
 });

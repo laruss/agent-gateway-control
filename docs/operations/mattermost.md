@@ -168,6 +168,14 @@ leaves it `retiring` with `last_error`, surfaced by `gateway doctor`; **a databa
 never reactivates a Mattermost account that a provisioner pass already deactivated** — Mattermost
 is never inside a Gateway database transaction.
 
+If an agent's own bot was never fully resolved before it is retired (a crash mid-`create`, say),
+retirement recovers its account by checking `owner_id` against every provisioning admin account
+this Gateway has ever recorded for itself — the current one, or an earlier one `admin-token set`
+has since pointed at a different account — not only the current one, so switching admin accounts
+never orphans a bot created under the old one. A bot that matches none of them, with no admin
+account switch on record at all to rule it out, still has its cleanup skipped (never adopted on a
+guess) but logs a visible warning and a `gateway doctor`-visible note, worth a look.
+
 Retiring the organization's configured finance agent is refused unless the same command also
 reassigns the role:
 
