@@ -170,6 +170,12 @@ export class MattermostClient {
 		return this.call("POST", "bots", ApiBotSchema, bot);
 	}
 
+	/** Null for an id that is not a bot at all (404) — `include_deleted=true` so a disabled one is
+	 * still found, the same lookups elsewhere already tolerate. */
+	getBot(userId: MattermostId): Promise<ApiBot | null> {
+		return this.optional(this.call("GET", `bots/${userId}?include_deleted=true`, ApiBotSchema));
+	}
+
 	enableBot(userId: MattermostId): Promise<ApiBot> {
 		return this.call("POST", `bots/${userId}/enable`, ApiBotSchema);
 	}
@@ -238,26 +244,50 @@ export class MattermostClient {
 		}
 	}
 
-	/** Ids of the first page of an account's access tokens (values are never returned). */
+	/** Every id of an account's access tokens (values are never returned), paged until a page
+	 * comes back with fewer than `per_page`: an account with more tokens than one page holds
+	 * (a pile left by earlier crashed rotations, say) must still be seen in full, not just its
+	 * first page. */
 	async userAccessTokenIds(userId: MattermostId): Promise<Readonly<string[]>> {
-		const tokens = await this.call(
-			"GET",
-			`users/${userId}/tokens?page=0&per_page=200`,
-			z.array(z.looseObject({ id: z.string() })),
-		);
-		return tokens.map((token) => token.id);
+		return (await this.userAccessTokens(userId)).map((token) => token.id);
+	}
+
+	/** Every access token of an account, id and description (values are never returned), paged the
+	 * same way `userAccessTokenIds` is: `gateway mattermost admin-token rotate`'s own way of telling
+	 * its own tokens apart from an unrelated one the account also happens to have, which must never
+	 * be revoked. */
+	async userAccessTokens(
+		userId: MattermostId,
+	): Promise<Readonly<{ id: string; description: string }[]>> {
+		const perPage = 200;
+		const tokens: { id: string; description: string }[] = [];
+		for (let page = 0; ; page += 1) {
+			const pageTokens = await this.call(
+				"GET",
+				`users/${userId}/tokens?page=${page}&per_page=${perPage}`,
+				z.array(z.looseObject({ id: z.string(), description: z.string() })),
+			);
+			tokens.push(...pageTokens);
+			if (pageTokens.length < perPage) {
+				return tokens;
+			}
+		}
 	}
 
 	async revokeUserAccessToken(tokenId: string): Promise<void> {
 		await this.call("POST", "users/tokens/revoke", null, { token_id: tokenId });
 	}
 
-	/** Creates a personal access token for `userId`; the value is returned once, never logged. */
-	async createUserAccessToken(userId: MattermostId, description: string): Promise<string> {
-		const created = await this.call("POST", `users/${userId}/tokens`, ApiUserAccessTokenSchema, {
-			description,
-		});
-		return created.token;
+	/**
+	 * Creates a personal access token for `userId`; the token value is returned once (never
+	 * logged), alongside its own id — not secret, and the only way to find this exact token again
+	 * later (a listing never returns values; see `userAccessTokenIds`).
+	 */
+	async createUserAccessToken(
+		userId: MattermostId,
+		description: string,
+	): Promise<Readonly<{ id: string; token: string }>> {
+		return this.call("POST", `users/${userId}/tokens`, ApiUserAccessTokenSchema, { description });
 	}
 
 	/** Resolves 404 (and 403 for things the token may not see) to null. */
@@ -332,6 +362,37 @@ export class MattermostClient {
 		return parsed.data;
 	}
 }
+
+/**
+ * The subset of `MattermostClient` an admin token's own calls need (`ensureBot`/`revokeAllTokens`/
+ * `tokenOwner` in `bootstrap.ts`, and the lifecycle provisioner): narrow enough that a test's fake
+ * admin client can satisfy it as a plain object, without subclassing a class that has private
+ * fields (a real `MattermostClient` instance already satisfies it, structurally, as any wider type
+ * would).
+ */
+export type AdminMattermostClient = Pick<
+	MattermostClient,
+	| "me"
+	| "user"
+	| "userByUsername"
+	| "createBot"
+	| "getBot"
+	| "enableBot"
+	| "disableBot"
+	| "addTeamMember"
+	| "removeTeamMember"
+	| "addChannelMember"
+	| "removeChannelMember"
+	| "userChannelsInTeam"
+	| "userTeams"
+	| "teamMember"
+	| "channelMember"
+	| "setTeamMemberRoles"
+	| "setChannelMemberRoles"
+	| "userAccessTokenIds"
+	| "revokeUserAccessToken"
+	| "createUserAccessToken"
+>;
 
 function safeJson(text: string): JsonValue | undefined {
 	try {

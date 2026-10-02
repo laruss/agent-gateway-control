@@ -95,7 +95,7 @@ The next phases build the release images and deploy them.
   | Event payloads | 30 |
   | Run results, summaries, error details and exact turn inputs (`context_snapshots`) | 30 |
   | Delivered outbox payloads | 8 |
-  | Dead outbox payloads | 30 |
+  | Dead or cancelled outbox payloads | 30 |
   | Policy decision inputs | 30 |
   | Inactive thread summaries | 90 |
   | Rejected and superseded memory | 30 |
@@ -114,7 +114,9 @@ The next phases build the release images and deploy them.
   - the edits and deletions of those posts, so a turn shows a post as it is now;
   - the content and snapshot of a run whose wait still has work waiting;
   - a dead outbox item's payload for its whole period after the last attempt, not after its
-    creation.
+    creation. A `cancelled` outbox item (its agent retired before it ever went out, ADR-026) ages
+    out on the same rule: it is never redriven either, and is otherwise forgotten by every other
+    retention step.
 
   A reader that meets an expired event skips it (late wait matches) or shows its columns
   (`gateway events show`); it never parses it as an envelope.

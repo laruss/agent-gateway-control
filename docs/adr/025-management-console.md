@@ -201,6 +201,14 @@ one of those checks.
   history (`listConfigRevisions`, unchanged) and a structural diff of one revision against its
   parent (`consoleRevisionDiff`, reusing `configDiff`) for any recorded revision, not only the
   currently active one.
+- **The agent lifecycle (ADR-026).** `POST /api/agents` (create), `POST /api/agents/:id/retry`,
+  `POST /api/agents/:id/retire`, `POST /api/agents/:id/restore`, `GET /api/agents/:id/lifecycle`,
+  `GET /api/agents/:id/channels` and `POST /api/agents/:id/channels/revoke` sit under this exact
+  same session/CSRF/exact-Origin regime — every `POST` needs the exact Origin and a matching CSRF
+  header, every route needs a valid session, the same as `preview`/`commit` above. ADR-026 is
+  their own authority for what each one does and returns; this ADR's own authority is only that
+  they are reached, authenticated and protected the same way every other mutating route here is —
+  no new mechanism, no exception carved out for them.
 - **Actor and source.** Every commit this surface makes carries `source: "console"` (reserved for
   exactly this by ADR-024) and `actor: "console:owner"` — a fixed string, since the console has
   exactly one account and no per-user identity of its own (ADR-023/025). `gateway config history`

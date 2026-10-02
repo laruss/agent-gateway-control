@@ -1,13 +1,23 @@
 import { randomUUID } from "node:crypto";
 import type { ConfigApplyInput } from "@agent-gateway/core";
-import { applyConfig, commitChange, ensureConfigHistory } from "@agent-gateway/core";
+import {
+	applyConfig,
+	commitChange,
+	completeOperation,
+	ensureAgentLifecycleAdoption,
+	ensureConfigHistory,
+	failOperation,
+	grantChannel,
+	markProvisioning,
+	setAgentBotUser,
+} from "@agent-gateway/core";
 import { withTransaction } from "@agent-gateway/db";
 import { silentLogger } from "@agent-gateway/logging";
 import { hashConsolePassword } from "@agent-gateway/service";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { type ConsoleServerOptions, startConsoleServer } from "./console-server.ts";
 import { collectConsoleStatus, createConsoleStatusCache } from "./console-status.ts";
-import { exampleConfig, startTestGateway, type TestGateway } from "./test-gateway.ts";
+import { exampleConfig, IDS, startTestGateway, type TestGateway } from "./test-gateway.ts";
 
 const PASSWORD = "console management integration test password";
 const ORIGIN = "https://gateway.local";
@@ -91,6 +101,11 @@ describe("the Agents hub's management API (ADR-024/ADR-025)", () => {
 	beforeAll(async () => {
 		gateway = await startTestGateway();
 		passwordHash = await hashConsolePassword(PASSWORD);
+		// `startTestGateway` starts the controller (which would otherwise run this backfill itself)
+		// before applying the example configuration, so every example agent — "finance" in
+		// particular, for the retire-without-reassignment test below — would otherwise have no
+		// `agent_lifecycle` row at all.
+		await ensureAgentLifecycleAdoption(gateway.deps(), "test");
 	});
 
 	afterAll(async () => {
@@ -130,6 +145,31 @@ describe("the Agents hub's management API (ADR-024/ADR-025)", () => {
 		const revisionId = (detail.body.agent as JsonBody).activeRevisionId as number;
 		expect(revisionId).toBeGreaterThan(0);
 		return revisionId;
+	}
+
+	type CreatedAgent = Readonly<{ agentId: string; operationId: string; revisionId: number }>;
+
+	/** `POST /api/agents`: a fresh, lifecycle-owned agent with no channels of its own, for the
+	 * retire/restore/retry tests below — never `AGENT_ID` itself, which every other test in this
+	 * file depends on staying configured and active. */
+	async function createLifecycleAgent(
+		base: string,
+		session: { cookie: string; csrfToken: string },
+		id: string,
+		allowedChannels: Readonly<string[]> = [],
+	): Promise<CreatedAgent> {
+		const res = await postJson(base, "/api/agents", session, {
+			idempotencyKey: randomUUID(),
+			id,
+			displayName: id,
+			allowedChannels,
+			rolePrompt: `Role prompt for ${id}.`,
+			// Every ready worker in this test harness is "mock" (`exampleConfig`); left unset, a
+			// create request defaults to the deployment's Codex settings, which have none here.
+			runtime: { adapter: "mock" },
+		});
+		expect(res.status).toBe(200);
+		return res.body as unknown as CreatedAgent;
 	}
 
 	it("lists every agent with its runtime, channel count, last run and active revision", async () => {
@@ -776,6 +816,300 @@ describe("the Agents hub's management API (ADR-024/ADR-025)", () => {
 			expect(list.status).toBe(200);
 			const agents = list.body.agents as JsonBody[];
 			expect(agents.some((a) => a.id === RETAINED_AGENT_ID)).toBe(false);
+		});
+	});
+
+	describe("lifecycle: create, retry, retire, restore, channels (ADR-026)", () => {
+		it("creates an agent, queuing a pending create operation, idempotently", async () => {
+			const { base } = await withServer();
+			const session = await signIn(base);
+			const body = {
+				idempotencyKey: randomUUID(),
+				id: "console-created",
+				displayName: "Console Created",
+				allowedChannels: ["hq"],
+				rolePrompt: "You are a console-created test agent.",
+				runtime: { adapter: "mock" as const },
+			};
+			const res = await postJson(base, "/api/agents", session, body);
+			expect(res.status).toBe(200);
+			expect(res.body.agentId).toBe("console-created");
+			expect(res.body.operationId).toEqual(expect.any(String));
+
+			const [lifecycle] = (
+				await gateway.pool.query<{ status: string }>(
+					"select status from agent_lifecycle where agent_id = $1",
+					["console-created"],
+				)
+			).rows;
+			expect(lifecycle?.status).toBe("pending");
+
+			// Idempotent replay: the same key returns the first call's own result, never a second
+			// `agent_lifecycle_operations` row.
+			const replay = await postJson(base, "/api/agents", session, body);
+			expect(replay.status).toBe(200);
+			expect(replay.body.operationId).toBe(res.body.operationId);
+			expect(replay.body.revisionId).toBe(res.body.revisionId);
+			const count = await gateway.pool.query<{ count: string }>(
+				"select count(*)::text as count from agent_lifecycle_operations where agent_id = $1",
+				["console-created"],
+			);
+			expect(count.rows[0]?.count).toBe("1");
+		});
+
+		it("401s every new lifecycle route without a session", async () => {
+			const { base } = await withServer();
+			expect((await fetch(`${base}/api/agents`, { method: "POST" })).status).toBe(401);
+			expect((await fetch(`${base}/api/agents/${AGENT_ID}/retry`, { method: "POST" })).status).toBe(
+				401,
+			);
+			expect(
+				(await fetch(`${base}/api/agents/${AGENT_ID}/retire`, { method: "POST" })).status,
+			).toBe(401);
+			expect(
+				(await fetch(`${base}/api/agents/${AGENT_ID}/restore`, { method: "POST" })).status,
+			).toBe(401);
+			expect((await fetch(`${base}/api/agents/${AGENT_ID}/lifecycle`)).status).toBe(401);
+			expect((await fetch(`${base}/api/agents/${AGENT_ID}/channels`)).status).toBe(401);
+			expect(
+				(await fetch(`${base}/api/agents/${AGENT_ID}/channels/revoke`, { method: "POST" })).status,
+			).toBe(401);
+		});
+
+		it("403s create and retire missing the CSRF header or carrying a foreign Origin", async () => {
+			const { base } = await withServer();
+			const session = await signIn(base);
+			const body = {
+				idempotencyKey: randomUUID(),
+				id: "console-csrf-guard",
+				displayName: "Csrf Guard",
+				allowedChannels: [],
+				rolePrompt: "x",
+			};
+
+			const missingCsrf = await fetch(`${base}/api/agents`, {
+				method: "POST",
+				headers: { cookie: session.cookie, origin: ORIGIN, "content-type": "application/json" },
+				body: JSON.stringify(body),
+			});
+			expect(missingCsrf.status).toBe(403);
+
+			const foreignOrigin = await postJson(base, "/api/agents", session, body, {
+				origin: FOREIGN_ORIGIN,
+			});
+			expect(foreignOrigin.status).toBe(403);
+
+			const retireMissingCsrf = await fetch(`${base}/api/agents/${AGENT_ID}/retire`, {
+				method: "POST",
+				headers: { cookie: session.cookie, origin: ORIGIN, "content-type": "application/json" },
+				body: JSON.stringify({ idempotencyKey: randomUUID() }),
+			});
+			expect(retireMissingCsrf.status).toBe(403);
+		});
+
+		it("422s a create whose agent id already exists", async () => {
+			const { base } = await withServer();
+			const session = await signIn(base);
+			const res = await postJson(base, "/api/agents", session, {
+				idempotencyKey: randomUUID(),
+				id: AGENT_ID,
+				displayName: "Duplicate",
+				allowedChannels: [],
+				rolePrompt: "x",
+			});
+			expect(res.status).toBe(422);
+			expect(res.body.problems).toEqual(expect.any(Array));
+		});
+
+		it("retires and restores a lifecycle-created agent, through a retry of a simulated permanent failure", async () => {
+			const { base } = await withServer();
+			const session = await signIn(base);
+			const created = await createLifecycleAgent(base, session, "console-retire-restore");
+			await markProvisioning(gateway.deps(), created.operationId, "test");
+			await completeOperation(gateway.deps(), created.operationId, "test");
+
+			const retireKey = randomUUID();
+			const retire = await postJson(base, `/api/agents/${created.agentId}/retire`, session, {
+				idempotencyKey: retireKey,
+			});
+			expect(retire.status).toBe(200);
+
+			// Idempotent replay of the retire itself: the same key replays the same operation,
+			// never cancelling its (already cancelled) jobs or auditing its own cleanup again.
+			const retireReplay = await postJson(base, `/api/agents/${created.agentId}/retire`, session, {
+				idempotencyKey: retireKey,
+			});
+			expect(retireReplay.status).toBe(200);
+			expect(retireReplay.body.operationId).toBe(retire.body.operationId);
+
+			const [retiring] = (
+				await gateway.pool.query<{ status: string }>(
+					"select status from agent_lifecycle where agent_id = $1",
+					[created.agentId],
+				)
+			).rows;
+			expect(retiring?.status).toBe("retiring");
+
+			// A simulated permanent failure of the retire's own cleanup.
+			await markProvisioning(gateway.deps(), retire.body.operationId as string, "test");
+			await failOperation(
+				gateway.deps(),
+				retire.body.operationId as string,
+				"test",
+				"the admin token was rejected",
+			);
+
+			const lifecycleState = await getJson(
+				base,
+				`/api/agents/${created.agentId}/lifecycle`,
+				session.cookie,
+			);
+			expect(lifecycleState.status).toBe(200);
+			expect(lifecycleState.body.status).toBe("retiring");
+			expect(lifecycleState.body.lastError).toContain("admin token was rejected");
+			expect((lifecycleState.body.operations as JsonBody[])[0]).toMatchObject({
+				kind: "retire",
+				state: "failed",
+			});
+
+			const retry = await postJson(base, `/api/agents/${created.agentId}/retry`, session, {
+				idempotencyKey: randomUUID(),
+			});
+			expect(retry.status).toBe(200);
+			expect(retry.body.kind).toBe("retire");
+
+			await markProvisioning(gateway.deps(), retry.body.operationId as string, "test");
+			await completeOperation(gateway.deps(), retry.body.operationId as string, "test");
+
+			const [retired] = (
+				await gateway.pool.query<{ status: string }>(
+					"select status from agent_lifecycle where agent_id = $1",
+					[created.agentId],
+				)
+			).rows;
+			expect(retired?.status).toBe("retired");
+
+			const restore = await postJson(base, `/api/agents/${created.agentId}/restore`, session, {
+				idempotencyKey: randomUUID(),
+			});
+			expect(restore.status).toBe(200);
+			const [restored] = (
+				await gateway.pool.query<{ status: string }>(
+					"select status from agent_lifecycle where agent_id = $1",
+					[created.agentId],
+				)
+			).rows;
+			expect(restored?.status).toBe("pending");
+		});
+
+		it("redacts a secret-looking failure before it ever reaches the lifecycle route's JSON body", async () => {
+			const { base } = await withServer();
+			const session = await signIn(base);
+			const created = await createLifecycleAgent(base, session, "console-redaction");
+			await markProvisioning(gateway.deps(), created.operationId, "test");
+			await failOperation(
+				gateway.deps(),
+				created.operationId,
+				"test",
+				"bot creation failed: Authorization: Bearer abcdefghijklmnopqrstuvwxyz",
+			);
+
+			const res = await getJson(base, `/api/agents/${created.agentId}/lifecycle`, session.cookie);
+			expect(res.status).toBe(200);
+			expect(JSON.stringify(res.body)).not.toContain("abcdefghijklmnopqrstuvwxyz");
+		});
+
+		it("422s retiring the organization's finance agent without reassigning the role", async () => {
+			const { base } = await withServer();
+			const session = await signIn(base);
+			const res = await postJson(base, "/api/agents/finance/retire", session, {
+				idempotencyKey: randomUUID(),
+			});
+			expect(res.status).toBe(422);
+			expect(res.body.problems).toEqual(
+				expect.arrayContaining([expect.stringContaining("reassignFinanceTo")]),
+			);
+		});
+
+		it("422s restoring an agent that is not retired", async () => {
+			const { base } = await withServer();
+			const session = await signIn(base);
+			const created = await createLifecycleAgent(base, session, "console-restore-guard");
+			const res = await postJson(base, `/api/agents/${created.agentId}/restore`, session, {
+				idempotencyKey: randomUUID(),
+			});
+			expect(res.status).toBe(422);
+		});
+
+		it("422s retrying an agent whose current operation has not actually failed", async () => {
+			const { base } = await withServer();
+			const session = await signIn(base);
+			const created = await createLifecycleAgent(base, session, "console-retry-guard");
+			const res = await postJson(base, `/api/agents/${created.agentId}/retry`, session, {
+				idempotencyKey: randomUUID(),
+			});
+			expect(res.status).toBe(422);
+		});
+
+		it("lists an agent's channels with provenance, configured and granted alike", async () => {
+			const { base } = await withServer();
+			const session = await signIn(base);
+			const created = await createLifecycleAgent(base, session, "console-channels", ["hq"]);
+
+			const res = await getJson(base, `/api/agents/${created.agentId}/channels`, session.cookie);
+			expect(res.status).toBe(200);
+			const channels = res.body.channels as JsonBody[];
+			expect(channels).toEqual([
+				expect.objectContaining({ channelName: "hq", provenance: "configured" }),
+			]);
+
+			// A direct grant (an owner adding the bot to a channel outside its configured list, ADR-022).
+			await setAgentBotUser(gateway.deps(), created.agentId, IDS.owner, "test");
+			const granted = await grantChannel(gateway.deps(), {
+				agentId: created.agentId,
+				botUserId: IDS.owner,
+				teamId: IDS.channel("team"),
+				channelId: IDS.channel("research"),
+				channelName: "research",
+				grantorUserId: IDS.owner,
+				evidencePostId: "p".repeat(26),
+				sinceMs: Date.now(),
+			});
+			expect(granted).toBe(true);
+
+			const afterGrant = await getJson(
+				base,
+				`/api/agents/${created.agentId}/channels`,
+				session.cookie,
+			);
+			const names = (afterGrant.body.channels as JsonBody[]).map((c) => c.channelName).sort();
+			expect(names).toEqual(["hq", "research"]);
+
+			const revoke = await postJson(
+				base,
+				`/api/agents/${created.agentId}/channels/revoke`,
+				session,
+				{ channelId: IDS.channel("research") },
+			);
+			expect(revoke.status).toBe(200);
+			expect(revoke.body.channelName).toBe("research");
+
+			const afterRevoke = await getJson(
+				base,
+				`/api/agents/${created.agentId}/channels`,
+				session.cookie,
+			);
+			expect((afterRevoke.body.channels as JsonBody[]).map((c) => c.channelName)).toEqual(["hq"]);
+		});
+
+		it("revoking a channel nothing was ever granted for is a no-op, not an error", async () => {
+			const { base } = await withServer();
+			const session = await signIn(base);
+			const res = await postJson(base, `/api/agents/${AGENT_ID}/channels/revoke`, session, {
+				channelId: IDS.channel("never-granted"),
+			});
+			expect(res.status).toBe(200);
+			expect(res.body.channelName).toBeNull();
 		});
 	});
 });

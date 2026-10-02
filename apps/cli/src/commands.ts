@@ -7,8 +7,10 @@ import {
 	CONSOLE_PASSWORD_HASH_SECRET_FILE,
 	GatewayEventSchema,
 	GmailMailboxIdSchema,
+	MATTERMOST_ADMIN_TOKEN_SECRET_FILE,
 	MattermostIdSchema,
 	QUEUES,
+	type RequestAgentCreateInput,
 	RuntimeAdapterIdSchema,
 	reportQueue,
 	runDeadLetterQueue,
@@ -29,17 +31,20 @@ import {
 	configBundleProblems,
 	configHistoryNeedsBackfill,
 	decideMemory,
+	ensureAgentLifecycleAdoption,
 	ensureConfigHistory,
 	ingestEvent,
 	killAll,
 	listAgents,
 	listApprovals,
 	listGmailMailboxes,
+	listLifecycleOperations,
 	listMemory,
 	listOutbox,
 	listRuns,
 	listToolActions,
 	listWaits,
+	loadAgentChannelAssignments,
 	MAINTENANCE_STALE_MS,
 	MEMORY_REVIEW_STATUSES,
 	pauseAgent,
@@ -47,8 +52,13 @@ import {
 	redriveOutbox,
 	redriveRun,
 	releaseKillSwitch,
+	requestAgentCreate,
+	requestAgentRestore,
+	requestAgentRetire,
+	requestOperationRetry,
 	resetGmailMailbox,
 	resumeAgent,
+	revokeChannelGrant,
 	runtimeHealth,
 	setAgentEnabled,
 	setDirectoryEntry,
@@ -67,6 +77,8 @@ import {
 	holdDeploymentLock,
 	loadLocalSchema,
 	migrateSchema,
+	OUTBOX_STATUSES,
+	type OutboxStatus,
 	readSchemaState,
 	schemaCompatibility,
 } from "@agent-gateway/db";
@@ -80,6 +92,7 @@ import {
 import { runtimeDoctor } from "@agent-gateway/runtime-sdk";
 import {
 	intSetting,
+	readOptionalFileSetting,
 	readSetting,
 	requireSetting,
 	resolveSecretPath,
@@ -96,14 +109,19 @@ import {
 	configImport,
 	configRollback,
 } from "./config-commands.ts";
-import { loadConfigDirectory } from "./config-files.ts";
+import { loadConfigDirectory, readPromptFile } from "./config-files.ts";
 import {
 	consolePasswordSet,
 	nodeHiddenReader,
 	revokeConsoleSessionsAfterRotation,
 } from "./console-commands.ts";
 import { gmailAuthorize } from "./gmail-commands.ts";
-import { mattermostBootstrap, mattermostReconcile } from "./mattermost-commands.ts";
+import {
+	mattermostAdminTokenRotate,
+	mattermostAdminTokenSet,
+	mattermostBootstrap,
+	mattermostReconcile,
+} from "./mattermost-commands.ts";
 
 export class UsageError extends Error {
 	constructor(message: string) {
@@ -166,6 +184,32 @@ export const USAGE = `gateway <command>
                                       recommitting its own content alone is a no-op
   directory set <channel|user|team> <name> <mattermost-id>
   agents list | show <id> | enable <id> | disable <id> | pause <id> | resume <id>
+  agents create <id> --display-name <name> --role-prompt-file <prompts/....md>
+                [--channel <name>]... [--root .] [--runtime <adapter>] [--model <id>]
+                                      provision a new agent's Mattermost bot automatically (no
+                                      bootstrap needed): commits its configuration and starts the
+                                      lifecycle provisioner, which creates the bot, its token and
+                                      its channel memberships; 'agents operations' follows along
+  agents operations [--agent <id>]    lifecycle operations (create/retire/restore/reprovision),
+                                      newest first: state, checkpoints and error, if any
+  agents retire <id> [--reason <text>] [--reassign-finance-to <id>]
+                                      cancels its runs/waits/approvals, revokes its channel
+                                      grants, blocks its pending deliveries, then asks the
+                                      provisioner to deactivate its bot; refused for the
+                                      organization's finance agent without --reassign-finance-to
+  agents restore <id> [--make-finance-agent]
+                                      re-adds a retired agent's last configuration (pending ->
+                                      provisioning again); the provisioner re-enables its bot.
+                                      A former finance agent's permissions are normalized unless
+                                      --make-finance-agent reassigns the role back to it atomically
+  agents retry <id>                   queues a fresh attempt of a failed create/restore/
+                                      reprovision operation, or a retiring agent's own failed
+                                      retire cleanup; carries forward whatever it already
+                                      checkpointed, so a completed step is not repeated
+  agents channels <id>                its channels with provenance: configured vs granted
+                                      (by whom, when, evidence post) vs member-unauthorized
+  agents revoke-grant <id> <channel>  revokes a channel an owner or admin granted the agent's bot
+                                      directly; the bot is removed from it (provisioner/listener)
   runtimes list                       worker availability and runtime versions per adapter
   runs list [--agent <id>] | show <run-id> | cancel <run-id> | redrive <run-id>
   waits list
@@ -187,6 +231,16 @@ export const USAGE = `gateway <command>
                                       MATTERMOST_URL and a temporary MATTERMOST_ADMIN_TOKEN)
   mattermost reconcile [--secrets-dir <dir>]
                                       check tokens, bot accounts and memberships
+  mattermost admin-token set [--secrets-dir <dir>]
+                                      hidden entry: store a personal access token of a dedicated,
+                                      non-bot Mattermost system-admin account (validated: must
+                                      have the 'system_admin' role) for the lifecycle provisioner
+                                      to create agent bots with, without a temporary admin token
+  mattermost admin-token rotate [--secrets-dir <dir>]
+                                      create-verify-switch-revoke: issue a new personal access
+                                      token for the same account, verify it, switch to it, then
+                                      revoke every other token on the account (do this every 90
+                                      days; needs MATTERMOST_URL and the current admin token)
   gmail authorize --out <file> [--port <n>] [--pubsub]
                                       consent for the Gmail connector (read mail; --pubsub also
                                       pulls its notifications); stores the refresh token in
@@ -238,6 +292,86 @@ function flag(args: Readonly<string[]>, name: string): string | null {
 		throw new UsageError(`--${name} needs a value`);
 	}
 	return value;
+}
+
+/** `gateway outbox list --status <status>`'s own validation: `null` for no flag at all, the
+ * matching status otherwise, refusing anything not in {@link OUTBOX_STATUSES} — kept in sync with
+ * that shared, authoritative list (the same one the database's own check constraint enforces,
+ * `@agent-gateway/db`) rather than a second, separately maintained one that can drift from it and
+ * silently refuse a real status (`cancelled`, added for a retired agent's own blocked deliveries,
+ * ADR-026). Exported so this one rule is tested without a database. */
+export function parseOutboxStatusFlag(status: string | null): OutboxStatus | null {
+	const valid = OUTBOX_STATUSES.find((candidate) => candidate === status);
+	if (status !== null && valid === undefined) {
+		throw new UsageError(`--status must be one of ${OUTBOX_STATUSES.join(", ")}`);
+	}
+	return valid ?? null;
+}
+
+/** Every value of a flag given more than once (`--channel hq --channel research`), in order. */
+function flagsAll(args: Readonly<string[]>, name: string): Readonly<string[]> {
+	const values: string[] = [];
+	for (const [index, token] of args.entries()) {
+		if (token === `--${name}`) {
+			const value = args[index + 1];
+			if (value === undefined || value.startsWith("--")) {
+				throw new UsageError(`--${name} needs a value`);
+			}
+			values.push(value);
+		}
+	}
+	return values;
+}
+
+/**
+ * `gateway agents create`'s own arguments, turned into a `requestAgentCreate` input: reads the
+ * role prompt file (a `prompts/<...>.md` path, relative to `root`) and assembles the rest from
+ * flags, leaving `mattermost.token_secret_file`, `runtime` and `permissions` for the service to
+ * default — `permissions` in particular needs the active organization's `finance_agent_id`
+ * (`defaultAgentPermissions`, `config-bundle.ts`) to know whether the new agent must deny
+ * `finance.*`, which this builder has no database access to read. No database or network access
+ * otherwise, so a test can call it directly with a `root` of its own.
+ */
+export function buildAgentCreateRequest(
+	args: Readonly<string[]>,
+	root: string,
+	actor: string,
+): RequestAgentCreateInput {
+	const id = arg(args, 2, "id");
+	const displayName = flag(args, "display-name");
+	if (displayName === null) {
+		throw new UsageError("missing --display-name <name>");
+	}
+	const rolePromptFile = flag(args, "role-prompt-file");
+	if (rolePromptFile === null) {
+		throw new UsageError(
+			"missing --role-prompt-file <path> (a 'prompts/<...>.md' path, relative to --root)",
+		);
+	}
+	const runtimeFlag = flag(args, "runtime");
+	const modelFlag = flag(args, "model");
+	const runtime =
+		runtimeFlag === null && modelFlag === null
+			? undefined
+			: {
+					...(runtimeFlag === null ? {} : { adapter: RuntimeAdapterIdSchema.parse(runtimeFlag) }),
+					...(modelFlag === null ? {} : { model: modelFlag }),
+				};
+	return {
+		agent: {
+			id,
+			display_name: displayName,
+			mattermost: { username: id, allowed_channels: [...flagsAll(args, "channel")] },
+			...(runtime === undefined ? {} : { runtime }),
+			prompts: { role_file: rolePromptFile },
+			wake_rules: [{ event_type: "mattermost.agent.mentioned", target_agent_id: id }],
+			concurrency: { while_running: "enqueue" },
+			memory: { private_namespace: `agents/${id}`, shared_namespaces: [] },
+		},
+		rolePrompt: readPromptFile(root, rolePromptFile),
+		actor,
+		source: "cli",
+	};
 }
 
 /** Development: every agent on the mock runtime, keeping everything else as configured. */
@@ -318,7 +452,7 @@ async function migrate(out: Output): Promise<void> {
 	}
 }
 
-async function doctor(session: Session, out: Output): Promise<boolean> {
+export async function doctor(session: Session, out: Output): Promise<boolean> {
 	const { pool } = session.deps;
 	const checks: { name: string; ok: boolean; detail: string }[] = [];
 	await pool.query("select 1");
@@ -412,6 +546,65 @@ async function doctor(session: Session, out: Output): Promise<boolean> {
 				held.length === 0
 					? `no hold on ${budgets.day}`
 					: `held on ${budgets.day}: ${held.map((agent) => `@${agent.agentId}`).join(", ")}`,
+		});
+		// The lifecycle provisioner (ADR-026) is idle with no admin token configured: a
+		// `create`/`restore`/`reprovision` operation stays `pending` indefinitely until one is set —
+		// and so does a `retire`, driven by the very same tick (`runProvisionerPass`'s own
+		// `processRetireOperation` loop, gated on the same admin token as `processOperation`).
+		const adminTokenConfigured = readOptionalFileSetting("MATTERMOST_ADMIN_TOKEN") !== undefined;
+		const waiting = await pool.query<{ n: number }>(
+			`select count(*)::int as n from agent_lifecycle_operations
+			  where state in ('pending', 'running')
+			    and kind in ('create', 'restore', 'reprovision', 'retire')`,
+		);
+		const waitingCount = waiting.rows[0]?.n ?? 0;
+		checks.push({
+			name: "mattermost_provisioning",
+			ok: adminTokenConfigured || waitingCount === 0,
+			detail: adminTokenConfigured
+				? `admin token configured; ${waitingCount} operation(s) in progress`
+				: `no Mattermost admin token configured; ${waitingCount} operation(s) waiting ` +
+					"('gateway mattermost admin-token set')",
+		});
+		// An agent's own current operation left `failed`: a stuck `create`/`restore` (the agent
+		// itself `failed`) or `retire` (`retiring` with its own cleanup stuck) already show up as the
+		// agent's own status, but a failed `reprovision` never moves its agent out of `ready`
+		// (ADR-026) — invisible from `gateway agents list` alone, and easy to miss without this,
+		// since nothing else about a `ready` agent says one of its own operations needs attention.
+		const failedLifecycle = await pool.query<{ n: number }>(
+			`select count(*)::int as n
+			   from agent_lifecycle al
+			   join agent_lifecycle_operations op on op.id = al.operation_id
+			  where op.state = 'failed'`,
+		);
+		const failedLifecycleCount = failedLifecycle.rows[0]?.n ?? 0;
+		checks.push({
+			name: "lifecycle_failures",
+			ok: failedLifecycleCount === 0,
+			detail:
+				`${failedLifecycleCount} agent(s) with a failed lifecycle operation` +
+				(failedLifecycleCount === 0 ? "" : " ('gateway agents retry <id>')"),
+		});
+		// A retiring agent's own Mattermost-side cleanup was skipped because a plain bot at its
+		// configured username matched no admin account this Gateway has on record, current or past
+		// (`owner_unverified`, ADR-026): a confirmed, legitimate outcome (the username belongs to a
+		// stranger's bot, or to an account that is not plausibly the Gateway's own plain bot at all),
+		// not an unresolved one — the agent is still correctly `retired` either way, and there is
+		// nothing left to clean up for it. Surfaced for a human look, never failing doctor over it.
+		const ambiguousRetirements = await pool.query<{ n: number }>(
+			`select count(*)::int as n
+			   from agent_lifecycle al
+			   join agent_lifecycle_operations op on op.id = al.operation_id
+			  where op.kind = 'retire' and op.checkpoints ->> 'owner_unverified' = 'true'`,
+		);
+		const ambiguousRetirementCount = ambiguousRetirements.rows[0]?.n ?? 0;
+		checks.push({
+			name: "lifecycle_retire_ownership",
+			ok: true,
+			detail:
+				`${ambiguousRetirementCount} retired agent(s) whose own bot's Mattermost-side cleanup ` +
+				"was skipped because its username belonged to an account this Gateway never created; " +
+				"nothing was left to clean up for them",
 		});
 		// `doctor` never runs `ensureConfigHistory` itself (it is read-only), so right after a
 		// forward upgrade the journal's latest entry can still look exactly as it did before the
@@ -727,6 +920,45 @@ export async function runCommand(args: Readonly<string[]>, out: Output): Promise
 		}
 		return 0;
 	}
+	if (group === "mattermost" && action === "admin-token" && args[2] === "set") {
+		const secretsDirFlag = flag(args, "secrets-dir") ?? readSetting("SECRETS_DIR");
+		const secretsDir = secretsDirFlag === undefined ? undefined : resolve(secretsDirFlag);
+		// A lightweight pool of its own, like `db status`'s own one-off commands: this command needs
+		// the database only to hold the admin-token lock (ADR-026), never a full session.
+		const pool = createPool(requireSetting("DATABASE_URL"), 1);
+		try {
+			await mattermostAdminTokenSet(
+				{
+					baseUrl: requireSetting("MATTERMOST_URL"),
+					secretPath: resolveSecretPath(MATTERMOST_ADMIN_TOKEN_SECRET_FILE, secretsDir),
+					reader: nodeHiddenReader(),
+					pool,
+				},
+				out.print,
+			);
+		} finally {
+			await pool.end();
+		}
+		return 0;
+	}
+	if (group === "mattermost" && action === "admin-token" && args[2] === "rotate") {
+		const secretsDirFlag = flag(args, "secrets-dir") ?? readSetting("SECRETS_DIR");
+		const secretsDir = secretsDirFlag === undefined ? undefined : resolve(secretsDirFlag);
+		const pool = createPool(requireSetting("DATABASE_URL"), 1);
+		try {
+			await mattermostAdminTokenRotate(
+				{
+					baseUrl: requireSetting("MATTERMOST_URL"),
+					secretPath: resolveSecretPath(MATTERMOST_ADMIN_TOKEN_SECRET_FILE, secretsDir),
+					pool,
+				},
+				out.print,
+			);
+		} finally {
+			await pool.end();
+		}
+		return 0;
+	}
 	if (group === "runtime" && action === "doctor") {
 		const adapter = RuntimeAdapterIdSchema.parse(arg(args, 2, "adapter"));
 		const report = await runtimeDoctor(createRuntimeAdapter(adapter), {
@@ -798,6 +1030,8 @@ async function runSessionCommand(
 			// command past this point — not just `config apply` — sees an up-to-date base revision
 			// (a console or `gateway agents enable|disable` reads it through `prepareChange`).
 			await ensureConfigHistory(session.deps, actor());
+			// ADR-026: adopts every configured agent that has no `agent_lifecycle` row yet.
+			await ensureAgentLifecycleAdoption(session.deps, actor());
 		}
 		return await dispatchSessionCommand(session, command, args, out);
 	} finally {
@@ -949,6 +1183,80 @@ async function dispatchSessionCommand(
 		case "agents resume":
 			out.print(await resumeAgent(deps, arg(args, 2, "id"), who));
 			return 0;
+		case "agents create": {
+			const created = await requestAgentCreate(
+				deps,
+				buildAgentCreateRequest(args, resolve(flag(args, "root") ?? "."), who),
+			);
+			out.print(json(created));
+			return 0;
+		}
+		case "agents operations": {
+			const agentFlag = flag(args, "agent");
+			out.print(json(await listLifecycleOperations(deps, agentFlag ?? undefined)));
+			return 0;
+		}
+		case "agents retire": {
+			const agentId = arg(args, 2, "id");
+			const reasonFlag = flag(args, "reason");
+			const reassignFlag = flag(args, "reassign-finance-to");
+			const retired = await requestAgentRetire(deps, {
+				agentId,
+				actor: who,
+				source: "cli",
+				...(reasonFlag === null ? {} : { reason: reasonFlag }),
+				...(reassignFlag === null ? {} : { reassignFinanceTo: reassignFlag }),
+			});
+			await cancelJobs(boss, retired.cancelledJobs);
+			out.print(json(retired));
+			return 0;
+		}
+		case "agents restore":
+			out.print(
+				json(
+					await requestAgentRestore(deps, {
+						agentId: arg(args, 2, "id"),
+						actor: who,
+						source: "cli",
+						...(args.includes("--make-finance-agent") ? { makeFinanceAgent: true } : {}),
+					}),
+				),
+			);
+			return 0;
+		case "agents retry":
+			out.print(
+				json(
+					await requestOperationRetry(deps, {
+						agentId: arg(args, 2, "id"),
+						actor: who,
+						source: "cli",
+					}),
+				),
+			);
+			return 0;
+		case "agents channels":
+			out.print(json(await loadAgentChannelAssignments(deps, arg(args, 2, "id"))));
+			return 0;
+		case "agents revoke-grant": {
+			const agentId = arg(args, 2, "id");
+			const channel = arg(args, 3, "channel");
+			const assignments = await loadAgentChannelAssignments(deps, agentId);
+			const match = assignments.find(
+				(assignment) => assignment.channelName === channel || assignment.channelId === channel,
+			);
+			if (match === undefined) {
+				throw new UsageError(`agent '${agentId}' has no channel '${channel}' to revoke`);
+			}
+			const stillFollowed = await revokeChannelGrant(deps, {
+				agentId,
+				channelId: match.channelId,
+				actor: who,
+			});
+			out.print(
+				json({ channelId: match.channelId, channelName: match.channelName, stillFollowed }),
+			);
+			return 0;
+		}
 		case "runs list":
 			out.print(json(await listRuns(deps, flag(args, "agent"))));
 			return 0;
@@ -1010,13 +1318,7 @@ async function dispatchSessionCommand(
 			return 0;
 		}
 		case "outbox list": {
-			const status = flag(args, "status");
-			const statuses = ["pending", "sending", "sent", "dead"] as const;
-			const valid = statuses.find((s) => s === status);
-			if (status !== null && valid === undefined) {
-				throw new UsageError(`--status must be one of ${statuses.join(", ")}`);
-			}
-			out.print(json(await listOutbox(deps, valid ?? null)));
+			out.print(json(await listOutbox(deps, parseOutboxStatusFlag(flag(args, "status")))));
 			return 0;
 		}
 		case "outbox redrive":

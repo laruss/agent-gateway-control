@@ -2059,3 +2059,140 @@ Deliberate choices here ([ADR-025](docs/adr/025-management-console.md)):
   `useState`, the same the sign-in page already uses) fit better than a new dependency.
 
 Released as 0.5.0 (migrations `0022_console_sessions` and `0023_console_csrf_derived`, both expand; head `0023_console_csrf_derived`, pg-boss schema 42).
+
+## Phase 14 - Agent lifecycle: creation, assignment and retirement
+
+Status: **done** (review closed after round 5, the round limit; its findings and those of a final
+review of the fix commit are fixed and covered by tests)
+
+| Item | State | Evidence |
+|------|-------|----------|
+| `secrets/controller-bots` (mode 0700, owner 10001), mounted read-write into the controller at `/run/bot-secrets`, distinct from the read-only `/run/secrets`; `SecretFileSchema` accepts both mounts | done | `deploy/release/bin/init-home.sh`, `deploy/release/compose.yaml`, `packages/contracts/src/common.ts` |
+| `MATTERMOST_ADMIN_TOKEN_FILE` read from the controller's existing read-only secrets mount; the lifecycle provisioner stays idle with none configured, surfaced by `gateway doctor`'s `mattermost_provisioning` check rather than failing anything | done | `deploy/release/compose.yaml`, `apps/controller/src/agent-provisioner.ts`, `apps/cli/src/commands.ts` |
+| A create request's `mattermost.token_secret_file` is optional; left unset, `requestAgentCreate` generates `/run/bot-secrets/mm_<id>_token` itself — never a path a client chooses | done | `packages/contracts/src/agent-lifecycle.ts`, `packages/core/src/services/agent-lifecycle.ts` (`defaultBotSecretFile`) |
+| The provisioner: a controller loop alongside `reconcile`/`retain` that takes `pending`/`running` `create`/`restore`/`reprovision` operations and drives each one's steps (resolve or create the bot by username, issue and write its token, add it to the team and its configured channels, record its account), checkpointing after every external step and never holding a transaction across a Mattermost call; resumes `running` operations from their checkpoint after a restart | done | `apps/controller/src/agent-provisioner.ts`, `checkpointOperation`/`listPendingLifecycleOperations` in `packages/core/src/services/agent-lifecycle.ts` |
+| Failure classification: a username taken by an account that is not plausibly the Gateway's own, or a rejected/insufficient admin token, fail the operation (`failOperation`, redacted); anything else is retried on the next pass; a lost token response is recovered by revoking every token the bot has that is not the one in its file and issuing a fresh one | done | `apps/controller/src/agent-provisioner.ts` |
+| The provisioning admin account is resolved from its own token (`users/me`) every pass and excluded from routing exactly like the listener bot: a post by it never wakes an agent | done | `packages/core/src/services/store.ts` (`PROVISIONING_ADMIN_DIRECTORY_NAME`), `packages/mattermost/src/normalize.ts` (`admin_post` skip reason) |
+| `gateway mattermost admin-token set` (hidden entry, validates `users/me`: non-bot, `system_admin`) and `admin-token rotate` (create-verify-switch-revoke: a new token for the same account, verified, switched, then every other Gateway-tagged token on the account revoked, never an unrelated one; `set` converts the pasted token into a Gateway-tagged one; both run under the shared Mattermost credential lock) | done | `apps/cli/src/mattermost-commands.ts`, `packages/mattermost/src/client.ts` (`createUserAccessToken` now returns its id too) |
+| `gateway agents create <id> --display-name ... --role-prompt-file ... [--channel ...] [--runtime ...] [--model ...]` (a thin wrapper over `requestAgentCreate`) and `gateway agents operations [--agent <id>]` | done | `apps/cli/src/commands.ts` |
+| `gateway mattermost bootstrap` unchanged; an agent it created keeps its own `/run/secrets/...` token path | done | `apps/cli/src/mattermost-commands.ts` (unchanged) |
+| Retirement cleanup: an active run cancelled, waits cancelled, approvals/tool actions withdrawn (card updated), every channel grant tombstoned, pending outbox deliveries blocked (`cancelled` status), all in the same transaction as `remove_agent`; the finance agent refused without `reassignFinanceTo` | done | `packages/core/src/services/agent-lifecycle.ts` (`requestAgentRetire`), `packages/core/src/services/channel-grants.ts` (`revokeAllActiveGrantsIn`), `packages/db/migrations/0026_outbox_cancelled_status.sql` |
+| Late run/tool reports for a `retiring`/`retired` agent publish no effect, dropped with an audit entry | done | `packages/core/src/services/runs.ts` (`handleRunReport`), `packages/core/src/services/approvals.ts` (`handleToolReport`) |
+| Private memory excluded from `gateway memory list`; shared memory the agent wrote stays | done | `packages/core/src/services/memory.ts` (`retiredPrivateNamespaces`) |
+| The provisioner executes `retire`: every token revoked, the bot deactivated, every channel left, a lifecycle-created agent's own token file removed (never a bootstrap-managed one); `restore` reuses `create`'s own steps unchanged (`ensureBot` already re-enables a disabled bot) | done | `apps/controller/src/agent-provisioner.ts` (`processRetireOperation`) |
+| Assignments read model (`configured`/`granted` provenance) and `gateway agents channels <id>` / `gateway agents revoke-grant <id> <channel>` / `gateway agents retire <id>` / `gateway agents restore <id>` | done | `packages/core/src/services/channel-grants.ts` (`loadAgentChannelAssignments`, `revokeChannelGrant`), `apps/cli/src/commands.ts` |
+| `config apply`'s whole-bundle replace runs the same `/run/bot-secrets/` ownership check and `reprovision` queuing a managed-configuration commit already did | done | `packages/core/src/services/admin.ts` (`applyConfig`) |
+| Queuing a `reprovision` locks affected agents' lifecycle rows before the `agents` table (matching `completeOperation`'s own order); a config edit during a running `reprovision` cancels it and queues a fresh one; the leaving-channels step re-checks grants immediately before each removal | done | `packages/core/src/services/management.ts` (`queueMembershipReprovisioning`, `lockLifecycleRows`), `apps/controller/src/agent-provisioner.ts` |
+| `requestOperationRetry`: refused unless an agent's current operation is actually `failed`; queues a fresh operation of the same kind, carrying its checkpoints forward, never resurrecting the terminal row (the journal stays append-only); the agent returns to `pending` (or stays `retiring`, for a retried retire). `gateway agents retry <id>` is its CLI surface | done | `packages/core/src/services/agent-lifecycle.ts` (`requestOperationRetry`), `apps/cli/src/commands.ts` |
+| Console management routes for the full lifecycle: `POST /api/agents` (create), `POST /api/agents/:id/{retry,retire,restore}`, `GET /api/agents/:id/lifecycle`, `GET /api/agents/:id/channels`, `POST /api/agents/:id/channels/revoke` — the same session/CSRF/exact-Origin protection and idempotency-key convention `preview`/`commit` already use; `AdminError`/`ManagementConflictError` map to `422`/`409` the same way | done | `apps/controller/src/console-management.ts`, `packages/core/src/services/console-management.ts`, `packages/contracts/src/console-management.ts` |
+| Console UI: a "New agent" dialog (id, display name, channels, role prompt, a runtime adapter/model picker restricted to adapters with a ready worker); a lifecycle status badge and live progress (polled checkpoints) on the agent page; Retry next to an actionable failure message; a Retire confirmation requiring a finance reassignment when applicable and warning (not blocking) for a system-flagged agent; Restore for a retired agent (which stays listed, filterable, specifically so Restore is reachable, falling back to a read-only lifecycle view since it has no editable configuration); a channel assignments view (configured/granted, with provenance) with a Revoke action | done | `apps/console/src/routes/agents-list-page.tsx`, `apps/console/src/routes/agents-list/new-agent-dialog.tsx`, `apps/console/src/routes/agent-detail/{lifecycle-panel,retire-dialog,retired-agent-view,channel-assignments}.tsx` |
+
+Acceptance:
+
+- [x] Each provisioning step is idempotent and checkpointed; a fake-client unit suite covers
+  resuming after a failure following each step without duplicating work, a lost token response
+  (the old token revoked, a new one written), a username taken by a non-Gateway account (permanent
+  failure), no admin token configured (idle, surfaced by doctor), and that no secret ever reaches
+  a log or a stored error (the existing redaction helpers).
+- [x] Retiring an agent and completing one of its operations concurrently, many times over, never
+  deadlocks (Postgres 40P01): `lockCurrentOperation` locks the agent's lifecycle row before its
+  operation row, the same order `requestAgentRetire` already took.
+- [x] Against a real, dev Mattermost 11.7 server: `requestAgentCreate` through to a `ready`
+  agent — the provisioner creates its bot, token and memberships without any bootstrap run — and a
+  mention in a channel wakes it (mock runtime), its reply posted by the newly created bot.
+  `admin-token rotate` leaves the old token rejected and the new one working.
+- [x] CLI integration coverage of `agents create`/`agents operations`, and `admin-token set`
+  refusing a bot token or a non-admin account.
+- [x] Retiring an agent mid-queue, mid-run, with a pending wait, a pending approval and a pending
+  outbox item each cancels or blocks its own kind, auditing every one; a late run report after
+  retire publishes nothing; the finance agent's retirement is refused without `reassignFinanceTo`
+  and succeeds with it; a grant revoked on retire stays revoked even after the bot is re-added to
+  the channel.
+- [x] Against a real, dev Mattermost server: create through to `ready`, then retire — the bot is
+  deactivated, removed from its channels, its token rejected by the server; restore brings it back
+  to working.
+- [x] A fake-client provisioner suite covers `retire`'s own steps resuming from each checkpoint,
+  and a permanent failure leaving the agent `retiring` with `last_error`.
+- [x] A concurrent config edit and a running `reprovision` operation never deadlock and never lose
+  the edit: the edit either rides an operation still `pending`, or cancels one already `running` and
+  queues a fresh one that reads the edited configuration.
+- [x] Core integration coverage of `requestOperationRetry`: retry after a failed create completes
+  (reaching `ready`); retry of a failed retire completes (reaching `retired`, agent stays
+  `retiring` throughout); retry carries a failed operation's own checkpoints forward; refused for
+  an agent whose current operation is not actually failed, or with no lifecycle record at all; a
+  repeat with the same idempotency key replays rather than queuing a second operation.
+- [x] Controller integration coverage of every new console route: auth required (`401`), CSRF and
+  exact-Origin required on every mutation (`403`), `422` for a business-rule refusal (a duplicate
+  create id, retiring the finance agent without reassigning it, restoring/retrying an agent not in
+  the right state), an idempotent replay of create and of retire, and a secret-looking failure
+  message never reaching the lifecycle route's JSON body.
+- [x] Console unit coverage: the "New agent" dialog's own validation (id format, required fields)
+  and submission; the lifecycle panel's progress rendering from `pending`/`failed` operation
+  states and its Retry action; the retire dialog's required finance reassignment and its
+  non-blocking system-agent warning.
+- [x] Against a real, dev Mattermost server, through the console's own HTTP routes (no manual
+  YAML/bootstrap/reconcile): signing in, creating an agent, through to `ready`; a mention wakes it
+  and its own newly created bot replies; retiring it deactivates the bot. A separately simulated
+  permanent failure retried through the console's own retry route completes against the real
+  server.
+
+Deliberate choices here ([ADR-026](docs/adr/026-agent-lifecycle.md)):
+
+- The provisioner reuses `ensureBot`'s existing semantics (refuse a non-bot account or one with
+  elevated roles) rather than tracking "which bot did the Gateway itself create": Mattermost's API
+  gives no way to ask a bot account who made it, and a lifecycle-created agent's username is
+  already reserved in the Gateway's own database before any Mattermost call happens, so a plain bot
+  already there under that exact name is, in practice, the provisioner's own earlier attempt.
+- Team and channel resolution is not duplicated here: `allowed_channels` is already validated as a
+  subset of `organization.mattermost.channels`, so the provisioner only reads the directory entries
+  bootstrap (or an earlier provisioner pass) already resolved, waiting rather than failing when one
+  is not there yet.
+- A retry queues a fresh operation rather than resetting the failed row in place: the operation
+  journal's own append-only guard (migration 0025) only ever lets `state` move forward, so a
+  terminal row can never become `pending` again — the same reason a superseded `create`/`restore`
+  is cancelled and replaced rather than rewound.
+- `secrets/controller-bots` needs no change to `backup.sh`/`restore.sh`: both already archive and
+  restore the whole of `$GATEWAY_HOME` (minus `backups/` itself), so the new directory is included
+  and restored automatically, the same as every other secrets directory.
+- Retirement's channel-removal order follows `bootstrapMattermost`'s own retirement of a replaced
+  bot: tokens revoked and the bot deactivated *before* any channel is left, so a crash partway
+  through the (purely cosmetic, from that point on) channel list leaves no working access behind.
+- Restore needed no new provisioner code at all: `create`/`restore` already share one path through
+  the provisioner, and `ensureBot` already re-enabled a disabled bot it finds by username before
+  this phase: a restored agent is, to that function, indistinguishable from an existing bot
+  bootstrap would adopt.
+- The assignments read model's third provenance, `member-unauthorized`, is live-only (what
+  Mattermost itself currently reports) and so is not part of `loadAgentChannelAssignments`, which
+  reads only the database, or of the console's own `GET /api/agents/:id/channels`: a live check
+  against Mattermost itself is `gateway mattermost reconcile`'s own job, not this read model's.
+- `gateway agents revoke-grant` queues a `reprovision` for a lifecycle-owned, `ready` agent so the
+  bot's removal does not wait for an unrelated configuration change; a bootstrap-managed agent has
+  no such operation, and is left to the membership synchronizer's own next pass (seconds away),
+  which already removes a bot from a channel it has neither a grant nor a configuration entry for.
+
+Not yet released; see the Changelog's `[Unreleased]` section.
+
+### Phase 14 review log
+
+- Per-change reviews (Codex) while building: retirement cleanup (1 P1 + 2 P2: bot identity
+  recovery, restore of bootstrap-managed tokens, retention of cancelled deliveries) and the
+  console lifecycle (4 P2: polling, retired view, retry replay, finance choices) — fixed.
+- Round 1 (Codex + Opus subagent): Codex 1 P1 + 5 P2, Opus 2 P2 + 5 P3. Fixed: channel edits
+  during provisioning, team changes, restoring a former finance agent, failed reprovisions
+  stopping an agent, config writes dropping lifecycle agents, doctor and audit noise, adopting a
+  foreign bot, rotation revoking unrelated tokens.
+- Round 2: Codex 1 P1 + 4 P2, Opus 3 P2 + 3 P3. Fixed: retire recovery touching a foreign bot,
+  a completion fence for configuration changes, permission-preserving restore, failed
+  reprovisions visible in the console and doctor, tagged admin tokens, retry provenance
+  (migration `0027_lifecycle_retry_of`).
+- Round 3: Codex 2 P1 + 2 P2, Opus 3 P2 + 3 P3. Fixed: membership now converges from live
+  Mattermost state every pass (teams and channels), elevated membership roles demoted, retired
+  agents cannot be re-added outside restore, bounded checkpoints, earlier admin owners.
+- Round 4: Codex 1 P1 + 5 P2, Opus 5 P3. Fixed: cross-process provisioning and admin-token
+  locks, bootstrap leaving lifecycle retirees alone, immutable lifecycle token paths, admin
+  history on create resume, checkpoint bounds, shared config guards, a team-leave e2e test.
+- Round 5: Codex 1 P1 + 2 P2, Opus 1 P2 + 2 P3. Fixed: one lock for every Mattermost credential
+  writer (provisioner, bootstrap, admin-token), the token read under it, a 401 after a token
+  swap retried rather than failed, lifecycle refreshed after a revoke.
+- Final review of the fix commit: 2 P2 (bootstrap's token read under the lock, a connection whose
+  credential unlock failed is discarded) — fixed.

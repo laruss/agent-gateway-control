@@ -1,8 +1,15 @@
-import type { AgentPatch, ConsoleAgentDetailResponse } from "@agent-gateway/contracts";
+import type {
+	AgentPatch,
+	ConsoleAgentDetailResponse,
+	ConsoleAgentLifecycleResponse,
+	ConsoleAgentListResponse,
+} from "@agent-gateway/contracts";
+import { useQueryClient } from "@tanstack/react-query";
 import { AlertCircle } from "lucide-react";
 import * as React from "react";
 import { useNavigate, useParams } from "react-router";
 import { toast } from "sonner";
+import { LifecycleStatusBadge } from "@/components/lifecycle-badge";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
 	AlertDialog,
@@ -18,13 +25,17 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { ApiError, fetchAgentDetail, fetchAgentsList } from "@/lib/api-client";
+import { useAgentLifecycle } from "@/hooks/use-agent-lifecycle";
+import { ApiError, fetchAgentDetail, fetchAgentLifecycle, fetchAgentsList } from "@/lib/api-client";
 import { AssignmentsTab } from "./agent-detail/assignments-tab.tsx";
 import { HistoryTab } from "./agent-detail/history-tab.tsx";
 import { InstructionsTab } from "./agent-detail/instructions-tab.tsx";
+import { LifecyclePanel } from "./agent-detail/lifecycle-panel.tsx";
 import { OverviewTab } from "./agent-detail/overview-tab.tsx";
 import { PermissionsTab } from "./agent-detail/permissions-tab.tsx";
 import { clearAppliedFields, rebaseDraft } from "./agent-detail/rebase-draft.ts";
+import { RetireAgentDialog } from "./agent-detail/retire-dialog.tsx";
+import { RetiredAgentView } from "./agent-detail/retired-agent-view.tsx";
 import { ReviewChangesDialog } from "./agent-detail/review-dialog.tsx";
 import { RuntimeTab } from "./agent-detail/runtime-tab.tsx";
 import type { AgentDetailTabProps } from "./agent-detail/types.ts";
@@ -36,7 +47,27 @@ type LoadState =
 			status: "ok";
 			detail: ConsoleAgentDetailResponse;
 			knownAgentIds: Readonly<string[]>;
-	  }>;
+			/** `knownAgentIds` narrowed to agents still active in the configuration
+			 * (`activeRevisionId` non-null): the choices `requestAgentRetire`'s own
+			 * `reassignFinanceTo` can actually accept — it rejects a retiring or already-retired one
+			 * (see `GET /api/agents`'s own `ConsoleAgentListItem.activeRevisionId`). */
+			activeAgentIds: Readonly<string[]>;
+	  }>
+	| Readonly<{ status: "retired"; lifecycle: ConsoleAgentLifecycleResponse }>;
+
+/** Agents still active in the configuration snapshot, for a reassignment select whose target
+ * `requestAgentRetire` would actually accept — never a retiring or already-retired one. */
+function activeAgentIdsOf(agents: ConsoleAgentListResponse["agents"]): Readonly<string[]> {
+	return agents.filter((agent) => agent.activeRevisionId !== null).map((agent) => agent.id);
+}
+
+/** A retiring or retired agent's lifecycle status, naming exactly the two states
+ * {@link RetiredAgentView} knows how to render — any other status reaching a `404` here is an
+ * unrelated retained-but-invalid row (ADR-024's own disable-with-fallback case), which stays a
+ * plain "not found" rather than a misleading retired view. */
+function isRetiredStatus(status: string): boolean {
+	return status === "retiring" || status === "retired";
+}
 
 /**
  * The agent editor (ADR-025): loads the agent's current configuration, accumulates edits in a
@@ -49,9 +80,15 @@ type LoadState =
 export function AgentDetailPage(): React.ReactElement {
 	const { agentId } = useParams<{ agentId: string }>();
 	const navigate = useNavigate();
+	const queryClient = useQueryClient();
+	// Called unconditionally, before any of this page's own early returns below (Rules of Hooks):
+	// its query key is shared with `LifecyclePanel`'s own instance of this same hook, so the two
+	// never fetch or poll independently of each other.
+	const lifecycle = useAgentLifecycle(agentId);
 	const [state, setState] = React.useState<LoadState>({ status: "loading" });
 	const [draft, setDraft] = React.useState<AgentPatch>({});
 	const [reviewOpen, setReviewOpen] = React.useState(false);
+	const [retireOpen, setRetireOpen] = React.useState(false);
 	const [confirmLeaveOpen, setConfirmLeaveOpen] = React.useState(false);
 
 	const load = React.useCallback(async () => {
@@ -61,8 +98,24 @@ export function AgentDetailPage(): React.ReactElement {
 		setState({ status: "loading" });
 		try {
 			const [detail, agents] = await Promise.all([fetchAgentDetail(agentId), fetchAgentsList()]);
-			setState({ status: "ok", detail, knownAgentIds: agents.agents.map((a) => a.id) });
+			setState({
+				status: "ok",
+				detail,
+				knownAgentIds: agents.agents.map((a) => a.id),
+				activeAgentIds: activeAgentIdsOf(agents.agents),
+			});
 		} catch (error) {
+			if (error instanceof ApiError && error.status === 404) {
+				// Outside the active configuration snapshot `consoleShowAgent` reads from: a
+				// retiring/retired agent still has its own lifecycle row to show (with a Restore
+				// action once it reaches `retired`) — anything else in this state (a disabled,
+				// retained-but-invalid row, ADR-024) stays a plain "not found".
+				const lifecycle = await fetchAgentLifecycle(agentId).catch(() => null);
+				if (lifecycle !== null && isRetiredStatus(lifecycle.status)) {
+					setState({ status: "retired", lifecycle });
+					return;
+				}
+			}
 			setState({
 				status: "error",
 				message:
@@ -92,7 +145,12 @@ export function AgentDetailPage(): React.ReactElement {
 		try {
 			const [detail, agents] = await Promise.all([fetchAgentDetail(agentId), fetchAgentsList()]);
 			const { rebased, discardedFields } = rebaseDraft(previousAgent, detail.agent, draft);
-			setState({ status: "ok", detail, knownAgentIds: agents.agents.map((a) => a.id) });
+			setState({
+				status: "ok",
+				detail,
+				knownAgentIds: agents.agents.map((a) => a.id),
+				activeAgentIds: activeAgentIdsOf(agents.agents),
+			});
 			setDraft(rebased);
 			if (discardedFields.length > 0) {
 				toast.warning(
@@ -159,7 +217,22 @@ export function AgentDetailPage(): React.ReactElement {
 		);
 	}
 
-	const { agent, knownChannels, knownRuntimeAdapters } = state.detail;
+	if (state.status === "retired") {
+		return (
+			<RetiredAgentView
+				agentId={agentId}
+				// The snapshot `load()` captured at 404 time (`state.lifecycle`) is only an initial
+				// fallback, for the moment before `lifecycle`'s own live query (polling per
+				// `useAgentLifecycle`, shared with `LifecyclePanel`) has data of its own: once it does,
+				// its freshest read wins, so a retire finishing (-> `retired`, Restore appearing) or
+				// failing shows up here without the owner having to trigger a reload themselves.
+				lifecycle={lifecycle.data ?? state.lifecycle}
+				onReload={() => void load()}
+			/>
+		);
+	}
+
+	const { agent, knownChannels, knownRuntimeAdapters, financeAgentId } = state.detail;
 	const tabProps: AgentDetailTabProps = {
 		original: agent,
 		draft,
@@ -182,15 +255,23 @@ export function AgentDetailPage(): React.ReactElement {
 					</button>
 					<h1 className="text-lg font-semibold">
 						{agent.displayName} <span className="text-muted-foreground">({agent.id})</span>
+						{lifecycle.data != null && (
+							<LifecycleStatusBadge status={lifecycle.data.status} className="ml-2 align-middle" />
+						)}
 					</h1>
 				</div>
 				<div className="flex items-center gap-2">
 					{hasUnsavedChanges && <Badge variant="outline">Unsaved changes</Badge>}
+					<Button variant="outline" onClick={() => setRetireOpen(true)}>
+						Retire
+					</Button>
 					<Button disabled={!hasUnsavedChanges} onClick={() => setReviewOpen(true)}>
 						Review changes
 					</Button>
 				</div>
 			</div>
+
+			<LifecyclePanel agentId={agent.id} onRetried={() => void load()} />
 
 			<Tabs defaultValue="overview">
 				<TabsList>
@@ -235,7 +316,23 @@ export function AgentDetailPage(): React.ReactElement {
 				onApplied={(_revisionId, appliedPatch) => {
 					setDraft((current) => clearAppliedFields(current, appliedPatch));
 					void load();
+					// A committed `allowedChannels` or `enabled` edit queues a `reprovision` for a
+					// lifecycle-owned, `ready` agent (ADR-026): the lifecycle query may already have
+					// settled on a terminal operation (polling stopped, `shouldPollLifecycle`), so
+					// without this it would never notice the new one, and its progress or failure
+					// would never show.
+					void queryClient.invalidateQueries({ queryKey: ["agent-lifecycle", agentId] });
 				}}
+			/>
+
+			<RetireAgentDialog
+				open={retireOpen}
+				onOpenChange={setRetireOpen}
+				agentId={agent.id}
+				isSystemAgent={agent.permissions.observe_system === true}
+				isFinanceAgent={financeAgentId === agent.id}
+				otherAgentIds={state.activeAgentIds.filter((id) => id !== agent.id)}
+				onRetired={() => void load()}
 			/>
 
 			<AlertDialog open={confirmLeaveOpen} onOpenChange={setConfirmLeaveOpen}>

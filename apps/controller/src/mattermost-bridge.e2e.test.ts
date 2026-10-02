@@ -8,6 +8,7 @@ import {
 	type ControlPlaneDeps,
 	loadConfigGeneration,
 	loadDirectoryEntry,
+	loadLifecycleOwnedAgentIds,
 	loadMattermostIdentity,
 	loadMattermostPlanSource,
 	mattermostBootstrapStore,
@@ -76,6 +77,7 @@ describe("Mattermost bridge against a real server", () => {
 			source.agents,
 			(ref) => resolveSecretPath(ref, secretsDir),
 			source.retired,
+			await loadLifecycleOwnedAgentIds(deps),
 		);
 		await bootstrapMattermost({
 			baseUrl: mm.url,
@@ -791,7 +793,7 @@ describe("Mattermost bridge against a real server", () => {
 				() => true,
 				() => false,
 			);
-		expect(await member(listener)).toBe(true);
+		await eventually(() => member(listener), 30_000, "the listener joined the granted channel");
 		const after = await say("garden", "@research please say hello", { channelId: garden });
 		const event = await eventOf(after);
 		const run = await finishedRun(event.id, "research run in the granted channel");

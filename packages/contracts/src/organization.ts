@@ -104,7 +104,8 @@ export const OrganizationRetentionSchema = z.strictObject({
 	run_content_days: retentionDays(30),
 	/** Payloads of delivered outbox items. */
 	outbox_sent_days: retentionDays(8),
-	/** Payloads of outbox items that could not be delivered. */
+	/** Payloads of outbox items that could not be delivered (`dead`) or were blocked by an agent's
+	 * retirement before they ever went out (`cancelled`): the same age rule retires both. */
 	outbox_dead_days: retentionDays(30),
 	/** Inputs of policy decisions. */
 	policy_input_days: retentionDays(30),

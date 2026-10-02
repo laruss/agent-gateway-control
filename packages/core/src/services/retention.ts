@@ -103,12 +103,15 @@ const STEPS: Readonly<RetentionStep[]> = [
 	},
 	{
 		// Counted from the last attempt, not the creation: an item that died after a long outage
-		// keeps its payload for the whole period, so it can still be redriven.
+		// keeps its payload for the whole period, so it can still be redriven. `cancelled` (an
+		// agent retired with it still undelivered, ADR-026) is never redriven, but it carries the
+		// same payload a `dead` item does and is otherwise forgotten by every other step, so it
+		// ages out on the same rule rather than staying forever.
 		name: "outbox_dead",
 		days: (r) => r.outbox_dead_days,
 		sql: `with batch as (
 			select id from outbox
-			 where content_expired_at is null and status = 'dead'
+			 where content_expired_at is null and status in ('dead', 'cancelled')
 			   and greatest(created_at, next_attempt_at, coalesce(locked_until, created_at)) < $1
 			 order by created_at limit $2 for no key update skip locked)
 			update outbox o set content_expired_at = now(), payload = '{}'::jsonb

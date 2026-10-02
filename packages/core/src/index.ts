@@ -2,6 +2,7 @@ export * from "./channel-access.ts";
 export * from "./outcome.ts";
 export * from "./routing.ts";
 export * from "./services/admin.ts";
+export * from "./services/agent-lifecycle.ts";
 export * from "./services/alerts.ts";
 export {
 	ApprovalCardPendingError,
@@ -23,6 +24,7 @@ export * from "./services/console-sessions.ts";
 export * from "./services/deps.ts";
 export * from "./services/gmail.ts";
 export * from "./services/ingest.ts";
+export * from "./services/lifecycle-guards.ts";
 export * from "./services/management.ts";
 export * from "./services/mattermost-bridge.ts";
 export { decideMemory, listMemory, MEMORY_REVIEW_STATUSES } from "./services/memory.ts";
@@ -35,7 +37,9 @@ export {
 	type ActiveConfig,
 	enqueueOutbox,
 	loadActiveConfig,
+	loadProvisioningAdminUserId,
 	type OutboxDraft,
+	PROVISIONING_ADMIN_DIRECTORY_NAME,
 	raiseAlert,
 } from "./services/store.ts";
 export * from "./services/system-status.ts";

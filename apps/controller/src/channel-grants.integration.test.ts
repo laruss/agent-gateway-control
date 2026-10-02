@@ -7,8 +7,10 @@ import {
 	applyConfig,
 	grantChannel,
 	ingestEvent,
+	loadAgentChannelAssignments,
 	loadMattermostSnapshot,
 	readChannelFloor,
+	recordChannelGrantRevoked,
 	revokeChannelGrant,
 	setAgentBotUser,
 	unneededChannels,
@@ -97,7 +99,9 @@ describe("channel grants", () => {
 	it("counts only the add a grant came from once, and a newer one again", async () => {
 		// The same add again: nothing new, the grant holds.
 		expect(await grant(since)).toBe(true);
-		expect(await revokeChannelGrant(gateway.deps(), "research", LAB, "bot_left")).toBe(false);
+		expect(await recordChannelGrantRevoked(gateway.deps(), "research", LAB, "bot_left")).toBe(
+			false,
+		);
 		expect(await researchChannels()).not.toContain(LAB);
 		expect(await mayPost()).toBe(false);
 		// Nothing needs the channel: its catch-up is gone.
@@ -143,7 +147,7 @@ describe("channel grants", () => {
 				)
 			).rows[0]?.status;
 		await session();
-		await revokeChannelGrant(gateway.deps(), "research", LAB, "bot_left");
+		await recordChannelGrantRevoked(gateway.deps(), "research", LAB, "bot_left");
 		expect(await status()).toBe("revoked");
 		await session();
 		expect(await grant(since + 7000)).toBe(true);
@@ -158,6 +162,91 @@ describe("channel grants", () => {
 		// A stale row keeps nothing followed.
 		expect(await unneededChannels(gateway.deps(), [LAB])).toEqual([LAB]);
 		await setAgentBotUser(gateway.deps(), "research", RESEARCH_BOT, "test");
+	});
+
+	it("revokeChannelGrant (owner-facing) tombstones a grant, audited with the given actor; stale evidence never resurrects it", async () => {
+		const opsReview = IDS.channel("ops-review");
+		const grantedAt = Date.now() - 5000;
+		expect(
+			await grantChannel(gateway.deps(), {
+				agentId: "research",
+				botUserId: RESEARCH_BOT,
+				teamId: IDS.channel("team"),
+				channelId: opsReview,
+				channelName: "ops-review",
+				grantorUserId: IDS.owner,
+				evidencePostId: EVIDENCE,
+				sinceMs: grantedAt,
+			}),
+		).toBe(true);
+		expect(await researchChannels()).toContain(opsReview);
+
+		await revokeChannelGrant(gateway.deps(), {
+			agentId: "research",
+			channelId: opsReview,
+			actor: "owner:test",
+		});
+		expect(await researchChannels()).not.toContain(opsReview);
+		const audited = await gateway.pool.query<{ actor: string }>(
+			"select actor from audit_log where action = 'mattermost.channel.revoked' and subject_id = 'research' order by at desc limit 1",
+		);
+		expect(audited.rows[0]).toMatchObject({ actor: "owner:test" });
+
+		// Re-adding the bot from the same, already-used evidence never silently re-grants it.
+		expect(
+			await grantChannel(gateway.deps(), {
+				agentId: "research",
+				botUserId: RESEARCH_BOT,
+				teamId: IDS.channel("team"),
+				channelId: opsReview,
+				channelName: "ops-review",
+				grantorUserId: IDS.owner,
+				evidencePostId: EVIDENCE,
+				sinceMs: grantedAt,
+			}),
+		).toBe(false);
+		expect(await researchChannels()).not.toContain(opsReview);
+	});
+
+	it("the assignments read model lists configured and granted channels with provenance", async () => {
+		const opsReview2 = IDS.channel("ops-review-2");
+		const grantedAt = Date.now();
+		expect(
+			await grantChannel(gateway.deps(), {
+				agentId: "research",
+				botUserId: RESEARCH_BOT,
+				teamId: IDS.channel("team"),
+				channelId: opsReview2,
+				channelName: "ops-review-2",
+				grantorUserId: IDS.owner,
+				evidencePostId: EVIDENCE,
+				sinceMs: grantedAt,
+			}),
+		).toBe(true);
+
+		const assignments = await loadAgentChannelAssignments(gateway.deps(), "research");
+		const config = exampleConfig();
+		const research = config.agents.find((a) => a.id === "research");
+		for (const name of research?.mattermost.allowed_channels ?? []) {
+			expect(assignments).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({ channelName: name, provenance: "configured" }),
+				]),
+			);
+		}
+		expect(assignments).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					channelId: opsReview2,
+					channelName: "ops-review-2",
+					provenance: "granted",
+					grantedByUserId: IDS.owner,
+					evidencePostId: EVIDENCE,
+				}),
+			]),
+		);
+
+		await recordChannelGrantRevoked(gateway.deps(), "research", opsReview2, "cleanup");
 	});
 
 	it("turns a channel taken out of allowed_channels into a tombstone, not a grant", async () => {

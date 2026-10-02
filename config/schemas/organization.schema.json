@@ -237,7 +237,7 @@
             },
             "token_secret_file": {
               "type": "string",
-              "pattern": "^\\/run\\/secrets\\/[a-z0-9_]+$"
+              "pattern": "^\\/run\\/(?:secrets|bot-secrets)\\/[a-z0-9_]+$"
             }
           },
           "required": ["username", "token_secret_file"],

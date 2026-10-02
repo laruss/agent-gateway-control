@@ -1,5 +1,11 @@
+import { randomUUID } from "node:crypto";
 import {
 	type AgentConfig,
+	type AgentId,
+	type AgentLifecycleOperationKind,
+	type AgentLifecycleOperationState,
+	type AgentLifecycleSource,
+	BOT_SECRET_FILE_PREFIX,
 	type ChangeOperation,
 	type ChangeSet,
 	type ChangeSetInput,
@@ -14,9 +20,16 @@ import {
 	type OrganizationConfig,
 	type TextChange,
 } from "@agent-gateway/contracts";
-import { agents, configRevisions, configSnapshots, gatewayControls } from "@agent-gateway/db";
+import {
+	agentLifecycle,
+	agentLifecycleOperations,
+	agents,
+	configRevisions,
+	configSnapshots,
+	gatewayControls,
+} from "@agent-gateway/db";
 import { canonicalHash } from "@agent-gateway/events";
-import { desc, eq, inArray, or } from "drizzle-orm";
+import { asc, desc, eq, inArray, or } from "drizzle-orm";
 import {
 	AdminError,
 	type ConfigApplyInput,
@@ -28,6 +41,12 @@ import {
 	writeConfigRevisionIn,
 } from "./admin.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
+import {
+	rejectLifecycleOwnedRemovals,
+	rejectLifecycleOwnedTokenPathChanges,
+	rejectRetiredAgentReadditions,
+} from "./lifecycle-guards.ts";
+import { audit, lifecycleOwnedAgentIds } from "./store.ts";
 
 type Db = UnitOfWork["tx"]["db"];
 
@@ -286,6 +305,21 @@ function applyOperation(draft: ConfigDraftBundle, op: ChangeOperation): Operatio
 			const agents = [...draft.agents];
 			agents[index] = { ...current, enabled: op.enabled };
 			return { draft: { ...draft, agents }, problems: [] };
+		}
+		case "set_finance_agent": {
+			if (draft.organization === null) {
+				return { draft, problems: ["set_finance_agent: no organization is configured yet"] };
+			}
+			return {
+				draft: {
+					...draft,
+					organization: {
+						...draft.organization,
+						organization: { ...draft.organization.organization, finance_agent_id: op.agentId },
+					},
+				},
+				problems: [],
+			};
 		}
 	}
 }
@@ -602,7 +636,7 @@ export class ManagementConflictError extends Error {
 }
 
 /** What the commit transaction settled on; a conflict is thrown only once it has committed. */
-type CommitOutcome =
+export type CommitOutcome =
 	| Readonly<{ kind: "committed"; result: CommitChangeResult }>
 	| Readonly<{ kind: "conflict"; currentRevisionId: number | null }>;
 
@@ -670,6 +704,434 @@ function checkCommitChangeInput(
 }
 
 /**
+ * `/run/bot-secrets/` is the lifecycle provisioner's own directory (ADR-026): naming it in
+ * `token_secret_file` is refused for any agent that is not lifecycle-owned (its operation journal
+ * names a `create` or `restore`) or one `trustedAgentIds` names (the lifecycle's own commit of the
+ * very `create` that is about to own it, whose own `agent_lifecycle_operations` row this same
+ * transaction has not written yet). Every other agent naming it — a plain console edit, a CLI
+ * import, a YAML `config apply` — is refused: an operator or a model configuring a token path
+ * under the controller's own read-write directory could otherwise collide with, or silently steal,
+ * a token the provisioner manages.
+ */
+export async function rejectUnownedBotSecretPaths(
+	db: Db,
+	draftAgents: Readonly<AgentConfig[]>,
+	trustedAgentIds: ReadonlySet<AgentId>,
+): Promise<Readonly<string[]>> {
+	const candidates = draftAgents.filter((agent) =>
+		agent.mattermost.token_secret_file.startsWith(BOT_SECRET_FILE_PREFIX),
+	);
+	if (candidates.length === 0) {
+		return [];
+	}
+	const owned = await lifecycleOwnedAgentIds(
+		db,
+		candidates.map((agent) => agent.id),
+	);
+	return candidates
+		.filter((agent) => !trustedAgentIds.has(agent.id) && !owned.has(agent.id))
+		.map(
+			(agent) =>
+				`agent ${agent.id}: token_secret_file '${agent.mattermost.token_secret_file}' is under ` +
+				"the lifecycle provisioner's own directory, but this agent was not created or restored " +
+				"through the lifecycle",
+		);
+}
+
+/** The nearest `AgentLifecycleSource` for a configuration commit's own `ConfigRevisionSource`: a
+ * console edit stays `console`, an agent's own proposal stays `agent`, and every CLI-driven source
+ * this journal has (`cli_apply`, `import`, `rollback`, `backfill`) maps to the lifecycle's own,
+ * narrower `cli` — the reverse of `configRevisionSourceOf` (`agent-lifecycle.ts`). Exported so
+ * every committing path (`commitChangeIn`, `applyConfig`) maps its own source the same way before
+ * queuing a `reprovision`. */
+export function agentLifecycleSourceOf(source: ConfigRevisionSource): AgentLifecycleSource {
+	return source === "console" || source === "agent" ? source : "cli";
+}
+
+/** Whether `a` and `b` name the same channels, regardless of order. */
+function sameChannels(a: Readonly<string[]>, b: Readonly<string[]>): boolean {
+	const setA = new Set(a);
+	const setB = new Set(b);
+	return setA.size === setB.size && [...setA].every((name) => setB.has(name));
+}
+
+type AgentLifecycleRow = typeof agentLifecycle.$inferSelect;
+
+/**
+ * Agent ids (sorted) whose `allowed_channels` differ between `before` and `after`: a config
+ * writer's own candidates for a `reprovision` operation (ADR-026). An agent not present in
+ * `before` (just added) is never a candidate: its own `create` operation already owns joining
+ * every channel it opens with, and one not present in `after` (just removed) is retiring, not
+ * reprovisioning.
+ */
+export function channelsChangedAgentIds(
+	before: Readonly<AgentConfig[]>,
+	after: Readonly<AgentConfig[]>,
+): Readonly<AgentId[]> {
+	const beforeById = new Map(before.map((agent) => [agent.id, agent]));
+	return after
+		.filter((agent) => {
+			const prior = beforeById.get(agent.id);
+			return (
+				prior !== undefined &&
+				!sameChannels(prior.mattermost.allowed_channels, agent.mattermost.allowed_channels)
+			);
+		})
+		.map((agent) => agent.id)
+		.sort();
+}
+
+/**
+ * True when the organization's own Mattermost team just changed: every lifecycle-owned, `ready`
+ * agent's bot needs to join the new team, not only the ones whose own `allowed_channels` also
+ * changed in the same commit (ADR-026) — `null` (nothing active yet) is never a "change", since no
+ * agent can be lifecycle-owned before an organization has ever been committed.
+ */
+function organizationTeamChanged(
+	before: OrganizationConfig | null,
+	after: OrganizationConfig,
+): boolean {
+	return before !== null && before.mattermost.team !== after.mattermost.team;
+}
+
+/**
+ * Locks (`for update`) the `agent_lifecycle` rows of `agentIds`, in ascending id order — the
+ * global lock order every lifecycle writer keeps: `gateway_controls` (already held by the
+ * caller), then lifecycle row(s), then agent row(s), then operation rows. Called before a config
+ * writer locks the `agents` table itself (`writeConfigRevisionIn`'s own "every existing agent row,
+ * locked in id order up front"), so a concurrent `completeOperation` — which locks a lifecycle
+ * row, then that same agent's row via `scheduleAgent` — can never deadlock against it (both now
+ * take lifecycle-before-agent, never the reverse). An id with no lifecycle row at all (not yet
+ * adopted) is simply absent from the result.
+ */
+export async function lockLifecycleRows(
+	db: Db,
+	agentIds: Readonly<AgentId[]>,
+): Promise<ReadonlyMap<AgentId, AgentLifecycleRow>> {
+	if (agentIds.length === 0) {
+		return new Map();
+	}
+	const sorted = [...agentIds].sort();
+	const rows = await db
+		.select()
+		.from(agentLifecycle)
+		.where(inArray(agentLifecycle.agentId, sorted))
+		.orderBy(asc(agentLifecycle.agentId))
+		.for("update");
+	return new Map(rows.map((row) => [row.agentId, row]));
+}
+
+/**
+ * Queues a `reprovision` operation for every lifecycle-owned, `ready` agent named in `agentIds`
+ * (console patch, CLI import, `config apply`, or a single agent whose channel grant just changed
+ * — any caller that already locked its `agent_lifecycle` row, via {@link lockLifecycleRows}, before
+ * this is called): the provisioner picks it up like any other pending operation, joining newly
+ * configured channels and leaving channels no longer configured (ADR-026).
+ *
+ * Deduping and superseding, both decided under the operation row's own lock (the same order
+ * `markProvisioning`/`completeOperation` take: lifecycle row, then operation row, so this can
+ * never deadlock against them either): an agent whose current operation is already a `pending`
+ * `reprovision` keeps it rather than queuing a second one — the provisioner reads the agent's live
+ * configuration only after it claims the operation (`markProvisioning`), so one pending operation
+ * already covers every edit made before it starts. One that is already `running` is different: the
+ * provisioner claimed it, and whatever it read before claiming is now fixed for the rest of its own
+ * run, so a further edit cannot simply ride along — it is cancelled (like a superseded `create`
+ * `requestAgentRetire`/`requestAgentRestore` already cancel) and a fresh `pending` operation takes
+ * its place, so nothing is silently lost to an operation already mid-flight. An agent not
+ * lifecycle-owned, or not currently `ready` (still being created or restored, already retiring or
+ * retired, or failed), is left alone: its own operation already owns reconciling its membership, or
+ * nothing here should touch it.
+ */
+export async function queueMembershipReprovisioning(
+	uow: UnitOfWork,
+	agentIds: Readonly<AgentId[]>,
+	locked: ReadonlyMap<AgentId, AgentLifecycleRow>,
+	revisionId: number | null,
+	actor: string,
+	source: AgentLifecycleSource,
+): Promise<void> {
+	if (agentIds.length === 0) {
+		return;
+	}
+	const { db } = uow.tx;
+	const owned = await lifecycleOwnedAgentIds(db, agentIds);
+	for (const agentId of agentIds) {
+		const lifecycle = locked.get(agentId);
+		if (lifecycle === undefined || lifecycle.status !== "ready" || !owned.has(agentId)) {
+			continue;
+		}
+		let current:
+			| { id: string; kind: AgentLifecycleOperationKind; state: AgentLifecycleOperationState }
+			| undefined;
+		if (lifecycle.operationId !== null) {
+			[current] = await db
+				.select({
+					id: agentLifecycleOperations.id,
+					kind: agentLifecycleOperations.kind,
+					state: agentLifecycleOperations.state,
+				})
+				.from(agentLifecycleOperations)
+				.where(eq(agentLifecycleOperations.id, lifecycle.operationId))
+				.for("update");
+		}
+		if (current?.kind === "reprovision" && current.state === "pending") {
+			continue;
+		}
+		if (current?.kind === "reprovision" && current.state === "running") {
+			await db
+				.update(agentLifecycleOperations)
+				.set({ state: "cancelled", updatedAt: uow.now, finishedAt: uow.now })
+				.where(eq(agentLifecycleOperations.id, current.id));
+		}
+		const operationId = randomUUID();
+		const generation = lifecycle.generation + 1;
+		await db.insert(agentLifecycleOperations).values({
+			id: operationId,
+			agentId,
+			kind: "reprovision",
+			requestedBy: actor,
+			source,
+			configRevisionId: revisionId,
+			generation,
+			state: "pending",
+			checkpoints: {},
+			createdAt: uow.now,
+			updatedAt: uow.now,
+		});
+		await db
+			.update(agentLifecycle)
+			.set({ operationId, generation })
+			.where(eq(agentLifecycle.agentId, agentId));
+		await audit(uow, actor, "agent_lifecycle.reprovision", "agent", agentId, {
+			operation_id: operationId,
+			revision_id: revisionId,
+		});
+	}
+}
+
+/**
+ * {@link commitChange}'s own transactional body, taking an already-open `uow` instead of opening
+ * one of its own: `requestAgentCreate`/`requestAgentRetire` (`agent-lifecycle.ts`) call this
+ * directly so their own lifecycle rows commit or roll back in the exact same transaction as the
+ * configuration change they carry, something the public `commitChange` — which always opens and
+ * commits its own transaction — cannot give a caller. `changeSet` is the already-parsed value (see
+ * `checkCommitChangeInput`); a caller building its own change set internally (never raw, unparsed
+ * request input) passes it directly, skipping a redundant re-parse.
+ */
+export async function commitChangeIn(
+	uow: UnitOfWork,
+	input: CommitChangeInput,
+	changeSet: ChangeSet,
+	/**
+	 * Agent ids this commit itself is about to make lifecycle-owned (a `create`'s own agent id),
+	 * trusted to claim `/run/bot-secrets/` even though no `agent_lifecycle_operations` row for them
+	 * exists yet this same transaction — it is written right after this commit returns
+	 * (`requestAgentCreate`). Never set by `commitChange`, the public entry point every untrusted
+	 * caller (a console patch, a CLI import) uses: only `agent-lifecycle.ts`'s own internal
+	 * `commitWithinLock` may pass this.
+	 */
+	trustedBotSecretAgentIds: ReadonlySet<AgentId> = new Set(),
+	/**
+	 * `requestAgentRetire`'s own agent id: trusted to remove a lifecycle-owned agent even though
+	 * its `agent_lifecycle` row has not moved to `retiring` yet this same transaction (that update
+	 * happens right after this commit returns). Never set by `commitChange`; see
+	 * `rejectLifecycleOwnedRemovals`.
+	 */
+	trustedRemovalAgentIds: ReadonlySet<AgentId> = new Set(),
+	/**
+	 * `requestAgentRestore`'s own agent id: trusted to add a `retired` agent back to the
+	 * configuration even though its `agent_lifecycle` row has not moved off `retired` yet this same
+	 * transaction (that update happens right after this commit returns). Never set by
+	 * `commitChange`; see `rejectRetiredAgentReadditions`.
+	 */
+	trustedReadditionAgentIds: ReadonlySet<AgentId> = new Set(),
+): Promise<CommitOutcome> {
+	const { db } = uow.tx;
+	await db.insert(gatewayControls).values({ id: 1 }).onConflictDoNothing();
+	const [controls] = await db
+		.select({
+			version: gatewayControls.activeConfigVersion,
+			generation: gatewayControls.configGeneration,
+			revision: gatewayControls.activeConfigRevision,
+		})
+		.from(gatewayControls)
+		.where(eq(gatewayControls.id, 1))
+		.for("update");
+	const generation = (controls?.generation ?? 0) + 1;
+
+	// Idempotent replay, checked under the lock: by the time a concurrent commit of the same key
+	// gets here, an earlier one that already wrote a row has committed and become visible (the
+	// lock serializes them), so this never races a conflict it should instead have replayed.
+	if (input.idempotencyKey !== undefined) {
+		const [existing] = await db
+			.select({
+				id: configRevisions.id,
+				snapshotHash: configRevisions.snapshotHash,
+				changeHash: configRevisions.changeHash,
+			})
+			.from(configRevisions)
+			.where(eq(configRevisions.idempotencyKey, input.idempotencyKey));
+		if (existing !== undefined) {
+			const changeHash = canonicalHash(changeSet);
+			if (existing.changeHash !== changeHash) {
+				throw new AdminError(
+					`idempotency key '${input.idempotencyKey}' was already used with a different change set`,
+				);
+			}
+			return {
+				kind: "committed",
+				result: {
+					revisionId: existing.id,
+					hash: existing.snapshotHash,
+					noop: false,
+					replayed: true,
+					activeRevisionId: controls?.revision ?? null,
+				},
+			};
+		}
+	}
+
+	const currentRevisionId = await ensureConfigHistoryIn(
+		uow,
+		{
+			version: controls?.version ?? null,
+			generation: controls?.generation ?? 0,
+			revision: controls?.revision ?? null,
+		},
+		input.actor,
+	);
+	if (input.baseRevisionId !== currentRevisionId) {
+		if (currentRevisionId !== (controls?.revision ?? null)) {
+			// A backfill this transaction just recorded (an older release changed the configuration
+			// since `ensureConfigHistory` above): committed with its active pointer, so the conflict
+			// names a revision that exists.
+			await db
+				.update(gatewayControls)
+				.set({ activeConfigRevision: currentRevisionId, updatedAt: uow.now })
+				.where(eq(gatewayControls.id, 1));
+		}
+		return { kind: "conflict", currentRevisionId };
+	}
+
+	const { bundle: base, hash: baseHash } = await loadActiveBundle(db, currentRevisionId);
+	const { draft, problems: opProblems } = applyChangeSet(base, changeSet);
+	const problems = [...opProblems, ...draftBundleProblems(draft)];
+	if (problems.length > 0) {
+		throw new AdminError(`configuration is invalid:\n- ${problems.join("\n- ")}`);
+	}
+	if (draft.organization === null) {
+		throw new AdminError("internal: a validated configuration always has an organization");
+	}
+	const botSecretProblems = await rejectUnownedBotSecretPaths(
+		db,
+		draft.agents,
+		trustedBotSecretAgentIds,
+	);
+	if (botSecretProblems.length > 0) {
+		throw new AdminError(`configuration is invalid:\n- ${botSecretProblems.join("\n- ")}`);
+	}
+	const removalProblems = await rejectLifecycleOwnedRemovals(
+		db,
+		base.agents,
+		draft.agents,
+		trustedRemovalAgentIds,
+	);
+	if (removalProblems.length > 0) {
+		throw new AdminError(`configuration is invalid:\n- ${removalProblems.join("\n- ")}`);
+	}
+	const readditionProblems = await rejectRetiredAgentReadditions(
+		db,
+		base.agents,
+		draft.agents,
+		trustedReadditionAgentIds,
+	);
+	if (readditionProblems.length > 0) {
+		throw new AdminError(`configuration is invalid:\n- ${readditionProblems.join("\n- ")}`);
+	}
+	const tokenPathProblems = await rejectLifecycleOwnedTokenPathChanges(
+		db,
+		base.agents,
+		draft.agents,
+		trustedReadditionAgentIds,
+	);
+	if (tokenPathProblems.length > 0) {
+		throw new AdminError(`configuration is invalid:\n- ${tokenPathProblems.join("\n- ")}`);
+	}
+	const resolvedInput: ConfigApplyInput = {
+		organization: draft.organization,
+		agents: draft.agents,
+		constitution: draft.constitution,
+		rolePrompts: draft.rolePrompts,
+	};
+	const bundle = configSnapshotBundle(resolvedInput);
+	const version = canonicalHash(bundle);
+
+	if (
+		currentRevisionId !== null &&
+		baseHash === version &&
+		!(await liveEnabledDiverges(db, enabledById(draft.agents)))
+	) {
+		return {
+			kind: "committed",
+			result: {
+				revisionId: currentRevisionId,
+				hash: version,
+				noop: true,
+				replayed: false,
+				activeRevisionId: currentRevisionId,
+			},
+		};
+	}
+
+	// Locked before `writeConfigRevisionIn` locks the `agents` table itself, so the global lock
+	// order (`gateway_controls` -> lifecycle row(s) -> agent row(s) -> operation rows) holds even
+	// though the actual queuing only happens after the write below (see `lockLifecycleRows`). A
+	// team change reprovisions every current agent, not only the ones whose own `allowed_channels`
+	// changed in this same commit (`organizationTeamChanged`, ADR-026): every lifecycle-owned bot
+	// needs the new team joined, regardless of whether its channel list also moved.
+	const channelsChangedIds = organizationTeamChanged(base.organization, draft.organization)
+		? [
+				...new Set([
+					...channelsChangedAgentIds(base.agents, draft.agents),
+					...draft.agents.map((agent) => agent.id),
+				]),
+			].sort()
+		: channelsChangedAgentIds(base.agents, draft.agents);
+	const lockedLifecycle = await lockLifecycleRows(db, channelsChangedIds);
+
+	const result = await writeConfigRevisionIn(uow, {
+		input: resolvedInput,
+		bundle,
+		version,
+		generation,
+		parentRevisionId: currentRevisionId,
+		actor: input.actor,
+		source: input.source,
+		reason: input.reason ?? null,
+		idempotencyKey: input.idempotencyKey ?? null,
+		changeHash: input.idempotencyKey === undefined ? null : canonicalHash(changeSet),
+	});
+	await queueMembershipReprovisioning(
+		uow,
+		channelsChangedIds,
+		lockedLifecycle,
+		result.revisionId,
+		input.actor,
+		agentLifecycleSourceOf(input.source),
+	);
+	return {
+		kind: "committed",
+		result: {
+			revisionId: result.revisionId,
+			hash: result.version,
+			noop: false,
+			replayed: false,
+			activeRevisionId: result.revisionId,
+		},
+	};
+}
+
+/**
  * Applies `changeSet` to the active configuration and commits the result, in one transaction with
  * the same lock order `applyConfig` uses (the `gateway_controls` row first). Conflict: the active
  * revision has moved past `baseRevisionId` — {@link ManagementConflictError} names the revision it
@@ -695,132 +1157,7 @@ export async function commitChange(
 	// a backfill this commit's own attempt discovers it needs must survive even when the commit
 	// itself goes on to conflict and roll back (see `prepareChange`).
 	await ensureConfigHistory(deps, input.actor);
-	const outcome = await inTransaction(deps, async (uow): Promise<CommitOutcome> => {
-		const { db } = uow.tx;
-		await db.insert(gatewayControls).values({ id: 1 }).onConflictDoNothing();
-		const [controls] = await db
-			.select({
-				version: gatewayControls.activeConfigVersion,
-				generation: gatewayControls.configGeneration,
-				revision: gatewayControls.activeConfigRevision,
-			})
-			.from(gatewayControls)
-			.where(eq(gatewayControls.id, 1))
-			.for("update");
-		const generation = (controls?.generation ?? 0) + 1;
-
-		// Idempotent replay, checked under the lock: by the time a concurrent commit of the same key
-		// gets here, an earlier one that already wrote a row has committed and become visible (the
-		// lock serializes them), so this never races a conflict it should instead have replayed.
-		if (input.idempotencyKey !== undefined) {
-			const [existing] = await db
-				.select({
-					id: configRevisions.id,
-					snapshotHash: configRevisions.snapshotHash,
-					changeHash: configRevisions.changeHash,
-				})
-				.from(configRevisions)
-				.where(eq(configRevisions.idempotencyKey, input.idempotencyKey));
-			if (existing !== undefined) {
-				const changeHash = canonicalHash(changeSet);
-				if (existing.changeHash !== changeHash) {
-					throw new AdminError(
-						`idempotency key '${input.idempotencyKey}' was already used with a different change set`,
-					);
-				}
-				return {
-					kind: "committed",
-					result: {
-						revisionId: existing.id,
-						hash: existing.snapshotHash,
-						noop: false,
-						replayed: true,
-						activeRevisionId: controls?.revision ?? null,
-					},
-				};
-			}
-		}
-
-		const currentRevisionId = await ensureConfigHistoryIn(
-			uow,
-			{
-				version: controls?.version ?? null,
-				generation: controls?.generation ?? 0,
-				revision: controls?.revision ?? null,
-			},
-			input.actor,
-		);
-		if (input.baseRevisionId !== currentRevisionId) {
-			if (currentRevisionId !== (controls?.revision ?? null)) {
-				// A backfill this transaction just recorded (an older release changed the configuration
-				// since `ensureConfigHistory` above): committed with its active pointer, so the conflict
-				// names a revision that exists.
-				await db
-					.update(gatewayControls)
-					.set({ activeConfigRevision: currentRevisionId, updatedAt: uow.now })
-					.where(eq(gatewayControls.id, 1));
-			}
-			return { kind: "conflict", currentRevisionId };
-		}
-
-		const { bundle: base, hash: baseHash } = await loadActiveBundle(db, currentRevisionId);
-		const { draft, problems: opProblems } = applyChangeSet(base, changeSet);
-		const problems = [...opProblems, ...draftBundleProblems(draft)];
-		if (problems.length > 0) {
-			throw new AdminError(`configuration is invalid:\n- ${problems.join("\n- ")}`);
-		}
-		if (draft.organization === null) {
-			throw new AdminError("internal: a validated configuration always has an organization");
-		}
-		const resolvedInput: ConfigApplyInput = {
-			organization: draft.organization,
-			agents: draft.agents,
-			constitution: draft.constitution,
-			rolePrompts: draft.rolePrompts,
-		};
-		const bundle = configSnapshotBundle(resolvedInput);
-		const version = canonicalHash(bundle);
-
-		if (
-			currentRevisionId !== null &&
-			baseHash === version &&
-			!(await liveEnabledDiverges(db, enabledById(draft.agents)))
-		) {
-			return {
-				kind: "committed",
-				result: {
-					revisionId: currentRevisionId,
-					hash: version,
-					noop: true,
-					replayed: false,
-					activeRevisionId: currentRevisionId,
-				},
-			};
-		}
-
-		const result = await writeConfigRevisionIn(uow, {
-			input: resolvedInput,
-			bundle,
-			version,
-			generation,
-			parentRevisionId: currentRevisionId,
-			actor: input.actor,
-			source: input.source,
-			reason: input.reason ?? null,
-			idempotencyKey: input.idempotencyKey ?? null,
-			changeHash: input.idempotencyKey === undefined ? null : canonicalHash(changeSet),
-		});
-		return {
-			kind: "committed",
-			result: {
-				revisionId: result.revisionId,
-				hash: result.version,
-				noop: false,
-				replayed: false,
-				activeRevisionId: result.revisionId,
-			},
-		};
-	});
+	const outcome = await inTransaction(deps, (uow) => commitChangeIn(uow, input, changeSet));
 	if (outcome.kind === "conflict") {
 		throw new ManagementConflictError(outcome.currentRevisionId);
 	}

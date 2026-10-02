@@ -1,4 +1,5 @@
 import {
+	type AgentLifecycleStatus,
 	type GatewayEvent,
 	GatewayEventSchema,
 	type JsonObject,
@@ -9,6 +10,8 @@ import {
 } from "@agent-gateway/contracts";
 import {
 	type AgentState,
+	agentLifecycle,
+	agentLifecycleOperations,
 	agentRuns,
 	agents,
 	auditLog,
@@ -164,6 +167,54 @@ export async function lockAgent(db: Db, agentId: string): Promise<AgentRow | nul
 	return rows[0] ?? null;
 }
 
+/**
+ * The agent's Mattermost-provisioning status (ADR-026), null when no `agent_lifecycle` row exists
+ * at all — only possible for a configured agent before the startup adoption backfill has run, in
+ * which case scheduling behaves exactly as it did before this table existed. The scheduler gates
+ * a run on this being `ready`; nothing else reads it on the hot path, so this is a plain read, no
+ * lock.
+ */
+export async function loadAgentLifecycleStatus(
+	db: Db,
+	agentId: string,
+): Promise<AgentLifecycleStatus | null> {
+	const [row] = await db
+		.select({ status: agentLifecycle.status })
+		.from(agentLifecycle)
+		.where(eq(agentLifecycle.agentId, agentId));
+	return row?.status ?? null;
+}
+
+/**
+ * Agent ids that were created or restored through the lifecycle (their own operation journal
+ * names at least one `create` or `restore` operation), regardless of their current status — never
+ * an agent merely adopted from a pre-existing configuration (adoption only ever writes a
+ * `succeeded` `adopt` operation). The database, not a `token_secret_file` prefix, is lifecycle
+ * ownership's one source of truth (ADR-026): `mattermostPlan`'s caller uses this to decide which
+ * agents bootstrap/reconcile leave entirely to the lifecycle provisioner, and the managed-
+ * configuration service uses it to refuse a `/run/bot-secrets/` token path for any agent that is
+ * not one of these, and to decide which ready agent gets a `reprovision` operation when its
+ * channels change. Scoped to `agentIds` when given, to avoid scanning the whole journal for a
+ * commit that only ever touches a handful of agents.
+ */
+export async function lifecycleOwnedAgentIds(
+	db: Db,
+	agentIds?: Readonly<string[]>,
+): Promise<ReadonlySet<string>> {
+	const rows = await db
+		.selectDistinct({ agentId: agentLifecycleOperations.agentId })
+		.from(agentLifecycleOperations)
+		.where(
+			agentIds === undefined
+				? inArray(agentLifecycleOperations.kind, ["create", "restore"])
+				: and(
+						inArray(agentLifecycleOperations.kind, ["create", "restore"]),
+						inArray(agentLifecycleOperations.agentId, agentIds),
+					),
+		);
+	return new Set(rows.map((row) => row.agentId));
+}
+
 export async function setAgentState(
 	uow: UnitOfWork,
 	agentId: string,
@@ -271,6 +322,24 @@ export async function loadOwnerUserIds(db: Db): Promise<MattermostId[]> {
 		},
 	);
 	return [...new Set(ids)];
+}
+
+/**
+ * A reserved directory name no real Mattermost account can ever resolve to (`#` is outside
+ * `MattermostNameSchema`'s charset, which every configured owner or bot username is validated
+ * against): the dedicated provisioning admin account's own user id, recorded from its token
+ * (`users/me`) whenever the lifecycle provisioner runs. Posts by this account route exactly like
+ * the listener's own — never a wake-up, never an approval (ADR-026) — because it is control-plane
+ * infrastructure the Gateway calls Mattermost with, not a conversational participant; it is never
+ * resolved under its real username the way an owner or a bot is, so it is excluded from
+ * `loadOwnerUserIds` above by construction, as long as it is never also listed as an owner.
+ */
+export const PROVISIONING_ADMIN_DIRECTORY_NAME = "#provisioning-admin";
+
+/** The provisioning admin account's own user id, or null before the provisioner has resolved one
+ * (no admin token configured yet, or the controller has not started since one was). */
+export async function loadProvisioningAdminUserId(db: Db): Promise<MattermostId | null> {
+	return (await loadDirectory(db, "user")).get(PROVISIONING_ADMIN_DIRECTORY_NAME) ?? null;
 }
 
 type EventRow = typeof events.$inferSelect;

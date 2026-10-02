@@ -619,7 +619,21 @@ describe("validateConfigBundle", () => {
 		});
 		const issues = validateConfigBundle({ organization: org, agents: [clash, agent("finance")] });
 		expect(issues.map((i) => i.message)).toContain(
-			"token secret file '/run/secrets/gateway_routing_key' is used by another bot or the routing key",
+			"token secret file '/run/secrets/gateway_routing_key' is used by another bot, the routing key or the Mattermost admin token",
+		);
+	});
+
+	it("reserves the Mattermost admin token file (ADR-026): no bot's token may live there either", () => {
+		const org = organization();
+		const clash = agent("developer", {
+			mattermost: {
+				...agent("developer").mattermost,
+				token_secret_file: "/run/secrets/mattermost_admin_token",
+			},
+		});
+		const issues = validateConfigBundle({ organization: org, agents: [clash, agent("finance")] });
+		expect(issues.map((i) => i.message)).toContain(
+			"token secret file '/run/secrets/mattermost_admin_token' is used by another bot, the routing key or the Mattermost admin token",
 		);
 	});
 

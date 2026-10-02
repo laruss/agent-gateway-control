@@ -49,6 +49,9 @@ export type ApiUser = z.infer<typeof ApiUserSchema>;
 
 export const ApiBotSchema = z.looseObject({
 	user_id: MattermostIdSchema,
+	/** The account that created this bot (`POST /bots`'s own caller): the Gateway's own admin
+	 * account, for a bot the lifecycle provisioner itself created (ADR-026). */
+	owner_id: MattermostIdSchema,
 	username: z.string(),
 	delete_at: z.number().int(),
 });

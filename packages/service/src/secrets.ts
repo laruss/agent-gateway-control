@@ -12,18 +12,48 @@ import {
 import { basename, dirname, join } from "node:path";
 import { SettingError } from "./settings.ts";
 
-/** Where configuration expects secret files (Docker/Compose secrets). */
+/** Where configuration expects secret files (Docker/Compose secrets): the controller's own
+ * read-only mount, managed by the operator (bootstrap-created agents, the admin token, ...). */
 export const SECRET_MOUNT = "/run/secrets/";
 
+/** The controller's read-write mount for tokens it provisions itself (ADR-026): lifecycle-created
+ * agents' bot tokens, generated server-side and never configured by a client. */
+export const BOT_SECRET_MOUNT = "/run/bot-secrets/";
+
 /**
- * The file behind a configured secret reference (`/run/secrets/<name>`). With `secretsDir`
- * (local development, bootstrap output) the same name is looked up there instead.
+ * The file behind a configured secret reference (`/run/secrets/<name>` or
+ * `/run/bot-secrets/<name>`). `secretsDir` overrides where a `/run/secrets/` reference is looked
+ * up instead (local development, bootstrap output); `botSecretsDir` does the same for a
+ * `/run/bot-secrets/` one, separately — the two mounts are distinct directories in production
+ * (the controller's read-only, operator-managed secrets vs. its own read-write provisioned-token
+ * directory), so collapsing both into one override directory would resolve a lifecycle-created
+ * agent's token into the wrong place. Left unset, `botSecretsDir` defaults to `secretsDir`, so a
+ * single flattened directory standing in for both mounts (development and tests that never had
+ * two directories to begin with) still works without naming it twice.
  */
-export function resolveSecretPath(ref: string, secretsDir: string | undefined): string {
-	if (!ref.startsWith(SECRET_MOUNT) || basename(ref) !== ref.slice(SECRET_MOUNT.length)) {
-		throw new SettingError(`secret reference '${ref}' is not a file under ${SECRET_MOUNT}`);
+export function resolveSecretPath(
+	ref: string,
+	secretsDir: string | undefined,
+	botSecretsDir: string | undefined = secretsDir,
+): string {
+	if (ref.startsWith(SECRET_MOUNT)) {
+		return resolveWithinMount(ref, SECRET_MOUNT, secretsDir);
 	}
-	return secretsDir === undefined ? ref : join(secretsDir, basename(ref));
+	if (ref.startsWith(BOT_SECRET_MOUNT)) {
+		return resolveWithinMount(ref, BOT_SECRET_MOUNT, botSecretsDir);
+	}
+	throw new SettingError(
+		`secret reference '${ref}' is not a file under ${SECRET_MOUNT} or ${BOT_SECRET_MOUNT}`,
+	);
+}
+
+function resolveWithinMount(ref: string, mount: string, dir: string | undefined): string {
+	if (basename(ref) !== ref.slice(mount.length)) {
+		throw new SettingError(
+			`secret reference '${ref}' is not a file under ${SECRET_MOUNT} or ${BOT_SECRET_MOUNT}`,
+		);
+	}
+	return dir === undefined ? ref : join(dir, basename(ref));
 }
 
 /** Reads a secret file; an empty file is an error, never an empty credential. */
@@ -84,4 +114,14 @@ export function writeSecretFile(path: string, value: string): void {
 	}
 	closeSync(fd);
 	renameSync(temporary, path);
+}
+
+/**
+ * Removes a secret file, idempotently (a repeat, or a file already gone, is not an error): the
+ * lifecycle provisioner's own retire step, for a lifecycle-created agent's `/run/bot-secrets/`
+ * token file, once its server-side token is already revoked (ADR-026). Never called for a
+ * `/run/secrets/` reference — that mount is an operator's own, read-only to the controller.
+ */
+export function deleteSecretFile(path: string): void {
+	rmSync(path, { force: true });
 }

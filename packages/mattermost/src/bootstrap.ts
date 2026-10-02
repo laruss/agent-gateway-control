@@ -5,6 +5,7 @@ import type {
 	OrganizationConfig,
 } from "@agent-gateway/contracts";
 import { type ApiChannel, isElevatedMember } from "./api-schemas.ts";
+import type { AdminMattermostClient, MattermostClientOptions } from "./client.ts";
 import { MattermostApiError, MattermostClient } from "./client.ts";
 
 /** A bot the Gateway runs: the listener, or one per agent. */
@@ -25,26 +26,50 @@ export type MattermostPlan = Readonly<{
 	channels: Readonly<string[]>;
 	owners: Readonly<string[]>;
 	bots: Readonly<BotSpec[]>;
-	/** Bots of agents removed from the configuration: deactivated, out of every channel. */
-	retiredBots: Readonly<Readonly<{ username: string; userId: MattermostId }>[]>;
+	/** Bots of agents removed from the configuration: deactivated, out of every channel. Never one
+	 * the lifecycle (ADR-026) owns: its own `retire` operation cleans that bot up through its own
+	 * checkpoints, and a bootstrap or reconcile run racing a restore must never revoke a token the
+	 * provisioner is mid-way through issuing. */
+	retiredBots: Readonly<Readonly<{ agentId: AgentId; username: string; userId: MattermostId }>[]>;
 }>;
 
 /**
  * Every bot of a configuration: the listener in all managed channels, each agent in its own.
  * `tokenPath` maps a configured secret reference to the file that holds it.
+ *
+ * An agent created or restored through the lifecycle (ADR-026, `lifecycleOwnedAgentIds`) is
+ * skipped entirely: its token lives under `/run/bot-secrets/`, issued and owned by the
+ * controller's own provisioner, which checkpoints and resumes its own provisioning independently.
+ * Bootstrap and reconcile never resolved that path correctly from the CLI container to begin with
+ * (it has no reason to share the provisioner's directory), and even where it does, revoking or
+ * rewriting that token out from under the provisioner is exactly the conflict this plan must not
+ * create. The caller decides this from the database (its own operation journal — never merely
+ * adopted), not from a `token_secret_file` prefix: a prefix is only ever an artifact of lifecycle
+ * ownership, and configuration itself may no longer claim it for any other agent (the
+ * managed-configuration service refuses that at commit time), but a database upgraded before that
+ * refusal existed could still hold one for an agent the lifecycle never actually owned.
+ *
+ * `retiredBots` is filtered the same way: an agent's stale `agents` row (ADR-024's own
+ * retained-row case) outlives it leaving the active configuration, so a lifecycle-owned agent
+ * `requestAgentRetire` or `requestAgentRestore` is presently working through still shows up there
+ * — its own cleanup (or re-provisioning) is the provisioner's, through its own checkpoints, never
+ * this plan's; a bootstrap or reconcile run racing either would otherwise revoke a token the
+ * provisioner is mid-way through issuing, or deactivate a bot it just re-enabled.
  */
 export function mattermostPlan(
 	organization: OrganizationConfig,
 	agents: Readonly<AgentConfig[]>,
 	tokenPath: (ref: string) => string,
-	retiredBots: MattermostPlan["retiredBots"] = [],
+	retiredBots: MattermostPlan["retiredBots"],
+	lifecycleOwnedAgentIds: ReadonlySet<AgentId>,
 ): MattermostPlan {
 	const { mattermost } = organization;
+	const bootstrapManaged = agents.filter((agent) => !lifecycleOwnedAgentIds.has(agent.id));
 	return {
 		team: mattermost.team,
 		channels: mattermost.channels,
 		owners: organization.organization.owner_mattermost_usernames,
-		retiredBots,
+		retiredBots: retiredBots.filter((bot) => !lifecycleOwnedAgentIds.has(bot.agentId)),
 		bots: [
 			{
 				agentId: null,
@@ -53,7 +78,7 @@ export function mattermostPlan(
 				channels: mattermost.channels,
 				tokenPath: tokenPath(mattermost.listener.token_secret_file),
 			},
-			...agents.map((agent) => ({
+			...bootstrapManaged.map((agent) => ({
 				agentId: agent.id,
 				username: agent.mattermost.username,
 				displayName: agent.display_name,
@@ -202,13 +227,18 @@ export class StaleConfigurationError extends BootstrapError {
 	}
 }
 
-const TOKEN_DESCRIPTION = "agent-gateway";
+/** The description every token the Gateway issues for a bot carries (bootstrap's and the
+ * lifecycle provisioner's alike): not a secret, just a marker a listing can show a human. */
+export const TOKEN_DESCRIPTION = "agent-gateway";
 
 /**
  * Revokes every access token of an account. The listing is paged; revoking empties the first
  * page, so it is read again until nothing is left.
  */
-async function revokeAllTokens(admin: MattermostClient, userId: MattermostId): Promise<void> {
+export async function revokeAllTokens(
+	admin: AdminMattermostClient,
+	userId: MattermostId,
+): Promise<void> {
 	for (let round = 0; round < 1000; round += 1) {
 		const ids = await admin.userAccessTokenIds(userId);
 		if (ids.length === 0) {
@@ -227,10 +257,12 @@ function isPlainSystemRoles(roles: string): boolean {
 }
 
 /** Every team member stays in the team's default channel; Mattermost does not let it leave. */
-const DEFAULT_CHANNEL = "town-square";
+export const DEFAULT_CHANNEL = "town-square";
 
-/** A team channel (public or private) a bot is in but should not be. */
-function isExtraChannel(channel: ApiChannel, allowed: ReadonlySet<MattermostId>): boolean {
+/** A team channel (public or private) a bot is in but should not be: reused by the lifecycle
+ * provisioner's own reprovision step (ADR-026), which leaves a bot's channels the same way once a
+ * configuration change takes one away. */
+export function isExtraChannel(channel: ApiChannel, allowed: ReadonlySet<MattermostId>): boolean {
 	return (
 		(channel.type === "O" || channel.type === "P") &&
 		channel.delete_at === 0 &&
@@ -239,9 +271,19 @@ function isExtraChannel(channel: ApiChannel, allowed: ReadonlySet<MattermostId>)
 	);
 }
 
-async function tokenOwner(baseUrl: string, token: string): Promise<MattermostId | null> {
+/** The account a token belongs to, or null when it is rejected (401): whether a stored token
+ * still works and for whom, without assuming which account that should be. Reused by the
+ * lifecycle provisioner to decide whether a bot's existing token file still has a working
+ * credential before replacing it (ADR-026). `makeClient` builds the one-off client that
+ * authenticates as `token`; overridden in tests with a fake, never a real one. */
+export async function tokenOwner(
+	baseUrl: string,
+	token: string,
+	makeClient: (options: MattermostClientOptions) => Pick<MattermostClient, "me"> = (options) =>
+		new MattermostClient(options),
+): Promise<MattermostId | null> {
 	try {
-		return (await new MattermostClient({ baseUrl, token }).me()).id;
+		return (await makeClient({ baseUrl, token }).me()).id;
 	} catch (error) {
 		if (error instanceof MattermostApiError && error.status === 401) {
 			return null;
@@ -250,7 +292,38 @@ async function tokenOwner(baseUrl: string, token: string): Promise<MattermostId 
 	}
 }
 
-async function ensureBot(admin: MattermostClient, bot: BotSpec): Promise<MattermostId> {
+/**
+ * Resolves a bot's account by username, creating it when nothing there yet has that name:
+ * reused by both bootstrap (every configured bot, in bulk) and the lifecycle provisioner (one
+ * agent at a time, ADR-026). Refuses to adopt a username that is not plausibly the Gateway's own
+ * plain bot — a regular user account, or a bot with elevated system roles — rather than silently
+ * taking over a stranger's account.
+ *
+ * `guard`, given only by the lifecycle provisioner's own `create`/`restore`/`reprovision` step
+ * (never bootstrap's bulk reconcile, whose own looser adoption of a pre-existing plain bot is
+ * unchanged): narrows which *existing* bot may be adopted at all. A plain bot at this username is
+ * otherwise adopted unconditionally — correct for an agent whose identity is already recorded
+ * (`restore`, or `create`/`reprovision` resuming an operation that already got this far) or one
+ * `bootstrapMattermost` is reconciling for the first time — but wrong for a brand-new `create`:
+ * nothing has ever resolved *this* agent's bot before, so any existing plain bot at its username
+ * is, by default, somebody else's (an unrelated integration's, say) — adopting it would hand the
+ * provisioner the next step's own token revocation and rewriting over an account it does not own.
+ * Adoption is allowed only when the existing account is already this agent's own recorded identity
+ * (`guard.knownUserId`) or was created by an admin account this Gateway has ever used for
+ * provisioning (`guard.knownAdminIds`, checked against the bot's own `owner_id` — covers a
+ * `create` resuming after a crash between `createBot` succeeding and its `bot_user_id` checkpoint
+ * ever being persisted, and the same account history retirement's own recovery already trusts,
+ * `findPlausibleGatewayBot`: an admin account rotated away from since this agent's own bot was
+ * created is still this Gateway's own as far as that bot is concerned, so a resumed `create` never
+ * fails permanently merely because an operator rotated the provisioning admin account in the
+ * meantime); refused otherwise, the same permanent "taken" failure an elevated-roles or
+ * regular-user collision already is.
+ */
+export async function ensureBot(
+	admin: AdminMattermostClient,
+	bot: Readonly<Pick<BotSpec, "username" | "displayName">>,
+	guard?: Readonly<{ knownUserId: MattermostId | null; knownAdminIds: ReadonlySet<MattermostId> }>,
+): Promise<MattermostId> {
 	const existing = await admin.userByUsername(bot.username);
 	if (existing === null) {
 		const created = await admin.createBot({
@@ -271,8 +344,55 @@ async function ensureBot(admin: MattermostClient, bot: BotSpec): Promise<Matterm
 			`bot '${bot.username}' has roles '${existing.roles}'; the Gateway adopts only plain members (system_user)`,
 		);
 	}
+	if (guard !== undefined && guard.knownUserId !== existing.id) {
+		const record = await admin.getBot(existing.id);
+		if (record === null || !guard.knownAdminIds.has(record.owner_id)) {
+			throw new BootstrapError(
+				`username '${bot.username}' is taken by a bot this Gateway did not create`,
+			);
+		}
+	}
 	if (existing.delete_at > 0) {
 		await admin.enableBot(existing.id);
+	}
+	return existing.id;
+}
+
+/**
+ * Looks up an existing account by `username`, without creating or adopting anything: the
+ * lifecycle provisioner's own last resort for recovering a retiring agent's bot id when neither its
+ * recorded identity nor its own create/restore operation's checkpoints ever named one (ADR-026) —
+ * a crash between checkpointing `bot_user_id` and `setAgentBotUser` recording it can leave both
+ * empty even though the bot, and a working token, already exist. Null for anything that is not
+ * plausibly the Gateway's own plain bot — no account at all, a regular user, or a bot with elevated
+ * system roles — the same plausibility `ensureBot` itself checks before ever creating or adopting
+ * one.
+ *
+ * A plain bot's own `owner_id` must also name one of `knownAdminIds` — the provisioning admin
+ * account the Gateway uses right now, or one it used before an operator rotated to a different
+ * account (`gateway mattermost admin-token set` pointed at a new account, not merely a token
+ * rotation of the same one) — exactly the ownership guard `ensureBot` applies to a fresh `create`'s
+ * own username-only resolution (never only `knownUserId`, since the whole point of this recovery
+ * path is that no identity was ever recorded): a username collision with an unrelated integration's
+ * own plain bot must never be mistaken for this agent's own account merely because nothing else
+ * claims the name. Retiring an agent whose own `create` genuinely failed on "username taken" must
+ * not revoke a stranger's bot's tokens and disable it — skipped instead (the caller has nothing
+ * Mattermost-side left to clean up for this agent, logs the skip visibly rather than quietly, and
+ * records it on a checkpoint `gateway doctor` surfaces, since this Gateway's own admin-rotation
+ * history — had any of it been lost — could in principle have vindicated the very same bot).
+ */
+export async function findPlausibleGatewayBot(
+	admin: Pick<AdminMattermostClient, "userByUsername" | "getBot">,
+	username: string,
+	knownAdminIds: ReadonlySet<MattermostId>,
+): Promise<MattermostId | null> {
+	const existing = await admin.userByUsername(username);
+	if (existing === null || !existing.is_bot || !isPlainSystemRoles(existing.roles)) {
+		return null;
+	}
+	const record = await admin.getBot(existing.id);
+	if (record === null || !knownAdminIds.has(record.owner_id)) {
+		return null;
 	}
 	return existing.id;
 }
@@ -453,7 +573,10 @@ export async function bootstrapMattermost(options: BootstrapOptions): Promise<vo
 			}
 		}
 		if (replaceToken) {
-			tokens.write(bot.tokenPath, await admin.createUserAccessToken(userId, TOKEN_DESCRIPTION));
+			tokens.write(
+				bot.tokenPath,
+				(await admin.createUserAccessToken(userId, TOKEN_DESCRIPTION)).token,
+			);
 		}
 		if (bot.agentId === null) {
 			await store.setUser(bot.username, userId);

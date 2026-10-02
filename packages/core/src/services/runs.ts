@@ -62,6 +62,7 @@ import {
 	audit,
 	enqueueOutbox,
 	loadActiveConfig,
+	loadAgentLifecycleStatus,
 	loadOwnerUserIds,
 	loadTeamChannels,
 	lockAgent,
@@ -84,7 +85,9 @@ export type ReportOutcome =
 	| "deferred"
 	| "failed"
 	| "ignored_stale"
-	| "ignored_unknown";
+	| "ignored_unknown"
+	/** The agent is `retiring`/`retired`: no effect of this report was published (ADR-026). */
+	| "ignored_retired";
 
 /** Correlations of the waits a completed report would create, sorted for a stable lock order. */
 function waitCorrelations(report: RunReport): Readonly<string[]> {
@@ -174,6 +177,18 @@ export async function handleRunReport(
 		}
 		if (!inProgress(run) || run.attempt !== report.attempt) {
 			return "ignored_stale";
+		}
+		// A retiring or already-retired agent publishes no further effects (posts, memory writes,
+		// waits): its runs were already cancelled by `requestAgentRetire`, so this defends the same
+		// invariant explicitly, rather than only by the run's own status, for an agent whose
+		// retirement and a worker's in-flight report happened to race.
+		const lifecycleStatus = await loadAgentLifecycleStatus(tx.db, agent.id);
+		if (lifecycleStatus === "retiring" || lifecycleStatus === "retired") {
+			await audit(uow, "system", "run.report.dropped_retired", "run", run.id, {
+				kind: report.kind,
+				lifecycle_status: lifecycleStatus,
+			});
+			return "ignored_retired";
 		}
 		switch (report.kind) {
 			case "started": {

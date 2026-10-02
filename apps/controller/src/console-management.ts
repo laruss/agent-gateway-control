@@ -1,17 +1,34 @@
 import {
+	type ConsoleAgentChannelsResponse,
+	ConsoleAgentCreateRequestSchema,
+	type ConsoleAgentCreateResponse,
 	type ConsoleAgentListResponse,
+	ConsoleAgentRestoreRequestSchema,
+	type ConsoleAgentRestoreResponse,
+	ConsoleAgentRetireRequestSchema,
+	type ConsoleAgentRetireResponse,
+	ConsoleAgentRetryRequestSchema,
+	type ConsoleAgentRetryResponse,
 	ConsoleCommitRequestSchema,
 	type ConsoleCommitResponse,
 	ConsolePreviewRequestSchema,
 	type ConsolePreviewResponse,
 	type ConsoleRevisionDiffResponse,
 	type ConsoleRevisionListResponse,
+	ConsoleRevokeGrantRequestSchema,
 } from "@agent-gateway/contracts";
 import {
 	type ControlPlaneDeps,
 	commitAgentPatch,
+	consoleAgentChannels,
+	consoleAgentLifecycle,
+	consoleCreateAgent,
 	consoleListAgents,
+	consoleRestoreAgent,
+	consoleRetireAgent,
+	consoleRetryOperation,
 	consoleRevisionDiff,
+	consoleRevokeGrant,
 	consoleShowAgent,
 	listConfigRevisions,
 	previewAgentPatch,
@@ -83,7 +100,12 @@ function parseBody<S extends z.ZodType>(schema: S, text: string): ParsedBody<z.i
 }
 
 async function listAgentsRoute(deps: ControlPlaneDeps): Promise<ManagementResult> {
-	const response: ConsoleAgentListResponse = { agents: [...(await consoleListAgents(deps))] };
+	const result = await consoleListAgents(deps);
+	const response: ConsoleAgentListResponse = {
+		agents: [...result.agents],
+		knownChannels: [...result.knownChannels],
+		knownRuntimeAdapters: [...result.knownRuntimeAdapters],
+	};
 	return { status: 200, body: response };
 }
 
@@ -92,6 +114,148 @@ async function showAgentRoute(deps: ControlPlaneDeps, agentId: string): Promise<
 	if (response === null) {
 		return notFound(`agent '${agentId}' not found`);
 	}
+	return { status: 200, body: response };
+}
+
+/** The `409` body every lifecycle mutation below reports on a stale `baseRevisionId`, the same
+ * shape `previewRoute`/`commitRoute` already use. */
+function staleConfiguration(currentRevisionId: number | null): ManagementResult {
+	return {
+		status: 409,
+		body: {
+			error: "the active configuration changed since this page was loaded",
+			currentRevisionId,
+		},
+	};
+}
+
+async function createAgentRoute(
+	deps: ControlPlaneDeps,
+	bodyText: string,
+): Promise<ManagementResult> {
+	const parsed = parseBody(ConsoleAgentCreateRequestSchema, bodyText);
+	if (!parsed.ok) {
+		return parsed.result;
+	}
+	const result = await consoleCreateAgent(deps, parsed.data, CONSOLE_ACTOR);
+	if (result.kind === "invalid") {
+		return {
+			status: 422,
+			body: { error: "the create request is invalid", problems: result.problems },
+		};
+	}
+	if (result.kind === "conflict") {
+		return staleConfiguration(result.currentRevisionId);
+	}
+	const response: ConsoleAgentCreateResponse = {
+		agentId: result.result.agentId,
+		operationId: result.result.operationId,
+		revisionId: result.result.revisionId,
+	};
+	return { status: 200, body: response };
+}
+
+async function retireAgentRoute(
+	deps: ControlPlaneDeps,
+	agentId: string,
+	bodyText: string,
+): Promise<ManagementResult> {
+	const parsed = parseBody(ConsoleAgentRetireRequestSchema, bodyText);
+	if (!parsed.ok) {
+		return parsed.result;
+	}
+	const result = await consoleRetireAgent(deps, agentId, parsed.data, CONSOLE_ACTOR);
+	if (result.kind === "invalid") {
+		return {
+			status: 422,
+			body: { error: "the retire request is invalid", problems: result.problems },
+		};
+	}
+	if (result.kind === "conflict") {
+		return staleConfiguration(result.currentRevisionId);
+	}
+	const response: ConsoleAgentRetireResponse = {
+		operationId: result.result.operationId,
+		revisionId: result.result.revisionId,
+	};
+	return { status: 200, body: response };
+}
+
+async function restoreAgentRoute(
+	deps: ControlPlaneDeps,
+	agentId: string,
+	bodyText: string,
+): Promise<ManagementResult> {
+	const parsed = parseBody(ConsoleAgentRestoreRequestSchema, bodyText);
+	if (!parsed.ok) {
+		return parsed.result;
+	}
+	const result = await consoleRestoreAgent(deps, agentId, parsed.data, CONSOLE_ACTOR);
+	if (result.kind === "invalid") {
+		return {
+			status: 422,
+			body: { error: "the restore request is invalid", problems: result.problems },
+		};
+	}
+	if (result.kind === "conflict") {
+		return staleConfiguration(result.currentRevisionId);
+	}
+	const response: ConsoleAgentRestoreResponse = {
+		operationId: result.result.operationId,
+		revisionId: result.result.revisionId,
+	};
+	return { status: 200, body: response };
+}
+
+async function retryOperationRoute(
+	deps: ControlPlaneDeps,
+	agentId: string,
+	bodyText: string,
+): Promise<ManagementResult> {
+	const parsed = parseBody(ConsoleAgentRetryRequestSchema, bodyText);
+	if (!parsed.ok) {
+		return parsed.result;
+	}
+	const result = await consoleRetryOperation(deps, agentId, parsed.data, CONSOLE_ACTOR);
+	if (result.kind === "invalid") {
+		return {
+			status: 422,
+			body: { error: "the retry request is invalid", problems: result.problems },
+		};
+	}
+	if (result.kind === "conflict") {
+		return staleConfiguration(result.currentRevisionId);
+	}
+	const response: ConsoleAgentRetryResponse = {
+		operationId: result.result.operationId,
+		kind: result.result.kind,
+	};
+	return { status: 200, body: response };
+}
+
+async function lifecycleRoute(deps: ControlPlaneDeps, agentId: string): Promise<ManagementResult> {
+	const response = await consoleAgentLifecycle(deps, agentId);
+	if (response === null) {
+		return notFound(`agent '${agentId}' has no lifecycle record`);
+	}
+	return { status: 200, body: response };
+}
+
+async function channelsRoute(deps: ControlPlaneDeps, agentId: string): Promise<ManagementResult> {
+	const response: ConsoleAgentChannelsResponse = await consoleAgentChannels(deps, agentId);
+	return { status: 200, body: response };
+}
+
+async function revokeGrantRoute(
+	deps: ControlPlaneDeps,
+	agentId: string,
+	bodyText: string,
+): Promise<ManagementResult> {
+	const parsed = parseBody(ConsoleRevokeGrantRequestSchema, bodyText);
+	if (!parsed.ok) {
+		return parsed.result;
+	}
+	const response = await consoleRevokeGrant(deps, agentId, parsed.data.channelId, CONSOLE_ACTOR);
 	return { status: 200, body: response };
 }
 
@@ -237,7 +401,10 @@ export async function routeConsoleManagement(
 	// `/api/config/*` here).
 	if (segments[1] === "agents") {
 		if (segments.length === 2) {
-			return method === "GET" ? listAgentsRoute(deps) : notFound();
+			if (method === "GET") {
+				return listAgentsRoute(deps);
+			}
+			return method === "POST" ? createAgentRoute(deps, bodyText) : notFound();
 		}
 		const agentId = segments[2];
 		if (agentId === undefined) {
@@ -246,13 +413,37 @@ export async function routeConsoleManagement(
 		if (segments.length === 3) {
 			return method === "GET" ? showAgentRoute(deps, agentId) : notFound();
 		}
-		if (segments.length === 4 && method === "POST") {
-			if (segments[3] === "preview") {
+		if (segments.length === 4) {
+			if (method === "GET" && segments[3] === "lifecycle") {
+				return lifecycleRoute(deps, agentId);
+			}
+			if (method === "GET" && segments[3] === "channels") {
+				return channelsRoute(deps, agentId);
+			}
+			if (method === "POST" && segments[3] === "preview") {
 				return previewRoute(deps, agentId, bodyText);
 			}
-			if (segments[3] === "commit") {
+			if (method === "POST" && segments[3] === "commit") {
 				return commitRoute(deps, agentId, bodyText);
 			}
+			if (method === "POST" && segments[3] === "retry") {
+				return retryOperationRoute(deps, agentId, bodyText);
+			}
+			if (method === "POST" && segments[3] === "retire") {
+				return retireAgentRoute(deps, agentId, bodyText);
+			}
+			if (method === "POST" && segments[3] === "restore") {
+				return restoreAgentRoute(deps, agentId, bodyText);
+			}
+			return notFound();
+		}
+		if (
+			segments.length === 5 &&
+			segments[3] === "channels" &&
+			segments[4] === "revoke" &&
+			method === "POST"
+		) {
+			return revokeGrantRoute(deps, agentId, bodyText);
 		}
 		return notFound();
 	}

@@ -19,9 +19,9 @@ import {
 	postCreationExists,
 	readChannelFloor,
 	readNumericCursor,
+	recordChannelGrantRevoked,
 	recordImpersonation,
 	rejectChannelAdd,
-	revokeChannelGrant,
 	routeGrantedMention,
 	startManagedChannel,
 	threadCorrelation,
@@ -78,6 +78,7 @@ async function bridgeDirectory(deps: ControlPlaneDeps): Promise<BridgeDirectory 
 		channels: snapshot.channels,
 		approvalsChannelId,
 		agents: snapshot.agents,
+		adminUserId: snapshot.adminUserId,
 	};
 }
 
@@ -231,7 +232,8 @@ export function membershipStore(deps: ControlPlaneDeps, secretsDir?: string): Me
 	return {
 		state: () => loadMembershipState(deps),
 		grant: (grant) => grantChannel(deps, grant),
-		revoke: (agentId, channelId, reason) => revokeChannelGrant(deps, agentId, channelId, reason),
+		revoke: (agentId, channelId, reason) =>
+			recordChannelGrantRevoked(deps, agentId, channelId, reason),
 		reject: (rejection) => rejectChannelAdd(deps, rejection),
 		unneeded: (channelIds) => unneededChannels(deps, channelIds),
 		checked: (agentId, channelId, atMs) => markGrantChecked(deps, agentId, channelId, atMs),

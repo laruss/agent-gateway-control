@@ -33,7 +33,10 @@ unset MATTERMOST_ADMIN_TOKEN                                       # then revoke
 ```
 
 Bootstrap is idempotent, runs one at a time, and runs again when the configuration changes
-while it works. It:
+while it works. It also waits, up to 30 seconds, for the same credential lock `admin-token
+set|rotate` and the lifecycle provisioner's own pass hold (ADR-026), so none of them ever revokes a
+token or deactivates a bot the others are mid-way through issuing or re-enabling; it fails with a
+clear message rather than hanging indefinitely if that wait runs out. It:
 
 - resolves the team, channels and owners and stores their ids (it never creates them);
 - creates each missing bot (the listener and one per agent) as a plain member, never an admin,
@@ -59,6 +62,201 @@ Nothing secret is printed. In a deployment, mount the secrets directory at `/run
 the controller container only; workers get none of these files. In local development
 (`bun run dev`) the worker runs as the same user in the same working tree and could read
 them: use throwaway development bots only.
+
+## Automated agent provisioning (no bootstrap needed)
+
+Bootstrap above sets up the team, the channels, the owners and the listener bot once, with a
+temporary admin token. Creating an agent afterwards does not need that temporary token, or a
+`gateway mattermost bootstrap` run, again: the controller provisions the new agent's bot itself,
+using a long-lived personal access token of a dedicated, non-bot Mattermost system-admin
+account ([ADR-026](../adr/026-agent-lifecycle.md)) — a credential kept in the controller's own
+secrets, never handed to a model, constrained in code to exactly the bot-provisioning actions
+below.
+
+### One-time setup
+
+1. In Mattermost (as an existing system admin, or the first account on the server), create a
+   dedicated user for this, e.g. `gateway-admin`, give it the **System Admin** role, and make sure
+   **Enable Personal Access Tokens** is on (`MM_SERVICESETTINGS_ENABLEUSERACCESSTOKENS=true`, the
+   same setting bootstrap needs). This account is never a bot (Mattermost bots cannot create other
+   bots) and is never one of the `owner_mattermost_usernames` an agent's approvals already trust —
+   keep it out of that list.
+2. As `gateway-admin`, create a personal access token (Profile, Security, Personal Access Tokens).
+3. Store it in the controller's secrets, from an interactive shell (hidden entry; the token is
+   never printed, logged or committed):
+
+   ```bash
+   bun run gateway mattermost admin-token set --secrets-dir secrets
+   ```
+
+   This validates the token (`users/me`: a non-bot account with the `system_admin` role), then
+   mints a gateway-tagged token from it, verifies that one too, and writes *that* one to
+   `<secrets-dir>/mattermost_admin_token`, mounted read-only into the controller at
+   `/run/secrets/mattermost_admin_token` (`MATTERMOST_ADMIN_TOKEN_FILE`) — the controller's
+   provisioner picks it up on its own next pass, no restart needed. The token you pasted is then
+   revoked (printed as "the token you entered was revoked"): on the freshly prepared account this
+   command is meant for, it is the only token found, so there is nothing ambiguous about which one
+   to retire. If the account already held more than one token, none are touched — a warning says
+   so, and the one you pasted is left for you to revoke by hand once you have confirmed the new
+   one works, exactly like `admin-token rotate`'s own "unrelated personal token" rule below.
+
+   Minting a tagged token immediately, rather than storing the pasted value as is, is what lets
+   every later `admin-token rotate` account for it correctly from the very first run: a token
+   entered by hand carries whatever description the operator gave it in Mattermost, never
+   guaranteed to be this command's own, so a plain hand-pasted token sitting in the file in place
+   of this step would simply never come up in rotate's own revoke pass.
+
+Both `admin-token set` and `admin-token rotate` need `DATABASE_URL` reachable: each holds a
+database lock for its own create-verify-write-revoke sequence, so a second run against the same
+account started while one is already in flight fails fast with a clear message instead of racing
+it (each could otherwise revoke the token the other just minted before it was ever written). Each
+also waits, up to 30 seconds, for the same credential lock `gateway mattermost bootstrap` and the
+lifecycle provisioner's own pass hold (ADR-026) — a provisioner pass in flight right now must
+finish before either command rewrites the account's tokens, never race it.
+
+With no admin token configured yet, `create`/`restore`/`reprovision` operations simply stay
+`pending`; `gateway doctor`'s `mattermost_provisioning` check names this plainly rather than
+failing them.
+
+### Creating an agent
+
+```bash
+bun run gateway agents create data-analyst \
+  --display-name "Data Analyst" \
+  --role-prompt-file prompts/agents/data-analyst.md \
+  --channel hq --channel research
+bun run gateway agents operations --agent data-analyst
+```
+
+`agents create` commits the agent's configuration and records a `create` operation; the
+provisioner then creates the bot (refusing to adopt an existing account that is not plausibly its
+own — a regular user, or a bot with elevated roles — with "username taken"), issues it a token
+under `/run/bot-secrets/mm_<id>_token` (generated, never a path you choose), adds it to the team
+and to each channel in `--channel`, and records its account the same way bootstrap does. Each step
+is checkpointed as it completes, so a controller restart mid-way resumes exactly where it left
+off, and a lost token response is recreated rather than reused. Once every step is done the agent
+becomes `ready` and a waiting mention runs at once. `agents operations` shows each operation's
+state, checkpoints and error, if any; a permanent failure (the username really is taken, or the
+admin token is rejected) needs an operator's attention — everything else (a slow or unreachable
+Mattermost) retries on its own. `gateway doctor`'s own `lifecycle_failures` check counts every agent
+whose own current lifecycle operation is `failed`, including a failed `reprovision` (below) — which
+never shows up as the agent's own status, since it leaves the agent `ready` throughout — so a stuck
+operation is never invisible just because its agent otherwise looks fine.
+
+The bot's token file is in `secrets/controller-bots/`, backed up and restored along with the rest
+of `$GATEWAY_HOME` (`docs/operations/home-server.md`); nothing needs to be reprovisioned after an
+ordinary restore. Only if that directory itself were ever lost without a backup would an agent's
+bot need a fresh token — created by hand in Mattermost and written to its
+`mattermost.token_secret_file`, or by retiring and restoring the agent (below).
+
+### Changing a lifecycle-created agent's channels
+
+Editing `allowed_channels` for a `ready`, lifecycle-created agent — the owner's console, or
+`gateway config import` — queues a `reprovision` operation the moment the change commits; no
+`gateway mattermost bootstrap` run touches this agent, so without it nothing would ever join or
+leave its bot to match. The provisioner picks it up like any other operation: it keeps the bot's
+existing token, joins every channel the edit added, and leaves every channel the edit removed
+(except one an owner or admin granted the bot directly, which stays). The agent itself stays
+`ready` throughout — a membership-only change is never a reason to pause its scheduling.
+
+### Retiring and restoring an agent
+
+```bash
+bun run gateway agents retire data-analyst --reason "role no longer needed"
+bun run gateway agents operations --agent data-analyst
+```
+
+`agents retire` cancels an active run (the same cancellation `agents pause` performs), cancels
+its waits, withdraws its pending approvals and queued tool actions (and asks a running one to
+stop), revokes every channel it was ever granted directly, ends its stored runtime session so a
+later restore never resumes a pre-retirement conversation, blocks its own pending Mattermost
+deliveries, and commits the configuration change that takes it out of scheduling — all before the
+Mattermost side even starts. The lifecycle moves to `retiring`, then the provisioner removes the
+bot from every channel it is in, revokes its access tokens, deactivates the account, and (for a
+lifecycle-created agent only — a bootstrap-managed one's `/run/secrets/...` file is never
+touched) deletes its local token file; the lifecycle becomes `retired`. A permanent failure
+leaves it `retiring` with `last_error`, surfaced by `gateway doctor`; **a database rollback alone
+never reactivates a Mattermost account that a provisioner pass already deactivated** — Mattermost
+is never inside a Gateway database transaction.
+
+If an agent's own bot was never fully resolved before it is retired (a crash mid-`create`, say),
+retirement recovers its account by checking `owner_id` against every provisioning admin account
+this Gateway has ever recorded for itself — the current one, or an earlier one `admin-token set`
+has since pointed at a different account — not only the current one, so switching admin accounts
+never orphans a bot created under the old one. A bot that matches none of them, with no admin
+account switch on record at all to rule it out, still has its cleanup skipped (never adopted on a
+guess) but logs a visible warning and a `gateway doctor`-visible note, worth a look.
+
+Retiring the organization's configured finance agent is refused unless the same command also
+reassigns the role:
+
+```bash
+bun run gateway agents retire finance-bot --reassign-finance-to data-analyst
+```
+
+An agent id is never reused, so a retired agent's identity, audit trail and run history always
+stay its own. Its private memory becomes unreadable at once (excluded from `gateway memory list`
+too) and is left to the existing retention to expire on its own schedule; shared memory it wrote
+and that was accepted is organization-owned and stays.
+
+```bash
+bun run gateway agents restore data-analyst
+```
+
+`agents restore` re-adds the agent's last recorded configuration (`pending`, then provisioning
+again): the provisioner re-enables the same bot account, issues it a fresh token (its old ones
+were revoked on retirement), and rejoins its configured channels — the same steps a fresh
+`create` takes, since `restore` shares the provisioner's own path with it. Restore is refused
+when no historical configuration for the agent is still available (an upgrade from a release
+before the configuration journal existed).
+
+Restoring also migrates `token_secret_file` to the provisioner's own `/run/bot-secrets/mm_<id>_token`,
+even for an agent that was originally bootstrap-managed (adopted, then later retired): its old
+`/run/secrets/...` file is read-only to the controller, and its token was already revoked above, so
+restoring the old reference unchanged would leave the agent stuck `reconciling` with no way to
+write a fresh one. That old `/run/secrets/...` file is simply stale after this — nothing reads or
+deletes it; remove it by hand once you no longer need it.
+
+The console (`docs/operations/console.md`) offers the same four actions — create, retire, restore
+and retry — from the Agents hub, through its own session-authenticated HTTP routes; either surface
+commits through the same service, so whichever one an owner used most recently is simply what is
+now active.
+
+### Retrying a failed operation
+
+```bash
+bun run gateway agents retry data-analyst
+```
+
+A `create`/`restore`/`reprovision` operation that `failOperation` left `failed`, or a `retire`
+whose own cleanup failed permanently (leaving the agent `retiring` with `last_error` rather than
+the generic `failed`), can be retried once its underlying cause is fixed (a stray account renamed
+out of the way, the admin token corrected). `agents retry` refuses an agent whose current operation
+is not actually in a failed state — nothing to retry. It queues a fresh operation of the same kind,
+carrying forward whatever the failed attempt already checkpointed (a bot it already resolved, a
+token it already issued), so a completed step is not repeated, only resumed; the agent itself
+returns to `pending` (or stays `retiring`, for a retried retire) until the provisioner finishes it.
+
+### Channel assignments and provenance
+
+```bash
+bun run gateway agents channels data-analyst
+```
+
+Lists the agent's channels with where each one comes from: `configured` (named in its own
+`allowed_channels`) or `granted` (an ADR-022 grant — by whom, when, and the post that is its
+evidence). Revoke a grant directly:
+
+```bash
+bun run gateway agents revoke-grant data-analyst research
+```
+
+This tombstones the grant (re-adding the bot to the same channel later never silently re-grants
+it) and removes the bot from the channel: at once, via a queued `reprovision` operation, for a
+lifecycle-created agent; on the membership synchronizer's own next pass (seconds away) for a
+bootstrap-managed one. A channel the bot is a member of that is neither configured nor granted
+(`member-unauthorized`) does not show up here — that is a live check against Mattermost itself,
+which `gateway mattermost reconcile` already performs.
 
 ## Giving an agent a channel
 
@@ -139,3 +337,24 @@ a sync after a failure is pending.
   existing bot account it adopts for the first time.
 - **Routing key:** replace the file and restart the controller. Agent posts signed with the
   old key that were not yet synced are rejected and alerted; there is no dual-key window.
+- **The provisioning admin token:** Mattermost access tokens do not expire on their own, so rotate
+  it by hand, every 90 days:
+
+  ```bash
+  bun run gateway mattermost admin-token rotate --secrets-dir secrets
+  ```
+
+  Create-verify-switch-revoke (ADR-026): it creates a new personal access token (tagged with a
+  fixed description, `agent-gateway-admin`) for the same `gateway-admin` account, verifies it
+  authenticates as that account, writes it over the current file — the controller's provisioner
+  reads it on its next pass, no restart needed — and only then revokes every *other* token carrying
+  that same description. A crash between any two of those steps leaves a token that still works;
+  re-running the command finishes it (it revokes every one of its own tokens that is not the one it
+  just wrote, however many stray ones a crashed earlier attempt left behind). A token on the account
+  without that description — an unrelated personal access token the admin also happens to hold — is
+  never touched; revoke that one yourself if it is no longer needed. `admin-token set` itself mints
+  and tags its own token from the moment it is first run (above), so there is no longer a "first
+  rotation never revokes the hand-entered one" gap to work around; if a rotate ever does revoke 0
+  tokens, it prints a warning rather than staying quiet about it — a sign that the token currently
+  in the file somehow never got tagged (an operator wrote the file directly, say), worth tracking
+  down and revoking by hand.

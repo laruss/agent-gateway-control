@@ -12,6 +12,7 @@ import {
 } from "@agent-gateway/contracts";
 import {
 	type ControlPlaneDeps,
+	ensureAgentLifecycleAdoption,
 	ensureConfigHistory,
 	handleRunReport,
 	handleRunTimeout,
@@ -35,6 +36,7 @@ import { createBoss, transactionalJobSink } from "@agent-gateway/queue";
 import { gauge, type HealthCheck, MetricsRegistry } from "@agent-gateway/service";
 import type pg from "pg";
 import type { PgBoss } from "pg-boss";
+import { startAgentProvisioner } from "./agent-provisioner.ts";
 import {
 	type MattermostBridgeOptions,
 	startBridgeListener,
@@ -59,6 +61,10 @@ export type ControllerOptions = Readonly<{
 	retentionIntervalMs?: number;
 	/** Listen to Mattermost; without it no Mattermost event reaches the Gateway. */
 	mattermost?: MattermostBridgeOptions;
+	/** How often the agent lifecycle provisioner (ADR-026) looks for new or resumed work; lower
+	 * in tests. Runs only alongside `mattermost`: with no Mattermost to provision against, there
+	 * is nothing for it to do. */
+	agentProvisionerPollIntervalMs?: number;
 	/** Where the controller's metrics go; a registry of its own by default. */
 	metrics?: MetricsRegistry;
 }>;
@@ -120,6 +126,9 @@ export async function startController(options: ControllerOptions): Promise<Runni
 	// before configuration history existed, so it is never left permanently unbackfilled on a
 	// controller that is restarted without an intervening `config apply`.
 	await ensureConfigHistory(deps, "system");
+	// ADR-026: adopts every configured agent that has no `agent_lifecycle` row yet (a database
+	// upgraded from a release before this table existed) — a no-op once every agent is adopted.
+	await ensureAgentLifecycleAdoption(deps, "system");
 	const metrics = options.metrics ?? new MetricsRegistry();
 	registerControllerMetrics(metrics, pool, clock);
 	const reportsApplied = metrics.counter(
@@ -371,6 +380,22 @@ export async function startController(options: ControllerOptions): Promise<Runni
 		options.mattermost === undefined
 			? null
 			: startBridgeMembershipSync(deps, options.mattermost, log);
+	const provisioner =
+		options.mattermost === undefined
+			? null
+			: startAgentProvisioner(
+					deps,
+					{
+						baseUrl: options.mattermost.baseUrl,
+						...(options.mattermost.secretsDir === undefined
+							? {}
+							: { secretsDir: options.mattermost.secretsDir }),
+						...(options.agentProvisionerPollIntervalMs === undefined
+							? {}
+							: { pollIntervalMs: options.agentProvisionerPollIntervalMs }),
+					},
+					log.child({ component: "agent-provisioner" }),
+				);
 
 	metrics.collect(() =>
 		listener === null
@@ -421,6 +446,7 @@ export async function startController(options: ControllerOptions): Promise<Runni
 			clearInterval(timer);
 			clearInterval(retentionTimer);
 			await Promise.allSettled([reconciling, retaining]);
+			await provisioner?.stop();
 			await membership?.stop();
 			await listener?.stop();
 			await boss.stop({ graceful: true, timeout: 30_000 });

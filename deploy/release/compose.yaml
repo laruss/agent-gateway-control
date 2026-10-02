@@ -92,9 +92,25 @@ services:
       DATABASE_URL_FILE: /run/secrets/database_url
       MATTERMOST_URL: ${MATTERMOST_URL:-}
       SECRETS_DIR: /run/secrets
+      # ADR-026: its own, separate override for /run/bot-secrets/ references (resolveSecretPath,
+      # @agent-gateway/service) — SECRETS_DIR must never collapse a lifecycle-created agent's bot
+      # token path into the operator-managed secrets directory above.
+      BOT_SECRETS_DIR: /run/bot-secrets
+      # `gateway doctor`'s 'mattermost_provisioning' check (ADR-026): read-only here too, the same
+      # file `gateway mattermost admin-token set|rotate` writes through the mount below.
+      MATTERMOST_ADMIN_TOKEN_FILE: /run/secrets/mattermost_admin_token
+      # `gateway mattermost bootstrap`'s own temporary admin token (docs/operations/mattermost.md):
+      # the operator exports it in the shell running `bin/agw`, which this interpolates at compose
+      # parse time, the same process environment `bin/agw` execs in — `docker compose run` forwards
+      # none of the caller's environment on its own. Empty when unset, read as "not configured"
+      # (`requireSettingPreferEnv`, @agent-gateway/service), never shadowed by the `_FILE` above.
+      MATTERMOST_ADMIN_TOKEN: ${MATTERMOST_ADMIN_TOKEN:-}
     volumes:
       - ${GATEWAY_HOME}/secrets/controller:/run/secrets
       - ${GATEWAY_HOME}/secrets:/secrets
+      # ADR-026: the lifecycle provisioner's own directory, read-only here — bootstrap never
+      # writes a lifecycle-created agent's token; the controller is its only writer.
+      - ${GATEWAY_HOME}/secrets/controller-bots:/run/bot-secrets:ro
       - ${GATEWAY_HOME}/config:/config:ro
       - ${GATEWAY_HOME}/backups:/backups
     tmpfs:
@@ -114,6 +130,12 @@ services:
       OUTBOX_DELIVERY: mattermost
       MATTERMOST_URL: ${MATTERMOST_URL:?set MATTERMOST_URL}
       GATEWAY_ROUTING_KEY_FILE: /run/secrets/gateway_routing_key
+      # ADR-026: a dedicated, non-bot Mattermost system-admin account's personal access token,
+      # read-only here — `gateway mattermost admin-token set|rotate` (run through gateway-cli,
+      # which mounts secrets/controller read-write) is the only writer. Absent until an operator
+      # sets one, which leaves the lifecycle provisioner idle (`gateway doctor`'s
+      # 'mattermost_provisioning' check names this).
+      MATTERMOST_ADMIN_TOKEN_FILE: /run/secrets/mattermost_admin_token
       # The owner's console (ADR-023): off unless gateway.env turns it on, and then only once
       # `gateway console password set` has written a password hash (a missing or invalid hash
       # refuses to start). CONSOLE_HOST is this container's alias on agent-mm only, resolved
@@ -128,6 +150,10 @@ services:
       CONSOLE_ORIGIN: ${CONSOLE_ORIGIN:-https://gateway.local}
     volumes:
       - ${GATEWAY_HOME}/secrets/controller:/run/secrets:ro
+      # ADR-026: where the lifecycle provisioner writes a lifecycle-created agent's bot token
+      # (generated server-side, `mm_<agent>_token`), read-write, distinct from the operator-managed
+      # secrets above — the controller never writes there, only here.
+      - ${GATEWAY_HOME}/secrets/controller-bots:/run/bot-secrets
     tmpfs:
       - /tmp:size=64m,nosuid,nodev,noexec
     networks:

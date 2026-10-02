@@ -24,17 +24,35 @@ export const MattermostNameSchema = z
 	.regex(/^[a-z0-9][a-z0-9._-]{0,63}$/, "Mattermost team/channel/user name");
 export type MattermostName = z.infer<typeof MattermostNameSchema>;
 
-/** A Docker/Compose secret file: `/run/secrets/<name>`. */
+/**
+ * A Docker/Compose secret file: `/run/secrets/<name>` (the controller's read-only, owner-managed
+ * secrets) or `/run/bot-secrets/<name>` (the controller's own read-write directory, where it
+ * writes tokens it provisions itself for lifecycle-created agents; see ADR-026).
+ */
 export const SecretFileSchema = z
 	.string()
-	.regex(/^\/run\/secrets\/[a-z0-9_]+$/, "path under /run/secrets/");
+	.regex(
+		/^\/run\/(?:secrets|bot-secrets)\/[a-z0-9_]+$/,
+		"path under /run/secrets/ or /run/bot-secrets/",
+	);
 export type SecretFile = z.infer<typeof SecretFileSchema>;
+
+/** Prefix of a lifecycle-created agent's bot token file (ADR-026): generated server-side by the
+ * controller's own provisioner, under its read-write directory — never bootstrap's or reconcile's
+ * to resolve or touch (`mattermostPlan` skips any agent whose `token_secret_file` lives here; it
+ * is the provisioner's bot to manage). */
+export const BOT_SECRET_FILE_PREFIX = "/run/bot-secrets/";
 
 /** The controller's HMAC key for agent routing props; no bot token may live there. */
 export const ROUTING_KEY_SECRET_FILE: SecretFile = "/run/secrets/gateway_routing_key";
 
 /** The console's sign-in credential: only its Argon2id hash is ever stored, never the password. */
 export const CONSOLE_PASSWORD_HASH_SECRET_FILE: SecretFile = "/run/secrets/console_password_hash";
+
+/** The dedicated, non-bot Mattermost system-admin account's personal access token the lifecycle
+ * provisioner uses (ADR-026): read-only to the controller, written only by
+ * `gateway mattermost admin-token set|rotate`. */
+export const MATTERMOST_ADMIN_TOKEN_SECRET_FILE: SecretFile = "/run/secrets/mattermost_admin_token";
 
 export const TimestampSchema = z.iso.datetime({ offset: true });
 export type Timestamp = z.infer<typeof TimestampSchema>;
