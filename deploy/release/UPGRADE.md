@@ -100,6 +100,22 @@ them on:
 Rolling back from 0.3.0 to 0.2.1 needs an extra check beyond the database: see ROLLBACK.md and
 [docs/operations/releases.md](../../docs/operations/releases.md#the-v2-compatibility-rule).
 
+## Upgrading to 0.5.0
+
+0.5.0 adds migrations `0022_console_sessions` and `0023_console_csrf_derived`, both expand: the
+steps above apply unchanged. The console ([ADR-025](../../docs/adr/025-management-console.md))
+becomes a management UI:
+
+- Sign-in is a page with a session cookie instead of the browser's HTTP Basic dialog. The
+  existing password hash is reused; every browser signs in once more after the upgrade.
+- `CONSOLE_ORIGIN` (default `https://gateway.local`) must equal the address the console is
+  opened at. On the home server kit the default is right; set it in `gateway.env` only if the
+  console is served elsewhere.
+- With `CONSOLE_ENABLED=true` the controller also needs `GATEWAY_ROUTING_KEY` (the home server
+  kit's `init-home.sh` already created `secrets/controller/gateway_routing_key`).
+- Edits made in the console's Agents hub are configuration revisions with source `console`
+  (`gateway config history`), the same as `config import`.
+
 ## Upgrading past 0.3.0: configuration history
 
 Starting with the release after 0.3.0, configuration is also kept as immutable snapshots and an
