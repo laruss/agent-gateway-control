@@ -180,6 +180,8 @@ export async function runProvisionerPass(
 	// A client whose unlock failed may still hold a lock: it is closed, not pooled (the same
 	// margin `runRetentionIfDue` leaves).
 	let unlocked = true;
+	// Likewise when the shared credential lock's own release failed, whatever the outer unlock did.
+	let credentialHeld = false;
 	try {
 		const locked = await lock.query<{ locked: boolean }>(
 			"select pg_try_advisory_lock(hashtextextended($1, 0)) as locked",
@@ -209,7 +211,9 @@ export async function runProvisionerPass(
 					adminTokenAtStart,
 				);
 			} finally {
+				credentialHeld = true;
 				await releaseMattermostCredentialLock(lock);
+				credentialHeld = false;
 			}
 		} finally {
 			unlocked = false;
@@ -219,7 +223,7 @@ export async function runProvisionerPass(
 			unlocked = true;
 		}
 	} finally {
-		lock.release(!unlocked);
+		lock.release(!unlocked || credentialHeld);
 	}
 }
 

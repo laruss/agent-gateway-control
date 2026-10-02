@@ -2060,9 +2060,10 @@ Deliberate choices here ([ADR-025](docs/adr/025-management-console.md)):
 
 Released as 0.5.0 (migrations `0022_console_sessions` and `0023_console_csrf_derived`, both expand; head `0023_console_csrf_derived`, pg-boss schema 42).
 
-## Phase 14 - Automated Mattermost provisioning and admin-token rotation
+## Phase 14 - Agent lifecycle: creation, assignment and retirement
 
-Status: **done**
+Status: **done** (review closed after round 5, the round limit; its findings and those of a final
+review of the fix commit are fixed and covered by tests)
 
 | Item | State | Evidence |
 |------|-------|----------|
@@ -2072,7 +2073,7 @@ Status: **done**
 | The provisioner: a controller loop alongside `reconcile`/`retain` that takes `pending`/`running` `create`/`restore`/`reprovision` operations and drives each one's steps (resolve or create the bot by username, issue and write its token, add it to the team and its configured channels, record its account), checkpointing after every external step and never holding a transaction across a Mattermost call; resumes `running` operations from their checkpoint after a restart | done | `apps/controller/src/agent-provisioner.ts`, `checkpointOperation`/`listPendingLifecycleOperations` in `packages/core/src/services/agent-lifecycle.ts` |
 | Failure classification: a username taken by an account that is not plausibly the Gateway's own, or a rejected/insufficient admin token, fail the operation (`failOperation`, redacted); anything else is retried on the next pass; a lost token response is recovered by revoking every token the bot has that is not the one in its file and issuing a fresh one | done | `apps/controller/src/agent-provisioner.ts` |
 | The provisioning admin account is resolved from its own token (`users/me`) every pass and excluded from routing exactly like the listener bot: a post by it never wakes an agent | done | `packages/core/src/services/store.ts` (`PROVISIONING_ADMIN_DIRECTORY_NAME`), `packages/mattermost/src/normalize.ts` (`admin_post` skip reason) |
-| `gateway mattermost admin-token set` (hidden entry, validates `users/me`: non-bot, `system_admin`) and `admin-token rotate` (create-verify-switch-revoke: a new token for the same account, verified, switched, then every other token on the account revoked — correct after any number of interrupted retries, since nothing but the file says which token is current) | done | `apps/cli/src/mattermost-commands.ts`, `packages/mattermost/src/client.ts` (`createUserAccessToken` now returns its id too) |
+| `gateway mattermost admin-token set` (hidden entry, validates `users/me`: non-bot, `system_admin`) and `admin-token rotate` (create-verify-switch-revoke: a new token for the same account, verified, switched, then every other Gateway-tagged token on the account revoked, never an unrelated one; `set` converts the pasted token into a Gateway-tagged one; both run under the shared Mattermost credential lock) | done | `apps/cli/src/mattermost-commands.ts`, `packages/mattermost/src/client.ts` (`createUserAccessToken` now returns its id too) |
 | `gateway agents create <id> --display-name ... --role-prompt-file ... [--channel ...] [--runtime ...] [--model ...]` (a thin wrapper over `requestAgentCreate`) and `gateway agents operations [--agent <id>]` | done | `apps/cli/src/commands.ts` |
 | `gateway mattermost bootstrap` unchanged; an agent it created keeps its own `/run/secrets/...` token path | done | `apps/cli/src/mattermost-commands.ts` (unchanged) |
 | Retirement cleanup: an active run cancelled, waits cancelled, approvals/tool actions withdrawn (card updated), every channel grant tombstoned, pending outbox deliveries blocked (`cancelled` status), all in the same transaction as `remove_agent`; the finance agent refused without `reassignFinanceTo` | done | `packages/core/src/services/agent-lifecycle.ts` (`requestAgentRetire`), `packages/core/src/services/channel-grants.ts` (`revokeAllActiveGrantsIn`), `packages/db/migrations/0026_outbox_cancelled_status.sql` |
@@ -2170,3 +2171,28 @@ Deliberate choices here ([ADR-026](docs/adr/026-agent-lifecycle.md)):
   which already removes a bot from a channel it has neither a grant nor a configuration entry for.
 
 Not yet released; see the Changelog's `[Unreleased]` section.
+
+### Phase 14 review log
+
+- Per-change reviews (Codex) while building: retirement cleanup (1 P1 + 2 P2: bot identity
+  recovery, restore of bootstrap-managed tokens, retention of cancelled deliveries) and the
+  console lifecycle (4 P2: polling, retired view, retry replay, finance choices) — fixed.
+- Round 1 (Codex + Opus subagent): Codex 1 P1 + 5 P2, Opus 2 P2 + 5 P3. Fixed: channel edits
+  during provisioning, team changes, restoring a former finance agent, failed reprovisions
+  stopping an agent, config writes dropping lifecycle agents, doctor and audit noise, adopting a
+  foreign bot, rotation revoking unrelated tokens.
+- Round 2: Codex 1 P1 + 4 P2, Opus 3 P2 + 3 P3. Fixed: retire recovery touching a foreign bot,
+  a completion fence for configuration changes, permission-preserving restore, failed
+  reprovisions visible in the console and doctor, tagged admin tokens, retry provenance
+  (migration `0027_lifecycle_retry_of`).
+- Round 3: Codex 2 P1 + 2 P2, Opus 3 P2 + 3 P3. Fixed: membership now converges from live
+  Mattermost state every pass (teams and channels), elevated membership roles demoted, retired
+  agents cannot be re-added outside restore, bounded checkpoints, earlier admin owners.
+- Round 4: Codex 1 P1 + 5 P2, Opus 5 P3. Fixed: cross-process provisioning and admin-token
+  locks, bootstrap leaving lifecycle retirees alone, immutable lifecycle token paths, admin
+  history on create resume, checkpoint bounds, shared config guards, a team-leave e2e test.
+- Round 5: Codex 1 P1 + 2 P2, Opus 1 P2 + 2 P3. Fixed: one lock for every Mattermost credential
+  writer (provisioner, bootstrap, admin-token), the token read under it, a 401 after a token
+  swap retried rather than failed, lifecycle refreshed after a revoke.
+- Final review of the fix commit: 2 P2 (bootstrap's token read under the lock, a connection whose
+  credential unlock failed is discarded) — fixed.

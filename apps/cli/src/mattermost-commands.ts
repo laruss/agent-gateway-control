@@ -105,14 +105,15 @@ export async function mattermostBootstrap(
 		throw new MattermostCommandError("pass --secrets-dir <dir> (or set SECRETS_DIR)");
 	}
 	const baseUrl = requireSetting("MATTERMOST_URL");
-	// `requireSettingPreferEnv`, not `requireSetting`: `gateway-cli` also names
-	// `MATTERMOST_ADMIN_TOKEN_FILE` (for `gateway doctor`'s own read), which does not exist yet on a
-	// fresh install — the temporary token this command's own workflow exports must never be
-	// shadowed by that absent file.
-	const adminToken = requireSettingPreferEnv("MATTERMOST_ADMIN_TOKEN");
 	// One bootstrap at a time; one that ran on a configuration replaced meanwhile runs again, so
 	// no membership of the old plan outlives the new one.
 	await withBootstrapLock(deps, async () => {
+		// `requireSettingPreferEnv`, not `requireSetting`: `gateway-cli` also names
+		// `MATTERMOST_ADMIN_TOKEN_FILE` (for `gateway doctor`'s own read), which does not exist yet on
+		// a fresh install — the temporary token this command's own workflow exports must never be
+		// shadowed by that absent file. Read under the credential lock: an `admin-token rotate` this
+		// run waited behind has replaced the file and revoked the token it held before.
+		const adminToken = requireSettingPreferEnv("MATTERMOST_ADMIN_TOKEN");
 		for (let run = 1; ; run += 1) {
 			// The generation, not the version: a configuration changed and changed back is a new
 			// generation with the old version, and its interim membership changes still count.
@@ -213,6 +214,8 @@ async function withAdminTokenLock<T>(pool: pg.Pool, work: () => Promise<T>): Pro
 	// A client whose unlock failed may still hold a lock: it is closed, not pooled (the same
 	// margin `withBootstrapLock`/`runRetentionIfDue` leave).
 	let unlocked = true;
+	// Likewise when the shared credential lock's own release failed, whatever the outer unlock did.
+	let credentialHeld = false;
 	try {
 		const locked = await client.query<{ locked: boolean }>(
 			"select pg_try_advisory_lock(hashtextextended($1, 0)) as locked",
@@ -228,7 +231,9 @@ async function withAdminTokenLock<T>(pool: pg.Pool, work: () => Promise<T>): Pro
 			try {
 				return await work();
 			} finally {
+				credentialHeld = true;
 				await releaseMattermostCredentialLock(client);
+				credentialHeld = false;
 			}
 		} finally {
 			unlocked = false;
@@ -236,7 +241,7 @@ async function withAdminTokenLock<T>(pool: pg.Pool, work: () => Promise<T>): Pro
 			unlocked = true;
 		}
 	} finally {
-		client.release(!unlocked);
+		client.release(!unlocked || credentialHeld);
 	}
 }
 
