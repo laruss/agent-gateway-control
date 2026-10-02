@@ -349,9 +349,14 @@ describe("agent lifecycle provisioner against a real server (ADR-026)", () => {
 		// A second team the organization's own configuration never names, created directly on the
 		// server (never through the Gateway) — standing in for a team the bot was added to by hand,
 		// or one the organization moved away from (`organization.mattermost.team` changed) without
-		// this very bot's own membership ever being revisited until now.
+		// this very bot's own membership ever being revisited until now. Named with a random suffix,
+		// never a fixed literal: Mattermost's own unique index on a team's name is not conditioned on
+		// `delete_at`, so even a team this test goes on to delete stays unavailable to recreate under
+		// the same name — a fixed name would make a retried or re-run test fail on "already exists"
+		// rather than the assertions it means to make.
+		const suffix = randomUUID().slice(0, 8);
 		const secondTeam = await mmApi("POST", "teams", mm.adminToken, {
-			name: "second-team",
+			name: `second-team-${suffix}`,
 			display_name: "Second Team",
 			type: "O",
 		});
@@ -359,84 +364,90 @@ describe("agent lifecycle provisioner against a real server (ADR-026)", () => {
 		if (typeof secondTeamId !== "string") {
 			throw new Error("second team has no id");
 		}
-		const secondChannel = await mmApi("POST", "channels", mm.adminToken, {
-			team_id: secondTeamId,
-			name: "second-hq",
-			display_name: "Second HQ",
-			type: "O",
-		});
-		const secondChannelId = secondChannel.id;
-		if (typeof secondChannelId !== "string") {
-			throw new Error("second team's channel has no id");
+		try {
+			const secondChannel = await mmApi("POST", "channels", mm.adminToken, {
+				team_id: secondTeamId,
+				name: `second-hq-${suffix}`,
+				display_name: "Second HQ",
+				type: "O",
+			});
+			const secondChannelId = secondChannel.id;
+			if (typeof secondChannelId !== "string") {
+				throw new Error("second team's channel has no id");
+			}
+			await mmApi("POST", `teams/${secondTeamId}/members`, mm.adminToken, {
+				team_id: secondTeamId,
+				user_id: botUserId,
+			});
+			await mmApi("POST", `channels/${secondChannelId}/members`, mm.adminToken, {
+				user_id: botUserId,
+			});
+			expect(
+				(await mmApi("GET", `teams/${secondTeamId}/members/${botUserId}`, mm.adminToken)).user_id,
+			).toBe(botUserId);
+
+			// Queues a `reprovision` directly (the same call a channel grant revoke or a committed
+			// channel/team edit already queues under the hood, ADR-026): the provisioner's own
+			// `convergeMembership` re-lists the bot's live teams on every pass, joins/keeps the
+			// organization's own configured team, and leaves every other one outright, which Mattermost
+			// itself then cascades into every channel of that left team — this is the one path the real
+			// server actually exercises; a fake can only ever assert that `removeTeamMember` was called.
+			await inTransaction(deps, async (uow) => {
+				const locked = await lockLifecycleRows(uow.tx.db, [agentId]);
+				await queueMembershipReprovisioning(uow, [agentId], locked, null, "e2e", "cli");
+			});
+
+			await eventually(
+				async () =>
+					(
+						await gateway.pool.query<{ state: string }>(
+							"select state from agent_lifecycle_operations where agent_id = $1 and kind = 'reprovision' order by created_at desc limit 1",
+							[agentId],
+						)
+					).rows[0]?.state === "succeeded" || null,
+				60_000,
+				"the analyst's reprovision finishes",
+			);
+
+			// Mattermost soft-deletes a team membership (`delete_at` set, the row itself still readable),
+			// unlike a channel membership, which the server stops reporting at all (404) the moment it
+			// ends — the retire test above already relies on that same difference.
+			const secondTeamMembership = await mmApi(
+				"GET",
+				`teams/${secondTeamId}/members/${botUserId}`,
+				mm.adminToken,
+			);
+			expect(secondTeamMembership.delete_at).not.toBe(0);
+			const stillInSecondChannel = await mmApi(
+				"GET",
+				`channels/${secondChannelId}/members/${botUserId}`,
+				mm.adminToken,
+			).catch((error: unknown) => error);
+			expect(stillInSecondChannel).toBeInstanceOf(Error);
+
+			// Unaffected: the organization's own configured team and channel, never touched by leaving an
+			// unrelated one.
+			const team = await mmApi("GET", `teams/name/${TEAM}`, mm.adminToken);
+			const teamId = team.id;
+			if (typeof teamId !== "string") {
+				throw new Error("team has no id");
+			}
+			expect(
+				(await mmApi("GET", `teams/${teamId}/members/${botUserId}`, mm.adminToken)).user_id,
+			).toBe(botUserId);
+			const hqChannel = await mmApi("GET", `teams/${teamId}/channels/name/hq`, mm.adminToken);
+			const hqChannelId = hqChannel.id;
+			if (typeof hqChannelId !== "string") {
+				throw new Error("channel has no id");
+			}
+			expect(
+				(await mmApi("GET", `channels/${hqChannelId}/members/${botUserId}`, mm.adminToken)).user_id,
+			).toBe(botUserId);
+		} finally {
+			// Deleted even on a failed assertion above: this throwaway team must never linger as
+			// visible clutter on the test server for the rest of this file's own run.
+			await mmApi("DELETE", `teams/${secondTeamId}`, mm.adminToken).catch(() => undefined);
 		}
-		await mmApi("POST", `teams/${secondTeamId}/members`, mm.adminToken, {
-			team_id: secondTeamId,
-			user_id: botUserId,
-		});
-		await mmApi("POST", `channels/${secondChannelId}/members`, mm.adminToken, {
-			user_id: botUserId,
-		});
-		expect(
-			(await mmApi("GET", `teams/${secondTeamId}/members/${botUserId}`, mm.adminToken)).user_id,
-		).toBe(botUserId);
-
-		// Queues a `reprovision` directly (the same call a channel grant revoke or a committed
-		// channel/team edit already queues under the hood, ADR-026): the provisioner's own
-		// `convergeMembership` re-lists the bot's live teams on every pass, joins/keeps the
-		// organization's own configured team, and leaves every other one outright, which Mattermost
-		// itself then cascades into every channel of that left team — this is the one path the real
-		// server actually exercises; a fake can only ever assert that `removeTeamMember` was called.
-		await inTransaction(deps, async (uow) => {
-			const locked = await lockLifecycleRows(uow.tx.db, [agentId]);
-			await queueMembershipReprovisioning(uow, [agentId], locked, null, "e2e", "cli");
-		});
-
-		await eventually(
-			async () =>
-				(
-					await gateway.pool.query<{ state: string }>(
-						"select state from agent_lifecycle_operations where agent_id = $1 and kind = 'reprovision' order by created_at desc limit 1",
-						[agentId],
-					)
-				).rows[0]?.state === "succeeded" || null,
-			60_000,
-			"the analyst's reprovision finishes",
-		);
-
-		// Mattermost soft-deletes a team membership (`delete_at` set, the row itself still readable),
-		// unlike a channel membership, which the server stops reporting at all (404) the moment it
-		// ends — the retire test above already relies on that same difference.
-		const secondTeamMembership = await mmApi(
-			"GET",
-			`teams/${secondTeamId}/members/${botUserId}`,
-			mm.adminToken,
-		);
-		expect(secondTeamMembership.delete_at).not.toBe(0);
-		const stillInSecondChannel = await mmApi(
-			"GET",
-			`channels/${secondChannelId}/members/${botUserId}`,
-			mm.adminToken,
-		).catch((error: unknown) => error);
-		expect(stillInSecondChannel).toBeInstanceOf(Error);
-
-		// Unaffected: the organization's own configured team and channel, never touched by leaving an
-		// unrelated one.
-		const team = await mmApi("GET", `teams/name/${TEAM}`, mm.adminToken);
-		const teamId = team.id;
-		if (typeof teamId !== "string") {
-			throw new Error("team has no id");
-		}
-		expect(
-			(await mmApi("GET", `teams/${teamId}/members/${botUserId}`, mm.adminToken)).user_id,
-		).toBe(botUserId);
-		const hqChannel = await mmApi("GET", `teams/${teamId}/channels/name/hq`, mm.adminToken);
-		const hqChannelId = hqChannel.id;
-		if (typeof hqChannelId !== "string") {
-			throw new Error("channel has no id");
-		}
-		expect(
-			(await mmApi("GET", `channels/${hqChannelId}/members/${botUserId}`, mm.adminToken)).user_id,
-		).toBe(botUserId);
 	});
 
 	describe("the console's own lifecycle routes against the real server (ADR-026)", () => {

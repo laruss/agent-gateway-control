@@ -464,4 +464,111 @@ describe("AgentDetailPage", () => {
 		// The agent being retired is never offered as its own reassignment target either.
 		expect(screen.queryByRole("option", { name: AGENT_ID })).not.toBeInTheDocument();
 	});
+
+	it("invalidates the lifecycle query once a commit applies: a reprovision it queues (ADR-026) shows its own progress without a manual reload", async () => {
+		const commitCalls: Array<{ baseRevisionId: number | null }> = [];
+		// Flips once the commit below lands: before it, the lifecycle query reports an already
+		// `succeeded` operation (polling has already stopped, `shouldPollLifecycle`), so only an
+		// explicit invalidate — never the interval — can surface the `reprovision` a committed
+		// `allowedChannels`/`enabled` edit queues for a lifecycle-owned, `ready` agent.
+		let committed = false;
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: string, init?: RequestInit) => {
+				const method = init?.method ?? "GET";
+				const path = new URL(input, "http://localhost").pathname;
+				if (path === "/api/session") {
+					return jsonResponse({
+						authenticated: true,
+						csrfToken: "t",
+						expiresAt: "2031-01-01T00:00:00.000Z",
+					});
+				}
+				if (path === "/api/status") {
+					return jsonResponse(statusSnapshot);
+				}
+				if (path === "/api/agents" && method === "GET") {
+					return jsonResponse(listFixture());
+				}
+				if (path === `/api/agents/${AGENT_ID}` && method === "GET") {
+					return jsonResponse(detailFixture());
+				}
+				if (path === `/api/agents/${AGENT_ID}/lifecycle` && method === "GET") {
+					return jsonResponse({
+						status: "ready",
+						generation: committed ? 2 : 1,
+						lastError: null,
+						statusChangedAt: new Date().toISOString(),
+						retiredAt: null,
+						operations: [
+							{
+								id: "55555555-5555-4555-8555-555555555555",
+								kind: committed ? "reprovision" : "create",
+								state: committed ? "running" : "succeeded",
+								checkpoints: {},
+								error: null,
+								createdAt: new Date().toISOString(),
+								updatedAt: new Date().toISOString(),
+								finishedAt: committed ? null : new Date().toISOString(),
+							},
+						],
+					});
+				}
+				if (path === `/api/agents/${AGENT_ID}/preview` && method === "POST") {
+					return jsonResponse({
+						baseRevisionId: 7,
+						baseHash: "a".repeat(64),
+						newHash: "b".repeat(64),
+						noop: false,
+						problems: [],
+						impact: [],
+						diff: {
+							agents: [
+								{
+									kind: "changed",
+									agentId: AGENT_ID,
+									fieldPaths: [],
+									rolePrompt: {
+										changed: true,
+										beforeSize: ORIGINAL_PROMPT.length,
+										afterSize: ORIGINAL_PROMPT.length + 5,
+									},
+								},
+							],
+							organizationFieldPaths: [],
+							constitution: { changed: false, beforeSize: 0, afterSize: 0 },
+						},
+					});
+				}
+				if (path === `/api/agents/${AGENT_ID}/commit` && method === "POST") {
+					const body = JSON.parse(String(init?.body)) as { baseRevisionId: number | null };
+					commitCalls.push({ baseRevisionId: body.baseRevisionId });
+					committed = true;
+					return jsonResponse({
+						revisionId: 8,
+						hash: "c".repeat(64),
+						noop: false,
+						replayed: false,
+						activeRevisionId: 8,
+					});
+				}
+				throw new Error(`unexpected request: ${method} ${path}`);
+			}),
+		);
+		renderDetail();
+		const user = userEvent.setup();
+		await openInstructionsTab(user);
+
+		const textarea = await screen.findByLabelText(/role prompt/i);
+		await user.type(textarea, " more");
+		// Before the commit: the last known operation is already terminal, so there is nothing to
+		// show and nothing left polling.
+		expect(screen.queryByText(/provisioning/i)).not.toBeInTheDocument();
+
+		await user.click(screen.getByRole("button", { name: /review changes/i }));
+		await user.click(await screen.findByRole("button", { name: /^apply$/i }));
+
+		await waitFor(() => expect(commitCalls).toHaveLength(1));
+		expect(await screen.findByText(/provisioning/i)).toBeInTheDocument();
+	});
 });

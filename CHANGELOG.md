@@ -269,6 +269,33 @@ All notable changes are documented here. The project follows Semantic Versioning
   never created, so its Mattermost-side cleanup was rightly skipped) and its detail text described
   that outcome as unresolved ("could not be confirmed either way") when it is in fact a definite
   one. It is now a warning that never fails doctor, with detail text naming the outcome correctly.
+- Bootstrap's own exclusion of lifecycle-owned agents from its plan narrowed the race it meant to
+  close rather than closing it: a plan computed before a `restore` operation's own `create`/
+  `restore` ever landed still classified that agent as bootstrap-managed, so bootstrap could still
+  reach its retired-cleanup step after the provisioner had already re-enabled the very bot it was
+  about to deactivate again. `gateway mattermost bootstrap`, `admin-token set|rotate`, and the
+  lifecycle provisioner's own pass now all hold one shared database lock for as long as they create,
+  token or revoke a Mattermost account, so none of them ever run those writes at the same time;
+  bootstrap and `admin-token set|rotate` wait for it (bounded, a clear message if that wait runs
+  out), and the provisioner's pass skips its tick instead of waiting behind a CLI command. (ADR-026)
+- `admin-token rotate` read the token file before taking any lock, so a concurrent rotate (or the
+  provisioner) that revoked and replaced it in the meantime left this run authenticating with an
+  already-stale value. The file's state and content are now both read only once every lock this
+  sequence takes is held. As defence in depth, the provisioner's own failure handling now also
+  retries (rather than permanently failing an operation) on a 401/403 that coincides with the admin
+  token file having changed since that pass started — the one gap the shared lock above cannot
+  close by itself, since a pass's own admin client is still built from a token value read before it
+  ever takes the lock.
+- Revoking a directly granted channel, or committing an edit to an agent's `allowedChannels`/
+  `enabled` field, queues a `reprovision` operation (ADR-026) the console's lifecycle query could
+  already have stopped polling for (it only polls while the agent's own current operation is
+  `pending`/`running`, and a prior one may have already settled): its progress, and any failure,
+  would never show without a manual reload. Both now also invalidate that query, so the console
+  picks the new operation up on its own.
+- The lifecycle provisioner logged "another pass is already running; skipping this tick" at `info`
+  every few seconds whenever a bootstrap or admin-token run (or another controller's own pass)
+  happened to overlap it — routine contention, not worth an operator's attention at that level. It
+  is now logged at `debug`.
 
 ## [0.5.0] - 2026-10-02
 

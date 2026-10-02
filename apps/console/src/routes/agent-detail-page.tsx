@@ -4,6 +4,7 @@ import type {
 	ConsoleAgentLifecycleResponse,
 	ConsoleAgentListResponse,
 } from "@agent-gateway/contracts";
+import { useQueryClient } from "@tanstack/react-query";
 import { AlertCircle } from "lucide-react";
 import * as React from "react";
 import { useNavigate, useParams } from "react-router";
@@ -79,6 +80,7 @@ function isRetiredStatus(status: string): boolean {
 export function AgentDetailPage(): React.ReactElement {
 	const { agentId } = useParams<{ agentId: string }>();
 	const navigate = useNavigate();
+	const queryClient = useQueryClient();
 	// Called unconditionally, before any of this page's own early returns below (Rules of Hooks):
 	// its query key is shared with `LifecyclePanel`'s own instance of this same hook, so the two
 	// never fetch or poll independently of each other.
@@ -314,6 +316,12 @@ export function AgentDetailPage(): React.ReactElement {
 				onApplied={(_revisionId, appliedPatch) => {
 					setDraft((current) => clearAppliedFields(current, appliedPatch));
 					void load();
+					// A committed `allowedChannels` or `enabled` edit queues a `reprovision` for a
+					// lifecycle-owned, `ready` agent (ADR-026): the lifecycle query may already have
+					// settled on a terminal operation (polling stopped, `shouldPollLifecycle`), so
+					// without this it would never notice the new one, and its progress or failure
+					// would never show.
+					void queryClient.invalidateQueries({ queryKey: ["agent-lifecycle", agentId] });
 				}}
 			/>
 

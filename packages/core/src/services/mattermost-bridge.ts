@@ -14,10 +14,12 @@ import {
 	mattermostDirectory,
 	mattermostIdentities,
 	outbox,
+	SERVICE_DATABASE_LIMITS,
 	sourceCursors,
 	withTransaction,
 } from "@agent-gateway/db";
 import { and, asc, eq, inArray, ne, sql } from "drizzle-orm";
+import type pg from "pg";
 import { agentChannelIds, grantedChannels } from "../channel-access.ts";
 import { setDirectoryEntry, setDirectoryEntryIn, TEAM_CHANGE_MARKER } from "./admin.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
@@ -738,24 +740,128 @@ export function mattermostReconcileStore(deps: ControlPlaneDeps) {
 	};
 }
 
-/** Advisory lock key of `gateway mattermost bootstrap`: one bootstrap at a time. */
-const BOOTSTRAP_LOCK = "mattermost-bootstrap";
+/**
+ * Advisory lock key serializing every writer of a Mattermost bot or admin credential (ADR-026):
+ * `gateway mattermost bootstrap`, `admin-token set|rotate`, and the lifecycle provisioner's own
+ * pass each hold this one for as long as they create, token or revoke a Mattermost account, so no
+ * two of them ever interleave those writes — one revoking a token another just issued, or
+ * deactivating a bot another just re-enabled. Exported so `admin-token set|rotate`
+ * (`apps/cli/src/mattermost-commands.ts`, its own pool, never `ControlPlaneDeps`) and the
+ * provisioner's own pass (`apps/controller/src/agent-provisioner.ts`, a try-lock that skips its
+ * tick rather than waiting) take the very same key `withBootstrapLock` does. `ADMIN_TOKEN_LOCK` and
+ * the provisioner's own `PROVISIONER_PASS_LOCK` stay distinct keys of their own, still serializing
+ * two runs of the very same command against each other.
+ */
+export const MATTERMOST_CREDENTIAL_LOCK = "agent-gateway:mattermost-credentials";
+
+/** How long a blocking acquire of {@link MATTERMOST_CREDENTIAL_LOCK} waits before giving up with a
+ * clear error, rather than hanging indefinitely: the same bound a service's own connections already
+ * apply to any lock wait ({@link SERVICE_DATABASE_LIMITS}), long enough for a provisioner pass or
+ * another bootstrap/admin-token run already holding it to finish its own bounded sequence of
+ * Mattermost calls. */
+const CREDENTIAL_LOCK_WAIT_MS = SERVICE_DATABASE_LIMITS.lockTimeoutMs;
+
+/** `withMattermostCredentialLock` gave up waiting for {@link MATTERMOST_CREDENTIAL_LOCK}: another
+ * bootstrap, `admin-token set|rotate`, or provisioner pass is still holding it. */
+export class MattermostCredentialLockTimeoutError extends Error {
+	constructor() {
+		super(
+			`could not acquire the Mattermost credential lock within ${CREDENTIAL_LOCK_WAIT_MS}ms; ` +
+				"another 'mattermost bootstrap', 'admin-token set/rotate', or the lifecycle provisioner " +
+				"is still running against the same Mattermost account; wait for it to finish and run " +
+				"this again",
+		);
+		this.name = "MattermostCredentialLockTimeoutError";
+	}
+}
+
+/** The Postgres SQLSTATE a statement waiting on a lock gets when `lock_timeout` elapses first
+ * (`lock_not_available`). */
+const LOCK_NOT_AVAILABLE = "55P03";
+
+function isLockTimeout(error: unknown): boolean {
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		"code" in error &&
+		(error as { code?: unknown }).code === LOCK_NOT_AVAILABLE
+	);
+}
 
 /**
- * Runs `work` holding the bootstrap lock (a session-level advisory lock on its own connection),
- * so two bootstraps never interleave their membership changes.
+ * Blocks, on `client`'s own session, up to {@link CREDENTIAL_LOCK_WAIT_MS} acquiring
+ * {@link MATTERMOST_CREDENTIAL_LOCK} — throwing {@link MattermostCredentialLockTimeoutError} rather
+ * than hanging indefinitely when another writer still holds it. Takes an already-connected client
+ * rather than a pool, so a caller that already holds one connection of its own (`admin-token
+ * set|rotate`'s own `ADMIN_TOKEN_LOCK`, taken on a pool sized for exactly one connection) can nest
+ * this lock on the very same session instead of a second `pool.connect()` that would otherwise
+ * deadlock waiting on itself. Paired with {@link releaseMattermostCredentialLock}.
  */
-export async function withBootstrapLock<T>(deps: ControlPlaneDeps, work: () => Promise<T>) {
-	const client = await deps.pool.connect();
+export async function acquireMattermostCredentialLock(client: pg.PoolClient): Promise<void> {
+	await client.query(`set lock_timeout = ${CREDENTIAL_LOCK_WAIT_MS}`);
 	try {
-		await client.query("select pg_advisory_lock(hashtextextended($1, 0))", [BOOTSTRAP_LOCK]);
+		await client.query("select pg_advisory_lock(hashtextextended($1, 0))", [
+			MATTERMOST_CREDENTIAL_LOCK,
+		]);
+	} catch (error) {
+		if (isLockTimeout(error)) {
+			throw new MattermostCredentialLockTimeoutError();
+		}
+		throw error;
+	} finally {
+		// `lock_timeout` was only ever meant to bound the wait above; a connection a caller goes on
+		// to reuse (pooled or not) must not keep applying it to whatever unrelated query runs next.
+		await client.query("set lock_timeout = default").catch(() => undefined);
+	}
+}
+
+/** Releases a lock {@link acquireMattermostCredentialLock} acquired on the same client. */
+export async function releaseMattermostCredentialLock(client: pg.PoolClient): Promise<void> {
+	await client.query("select pg_advisory_unlock(hashtextextended($1, 0))", [
+		MATTERMOST_CREDENTIAL_LOCK,
+	]);
+}
+
+/**
+ * Tries, without waiting, to acquire {@link MATTERMOST_CREDENTIAL_LOCK} on `client`'s own session:
+ * true when it was free and is now held, false when another writer already holds it. The
+ * lifecycle provisioner's own pass uses this (never the blocking
+ * {@link acquireMattermostCredentialLock}) to skip its tick instead of waiting behind a CLI command
+ * with no bound on how long an operator takes to run it. Released the same way, with
+ * {@link releaseMattermostCredentialLock}.
+ */
+export async function tryAcquireMattermostCredentialLock(client: pg.PoolClient): Promise<boolean> {
+	const result = await client.query<{ locked: boolean }>(
+		"select pg_try_advisory_lock(hashtextextended($1, 0)) as locked",
+		[MATTERMOST_CREDENTIAL_LOCK],
+	);
+	return result.rows[0]?.locked === true;
+}
+
+/**
+ * Runs `work` holding the Mattermost credential lock (a session-level advisory lock on its own,
+ * dedicated connection), so two bootstraps, or a bootstrap and a provisioner pass or an
+ * `admin-token set|rotate`, never interleave their membership or credential changes.
+ */
+export async function withBootstrapLock<T>(
+	deps: ControlPlaneDeps,
+	work: () => Promise<T>,
+): Promise<T> {
+	const client = await deps.pool.connect();
+	// A client whose unlock failed may still hold the lock: it is closed, not pooled (the same
+	// margin `runProvisionerPass`/`runRetentionIfDue` leave).
+	let unlocked = true;
+	try {
+		await acquireMattermostCredentialLock(client);
 		try {
 			return await work();
 		} finally {
-			await client.query("select pg_advisory_unlock(hashtextextended($1, 0))", [BOOTSTRAP_LOCK]);
+			unlocked = false;
+			await releaseMattermostCredentialLock(client);
+			unlocked = true;
 		}
 	} finally {
-		client.release();
+		client.release(!unlocked);
 	}
 }
 

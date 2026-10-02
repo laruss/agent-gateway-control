@@ -33,7 +33,10 @@ unset MATTERMOST_ADMIN_TOKEN                                       # then revoke
 ```
 
 Bootstrap is idempotent, runs one at a time, and runs again when the configuration changes
-while it works. It:
+while it works. It also waits, up to 30 seconds, for the same credential lock `admin-token
+set|rotate` and the lifecycle provisioner's own pass hold (ADR-026), so none of them ever revokes a
+token or deactivates a bot the others are mid-way through issuing or re-enabling; it fails with a
+clear message rather than hanging indefinitely if that wait runs out. It:
 
 - resolves the team, channels and owners and stores their ids (it never creates them);
 - creates each missing bot (the listener and one per agent) as a plain member, never an admin,
@@ -106,7 +109,10 @@ below.
 Both `admin-token set` and `admin-token rotate` need `DATABASE_URL` reachable: each holds a
 database lock for its own create-verify-write-revoke sequence, so a second run against the same
 account started while one is already in flight fails fast with a clear message instead of racing
-it (each could otherwise revoke the token the other just minted before it was ever written).
+it (each could otherwise revoke the token the other just minted before it was ever written). Each
+also waits, up to 30 seconds, for the same credential lock `gateway mattermost bootstrap` and the
+lifecycle provisioner's own pass hold (ADR-026) — a provisioner pass in flight right now must
+finish before either command rewrites the account's tokens, never race it.
 
 With no admin token configured yet, `create`/`restore`/`reprovision` operations simply stay
 `pending`; `gateway doctor`'s `mattermost_provisioning` check names this plainly rather than

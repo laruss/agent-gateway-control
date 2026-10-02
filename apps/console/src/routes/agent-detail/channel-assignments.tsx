@@ -1,4 +1,5 @@
 import type { ConsoleAgentChannelAssignment } from "@agent-gateway/contracts";
+import { useQueryClient } from "@tanstack/react-query";
 import * as React from "react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
@@ -22,6 +23,7 @@ type LoadState =
 export function ChannelAssignments({ agentId }: Readonly<{ agentId: string }>): React.ReactElement {
 	const [state, setState] = React.useState<LoadState>({ status: "loading" });
 	const [revokingId, setRevokingId] = React.useState<string | null>(null);
+	const queryClient = useQueryClient();
 
 	const load = React.useCallback(async () => {
 		setState({ status: "loading" });
@@ -46,6 +48,11 @@ export function ChannelAssignments({ agentId }: Readonly<{ agentId: string }>): 
 			await revokeAgentChannelGrant(agentId, assignment.channelId);
 			toast.success(`Revoked '${assignment.channelName}'.`);
 			await load();
+			// A revoke queues a `reprovision` for a lifecycle-owned, `ready` agent (ADR-026): the
+			// lifecycle query may already have settled on a terminal operation (polling stopped,
+			// `shouldPollLifecycle`), so without this it would never notice the new one, and its
+			// progress or failure would never show.
+			await queryClient.invalidateQueries({ queryKey: ["agent-lifecycle", agentId] });
 		} catch (error) {
 			toast.error(error instanceof ApiError ? error.message : "Could not revoke this channel.");
 		} finally {

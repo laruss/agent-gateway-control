@@ -8,6 +8,7 @@ import {
 	OrganizationConfigSchema,
 } from "@agent-gateway/contracts";
 import {
+	acquireMattermostCredentialLock,
 	activeConfigRevisionId,
 	applyConfig,
 	type ControlPlaneDeps,
@@ -17,6 +18,7 @@ import {
 	grantChannel,
 	markProvisioning,
 	recordWorkerStatus,
+	releaseMattermostCredentialLock,
 	requestAgentCreate,
 	requestAgentRestore,
 	requestAgentRetire,
@@ -37,7 +39,7 @@ import { createBoss, migrateQueues, transactionalJobSink } from "@agent-gateway/
 import { secretFileExists, secretFileState, writeSecretFile } from "@agent-gateway/service";
 import { startTestPostgres, type TestPostgres } from "@agent-gateway/testkit";
 import type pg from "pg";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { runProvisionerPass, startAgentProvisioner } from "./agent-provisioner.ts";
 
 const TEAM = "lab";
@@ -659,6 +661,41 @@ describe("agent lifecycle provisioner (ADR-026)", () => {
 		releaseGate();
 		await first;
 
+		const [finished] = (
+			await pool.query("select state from agent_lifecycle_operations where id = $1", [
+				created.operationId,
+			])
+		).rows;
+		expect(finished.state).toBe("succeeded");
+	});
+
+	it("skips its own tick while a bootstrap or admin-token run holds the shared Mattermost credential lock (ADR-026)", async () => {
+		const admin = new FakeAdminClient(CHANNEL_IDS);
+		const created = await requestAgentCreate(deps, createInput("analyst", ["hq"]));
+		const { logger, calls } = recordingLogger();
+
+		// Stands in for `gateway mattermost bootstrap` (or `admin-token set|rotate`) already holding
+		// the credential lock on a connection of its own: a pass that finds it held must skip this
+		// tick entirely, never computing or acting on a plan read before that run finishes.
+		const holder = await pool.connect();
+		await acquireMattermostCredentialLock(holder);
+		try {
+			await pass(admin, logger);
+			expect(calls.some((call) => call.message.includes("holds the credential lock"))).toBe(true);
+			expect(admin.calls).toEqual([]);
+			const [stillPending] = (
+				await pool.query("select state from agent_lifecycle_operations where id = $1", [
+					created.operationId,
+				])
+			).rows;
+			expect(stillPending.state).toBe("pending");
+		} finally {
+			await releaseMattermostCredentialLock(holder);
+			holder.release();
+		}
+
+		// Released: an ordinary pass now runs normally.
+		await pass(admin, logger);
 		const [finished] = (
 			await pool.query("select state from agent_lifecycle_operations where id = $1", [
 				created.operationId,
@@ -1392,6 +1429,80 @@ describe("agent lifecycle provisioner (ADR-026)", () => {
 			await pool.query("select state from agent_lifecycle_operations where agent_id = 'analyst'")
 		).rows;
 		expect(operation.state).toBe("succeeded");
+	});
+
+	describe("401/403 reclassification when the admin token changed mid-pass (ADR-026 defence in depth)", () => {
+		const originalAdminToken = process.env.MATTERMOST_ADMIN_TOKEN;
+
+		afterEach(() => {
+			if (originalAdminToken === undefined) {
+				delete process.env.MATTERMOST_ADMIN_TOKEN;
+			} else {
+				process.env.MATTERMOST_ADMIN_TOKEN = originalAdminToken;
+			}
+		});
+
+		it("stays permanent when the admin token file did not change since the pass started", async () => {
+			process.env.MATTERMOST_ADMIN_TOKEN = "token-a";
+			const admin = new FakeAdminClient(CHANNEL_IDS);
+			await requestAgentCreate(deps, createInput("analyst", ["hq"]));
+			admin.failures.set(
+				"createBot:analyst",
+				new MattermostApiError(401, null, "POST /api/v4/bots: HTTP 401"),
+			);
+			const { logger } = recordingLogger();
+
+			await runProvisionerPass(
+				deps,
+				admin,
+				options(),
+				"test",
+				logger,
+				() => false,
+				admin.resolveTokenOwner,
+				"token-a",
+			);
+
+			const [operation] = (
+				await pool.query("select state from agent_lifecycle_operations where agent_id = 'analyst'")
+			).rows;
+			expect(operation.state).toBe("failed");
+		});
+
+		it("becomes transient — retried, never failed — when the admin token file changed since the pass started", async () => {
+			process.env.MATTERMOST_ADMIN_TOKEN = "token-a";
+			const admin = new FakeAdminClient(CHANNEL_IDS);
+			await requestAgentCreate(deps, createInput("analyst", ["hq"]));
+			admin.failures.set(
+				"createBot:analyst",
+				new MattermostApiError(401, null, "POST /api/v4/bots: HTTP 401"),
+			);
+			const { logger, calls } = recordingLogger();
+
+			// Stands in for an `admin-token rotate` that both starts and finishes between `runTick`'s
+			// own read (captured here as this pass's `adminTokenAtStart`, "token-a") and this pass
+			// using the client it already built from it — the one gap the shared credential lock
+			// (ADR-026) cannot close by itself, since the pass's own client was built before it ever
+			// took that lock.
+			process.env.MATTERMOST_ADMIN_TOKEN = "token-b";
+
+			await runProvisionerPass(
+				deps,
+				admin,
+				options(),
+				"test",
+				logger,
+				() => false,
+				admin.resolveTokenOwner,
+				"token-a",
+			);
+
+			const [operation] = (
+				await pool.query("select state from agent_lifecycle_operations where agent_id = 'analyst'")
+			).rows;
+			expect(operation.state).toBe("running");
+			expect(calls.some((call) => call.message.includes("transient failure"))).toBe(true);
+		});
 	});
 
 	it("a committed channel change queues a reprovision operation; the provisioner joins the new channel and keeps the agent ready throughout", async () => {

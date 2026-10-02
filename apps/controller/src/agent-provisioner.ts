@@ -21,9 +21,11 @@ import {
 	loadMattermostSnapshot,
 	markProvisioning,
 	PROVISIONING_ADMIN_DIRECTORY_NAME,
+	releaseMattermostCredentialLock,
 	StaleLifecycleOperationError,
 	setAgentBotUser,
 	setDirectoryEntry,
+	tryAcquireMattermostCredentialLock,
 } from "@agent-gateway/core";
 import { errorFields, type Logger } from "@agent-gateway/logging";
 import {
@@ -134,7 +136,7 @@ async function runTick(
 		return;
 	}
 	const admin = new MattermostClient({ baseUrl: options.baseUrl, token: adminToken });
-	await runProvisionerPass(deps, admin, options, actor, log, stopped);
+	await runProvisionerPass(deps, admin, options, actor, log, stopped, tokenOwner, adminToken);
 }
 
 /** Advisory lock key of one provisioner pass (ADR-026): two overlapping controllers (one still
@@ -149,12 +151,20 @@ const PROVISIONER_PASS_LOCK = "agent-gateway:agent-provisioner";
  * steps. Exported, and `admin`/`resolveTokenOwner` are parameters rather than built inside, so
  * tests can run this directly against a fake Mattermost client — `startAgentProvisioner`'s own
  * loop (`runTick`) is the only production caller, and it is the one that resolves the real admin
- * token and constructs the real client.
+ * token and constructs the real client. `adminTokenAtStart`, also only ever given by `runTick`, is
+ * the exact value it read before building `admin`: `settleFailure`'s own defence in depth (ADR-026)
+ * compares it against a fresh read when a step fails with 401/403, never trusted by a test that
+ * omits it (no spurious "transient" reclassification just because nothing was ever provided).
  *
  * Holds a session-level advisory lock (a dedicated pooled connection, held for the whole pass,
  * the same pattern `runRetentionIfDue` already uses) around every step below: a concurrent pass —
  * another controller, or this one's own next tick outlasting its interval — skips this tick
- * rather than interleaving its own steps with one already running.
+ * rather than interleaving its own steps with one already running. It also, on the very same
+ * connection, tries the shared Mattermost credential lock (ADR-026, `MATTERMOST_CREDENTIAL_LOCK`):
+ * `gateway mattermost bootstrap` or `admin-token set|rotate` running right now holds it for as
+ * long as it creates, tokens or revokes a Mattermost account, and a pass that finds it held skips
+ * this tick too, rather than interleaving its own steps with a bootstrap plan computed before
+ * either of them ran, or racing a token mid-swap.
  */
 export async function runProvisionerPass(
 	deps: ControlPlaneDeps,
@@ -164,9 +174,10 @@ export async function runProvisionerPass(
 	log: Logger,
 	stopped: () => boolean = () => false,
 	resolveTokenOwner: typeof tokenOwner = tokenOwner,
+	adminTokenAtStart?: string,
 ): Promise<void> {
 	const lock = await deps.pool.connect();
-	// A client whose unlock failed may still hold the lock: it is closed, not pooled (the same
+	// A client whose unlock failed may still hold a lock: it is closed, not pooled (the same
 	// margin `runRetentionIfDue` leaves).
 	let unlocked = true;
 	try {
@@ -175,11 +186,31 @@ export async function runProvisionerPass(
 			[PROVISIONER_PASS_LOCK],
 		);
 		if (locked.rows[0]?.locked !== true) {
-			log.info("agent provisioner: another pass is already running; skipping this tick");
+			log.debug("agent provisioner: another pass is already running; skipping this tick");
 			return;
 		}
 		try {
-			await runLockedProvisionerPass(deps, admin, options, actor, log, stopped, resolveTokenOwner);
+			if (!(await tryAcquireMattermostCredentialLock(lock))) {
+				log.debug(
+					"agent provisioner: a bootstrap or admin-token run holds the credential lock; " +
+						"skipping this tick",
+				);
+				return;
+			}
+			try {
+				await runLockedProvisionerPass(
+					deps,
+					admin,
+					options,
+					actor,
+					log,
+					stopped,
+					resolveTokenOwner,
+					adminTokenAtStart,
+				);
+			} finally {
+				await releaseMattermostCredentialLock(lock);
+			}
 		} finally {
 			unlocked = false;
 			await lock.query("select pg_advisory_unlock(hashtextextended($1, 0))", [
@@ -200,6 +231,7 @@ async function runLockedProvisionerPass(
 	log: Logger,
 	stopped: () => boolean,
 	resolveTokenOwner: typeof tokenOwner,
+	adminTokenAtStart: string | undefined,
 ): Promise<void> {
 	let me: Awaited<ReturnType<AdminMattermostClient["me"]>>;
 	try {
@@ -234,7 +266,17 @@ async function runLockedProvisionerPass(
 		if (stopped()) {
 			return;
 		}
-		await processOperation(deps, admin, options, actor, operation, log, resolveTokenOwner, me.id);
+		await processOperation(
+			deps,
+			admin,
+			options,
+			actor,
+			operation,
+			log,
+			resolveTokenOwner,
+			me.id,
+			adminTokenAtStart,
+		);
 	}
 
 	const retiring = (await listRunningLifecycleOperations(deps)).filter((operation) =>
@@ -245,7 +287,16 @@ async function runLockedProvisionerPass(
 		if (stopped()) {
 			return;
 		}
-		await processRetireOperation(deps, admin, options, actor, operation, log, me.id);
+		await processRetireOperation(
+			deps,
+			admin,
+			options,
+			actor,
+			operation,
+			log,
+			me.id,
+			adminTokenAtStart,
+		);
 	}
 }
 
@@ -258,6 +309,7 @@ async function processOperation(
 	log: Logger,
 	resolveTokenOwner: typeof tokenOwner,
 	adminUserId: MattermostId,
+	adminTokenAtStart: string | undefined,
 ): Promise<void> {
 	// A cheap precheck, before ever claiming the operation: is there anything to provision yet at
 	// all. Re-read fresh right after claiming below — never this copy — since a config edit that
@@ -395,7 +447,7 @@ async function processOperation(
 		await completeOperation(deps, operation.id, actor, checkpoints);
 		log.info("agent provisioner: agent ready", { agent_id: operation.agentId });
 	} catch (error) {
-		await settleFailure(deps, operation, actor, error, log);
+		await settleFailure(deps, operation, actor, error, log, adminTokenAtStart);
 	}
 }
 
@@ -637,6 +689,7 @@ async function processRetireOperation(
 	operation: LifecycleOperation,
 	log: Logger,
 	adminUserId: MattermostId,
+	adminTokenAtStart: string | undefined,
 ): Promise<void> {
 	if (operation.state === "pending") {
 		try {
@@ -758,7 +811,7 @@ async function processRetireOperation(
 		await completeOperation(deps, operation.id, actor, checkpoints);
 		log.info("agent provisioner: agent retired", { agent_id: operation.agentId });
 	} catch (error) {
-		await settleFailure(deps, operation, actor, error, log);
+		await settleFailure(deps, operation, actor, error, log, adminTokenAtStart);
 	}
 }
 
@@ -768,6 +821,15 @@ async function processRetireOperation(
  * is not retryable — the admin token invalid or lacking permission) fails the operation with a
  * redacted message (`failOperation` itself redacts it), and anything else (a retryable
  * `MattermostApiError`, or an unexpected error) is left `running` for the next tick.
+ *
+ * A 401/403 is reclassified from permanent to transient when `adminTokenAtStart` (the value
+ * `runTick` read before this pass's own admin client was built, passed down from
+ * `runProvisionerPass`; `undefined` when a test built its own client with no such value) no longer
+ * matches a fresh read of the same setting: defence in depth (ADR-026) for the one gap the shared
+ * Mattermost credential lock cannot close by itself — an `admin-token rotate|set` run that starts
+ * and finishes entirely in the gap between that read and this pass's own lock acquisition leaves
+ * the pass holding a now-revoked token for the rest of its run, which must never fail an operation
+ * permanently merely because the account's admin rotated its credential in the meantime.
  */
 async function settleFailure(
 	deps: ControlPlaneDeps,
@@ -775,14 +837,21 @@ async function settleFailure(
 	actor: string,
 	error: unknown,
 	log: Logger,
+	adminTokenAtStart?: string,
 ): Promise<void> {
 	if (error instanceof StaleLifecycleOperationError) {
 		return;
 	}
+	const authRejected =
+		error instanceof MattermostApiError && (error.status === 401 || error.status === 403);
+	const adminTokenRotatedMidPass =
+		adminTokenAtStart !== undefined &&
+		readOptionalFileSetting("MATTERMOST_ADMIN_TOKEN") !== adminTokenAtStart;
 	const permanent =
-		error instanceof PermanentProvisioningError ||
-		error instanceof BootstrapError ||
-		(error instanceof MattermostApiError && !error.retryable);
+		!(authRejected && adminTokenRotatedMidPass) &&
+		(error instanceof PermanentProvisioningError ||
+			error instanceof BootstrapError ||
+			(error instanceof MattermostApiError && !error.retryable));
 	if (!permanent) {
 		log.warn("agent provisioner: transient failure; retrying later", {
 			agent_id: operation.agentId,

@@ -2,12 +2,14 @@ import { randomBytes } from "node:crypto";
 import { resolve } from "node:path";
 import { ROUTING_KEY_SECRET_FILE } from "@agent-gateway/contracts";
 import {
+	acquireMattermostCredentialLock,
 	type ControlPlaneDeps,
 	loadConfigGeneration,
 	loadLifecycleOwnedAgentIds,
 	loadMattermostPlanSource,
 	mattermostBootstrapStore,
 	mattermostReconcileStore,
+	releaseMattermostCredentialLock,
 	withBootstrapLock,
 } from "@agent-gateway/core";
 import {
@@ -196,10 +198,19 @@ const ADMIN_TOKEN_LOCK = "agent-gateway:admin-token";
  * Runs `work` holding the admin-token lock (a session-level advisory lock on its own connection),
  * so a concurrent `admin-token set`/`rotate` never interleaves its own create-verify-write-revoke
  * steps with this one. Fails fast, rather than waiting, when another run already holds it.
+ *
+ * Also holds the shared Mattermost credential lock (ADR-026, `MATTERMOST_CREDENTIAL_LOCK`) for the
+ * same duration, nested on this very connection rather than a second `pool.connect()` (this
+ * command's own pool holds exactly one): a provisioner pass or a `gateway mattermost bootstrap` run
+ * in flight must never revoke the fresh token this sequence is about to write, or see it revoked
+ * out from under a token it is mid-way through using. Unlike `ADMIN_TOKEN_LOCK` itself, this one
+ * waits (bounded, `MattermostCredentialLockTimeoutError`) rather than failing fast: a provisioner
+ * pass already holding it finishes in at most a few Mattermost calls, worth a short wait rather
+ * than refusing outright.
  */
 async function withAdminTokenLock<T>(pool: pg.Pool, work: () => Promise<T>): Promise<T> {
 	const client = await pool.connect();
-	// A client whose unlock failed may still hold the lock: it is closed, not pooled (the same
+	// A client whose unlock failed may still hold a lock: it is closed, not pooled (the same
 	// margin `withBootstrapLock`/`runRetentionIfDue` leave).
 	let unlocked = true;
 	try {
@@ -213,7 +224,12 @@ async function withAdminTokenLock<T>(pool: pg.Pool, work: () => Promise<T>): Pro
 			);
 		}
 		try {
-			return await work();
+			await acquireMattermostCredentialLock(client);
+			try {
+				return await work();
+			} finally {
+				await releaseMattermostCredentialLock(client);
+			}
 		} finally {
 			unlocked = false;
 			await client.query("select pg_advisory_unlock(hashtextextended($1, 0))", [ADMIN_TOKEN_LOCK]);
@@ -334,21 +350,26 @@ export type MattermostAdminTokenRotateOptions = Readonly<{
  * before this step, every token stranded by that crash too. A token's value is never readable
  * back from Mattermost, so "every other token" (not a specifically remembered old id) is how this
  * stays correct however many times it was interrupted before.
+ *
+ * The file's state and content are both read only once every lock this sequence takes is held
+ * (`withAdminTokenLock`), never before: a read taken earlier could describe a token a concurrent
+ * `admin-token rotate`/`set` or provisioner pass is itself about to rewrite or revoke, making this
+ * run create-verify-switch against a value already stale by the time it ever used it.
  */
 export async function mattermostAdminTokenRotate(
 	options: MattermostAdminTokenRotateOptions,
 	print: (line: string) => void,
 ): Promise<void> {
-	const state = secretFileState(options.secretPath);
-	if (state !== "private") {
-		throw new MattermostCommandError(
-			state === "missing"
-				? "no admin token is set yet; run 'gateway mattermost admin-token set' first"
-				: `admin token file '${options.secretPath}' is ${state === "symlink" ? "a symlink" : "readable by others"}; replace it and run 'admin-token set' again`,
-		);
-	}
-	const current = readSecretFile(options.secretPath);
 	await withAdminTokenLock(options.pool, async () => {
+		const state = secretFileState(options.secretPath);
+		if (state !== "private") {
+			throw new MattermostCommandError(
+				state === "missing"
+					? "no admin token is set yet; run 'gateway mattermost admin-token set' first"
+					: `admin token file '${options.secretPath}' is ${state === "symlink" ? "a symlink" : "readable by others"}; replace it and run 'admin-token set' again`,
+			);
+		}
+		const current = readSecretFile(options.secretPath);
 		const client = new MattermostClient({ baseUrl: options.baseUrl, token: current });
 		const me = await client.me();
 		const created = await client.createUserAccessToken(me.id, ADMIN_TOKEN_DESCRIPTION);

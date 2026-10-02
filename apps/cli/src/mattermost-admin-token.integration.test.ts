@@ -2,6 +2,10 @@ import { randomUUID } from "node:crypto";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+	acquireMattermostCredentialLock,
+	releaseMattermostCredentialLock,
+} from "@agent-gateway/core";
 import { createPool } from "@agent-gateway/db";
 import { secretFileState, writeSecretFile } from "@agent-gateway/service";
 import { startTestPostgres, type TestPostgres } from "@agent-gateway/testkit";
@@ -648,5 +652,59 @@ describe("gateway mattermost admin-token set|rotate (ADR-026)", () => {
 		const written = readFileSync(path, "utf8").trim();
 		expect(fake.worksNow(written)).toBe(true);
 		expect(fake.worksNow("admin-token-value")).toBe(false);
+	});
+
+	it("rotate reads the token file only once every lock it takes is held, never a value read before queuing behind another run (ADR-026)", async () => {
+		fake = startFakeMattermost();
+		// Two distinct accounts, so which one `rotate` actually authenticates as is unambiguous:
+		// account A's own token is what the file holds before this call is ever blocked, account B's
+		// is what it holds once unblocked.
+		fake.addAccount("token-a", {
+			id: mmId("admina"),
+			username: "gateway-admin-a",
+			is_bot: false,
+			roles: "system_user system_admin",
+			delete_at: 0,
+		});
+		fake.addAccount("token-b", {
+			id: mmId("adminb"),
+			username: "gateway-admin-b",
+			is_bot: false,
+			roles: "system_user system_admin",
+			delete_at: 0,
+		});
+		const path = secretPath();
+		writeSecretFile(path, "token-a");
+
+		// Stands in for a bootstrap run or a provisioner pass already holding the shared Mattermost
+		// credential lock (ADR-026): `rotate` must block behind it rather than racing it, and — the
+		// point of this test — must not have already read the file before it ever got here.
+		const holder = await pool.connect();
+		await acquireMattermostCredentialLock(holder);
+
+		const printed: string[] = [];
+		const rotating = mattermostAdminTokenRotate(
+			{ baseUrl: fake.baseUrl, secretPath: path, pool },
+			(line) => printed.push(line),
+		);
+
+		// `rotating` claims its own `ADMIN_TOKEN_LOCK` at once (nothing else holds it) and then
+		// blocks waiting for the credential lock `holder` has: the file is changed to account B's
+		// token while it waits there, exactly like a concurrent `admin-token set` switching it would,
+		// before it is ever released.
+		await new Promise((resolve) => setTimeout(resolve, 200));
+		writeSecretFile(path, "token-b");
+		await releaseMattermostCredentialLock(holder);
+		holder.release();
+
+		await rotating;
+
+		// Rotated account B's token, never account A's stale, pre-block one: proof the read happened
+		// after every lock was held, not before.
+		expect(fake.worksNow("token-a")).toBe(true);
+		const newToken = readFileSync(path, "utf8").trim();
+		expect(fake.worksNow(newToken)).toBe(true);
+		expect(fake.worksNow("token-b")).toBe(false);
+		expect(printed.join("\n")).toContain("gateway-admin-b");
 	});
 });

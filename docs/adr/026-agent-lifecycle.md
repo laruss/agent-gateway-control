@@ -236,6 +236,31 @@ constrained in code to exactly the actions provisioning performs, never handed t
   and replayed every pass, not only the one that first resolves the bot: a crash between
   persisting the `bot_user_id` checkpoint and that write completing must never let the operation
   reach `completeOperation` with no identity ever recorded.
+
+  **One lock for every writer of a Mattermost bot or admin credential.** The provisioner's own
+  pass-overlap lock is not the only one a pass takes: on the very same connection it also tries
+  (never waits for) the one credential-writer lock `gateway mattermost bootstrap` and `admin-token
+  set|rotate` each hold for as long as they run — skipping the tick entirely when either is in
+  flight, rather than computing a plan or issuing a step against an account either of them is
+  mid-way through changing. `gateway mattermost bootstrap` builds its own plan (which agents are
+  lifecycle-owned, which bots are retired) only after acquiring this same lock, so a bootstrap that
+  had to wait behind a `restore` operation's own pass always sees that agent's ownership and bot
+  state as the `restore` left it, never a plan computed before it ran: without this, a bootstrap
+  that captured a plan while an agent was still merely adopted (retired, say, with no `create`/
+  `restore` operation yet) could reach its own retirement cleanup step after a concurrent
+  `gateway agents restore` had already re-enabled that very bot, undoing the restore. `admin-token
+  set|rotate` take the same lock for their whole create-verify-write-revoke sequence, reading and
+  validating the current token file only once inside it, never before — a stale read taken before
+  the lock could otherwise describe a token another run's own revoke step had already superseded.
+  Unlike each command's own self-serializing lock (failing fast against a second run of the very
+  same command), this shared one waits, bounded (`MattermostCredentialLockTimeoutError`, a clear
+  message rather than hanging indefinitely), since whichever of the other two holds it finishes in
+  at most a few Mattermost calls. As defence in depth for the one gap this lock cannot close by
+  itself — a pass's own admin client is still built from a token value read *before* it ever
+  acquires any lock, so a rotation that both starts and finishes in that gap still leaves the pass
+  holding a now-revoked token for the rest of its run — a step that fails with 401/403 is
+  reclassified from permanent to transient (retried next tick, never `failOperation`) whenever the
+  admin token file no longer matches the value the pass started with.
 - **Membership reprovisioning.** When a committed configuration change (any path: a console patch,
   a CLI import) alters a lifecycle-owned, `ready` agent's `allowed_channels`, the same transaction
   queues a `reprovision` operation — deduped against one already `pending` for that agent, rather
@@ -321,7 +346,12 @@ constrained in code to exactly the actions provisioning performs, never handed t
   runs holding a session-level Postgres advisory lock of its own, failing fast rather than waiting
   when another run against the same account already holds it: unserialized, two overlapping runs
   could each revoke the token the other just minted before ever writing it, leaving the file holding
-  one already revoked. The account's tokens are listed a page at a time until a page comes back
+  one already revoked. It also, for the very same sequence, holds the one credential-writer lock
+  shared with `gateway mattermost bootstrap` and the provisioner's own pass (above) — bounded-wait
+  rather than failing fast, since either of those finishes quickly — and reads the current token
+  file only once that lock is held, never before: a read taken earlier could describe a token a
+  provisioner pass already in flight is about to find rejected and revoke on its own. The account's
+  tokens are listed a page at a time until a page comes back
   short, so an account with more of them than one page holds is still seen in full; revoking is
   itself listed and repeated, bounded, until none of its own remain but the newly written token. A
   rotation that ends up revoking none of them prints a warning rather than reporting success
