@@ -55,6 +55,7 @@ import { and, asc, desc, eq, inArray, isNotNull, isNull, ne, or, sql } from "dri
 import { grantedChannels } from "../channel-access.ts";
 import { nextAgentState, requireTransition } from "../state-machine.ts";
 import { revokeQueuedActions, sweepApprovals, withdrawOpenApprovals } from "./approvals.ts";
+import { attachmentCatalogProblems } from "./attachment-validation.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
 import {
 	rejectLifecycleOwnedRemovals,
@@ -1287,6 +1288,12 @@ export async function applyConfig(
 			: channelsChangedAgentIdsIn(priorAgents, input.agents);
 		const lockedLifecycle = await lockLifecycleRowsIn(db, channelsChangedIds);
 		const toolAttachments = await resolveApplyToolAttachments(db, parentRevisionId, input);
+		// The same catalog constraints every managed write checks (ADR-027): a directory exported before
+		// an entry was deleted must not bring its attachment back through a plain `config apply`.
+		const attachmentProblems = await attachmentCatalogProblems(db, toolAttachments);
+		if (attachmentProblems.length > 0) {
+			throw new AdminError(`configuration is invalid:\n- ${attachmentProblems.join("\n- ")}`);
+		}
 		const result = await writeConfigRevisionIn(uow, {
 			input,
 			bundle,

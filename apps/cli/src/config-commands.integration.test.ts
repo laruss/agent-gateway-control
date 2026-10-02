@@ -19,6 +19,7 @@ import {
 	commitChange,
 	configBundleProblems,
 	configSnapshotBundle,
+	deleteCatalogEntry,
 	ensureToolCatalogSeeded,
 	inTransaction,
 	loadActiveBundle,
@@ -772,6 +773,78 @@ describe("config export/import: tool attachments round-trip (ADR-027)", () => {
 		);
 		expect(rolledBack.toolAttachments.director).toEqual(
 			beforeBundle.toolAttachments.director ?? [],
+		);
+	});
+
+	it("retrying an import whose attachments are merely reordered replays it instead of refusing key reuse", async () => {
+		const base = await activeConfigRevisionId(harness.deps);
+		if (base === null) {
+			throw new Error("expected an active revision");
+		}
+		await attachTool(harness.deps, {
+			agentId: "director",
+			entryId: "gateway-mattermost-post",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+		const attached = await attachTool(harness.deps, {
+			agentId: "director",
+			entryId: "native-web-search",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+		const dir = exportDir();
+		await configExport(harness.deps, { dir, revisionId: attached.revisionId }, noopPrint);
+		const file = join(dir, "tool-attachments.json");
+		// Edited by hand below: the export's own manifest would refuse the changed file first.
+		rmSync(join(dir, "manifest.json"));
+		const exported: Record<string, { settings: Record<string, string> }[]> = JSON.parse(
+			readFileSync(file, "utf8"),
+		);
+		const director = exported.director ?? [];
+		expect(director.length).toBeGreaterThanOrEqual(2);
+		const edited = director.map((attachment) => ({ ...attachment, settings: { note: "edited" } }));
+		writeFileSync(file, `${JSON.stringify({ ...exported, director: edited }, null, 2)}\n`);
+		const options = {
+			dir,
+			root: dir,
+			expectedRevision: attached.revisionId,
+			reason: null,
+			actor: "test",
+		};
+		const first = await configImport(harness.deps, options, noopPrint);
+		expect(first.noop).toBe(false);
+
+		writeFileSync(
+			file,
+			`${JSON.stringify({ ...exported, director: [...edited].reverse() }, null, 2)}\n`,
+		);
+		const retry = await configImport(harness.deps, options, noopPrint);
+		expect(retry.revisionId).toBe(first.revisionId);
+	});
+
+	it("config apply refuses a directory that still attaches a since-deleted catalog entry", async () => {
+		const attached = await attachTool(harness.deps, {
+			agentId: "director",
+			entryId: "native-web-fetch",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+		const dir = exportDir();
+		await configExport(harness.deps, { dir, revisionId: attached.revisionId }, noopPrint);
+		await deleteCatalogEntry(harness.deps, "native-web-fetch", "test");
+
+		await expect(applyConfig(harness.deps, loadConfigDirectory(dir, dir), "test")).rejects.toThrow(
+			/native-web-fetch' does not exist/,
 		);
 	});
 });

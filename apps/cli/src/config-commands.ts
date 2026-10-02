@@ -71,7 +71,9 @@ function replaceBundleChangeSet(bundle: ReplaceableBundle): ChangeSetInput {
 		{
 			type: "replace_bundle",
 			bundle: configSnapshotBundle(bundle),
-			...(bundle.toolAttachments === undefined ? {} : { toolAttachments: bundle.toolAttachments }),
+			...(bundle.toolAttachments === undefined
+				? {}
+				: { toolAttachments: canonicalizeAttachments(bundle.toolAttachments) }),
 		},
 	];
 }
