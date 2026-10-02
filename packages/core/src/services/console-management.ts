@@ -1,17 +1,36 @@
 import type {
 	AgentConfig,
+	AgentId,
 	AgentPatch,
 	ChangeOperation,
 	ChangeSet,
 	ConfigDiff,
+	ConsoleAgentChannelsResponse,
+	ConsoleAgentCreateRequest,
 	ConsoleAgentDetailResponse,
 	ConsoleAgentLastRun,
+	ConsoleAgentLifecycleResponse,
 	ConsoleAgentListItem,
+	ConsoleAgentRestoreRequest,
+	ConsoleAgentRetireRequest,
+	ConsoleAgentRetryRequest,
+	ConsoleRevokeGrantResponse,
+	MattermostId,
+	RuntimeAdapterId,
 } from "@agent-gateway/contracts";
 import { RuntimeAdapterIdSchema } from "@agent-gateway/contracts";
-import { agents, configRevisions } from "@agent-gateway/db";
+import { agentLifecycle, agents, configRevisions } from "@agent-gateway/db";
 import { asc, eq } from "drizzle-orm";
 import { AdminError, inTransaction } from "./admin.ts";
+import {
+	listLifecycleOperations,
+	loadAgentLifecycle,
+	requestAgentCreate,
+	requestAgentRestore,
+	requestAgentRetire,
+	requestOperationRetry,
+} from "./agent-lifecycle.ts";
+import { loadAgentChannelAssignments, revokeChannelGrant } from "./channel-grants.ts";
 import type { ControlPlaneDeps } from "./deps.ts";
 import {
 	activeConfigRevisionId,
@@ -26,6 +45,7 @@ import {
 	ManagementConflictError,
 	previewChangeSetAgainst,
 } from "./management.ts";
+import { runtimeHealth } from "./runtime-health.ts";
 
 // ---------------------------------------------------------------------------
 // The Agents hub's own queries and change-set translation (ADR-024/ADR-025): read models for
@@ -65,14 +85,39 @@ function toLastRun(row: LastRunRow | undefined): ConsoleAgentLastRun | null {
  * for it, `consoleShowAgent` reads the snapshot alone, so listing it would be a link to a page
  * that cannot open), its runtime/model, channel count and its last run, newest first by id
  * (stable, matching every other admin listing in this package). */
-export async function consoleListAgents(
-	deps: ControlPlaneDeps,
-): Promise<Readonly<ConsoleAgentListItem[]>> {
+export type ConsoleAgentListResult = Readonly<{
+	agents: Readonly<ConsoleAgentListItem[]>;
+	knownChannels: Readonly<string[]>;
+	knownRuntimeAdapters: Readonly<RuntimeAdapterId[]>;
+}>;
+
+export async function consoleListAgents(deps: ControlPlaneDeps): Promise<ConsoleAgentListResult> {
 	const activeRevisionId = await activeConfigRevisionId(deps);
+	// A separate read, like `activeConfigRevisionId` above: the "New agent" dialog's own runtime
+	// picker only offers an adapter `requestAgentCreate` would actually accept (a fresh, ready
+	// worker on this deployment), never the full static enum `consoleShowAgent`'s own
+	// `knownRuntimeAdapters` offers an *existing* agent's Runtime tab (which must still show
+	// whatever adapter it is already configured with, ready or not).
+	const health = await runtimeHealth(deps);
+	const knownRuntimeAdapters = health.filter((h) => h.available).map((h) => h.adapter);
 	return inTransaction(deps, async ({ tx }) => {
 		const { db, client } = tx;
 		const { bundle } = await loadActiveBundle(db, activeRevisionId);
+		const knownChannels = bundle.organization?.mattermost.channels ?? [];
 		const activeIds = new Set(bundle.agents.map((agent) => agent.id));
+		const lifecycleRows = await db
+			.select({ agentId: agentLifecycle.agentId, status: agentLifecycle.status })
+			.from(agentLifecycle);
+		const lifecycleByAgent = new Map(lifecycleRows.map((row) => [row.agentId, row.status]));
+		// A retiring or retired agent's `remove_agent` commit already took it out of the active
+		// bundle, but it stays listed (filterable, with its own Restore action) rather than
+		// vanishing the moment its configuration change commits: an owner who just retired an agent
+		// still needs to find it again to restore it.
+		const retiredIds = new Set(
+			lifecycleRows
+				.filter((row) => row.status === "retiring" || row.status === "retired")
+				.map((row) => row.agentId),
+		);
 		const allRows = await db
 			.select({
 				id: agents.id,
@@ -84,9 +129,9 @@ export async function consoleListAgents(
 			})
 			.from(agents)
 			.orderBy(asc(agents.id));
-		const rows = allRows.filter((row) => activeIds.has(row.id));
+		const rows = allRows.filter((row) => activeIds.has(row.id) || retiredIds.has(row.id));
 		if (rows.length === 0) {
-			return [];
+			return { agents: [], knownChannels, knownRuntimeAdapters };
 		}
 		// The agent's latest run of any status, one row per agent in SQL (a lateral join, index-
 		// backed by `agent_runs_agent` on `(agent_id, queued_at)`) rather than every historical run
@@ -103,17 +148,22 @@ export async function consoleListAgents(
 			)
 		).rows;
 		const lastRunByAgent = new Map(runs.map((run) => [run.agent_id, run]));
-		return rows.map((row) => ({
-			id: row.id,
-			displayName: row.displayName,
-			enabled: row.enabled,
-			state: row.state,
-			runtimeAdapter: row.runtimeAdapter,
-			model: row.config.runtime.model ?? null,
-			channelCount: row.config.mattermost.allowed_channels.length,
-			lastRun: toLastRun(lastRunByAgent.get(row.id)),
-			activeRevisionId,
-		}));
+		return {
+			agents: rows.map((row) => ({
+				id: row.id,
+				displayName: row.displayName,
+				enabled: row.enabled,
+				state: row.state,
+				runtimeAdapter: row.runtimeAdapter,
+				model: row.config.runtime.model ?? null,
+				channelCount: row.config.mattermost.allowed_channels.length,
+				lastRun: toLastRun(lastRunByAgent.get(row.id)),
+				activeRevisionId: activeIds.has(row.id) ? activeRevisionId : null,
+				lifecycleStatus: lifecycleByAgent.get(row.id) ?? null,
+			})),
+			knownChannels,
+			knownRuntimeAdapters,
+		};
 	});
 }
 
@@ -174,6 +224,7 @@ export async function consoleShowAgent(
 		},
 		knownChannels: organization === null ? [] : organization.mattermost.channels,
 		knownRuntimeAdapters: [...RuntimeAdapterIdSchema.options],
+		financeAgentId: organization?.organization.finance_agent_id ?? null,
 	};
 }
 
@@ -626,4 +677,234 @@ export async function consoleRevisionDiff(
 		const { bundle: before } = await loadActiveBundle(db, revision.parentRevisionId);
 		return { parentRevisionId: revision.parentRevisionId, diff: configDiff(before, after) };
 	});
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle (ADR-026): create, retry, retire, restore; an agent's own status and operation
+// journal, read fresh; its channel assignments with provenance, and revoking one directly. Unlike
+// `commitAgentPatch`, none of these take a client-supplied `baseRevisionId` to check: they are
+// never asked to apply against a specific, previously loaded configuration snapshot the way
+// editing an agent's own definition is (they always act on whatever is live, the same way the
+// CLI's own `gateway agents create|retire|restore|retry` already do) — a stale page is instead
+// caught by each one's own business-rule refusal (`AdminError`, surfaced as `invalid`/422), which
+// names the actual problem ("already retired", "not failed, nothing to retry") more specifically
+// than a bare conflict would. `ManagementConflictError` is still mapped to `conflict`/409 — the
+// rare case `commitWithinLock`'s own internal retry can still raise (a configuration-history
+// backfill racing this very request) — never a raw thrown error reaching the HTTP layer either
+// way.
+// ---------------------------------------------------------------------------
+
+export type ConsoleCreateAgentResult =
+	| Readonly<{ kind: "conflict"; currentRevisionId: number | null }>
+	| Readonly<{ kind: "invalid"; problems: Readonly<string[]> }>
+	| Readonly<{ kind: "ok"; result: Awaited<ReturnType<typeof requestAgentCreate>> }>;
+
+/**
+ * `POST /api/agents`: builds the full `requestAgentCreate` input from the console's own narrower
+ * DTO, the same way `gateway agents create` already does (`buildAgentCreateRequest`) — the bot
+ * username (always the agent id), its wake rule (a mention in any allowed channel), concurrency
+ * and private memory namespace, never a client-chosen value beyond what the console DTO actually
+ * exposes. The server-generated bot token path is `requestAgentCreate`'s own job
+ * (`defaultBotSecretFile`); nothing here ever names one.
+ */
+export async function consoleCreateAgent(
+	deps: ControlPlaneDeps,
+	request: ConsoleAgentCreateRequest,
+	actor: string,
+): Promise<ConsoleCreateAgentResult> {
+	try {
+		const result = await requestAgentCreate(deps, {
+			agent: {
+				id: request.id,
+				display_name: request.displayName,
+				mattermost: { username: request.id, allowed_channels: [...request.allowedChannels] },
+				...(request.runtime === undefined ? {} : { runtime: request.runtime }),
+				prompts: { role_file: `prompts/agents/${request.id}.md` },
+				wake_rules: [{ event_type: "mattermost.agent.mentioned", target_agent_id: request.id }],
+				concurrency: { while_running: "enqueue" },
+				memory: { private_namespace: `agents/${request.id}`, shared_namespaces: [] },
+			},
+			rolePrompt: request.rolePrompt,
+			actor,
+			source: "console",
+			idempotencyKey: request.idempotencyKey,
+		});
+		return { kind: "ok", result };
+	} catch (error) {
+		if (error instanceof ManagementConflictError) {
+			return { kind: "conflict", currentRevisionId: error.currentRevisionId };
+		}
+		if (error instanceof AdminError) {
+			return { kind: "invalid", problems: [error.message] };
+		}
+		throw error;
+	}
+}
+
+export type ConsoleRetireAgentResult =
+	| Readonly<{ kind: "conflict"; currentRevisionId: number | null }>
+	| Readonly<{ kind: "invalid"; problems: Readonly<string[]> }>
+	| Readonly<{ kind: "ok"; result: Awaited<ReturnType<typeof requestAgentRetire>> }>;
+
+/** `POST /api/agents/:id/retire`. `request.reassignFinanceTo` is required by `requestAgentRetire`
+ * itself when `agentId` is the organization's finance agent; refusing it otherwise surfaces as
+ * `invalid`, the same as any other business-rule problem. */
+export async function consoleRetireAgent(
+	deps: ControlPlaneDeps,
+	agentId: AgentId,
+	request: ConsoleAgentRetireRequest,
+	actor: string,
+): Promise<ConsoleRetireAgentResult> {
+	try {
+		const result = await requestAgentRetire(deps, {
+			agentId,
+			actor,
+			source: "console",
+			idempotencyKey: request.idempotencyKey,
+			...(request.reason === undefined ? {} : { reason: request.reason }),
+			...(request.reassignFinanceTo === undefined
+				? {}
+				: { reassignFinanceTo: request.reassignFinanceTo }),
+		});
+		return { kind: "ok", result };
+	} catch (error) {
+		if (error instanceof ManagementConflictError) {
+			return { kind: "conflict", currentRevisionId: error.currentRevisionId };
+		}
+		if (error instanceof AdminError) {
+			return { kind: "invalid", problems: [error.message] };
+		}
+		throw error;
+	}
+}
+
+export type ConsoleRestoreAgentResult =
+	| Readonly<{ kind: "conflict"; currentRevisionId: number | null }>
+	| Readonly<{ kind: "invalid"; problems: Readonly<string[]> }>
+	| Readonly<{ kind: "ok"; result: Awaited<ReturnType<typeof requestAgentRestore>> }>;
+
+/** `POST /api/agents/:id/restore`. */
+export async function consoleRestoreAgent(
+	deps: ControlPlaneDeps,
+	agentId: AgentId,
+	request: ConsoleAgentRestoreRequest,
+	actor: string,
+): Promise<ConsoleRestoreAgentResult> {
+	try {
+		const result = await requestAgentRestore(deps, {
+			agentId,
+			actor,
+			source: "console",
+			idempotencyKey: request.idempotencyKey,
+		});
+		return { kind: "ok", result };
+	} catch (error) {
+		if (error instanceof ManagementConflictError) {
+			return { kind: "conflict", currentRevisionId: error.currentRevisionId };
+		}
+		if (error instanceof AdminError) {
+			return { kind: "invalid", problems: [error.message] };
+		}
+		throw error;
+	}
+}
+
+export type ConsoleRetryOperationResult =
+	| Readonly<{ kind: "conflict"; currentRevisionId: number | null }>
+	| Readonly<{ kind: "invalid"; problems: Readonly<string[]> }>
+	| Readonly<{ kind: "ok"; result: Awaited<ReturnType<typeof requestOperationRetry>> }>;
+
+/** `POST /api/agents/:id/retry`: refused (`invalid`) unless the agent's current operation is
+ * actually `failed` (`requestOperationRetry`). */
+export async function consoleRetryOperation(
+	deps: ControlPlaneDeps,
+	agentId: AgentId,
+	request: ConsoleAgentRetryRequest,
+	actor: string,
+): Promise<ConsoleRetryOperationResult> {
+	try {
+		const result = await requestOperationRetry(deps, {
+			agentId,
+			actor,
+			source: "console",
+			idempotencyKey: request.idempotencyKey,
+		});
+		return { kind: "ok", result };
+	} catch (error) {
+		if (error instanceof ManagementConflictError) {
+			return { kind: "conflict", currentRevisionId: error.currentRevisionId };
+		}
+		if (error instanceof AdminError) {
+			return { kind: "invalid", problems: [error.message] };
+		}
+		throw error;
+	}
+}
+
+/** `GET /api/agents/:id/lifecycle`: null when the agent has no `agent_lifecycle` row at all (only
+ * possible before the startup adoption backfill has run). */
+export async function consoleAgentLifecycle(
+	deps: ControlPlaneDeps,
+	agentId: AgentId,
+): Promise<ConsoleAgentLifecycleResponse | null> {
+	const lifecycle = await loadAgentLifecycle(deps, agentId);
+	if (lifecycle === null) {
+		return null;
+	}
+	const operations = await listLifecycleOperations(deps, agentId);
+	return {
+		status: lifecycle.status,
+		generation: lifecycle.generation,
+		lastError: lifecycle.lastError,
+		statusChangedAt: lifecycle.statusChangedAt,
+		retiredAt: lifecycle.retiredAt,
+		operations: operations.map((operation) => ({
+			id: operation.id,
+			kind: operation.kind,
+			state: operation.state,
+			checkpoints: operation.checkpoints,
+			error: operation.error,
+			createdAt: operation.createdAt,
+			updatedAt: operation.updatedAt,
+			finishedAt: operation.finishedAt,
+		})),
+	};
+}
+
+/** `GET /api/agents/:id/channels`: configured vs granted, the same read model `gateway agents
+ * channels` prints (`loadAgentChannelAssignments`) — database-only, never the live
+ * `member-unauthorized` check `gateway mattermost reconcile` performs. */
+export async function consoleAgentChannels(
+	deps: ControlPlaneDeps,
+	agentId: AgentId,
+): Promise<ConsoleAgentChannelsResponse> {
+	const assignments = await loadAgentChannelAssignments(deps, agentId);
+	return {
+		channels: assignments.map((assignment) => ({
+			channelId: assignment.channelId,
+			channelName: assignment.channelName,
+			provenance: assignment.provenance,
+			grantedByUserId: assignment.grantedByUserId,
+			grantedAt: assignment.grantedAt,
+			evidencePostId: assignment.evidencePostId,
+		})),
+	};
+}
+
+/** `POST /api/agents/:id/channels/revoke`: tombstones a directly granted channel the same way
+ * `gateway agents revoke-grant` does (looked up by id among the agent's own assignments, for the
+ * channel name the response reports — `revokeChannelGrant` itself only reports whether the
+ * channel is still followed for someone else). A channel the agent has no active grant for at all
+ * (already revoked, or never granted — `channelName: null`) is not an error: revoking is
+ * idempotent, the same as the CLI command. */
+export async function consoleRevokeGrant(
+	deps: ControlPlaneDeps,
+	agentId: AgentId,
+	channelId: MattermostId,
+	actor: string,
+): Promise<ConsoleRevokeGrantResponse> {
+	const assignments = await loadAgentChannelAssignments(deps, agentId);
+	const match = assignments.find((assignment) => assignment.channelId === channelId);
+	const stillFollowed = await revokeChannelGrant(deps, { agentId, channelId, actor });
+	return { channelId, channelName: match?.channelName ?? null, stillFollowed };
 }

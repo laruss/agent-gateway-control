@@ -79,8 +79,13 @@ Routes:
 | `/api/session` | `POST` | exact Origin | JSON `{password}`; returns `{csrfToken, expiresAt}` and sets the cookie. |
 | `/api/session` | `DELETE` | session, exact Origin, CSRF header | Logs out: revokes the session and clears the cookie. |
 | `/api/status` | `GET` | session | The same projection as JSON, for scripting or a quick `curl` once signed in. |
-| `/api/agents`, `/api/agents/:id` | `GET` | session | Every agent, or one agent's full editable configuration — see "Managing agents" below. |
+| `/api/agents`, `/api/agents/:id` | `GET` | session | Every agent (including a retiring/retired one, so its own Restore action stays reachable), or one agent's full editable configuration — see "Managing agents" below. |
+| `/api/agents` | `POST` | session, exact Origin, CSRF header | Create an agent — see "Agent lifecycle" below. |
 | `/api/agents/:id/preview`, `/api/agents/:id/commit` | `POST` | session, exact Origin, CSRF header | Preview or commit a configuration change to one agent. |
+| `/api/agents/:id/retry`, `/api/agents/:id/retire`, `/api/agents/:id/restore` | `POST` | session, exact Origin, CSRF header | Retry a failed operation, retire, or restore an agent — see "Agent lifecycle" below. |
+| `/api/agents/:id/lifecycle` | `GET` | session | The agent's own provisioning status and operation journal (status, checkpoints, error, timestamps). |
+| `/api/agents/:id/channels` | `GET` | session | Its channels with provenance: `configured` or `granted` (by whom, when, evidence post). |
+| `/api/agents/:id/channels/revoke` | `POST` | session, exact Origin, CSRF header | Revoke a directly granted channel. |
 | `/api/config/revisions`, `/api/config/revisions/:id/diff` | `GET` | session | The configuration's revision history, and a structural diff of one revision against its parent. |
 
 Every response — success, a failure, even a `503` for a missing build — carries
@@ -108,20 +113,22 @@ curl -s -b cookies.txt https://gateway.local/api/status
 
 ## Managing agents
 
-The Agents hub (`/agents`) lists every agent in the active configuration and lets the owner edit
-an existing one; creating or deleting an agent is not available from the console yet (`gateway
-config apply`/`import` still does that). An agent disabled and retained outside the active
-configuration (`gateway agent disable` falling back to `remove_agent` for a stale, no-longer-valid
-row — see the Overview tab's note below) is left out of this list entirely, consistent with its
-own detail route, which 404s for it the same way. Open an agent from the list to its editor, which
-has one tab per group of fields:
+The Agents hub (`/agents`) lists every agent in the active configuration, plus any agent currently
+`retiring`/`retired` (filterable behind a "Show retired" switch, so its own Restore action stays
+reachable after it has left the active configuration), and lets the owner edit an existing one,
+create a new one or retire/restore/retry one — see "Agent lifecycle" below. An agent disabled and
+retained outside the active configuration for an unrelated reason (`gateway agent disable` falling
+back to `remove_agent` for a stale, no-longer-valid row — see the Overview tab's note below) is
+left out of the list entirely, consistent with its own detail route, which 404s for it the same
+way: only a lifecycle-tracked retiring/retired agent gets the fallback lifecycle view described
+below. Open an agent from the list to its editor, which has one tab per group of fields:
 
 | Tab | Editable fields |
 |---|---|
 | Overview | Display name, enabled, plus the agent's current state and recent runs (from the same `/api/status` data the overview page shows — not a separate query). Disabling a *retained* agent whose own stored configuration no longer validates falls back to removing it from the configuration outright (the same fallback `gateway agent disable` already has); the preview's "impact" list says so before applying. |
 | Instructions | The role prompt (monospace, bounded at 50,000 characters, the same limit `set_role_prompt` enforces everywhere else). |
 | Runtime | Runtime adapter, model (clearing the field back to blank removes the override, falling back to the runtime adapter's own default — not merely leaving the stored value untouched), session policy, timeout. |
-| Assignments | Allowed Mattermost channels (from the organization's own configured list), wake rules (event type and an optional target agent). |
+| Assignments | Allowed Mattermost channels (from the organization's own configured list), its channel assignments with provenance (`configured` vs `granted` — by whom, when, evidence post — with a Revoke action for a granted one, ADR-022/026), wake rules (event type and an optional target agent). |
 | Permissions | The three tool-pattern lists (`tools_allow`, `tools_require_human_approval`, `tools_deny`) and `observe_system`. |
 | History | Revisions that touched this agent, each with its own diff. |
 
@@ -166,6 +173,59 @@ would any other revision — a console edit is not a separate kind of change the
 has to special-case. `config apply`/`import` from a YAML directory continue to work unchanged and
 independently of anything edited from the console; whichever happened most recently is simply the
 configuration that is now active, visible in the same journal either way.
+
+## Agent lifecycle
+
+Creating, retiring, restoring and retrying an agent (ADR-026) are console actions alongside
+editing one — no `gateway mattermost bootstrap`/`reconcile` run, and no YAML file, for any of it:
+
+- **New agent** (a button on the Agents hub's list) opens a dialog for the agent id, display name,
+  allowed channels, its role prompt text and, optionally, a runtime adapter/model — only adapters
+  with a fresh, ready worker on this deployment right now are offered, never one `requestAgentCreate`
+  would refuse outright. Creating an agent here never creates a worker container and never touches
+  Mattermost directly: it commits the agent's configuration (`enabled: true`, deny-by-default
+  permissions — the same `defaultAgentPermissions` the CLI's own `gateway agents create` falls back
+  to, so granting a tool like `mattermost.post` is a separate edit afterward, through the ordinary
+  preview/commit flow above) and queues a `create` operation for the controller's own background
+  provisioner, which creates the bot, issues its token, and joins it to the team and its channels.
+- **Lifecycle status and progress.** The agent page shows its own status badge
+  (`pending`/`reconciling`/`ready`/`failed`/`retiring`/`retired`) and, while an operation is
+  `pending`/`reconciling`, a live checklist of its current operation's own checkpoints — resolving
+  or creating the bot, issuing a token, joining the team, joining its channels (or the mirror image
+  for retirement) — polled from `GET /api/agents/:id/lifecycle` and updated as each step completes,
+  without a manual reload.
+- **Retry** appears once an agent is `failed`, or `retiring` with its own retire cleanup
+  permanently failed, next to its own actionable failure message (bounded, redacted — never a
+  secret). It queues a fresh attempt of the same kind of operation, carrying forward whatever it
+  already checkpointed, so a step already done is not repeated — the same thing
+  `gateway agents retry <id>` does from the CLI.
+- **Retire** (a button on the agent page) opens a confirmation stating plainly what retirement
+  cancels — its active run and waits, pending approvals and queued tool actions, every channel
+  grant, pending Mattermost deliveries — and that it is reversible (Restore re-adds its
+  configuration and re-provisions the same bot). Retiring the organization's configured finance
+  agent requires choosing a replacement in the same dialog before it can be submitted (the server
+  would refuse it anyway; asking first avoids the round trip). A system-flagged agent (one with
+  `observe_system` permission, like the example `operator` agent) shows a warning here, not a
+  block: the console and CLI both keep working with zero agents ready.
+- **Restore** appears on a retired agent, in the list and on its own page. A retiring or retired
+  agent has left the active configuration (its own `remove_agent` commit already took it out), so
+  `GET /api/agents/:id` 404s for it the same way any agent outside the active bundle does; its own
+  page falls back to a minimal view built from its lifecycle status, operations and channel
+  assignments alone (no editable configuration, since there is none to show) instead of the
+  ordinary error page.
+- **Channel assignments and revoking one directly.** The Assignments tab lists an agent's channels
+  with provenance — `configured` (in its own allowed-channels list, edited there) or `granted` (an
+  owner or system admin added its bot directly in Mattermost, ADR-022: by whom, when, which post is
+  the evidence) — with a Revoke action for a granted one. Revoking tombstones it (re-adding the bot
+  to the same channel later never silently re-grants it) and asks for its actual removal: at once,
+  through a queued `reprovision` operation, for a lifecycle-created agent; on the membership
+  synchronizer's own next pass (seconds away) for a bootstrap-managed one.
+
+Every CLI equivalent still works independently: `gateway agents create|retry|retire|restore` and
+`gateway agents channels|revoke-grant` (`docs/operations/mattermost.md`) commit through the exact
+same service this console surface calls — whichever one an owner used most recently is simply what
+is now active, the same "one journal, either source" guarantee the configuration editor above
+already gives.
 
 ## Building and running it in development
 

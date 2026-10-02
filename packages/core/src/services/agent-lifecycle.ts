@@ -3,6 +3,7 @@ import {
 	type AgentConfig,
 	type AgentCreateInput,
 	type AgentId,
+	type AgentLifecycle,
 	type AgentLifecycleCheckpoints,
 	type AgentLifecycleOperation,
 	type AgentLifecycleOperationKind,
@@ -18,6 +19,8 @@ import {
 	RequestAgentRestoreInputSchema,
 	type RequestAgentRetireInput,
 	RequestAgentRetireInputSchema,
+	type RequestOperationRetryInput,
+	RequestOperationRetryInputSchema,
 	type RuntimeAdapterId,
 	type SecretFile,
 } from "@agent-gateway/contracts";
@@ -778,6 +781,131 @@ export async function requestAgentRestore(
 }
 
 // ---------------------------------------------------------------------------
+// Retry
+// ---------------------------------------------------------------------------
+
+export type RequestOperationRetryResult = Readonly<{
+	operationId: string;
+	agentId: AgentId;
+	kind: AgentLifecycleOperationKind;
+}>;
+
+/**
+ * Requests a fresh attempt of an agent's own current operation: refused unless that operation is
+ * actually `failed` — a `create`/`restore`/`reprovision` that left the agent `failed`, or a
+ * `retire` that left it `retiring` with a permanent failure of its own cleanup. Queues a new
+ * operation of the *same* kind, `pending`, carrying the failed operation's own checkpoints forward
+ * (a step it already completed is not repeated) — never resurrects the failed row itself, since
+ * the operation journal is append-only and only ever moves a row's own state forward (ADR-026).
+ * The agent itself moves back to `pending` (the state a fresh `create`/`restore`/`reprovision`
+ * starts from) except for a retiring agent, which stays `retiring` throughout, the same way
+ * `markProvisioning` already leaves it for a `retire` operation; `last_error` is cleared either
+ * way, since this is a fresh attempt, not a continuation of the failure it is replacing.
+ *
+ * A repeat with the same `idempotencyKey` replays the first call's own result rather than
+ * re-validating — the same convention `requestAgentCreate`/`requestAgentRetire`/
+ * `requestAgentRestore` already share.
+ */
+export async function requestOperationRetry(
+	deps: ControlPlaneDeps,
+	input: RequestOperationRetryInput,
+): Promise<RequestOperationRetryResult> {
+	const parsed = parseOrRefuse(
+		RequestOperationRetryInputSchema.safeParse(input),
+		"agent retry request",
+	);
+	return inTransaction(deps, async (uow) => {
+		const { db } = uow.tx;
+
+		if (parsed.idempotencyKey !== undefined) {
+			const [existing] = await db
+				.select()
+				.from(agentLifecycleOperations)
+				.where(eq(agentLifecycleOperations.idempotencyKey, parsed.idempotencyKey));
+			if (existing !== undefined) {
+				if (existing.agentId !== parsed.agentId) {
+					throw new AdminError(
+						`idempotency key '${parsed.idempotencyKey}' was already used for a different request`,
+					);
+				}
+				return { operationId: existing.id, agentId: existing.agentId, kind: existing.kind };
+			}
+		}
+
+		const [lifecycle] = await db
+			.select()
+			.from(agentLifecycle)
+			.where(eq(agentLifecycle.agentId, parsed.agentId))
+			.for("update");
+		if (lifecycle === undefined) {
+			throw new AdminError(`agent '${parsed.agentId}' has no lifecycle record`);
+		}
+		if (lifecycle.operationId === null) {
+			throw new AdminError(`agent '${parsed.agentId}' has no operation to retry`);
+		}
+		const [failed] = await db
+			.select()
+			.from(agentLifecycleOperations)
+			.where(eq(agentLifecycleOperations.id, lifecycle.operationId))
+			.for("update");
+		if (failed === undefined) {
+			throw new AdminError(`lifecycle operation '${lifecycle.operationId}' does not exist`);
+		}
+		if (failed.state !== "failed") {
+			throw new AdminError(
+				`agent '${parsed.agentId}'s current operation is '${failed.state}', not failed; nothing to retry`,
+			);
+		}
+		if (lifecycle.status === "retiring") {
+			if (failed.kind !== "retire") {
+				throw new AdminError(
+					`agent '${parsed.agentId}' is retiring with an unexpected operation kind '${failed.kind}'`,
+				);
+			}
+		} else if (lifecycle.status !== "failed") {
+			throw new AdminError(
+				`agent '${parsed.agentId}' is '${lifecycle.status}', not failed or retiring; nothing to retry`,
+			);
+		}
+
+		const operationId = randomUUID();
+		const generation = lifecycle.generation + 1;
+		await db.insert(agentLifecycleOperations).values({
+			id: operationId,
+			agentId: parsed.agentId,
+			kind: failed.kind,
+			requestedBy: parsed.actor,
+			source: parsed.source,
+			idempotencyKey: parsed.idempotencyKey ?? null,
+			configRevisionId: failed.configRevisionId,
+			generation,
+			state: "pending",
+			checkpoints: failed.checkpoints,
+			createdAt: uow.now,
+			updatedAt: uow.now,
+		});
+		const nextStatus: AgentLifecycleStatus =
+			lifecycle.status === "retiring" ? "retiring" : "pending";
+		await db
+			.update(agentLifecycle)
+			.set({
+				status: nextStatus,
+				generation,
+				operationId,
+				statusChangedAt: uow.now,
+				lastError: null,
+			})
+			.where(eq(agentLifecycle.agentId, parsed.agentId));
+		await audit(uow, parsed.actor, "agent_lifecycle.retry", "agent", parsed.agentId, {
+			operation_id: operationId,
+			kind: failed.kind,
+			previous_operation_id: failed.id,
+		});
+		return { operationId, agentId: parsed.agentId, kind: failed.kind };
+	});
+}
+
+// ---------------------------------------------------------------------------
 // Operation state machine: markProvisioning / completeOperation / failOperation
 // ---------------------------------------------------------------------------
 
@@ -1066,6 +1194,33 @@ export async function listLifecycleOperations(
 		updatedAt: row.updatedAt.toISOString(),
 		finishedAt: row.finishedAt === null ? null : row.finishedAt.toISOString(),
 	}));
+}
+
+/**
+ * One agent's own `agent_lifecycle` row, for an owner to read (the console's lifecycle-state
+ * route; `gateway agents operations` reads the operation journal directly and has no equivalent
+ * today). Null when no row exists yet (only possible before the startup adoption backfill runs).
+ */
+export async function loadAgentLifecycle(
+	deps: ControlPlaneDeps,
+	agentId: AgentId,
+): Promise<AgentLifecycle | null> {
+	const [row] = await inTransaction(deps, ({ tx }) =>
+		tx.db.select().from(agentLifecycle).where(eq(agentLifecycle.agentId, agentId)),
+	);
+	if (row === undefined) {
+		return null;
+	}
+	return {
+		agentId: row.agentId,
+		status: row.status,
+		generation: row.generation,
+		operationId: row.operationId,
+		lastError: row.lastError,
+		statusChangedAt: row.statusChangedAt.toISOString(),
+		createdAt: row.createdAt.toISOString(),
+		retiredAt: row.retiredAt === null ? null : row.retiredAt.toISOString(),
+	};
 }
 
 /**

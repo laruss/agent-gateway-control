@@ -43,9 +43,9 @@ adopted from a pre-existing configuration:
 
 ```
 pending ----> reconciling ----> ready ----> retiring ----> retired
-   |              |               |
-   +--- failed <--+--- failed <---+
-        (retry: reconciling again, later work)
+   |              |               |             |
+   +--- failed <--+--- failed <---+             +--- (retry: stays retiring)
+        (retry: pending again)
 
 retired ----> pending   (restore: re-adds the last known configuration)
 ```
@@ -327,6 +327,84 @@ for having become lifecycle-owned. The old `/run/secrets/...` file is simply sta
 nothing reads or deletes it; `gateway doctor` has no way to tell it apart from one still in use, so
 an operator who no longer needs it removes it by hand. A lifecycle-created agent's own path is
 already `defaultBotSecretFile`, so the migration changes nothing for it.
+
+### Retry
+
+`requestOperationRetry` asks for a fresh attempt of an agent's own current operation: refused
+unless that operation is actually `failed` — a `create`/`restore`/`reprovision` that left the
+agent `failed` (`failOperation`'s own path for any of those kinds), or a `retire` whose own
+cleanup failed permanently, leaving the agent `retiring` with `last_error` rather than the generic
+`failed` (`failOperation`'s own doc comment). It queues a *new* operation of the same kind, never
+resurrects the failed row itself: the operation journal is append-only (its own guard trigger
+only ever lets `state` move forward, migration 0025), so a terminal row can never become `pending`
+again in place, the same reason a superseded `create`/`restore` is cancelled and replaced rather
+than rewound. The new operation carries the failed one's own checkpoints forward — a step the
+provisioner already completed (the bot resolved, a token issued, every channel but one joined) is
+not repeated, only resumed, the same way a controller restart resumes a `running` operation from
+its last checkpoint. The agent itself moves back to `pending` (the state a fresh
+`create`/`restore`/`reprovision` starts from, and `markProvisioning` reconciles from there as
+usual) — except a retiring agent, which stays `retiring` throughout, matching `markProvisioning`'s
+own rule for a `retire` operation; `last_error` is cleared either way, since this is a fresh
+attempt, not a continuation of the one that failed. A repeat with the same `idempotencyKey`
+replays the first call's own result, the same convention every other lifecycle request already
+follows. `gateway agents retry <id>` is its CLI surface; the console's agent page shows the same
+action next to the agent's own actionable failure message, live checkpoints as they complete while
+an operation is in flight (polling `GET /api/agents/:id/lifecycle`), and a progress view for
+`pending`/`reconciling`.
+
+### The console's own lifecycle routes
+
+The owner's console (ADR-025) drives the same four requests above, plus the read models they need,
+through its existing session/CSRF/exact-Origin-protected `/api/agents*` surface
+(`apps/controller/src/console-management.ts`), never a new authentication mechanism or a direct
+database write of its own:
+
+- **`POST /api/agents`** — `{idempotencyKey, id, displayName, allowedChannels, rolePrompt,
+  runtime?}`, the console's own narrower create DTO (`ConsoleAgentCreateRequestSchema`,
+  `packages/contracts/src/console-management.ts`): the bot username (always the agent id), its
+  wake rule (a mention in any of its own channels), concurrency and private memory namespace are
+  never client-supplied, built the same way `gateway agents create` already assembles them
+  (`buildAgentCreateRequest`). `runtime.adapter`, when given, is offered from the deployment's own
+  *qualified* list — an adapter with a fresh, ready worker right now (`runtimeHealth`), not the
+  full static enum `GET /api/agents`'s own editor-facing `knownRuntimeAdapters` offers for an
+  *existing* agent's Runtime tab (which must still show whatever it is already configured with,
+  ready or not). Its own permissions are left to `requestAgentCreate`'s existing
+  `defaultAgentPermissions` fallback (deny-by-default, same as the CLI); granting a tool (including
+  `mattermost.post`, before the new bot can post anything at all) goes through the existing
+  preview/commit flow afterward, never a field this create request exposes directly.
+- **`POST /api/agents/:id/retry`**, **`POST /api/agents/:id/retire`** (`{reason?,
+  reassignFinanceTo?}`), **`POST /api/agents/:id/restore`** — thin bodies, each carrying only its
+  own `idempotencyKey` and whatever `requestAgentRetire` itself needs; unlike `preview`/`commit`,
+  none of these take a client-supplied `baseRevisionId` to check against: they are never asked to
+  apply against a specific, previously loaded configuration snapshot the way editing an agent's own
+  definition is — they always act on whatever is live, the same way the CLI's own
+  `gateway agents retire|restore|retry` already do. A stale page is instead caught by each
+  request's own business-rule refusal (`AdminError`, surfaced as `422` with `problems`) — "already
+  retired", "not failed, nothing to retry" — which names the actual problem more specifically than
+  a bare conflict would; the rare `ManagementConflictError` a configuration-history backfill racing
+  this very request can still raise (`commitWithinLock`'s own internal retry) is still mapped to
+  `409`, the same as every other mutating route.
+- **`GET /api/agents/:id/lifecycle`** — `{status, generation, lastError, statusChangedAt,
+  retiredAt, operations}`: the agent's own `agent_lifecycle` row plus its operation journal,
+  newest first, each with its `checkpoints` and (already redacted and bounded at write time,
+  `redactForStorage`) `error` — never the journal's own identity columns
+  (`requestedBy`/`source`/`idempotencyKey`/`configRevisionId`/`generation`), operator detail the
+  console's progress view has no use for. `404` when the agent has no lifecycle row at all (only
+  possible before the startup adoption backfill has run).
+- **`GET /api/agents/:id/channels`** — the same `configured`/`granted` provenance read model
+  `gateway agents channels <id>` prints (`loadAgentChannelAssignments`), database-only; never the
+  live `member-unauthorized` check `gateway mattermost reconcile` performs.
+- **`POST /api/agents/:id/channels/revoke`** (`{channelId}`) — tombstones a directly granted
+  channel the same way `gateway agents revoke-grant <id> <channel>` does; idempotent (a channel
+  nothing was ever granted for is a no-op, `channelName: null`, never an error).
+
+Every route above is reachable only once an agent already exists (`POST /api/agents` aside); the
+console's own agents list stays the one place a retiring or retired agent remains reachable at all
+once its `remove_agent` commit has taken it out of the active configuration snapshot
+`GET /api/agents/:id` itself still reads from (which 404s for it, same as any other agent outside
+that snapshot) — the list includes it anyway, filterable, specifically so its own Restore action
+stays reachable; its agent page falls back to this same lifecycle/channels data (no editable
+configuration, since there is none to show) the moment its own detail fetch 404s this way.
 
 ### Assignments: a read model with provenance
 

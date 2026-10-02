@@ -53,6 +53,7 @@ function detailFixture(): ConsoleAgentDetailResponse {
 		},
 		knownChannels: ["hq", "research", "engineering"],
 		knownRuntimeAdapters: ["mock", "codex", "claude-code"],
+		financeAgentId: null,
 	};
 }
 
@@ -69,8 +70,11 @@ function listFixture(): ConsoleAgentListResponse {
 				channelCount: 2,
 				lastRun: null,
 				activeRevisionId: 7,
+				lifecycleStatus: "ready",
 			},
 		],
+		knownChannels: ["hq", "research", "engineering"],
+		knownRuntimeAdapters: ["mock", "codex", "claude-code"],
 	};
 }
 

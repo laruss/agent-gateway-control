@@ -1,8 +1,20 @@
 import {
+	type ConsoleAgentChannelsResponse,
+	ConsoleAgentChannelsResponseSchema,
+	type ConsoleAgentCreateRequest,
+	ConsoleAgentCreateResponseSchema,
 	type ConsoleAgentDetailResponse,
 	ConsoleAgentDetailResponseSchema,
+	type ConsoleAgentLifecycleResponse,
+	ConsoleAgentLifecycleResponseSchema,
 	type ConsoleAgentListResponse,
 	ConsoleAgentListResponseSchema,
+	type ConsoleAgentRestoreRequest,
+	ConsoleAgentRestoreResponseSchema,
+	type ConsoleAgentRetireRequest,
+	ConsoleAgentRetireResponseSchema,
+	type ConsoleAgentRetryRequest,
+	ConsoleAgentRetryResponseSchema,
 	type ConsoleCommitRequest,
 	ConsoleCommitResponseSchema,
 	type ConsolePreviewRequest,
@@ -12,6 +24,7 @@ import {
 	ConsoleRevisionDiffResponseSchema,
 	type ConsoleRevisionListResponse,
 	ConsoleRevisionListResponseSchema,
+	ConsoleRevokeGrantResponseSchema,
 	type ConsoleSnapshot,
 	ConsoleSnapshotSchema,
 } from "@agent-gateway/contracts";
@@ -363,4 +376,159 @@ export async function fetchConfigRevisionDiff(
 		throw new ApiError(response.status, await bodyText(response));
 	}
 	return ConsoleRevisionDiffResponseSchema.parse(await response.json());
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle (ADR-026): create, retry, retire, restore; an agent's own status and operation
+// journal; its channel assignments with provenance, and revoking one directly. `conflict`/
+// `invalid` are typed outcomes the caller reacts to directly, the same convention
+// `previewAgentChange`/`commitAgentChange` already use — only a transport-level failure throws.
+// ---------------------------------------------------------------------------
+
+export type CreateAgentOutcome =
+	| Readonly<{ kind: "ok"; agentId: string; operationId: string; revisionId: number }>
+	| Readonly<{ kind: "conflict"; currentRevisionId: number | null }>
+	| Readonly<{ kind: "invalid"; problems: Readonly<string[]> }>;
+
+export async function createAgent(body: ConsoleAgentCreateRequest): Promise<CreateAgentOutcome> {
+	const response = await request("/api/agents", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+	});
+	if (response.status === 409) {
+		const parsed = ConflictBodySchema.parse(await response.json());
+		return { kind: "conflict", currentRevisionId: parsed.currentRevisionId };
+	}
+	if (response.status === 422) {
+		const parsed = InvalidBodySchema.parse(await response.json());
+		return { kind: "invalid", problems: parsed.problems };
+	}
+	if (!response.ok) {
+		throw new ApiError(response.status, await bodyText(response));
+	}
+	const data = ConsoleAgentCreateResponseSchema.parse(await response.json());
+	return { kind: "ok", ...data };
+}
+
+export type RetireAgentOutcome =
+	| Readonly<{ kind: "ok"; operationId: string; revisionId: number }>
+	| Readonly<{ kind: "conflict"; currentRevisionId: number | null }>
+	| Readonly<{ kind: "invalid"; problems: Readonly<string[]> }>;
+
+export async function retireAgent(
+	agentId: string,
+	body: ConsoleAgentRetireRequest,
+): Promise<RetireAgentOutcome> {
+	const response = await request(`/api/agents/${encodeURIComponent(agentId)}/retire`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+	});
+	if (response.status === 409) {
+		const parsed = ConflictBodySchema.parse(await response.json());
+		return { kind: "conflict", currentRevisionId: parsed.currentRevisionId };
+	}
+	if (response.status === 422) {
+		const parsed = InvalidBodySchema.parse(await response.json());
+		return { kind: "invalid", problems: parsed.problems };
+	}
+	if (!response.ok) {
+		throw new ApiError(response.status, await bodyText(response));
+	}
+	const data = ConsoleAgentRetireResponseSchema.parse(await response.json());
+	return { kind: "ok", ...data };
+}
+
+export type RestoreAgentOutcome =
+	| Readonly<{ kind: "ok"; operationId: string; revisionId: number }>
+	| Readonly<{ kind: "conflict"; currentRevisionId: number | null }>
+	| Readonly<{ kind: "invalid"; problems: Readonly<string[]> }>;
+
+export async function restoreAgent(
+	agentId: string,
+	body: ConsoleAgentRestoreRequest,
+): Promise<RestoreAgentOutcome> {
+	const response = await request(`/api/agents/${encodeURIComponent(agentId)}/restore`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+	});
+	if (response.status === 409) {
+		const parsed = ConflictBodySchema.parse(await response.json());
+		return { kind: "conflict", currentRevisionId: parsed.currentRevisionId };
+	}
+	if (response.status === 422) {
+		const parsed = InvalidBodySchema.parse(await response.json());
+		return { kind: "invalid", problems: parsed.problems };
+	}
+	if (!response.ok) {
+		throw new ApiError(response.status, await bodyText(response));
+	}
+	const data = ConsoleAgentRestoreResponseSchema.parse(await response.json());
+	return { kind: "ok", ...data };
+}
+
+export type RetryOperationOutcome =
+	| Readonly<{ kind: "ok"; operationId: string; operationKind: string }>
+	| Readonly<{ kind: "conflict"; currentRevisionId: number | null }>
+	| Readonly<{ kind: "invalid"; problems: Readonly<string[]> }>;
+
+export async function retryOperation(
+	agentId: string,
+	body: ConsoleAgentRetryRequest,
+): Promise<RetryOperationOutcome> {
+	const response = await request(`/api/agents/${encodeURIComponent(agentId)}/retry`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+	});
+	if (response.status === 409) {
+		const parsed = ConflictBodySchema.parse(await response.json());
+		return { kind: "conflict", currentRevisionId: parsed.currentRevisionId };
+	}
+	if (response.status === 422) {
+		const parsed = InvalidBodySchema.parse(await response.json());
+		return { kind: "invalid", problems: parsed.problems };
+	}
+	if (!response.ok) {
+		throw new ApiError(response.status, await bodyText(response));
+	}
+	const data = ConsoleAgentRetryResponseSchema.parse(await response.json());
+	return { kind: "ok", operationId: data.operationId, operationKind: data.kind };
+}
+
+/** `GET /api/agents/:id/lifecycle`: null for a 404 (no `agent_lifecycle` row at all), never
+ * thrown — an agent list entry always has one, so this is only reachable from a stale link. */
+export async function fetchAgentLifecycle(
+	agentId: string,
+): Promise<ConsoleAgentLifecycleResponse | null> {
+	const response = await request(`/api/agents/${encodeURIComponent(agentId)}/lifecycle`);
+	if (response.status === 404) {
+		return null;
+	}
+	if (!response.ok) {
+		throw new ApiError(response.status, await bodyText(response));
+	}
+	return ConsoleAgentLifecycleResponseSchema.parse(await response.json());
+}
+
+export async function fetchAgentChannels(agentId: string): Promise<ConsoleAgentChannelsResponse> {
+	const response = await request(`/api/agents/${encodeURIComponent(agentId)}/channels`);
+	if (!response.ok) {
+		throw new ApiError(response.status, await bodyText(response));
+	}
+	return ConsoleAgentChannelsResponseSchema.parse(await response.json());
+}
+
+export async function revokeAgentChannelGrant(agentId: string, channelId: string) {
+	const response = await request(`/api/agents/${encodeURIComponent(agentId)}/channels/revoke`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ channelId }),
+	});
+	if (!response.ok) {
+		throw new ApiError(response.status, await bodyText(response));
+	}
+	return ConsoleRevokeGrantResponseSchema.parse(await response.json());
 }

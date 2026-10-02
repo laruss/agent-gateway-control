@@ -183,6 +183,26 @@ restoring the old reference unchanged would leave the agent stuck `reconciling` 
 write a fresh one. That old `/run/secrets/...` file is simply stale after this — nothing reads or
 deletes it; remove it by hand once you no longer need it.
 
+The console (`docs/operations/console.md`) offers the same four actions — create, retire, restore
+and retry — from the Agents hub, through its own session-authenticated HTTP routes; either surface
+commits through the same service, so whichever one an owner used most recently is simply what is
+now active.
+
+### Retrying a failed operation
+
+```bash
+bun run gateway agents retry data-analyst
+```
+
+A `create`/`restore`/`reprovision` operation that `failOperation` left `failed`, or a `retire`
+whose own cleanup failed permanently (leaving the agent `retiring` with `last_error` rather than
+the generic `failed`), can be retried once its underlying cause is fixed (a stray account renamed
+out of the way, the admin token corrected). `agents retry` refuses an agent whose current operation
+is not actually in a failed state — nothing to retry. It queues a fresh operation of the same kind,
+carrying forward whatever the failed attempt already checkpointed (a bot it already resolved, a
+token it already issued), so a completed step is not repeated, only resumed; the agent itself
+returns to `pending` (or stays `retiring`, for a retried retire) until the provisioner finishes it.
+
 ### Channel assignments and provenance
 
 ```bash

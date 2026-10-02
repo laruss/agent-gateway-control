@@ -220,3 +220,20 @@ export const RequestAgentRestoreInputSchema = z.strictObject({
 	idempotencyKey: IdempotencyKeySchema.optional(),
 });
 export type RequestAgentRestoreInput = z.input<typeof RequestAgentRestoreInputSchema>;
+
+/**
+ * Requests a fresh attempt of an agent's own current operation, for a `failed` agent (its
+ * `create`/`restore`/`reprovision` operation did not succeed) or a `retiring` one whose `retire`
+ * operation itself failed permanently: `requestOperationRetry` queues a new operation of the same
+ * kind, carrying the failed operation's own checkpoints forward (a step it already completed is
+ * not repeated), rather than resurrecting the failed row itself — the operation journal is
+ * append-only (ADR-026), so a terminal row never moves backward. Refused for an agent whose
+ * current operation is not actually `failed` (nothing to retry).
+ */
+export const RequestOperationRetryInputSchema = z.strictObject({
+	agentId: AgentIdSchema,
+	actor: z.string().min(1).max(200),
+	source: AgentLifecycleSourceSchema,
+	idempotencyKey: IdempotencyKeySchema.optional(),
+});
+export type RequestOperationRetryInput = z.input<typeof RequestOperationRetryInputSchema>;

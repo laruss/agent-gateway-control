@@ -55,6 +55,7 @@ import {
 	requestAgentCreate,
 	requestAgentRestore,
 	requestAgentRetire,
+	requestOperationRetry,
 	resetGmailMailbox,
 	resumeAgent,
 	revokeChannelGrant,
@@ -196,6 +197,10 @@ export const USAGE = `gateway <command>
                                       organization's finance agent without --reassign-finance-to
   agents restore <id>                 re-adds a retired agent's last configuration (pending ->
                                       provisioning again); the provisioner re-enables its bot
+  agents retry <id>                   queues a fresh attempt of a failed create/restore/
+                                      reprovision operation, or a retiring agent's own failed
+                                      retire cleanup; carries forward whatever it already
+                                      checkpointed, so a completed step is not repeated
   agents channels <id>                its channels with provenance: configured vs granted
                                       (by whom, when, evidence post) vs member-unauthorized
   agents revoke-grant <id> <channel>  revokes a channel an owner or admin granted the agent's bot
@@ -1134,6 +1139,17 @@ async function dispatchSessionCommand(
 			out.print(
 				json(
 					await requestAgentRestore(deps, {
+						agentId: arg(args, 2, "id"),
+						actor: who,
+						source: "cli",
+					}),
+				),
+			);
+			return 0;
+		case "agents retry":
+			out.print(
+				json(
+					await requestOperationRetry(deps, {
 						agentId: arg(args, 2, "id"),
 						actor: who,
 						source: "cli",

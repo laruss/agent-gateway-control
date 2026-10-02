@@ -45,6 +45,25 @@ All notable changes are documented here. The project follows Semantic Versioning
   one directly, removing the bot from it through the lifecycle provisioner (a lifecycle-owned
   agent) or the membership synchronizer's own next pass (a bootstrap-managed one).
   `gateway agents retire <id>` and `gateway agents restore <id>` are now CLI commands too.
+- `gateway agents retry <id>` (and the console's own Retry action) queues a fresh attempt of an
+  agent's own current operation once it is `failed` — a `create`/`restore`/`reprovision` that
+  failed, or a `retire` whose cleanup failed permanently — carrying forward whatever it already
+  checkpointed, so a step already done is not repeated. The operation journal stays append-only: a
+  retry queues a new operation rather than resurrecting the failed row. (ADR-026)
+- The owner's console can now create, retire, restore and retry an agent directly, alongside
+  editing one: a "New agent" dialog (id, display name, channels, role prompt, an optional runtime
+  adapter/model from the deployment's own qualified — ready-worker — list); a lifecycle status
+  badge and a live progress view (polling each checkpoint as the provisioner completes it) on the
+  agent page; a Retire confirmation stating what it cancels and that it is reversible, requiring a
+  finance-role reassignment when the agent is the organization's finance agent and warning (never
+  blocking) for a system-flagged one; Restore for a retired agent, which stays listed (filterable)
+  specifically so that action is reachable; and a channel assignments view (configured vs granted,
+  with who/when/evidence) with a Revoke action for a directly granted one. Every new mutating route
+  (`POST /api/agents`, `.../retry`, `.../retire`, `.../restore`, `.../channels/revoke`) sits under
+  the existing session/CSRF/exact-Origin protection and carries its own idempotency key; the two
+  new read routes (`GET .../lifecycle`, `GET .../channels`) need only a valid session. Creating an
+  agent here, like the CLI, never creates a worker container, and the console and CLI both keep
+  working with zero agents ready. (ADR-025, ADR-026)
 
 ### Fixed
 

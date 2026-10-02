@@ -12,6 +12,7 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { WAKEABLE_EVENT_TYPES } from "@/lib/wake-rule-event-types";
+import { ChannelAssignments } from "./channel-assignments.tsx";
 import type { AgentDetailTabProps } from "./types.ts";
 
 function ChannelsEditor({
@@ -199,6 +200,10 @@ export function AssignmentsTab(props: AgentDetailTabProps): React.ReactElement {
 	return (
 		<div className="flex flex-col gap-8">
 			<ChannelsEditor {...props} />
+			<div className="flex flex-col gap-2">
+				<h3 className="text-sm font-medium">Channel assignments</h3>
+				<ChannelAssignments agentId={props.original.id} />
+			</div>
 			<WakeRulesEditor {...props} />
 		</div>
 	);

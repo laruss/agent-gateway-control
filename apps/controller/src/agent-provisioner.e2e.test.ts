@@ -1,22 +1,26 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { JsonObject } from "@agent-gateway/contracts";
 import {
 	type ControlPlaneDeps,
+	failOperation,
 	loadConfigGeneration,
 	loadLifecycleOwnedAgentIds,
 	loadMattermostIdentity,
 	loadMattermostPlanSource,
+	markProvisioning,
 	mattermostBootstrapStore,
 	requestAgentCreate,
 	requestAgentRestore,
 	requestAgentRetire,
 	runtimeHealth,
 } from "@agent-gateway/core";
+import { silentLogger } from "@agent-gateway/logging";
 import { bootstrapMattermost, MattermostClient, mattermostPlan } from "@agent-gateway/mattermost";
 import {
+	hashConsolePassword,
 	readSecretFile,
 	resolveSecretPath,
 	secretFileState,
@@ -24,6 +28,8 @@ import {
 } from "@agent-gateway/service";
 import { startTestMattermost, type TestMattermost } from "@agent-gateway/testkit";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { type ConsoleServerOptions, startConsoleServer } from "./console-server.ts";
+import { collectConsoleStatus, createConsoleStatusCache } from "./console-status.ts";
 import { eventually, startTestGateway, type TestGateway } from "./test-gateway.ts";
 
 /**
@@ -326,6 +332,244 @@ describe("agent lifecycle provisioner against a real server (ADR-026)", () => {
 			"the restored analyst replies in #hq",
 		);
 		expect(reply.user_id).toBe(botUserId);
+	});
+
+	describe("the console's own lifecycle routes against the real server (ADR-026)", () => {
+		const PASSWORD = "console e2e lifecycle test password";
+		const ORIGIN = "https://gateway.local";
+		const CSRF_KEY = "a-test-only-csrf-derivation-key-at-least-32-chars";
+		let passwordHash: string;
+		let consoleBase: string;
+		let stopConsole: () => Promise<void>;
+
+		beforeAll(async () => {
+			passwordHash = await hashConsolePassword(PASSWORD);
+			const server = startConsoleServer({
+				port: 0,
+				hostname: "127.0.0.1",
+				passwordHash,
+				origin: ORIGIN,
+				csrfKey: CSRF_KEY,
+				deps: gateway.deps(),
+				cache: createConsoleStatusCache((now) => collectConsoleStatus(gateway.pool, now)),
+				log: silentLogger,
+			} satisfies ConsoleServerOptions);
+			consoleBase = `http://127.0.0.1:${server.port}`;
+			stopConsole = server.stop;
+		});
+
+		afterAll(async () => {
+			await stopConsole?.();
+		});
+
+		async function signIn(): Promise<{ cookie: string; csrfToken: string }> {
+			const res = await fetch(`${consoleBase}/api/session`, {
+				method: "POST",
+				headers: { "content-type": "application/json", origin: ORIGIN },
+				body: JSON.stringify({ password: PASSWORD }),
+			});
+			expect(res.status).toBe(200);
+			const body = (await res.json()) as { csrfToken: string };
+			const setCookie = res.headers.get("set-cookie") ?? "";
+			return { cookie: setCookie.split(";")[0] ?? "", csrfToken: body.csrfToken };
+		}
+
+		async function postJson(
+			path: string,
+			session: { cookie: string; csrfToken: string },
+			body: unknown,
+		): Promise<{ status: number; body: JsonObject }> {
+			const res = await fetch(`${consoleBase}${path}`, {
+				method: "POST",
+				headers: {
+					cookie: session.cookie,
+					origin: ORIGIN,
+					"content-type": "application/json",
+					"x-csrf-token": session.csrfToken,
+				},
+				body: JSON.stringify(body),
+			});
+			return { status: res.status, body: (await res.json()) as JsonObject };
+		}
+
+		async function getJson(
+			path: string,
+			session: { cookie: string },
+		): Promise<{ status: number; body: JsonObject }> {
+			const res = await fetch(`${consoleBase}${path}`, { headers: { cookie: session.cookie } });
+			return { status: res.status, body: (await res.json()) as JsonObject };
+		}
+
+		async function resolveChannelId(name: string): Promise<string> {
+			const team = await mmApi("GET", `teams/name/${TEAM}`, mm.adminToken);
+			const teamId = team.id;
+			if (typeof teamId !== "string") {
+				throw new Error("team has no id");
+			}
+			const channel = await mmApi("GET", `teams/${teamId}/channels/name/${name}`, mm.adminToken);
+			const channelId = channel.id;
+			if (typeof channelId !== "string") {
+				throw new Error("channel has no id");
+			}
+			return channelId;
+		}
+
+		it("creates an agent through the console's own HTTP routes, no manual YAML/bootstrap/reconcile: ready, a mention wakes it and gets a reply, then retire deactivates its bot", async () => {
+			const agentId = "advisor";
+			const session = await signIn();
+
+			const created = await postJson("/api/agents", session, {
+				idempotencyKey: randomUUID(),
+				id: agentId,
+				displayName: "Advisor",
+				allowedChannels: ["hq"],
+				rolePrompt: "You are the advisor. Reply briefly.",
+				runtime: { adapter: "mock" },
+			});
+			expect(created.status).toBe(200);
+			expect(created.body.agentId).toBe(agentId);
+
+			await eventually(
+				async () =>
+					(
+						await gateway.pool.query<{ status: string }>(
+							"select status from agent_lifecycle where agent_id = $1",
+							[agentId],
+						)
+					).rows[0]?.status === "ready" || null,
+				120_000,
+				"the advisor's lifecycle becomes ready (the real provisioner finished)",
+			);
+
+			const lifecycleState = await getJson(`/api/agents/${agentId}/lifecycle`, session);
+			expect(lifecycleState.status).toBe(200);
+			expect(lifecycleState.body.status).toBe("ready");
+
+			const identity = await loadMattermostIdentity(gateway.deps(), agentId);
+			const botUserId = identity?.userId ?? null;
+			if (botUserId === null) {
+				throw new Error("unreachable: the lifecycle is ready, so the identity must be resolved");
+			}
+			const bot = await mmApi("GET", `users/${botUserId}`, mm.adminToken);
+			expect(bot).toMatchObject({ username: agentId, is_bot: true });
+
+			// `requestAgentCreate` defaults a new agent's permissions deny-by-default
+			// (`defaultAgentPermissions`, `tools_allow: []`) the same way the CLI's own
+			// `gateway agents create` does; granting `mattermost.post` through the console's
+			// existing preview/commit flow is what actually lets its reply publish.
+			const detail = await getJson(`/api/agents/${agentId}`, session);
+			expect(detail.status).toBe(200);
+			const grantBaseRevisionId = (detail.body.agent as JsonObject).activeRevisionId;
+			const grant = await postJson(`/api/agents/${agentId}/commit`, session, {
+				baseRevisionId: grantBaseRevisionId,
+				changes: { permissions: { tools_allow: ["mattermost.post"] } },
+				idempotencyKey: randomUUID(),
+			});
+			expect(grant.status).toBe(200);
+
+			const hqChannel = await resolveChannelId("hq");
+			const mention = await mmApi("POST", "posts", humanToken(), {
+				channel_id: hqChannel,
+				message: `@${agentId} are you there?`,
+			});
+			const mentionId = mention.id;
+			if (typeof mentionId !== "string") {
+				throw new Error("mention post has no id");
+			}
+			const reply = await eventually(
+				async () => {
+					const list = await mmApi("GET", `channels/${hqChannel}/posts?per_page=10`, mm.adminToken);
+					const order = list.order;
+					const posts = list.posts;
+					if (!Array.isArray(order) || typeof posts !== "object" || posts === null) {
+						return null;
+					}
+					for (const id of order) {
+						if (typeof id !== "string" || id === mentionId) {
+							continue;
+						}
+						const post = (posts as Record<string, JsonObject>)[id];
+						if (post !== undefined && post.user_id === botUserId) {
+							return post;
+						}
+					}
+					return null;
+				},
+				90_000,
+				"the advisor's own bot replies in #hq",
+			);
+			expect(reply.user_id).toBe(botUserId);
+
+			const retire = await postJson(`/api/agents/${agentId}/retire`, session, {
+				idempotencyKey: randomUUID(),
+			});
+			expect(retire.status).toBe(200);
+			await eventually(
+				async () =>
+					(
+						await gateway.pool.query<{ status: string }>(
+							"select status from agent_lifecycle where agent_id = $1",
+							[agentId],
+						)
+					).rows[0]?.status === "retired" || null,
+				90_000,
+				"the advisor's lifecycle becomes retired (the real provisioner finished)",
+			);
+			const retiredBot = await mmApi("GET", `users/${botUserId}`, mm.adminToken);
+			expect(retiredBot.delete_at).not.toBe(0);
+		}, 300_000);
+
+		it("retries a permanently failed create (e.g. its username was taken) once the cause is fixed, completing against the real server", async () => {
+			const agentId = "retry-demo";
+			const session = await signIn();
+
+			const created = await postJson("/api/agents", session, {
+				idempotencyKey: randomUUID(),
+				id: agentId,
+				displayName: "Retry Demo",
+				allowedChannels: [],
+				rolePrompt: "You are retry-demo.",
+				runtime: { adapter: "mock" },
+			});
+			expect(created.status).toBe(200);
+			const operationId = created.body.operationId;
+			if (typeof operationId !== "string") {
+				throw new Error("create did not return an operation id");
+			}
+
+			// Simulates the real provisioner's own permanent-failure classification (its bot's
+			// username is taken by an account that is not plausibly the Gateway's own) — covered on
+			// its own terms by `agent-provisioner.integration.test.ts`'s fake-client suite; this test
+			// is about the console's own retry route resuming real provisioning afterward, not about
+			// re-proving that classification against a real server.
+			await markProvisioning(gateway.deps(), operationId, "e2e");
+			await failOperation(gateway.deps(), operationId, "e2e", "username taken");
+
+			const failedState = await getJson(`/api/agents/${agentId}/lifecycle`, session);
+			expect(failedState.status).toBe(200);
+			expect(failedState.body.status).toBe("failed");
+			expect(failedState.body.lastError).toBe("username taken");
+
+			const retry = await postJson(`/api/agents/${agentId}/retry`, session, {
+				idempotencyKey: randomUUID(),
+			});
+			expect(retry.status).toBe(200);
+			expect(retry.body.kind).toBe("create");
+
+			await eventually(
+				async () =>
+					(
+						await gateway.pool.query<{ status: string }>(
+							"select status from agent_lifecycle where agent_id = $1",
+							[agentId],
+						)
+					).rows[0]?.status === "ready" || null,
+				120_000,
+				"retry-demo's lifecycle becomes ready (the real provisioner finished the retried operation)",
+			);
+			const identity = await loadMattermostIdentity(gateway.deps(), agentId);
+			expect(identity?.userId ?? null).not.toBeNull();
+		}, 180_000);
 	});
 
 	it("admin token rotate against the real server: the old token stops working, the new one works", async () => {

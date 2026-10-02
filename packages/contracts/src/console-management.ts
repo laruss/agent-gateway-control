@@ -9,7 +9,15 @@ import {
 	WhileRunningPolicySchema,
 } from "./agent-config.ts";
 import {
+	AgentLifecycleCheckpointsSchema,
+	AgentLifecycleErrorSchema,
+	AgentLifecycleOperationKindSchema,
+	AgentLifecycleOperationStateSchema,
+	AgentLifecycleStatusSchema,
+} from "./agent-lifecycle.ts";
+import {
 	AgentIdSchema,
+	MattermostIdSchema,
 	MattermostNameSchema,
 	MemoryNamespaceSchema,
 	RuntimeAdapterIdSchema,
@@ -58,12 +66,26 @@ export const ConsoleAgentListItemSchema = z.strictObject({
 	model: AgentModelSchema.nullable(),
 	channelCount: z.int().min(0),
 	lastRun: ConsoleAgentLastRunSchema.nullable(),
+	/** Null for an agent outside the active configuration snapshot: only a `retiring`/`retired`
+	 * one is ever listed in that state (see `consoleListAgents`) — every other row's own
+	 * `lifecycleStatus` below is never null. */
 	activeRevisionId: z.int().positive().nullable(),
+	/** Null only for a database whose startup adoption backfill has not run yet. A `retiring`/
+	 * `retired` agent is listed specifically so it stays reachable for `Restore` once it has left
+	 * the active configuration. */
+	lifecycleStatus: AgentLifecycleStatusSchema.nullable(),
 });
 export type ConsoleAgentListItem = z.infer<typeof ConsoleAgentListItemSchema>;
 
 export const ConsoleAgentListResponseSchema = z.strictObject({
 	agents: z.array(ConsoleAgentListItemSchema),
+	/** The organization's own configured channels, for the "New agent" dialog's channel picker —
+	 * the same list `GET /api/agents/:id` already carries for the editor's own Assignments tab,
+	 * here too since a create request needs it before any agent (and so any detail response)
+	 * exists to read it from. */
+	knownChannels: z.array(MattermostNameSchema),
+	/** Every runtime adapter id the Gateway ships, for the "New agent" dialog's runtime picker. */
+	knownRuntimeAdapters: z.array(RuntimeAdapterIdSchema),
 });
 export type ConsoleAgentListResponse = z.infer<typeof ConsoleAgentListResponseSchema>;
 
@@ -119,6 +141,10 @@ export const ConsoleAgentDetailResponseSchema = z.strictObject({
 	knownChannels: z.array(MattermostNameSchema),
 	/** Every runtime adapter id the Gateway ships, for the runtime adapter picker. */
 	knownRuntimeAdapters: z.array(RuntimeAdapterIdSchema),
+	/** The organization's own `finance_agent_id`, null when none is configured: the Retire
+	 * dialog requires `reassignFinanceTo` exactly when this equals the agent's own id
+	 * (`requestAgentRetire`). */
+	financeAgentId: AgentIdSchema.nullable(),
 });
 export type ConsoleAgentDetailResponse = z.infer<typeof ConsoleAgentDetailResponseSchema>;
 
@@ -253,3 +279,141 @@ export const ConsoleErrorBodySchema = z.strictObject({
 	currentRevisionId: z.int().positive().nullable().optional(),
 });
 export type ConsoleErrorBody = z.infer<typeof ConsoleErrorBodySchema>;
+
+// ---------------------------------------------------------------------------
+// Lifecycle (ADR-026): create, retry, retire, restore; an agent's own provisioning status and
+// operation journal; its channel assignments with provenance, and revoking a directly granted
+// one. Every mutating route below carries a client-generated `idempotencyKey` (a repeated POST
+// replays the first call's own result) — never a `baseRevisionId` the way `preview`/`commit`
+// do: unlike editing an agent's own definition, none of `requestAgentCreate`/`requestAgentRetire`/
+// `requestAgentRestore`/`requestOperationRetry` are asked to apply against a specific, previously
+// loaded configuration snapshot (they always act on whatever is live, the same way the CLI's own
+// `gateway agents create|retire|restore|retry` already do); a stale page is instead caught by
+// each one's own business-rule refusal (`AdminError`, surfaced as `422`) — "already retired",
+// "not failed, nothing to retry" — which is more specific than a bare conflict would be. The rare
+// `ManagementConflictError` `commitWithinLock`'s own internal retry can still raise (a
+// configuration-history backfill racing this very request) is mapped to `409` regardless.
+// ---------------------------------------------------------------------------
+
+export const ConsoleAgentCreateRuntimeSchema = z.strictObject({
+	adapter: RuntimeAdapterIdSchema.optional(),
+	model: AgentModelSchema.optional(),
+});
+export type ConsoleAgentCreateRuntime = z.infer<typeof ConsoleAgentCreateRuntimeSchema>;
+
+export const ConsoleAgentCreateRequestSchema = z.strictObject({
+	idempotencyKey: UuidSchema,
+	id: AgentIdSchema,
+	displayName: AgentDisplayNameSchema,
+	allowedChannels: z.array(MattermostNameSchema).max(32),
+	rolePrompt: RolePromptSchema,
+	/** Left unset: the deployment's Codex defaults (`resolveCreateRuntime`, `@agent-gateway/core`). */
+	runtime: ConsoleAgentCreateRuntimeSchema.optional(),
+});
+export type ConsoleAgentCreateRequest = z.infer<typeof ConsoleAgentCreateRequestSchema>;
+
+export const ConsoleAgentCreateResponseSchema = z.strictObject({
+	agentId: AgentIdSchema,
+	operationId: UuidSchema,
+	revisionId: z.int().positive(),
+});
+export type ConsoleAgentCreateResponse = z.infer<typeof ConsoleAgentCreateResponseSchema>;
+
+export const ConsoleAgentRetireRequestSchema = z.strictObject({
+	idempotencyKey: UuidSchema,
+	reason: ConfigRevisionReasonSchema.optional(),
+	/** Required, naming a different, currently configured agent, when the retiring agent is the
+	 * organization's own finance agent (`requestAgentRetire`). */
+	reassignFinanceTo: AgentIdSchema.optional(),
+});
+export type ConsoleAgentRetireRequest = z.infer<typeof ConsoleAgentRetireRequestSchema>;
+
+export const ConsoleAgentRetireResponseSchema = z.strictObject({
+	operationId: UuidSchema,
+	revisionId: z.int().positive(),
+});
+export type ConsoleAgentRetireResponse = z.infer<typeof ConsoleAgentRetireResponseSchema>;
+
+export const ConsoleAgentRestoreRequestSchema = z.strictObject({
+	idempotencyKey: UuidSchema,
+});
+export type ConsoleAgentRestoreRequest = z.infer<typeof ConsoleAgentRestoreRequestSchema>;
+
+export const ConsoleAgentRestoreResponseSchema = z.strictObject({
+	operationId: UuidSchema,
+	revisionId: z.int().positive(),
+});
+export type ConsoleAgentRestoreResponse = z.infer<typeof ConsoleAgentRestoreResponseSchema>;
+
+export const ConsoleAgentRetryRequestSchema = z.strictObject({
+	idempotencyKey: UuidSchema,
+});
+export type ConsoleAgentRetryRequest = z.infer<typeof ConsoleAgentRetryRequestSchema>;
+
+export const ConsoleAgentRetryResponseSchema = z.strictObject({
+	operationId: UuidSchema,
+	kind: AgentLifecycleOperationKindSchema,
+});
+export type ConsoleAgentRetryResponse = z.infer<typeof ConsoleAgentRetryResponseSchema>;
+
+/** `GET /api/agents/:id/lifecycle`'s own view of one operation: the journal's identity columns
+ * (`requestedBy`, `source`, `idempotencyKey`, `configRevisionId`, `generation`) are omitted —
+ * operator detail the console's progress view has no use for, not a redaction of anything
+ * sensitive. */
+export const ConsoleLifecycleOperationSchema = z.strictObject({
+	id: UuidSchema,
+	kind: AgentLifecycleOperationKindSchema,
+	state: AgentLifecycleOperationStateSchema,
+	checkpoints: AgentLifecycleCheckpointsSchema,
+	/** Already redacted and bounded at write time (`failOperation`, `redactForStorage`); never a
+	 * secret. */
+	error: AgentLifecycleErrorSchema.nullable(),
+	createdAt: TimestampSchema,
+	updatedAt: TimestampSchema,
+	finishedAt: TimestampSchema.nullable(),
+});
+export type ConsoleLifecycleOperation = z.infer<typeof ConsoleLifecycleOperationSchema>;
+
+export const ConsoleAgentLifecycleResponseSchema = z.strictObject({
+	status: AgentLifecycleStatusSchema,
+	generation: z.int().nonnegative(),
+	lastError: AgentLifecycleErrorSchema.nullable(),
+	statusChangedAt: TimestampSchema,
+	retiredAt: TimestampSchema.nullable(),
+	/** Newest first, bounded the same way `gateway agents operations` already is. */
+	operations: z.array(ConsoleLifecycleOperationSchema),
+});
+export type ConsoleAgentLifecycleResponse = z.infer<typeof ConsoleAgentLifecycleResponseSchema>;
+
+export const ConsoleChannelProvenanceSchema = z.enum(["configured", "granted"]);
+export type ConsoleChannelProvenance = z.infer<typeof ConsoleChannelProvenanceSchema>;
+
+export const ConsoleAgentChannelAssignmentSchema = z.strictObject({
+	channelId: MattermostIdSchema,
+	channelName: MattermostNameSchema,
+	provenance: ConsoleChannelProvenanceSchema,
+	/** Set only for `granted`: who gave it, when, and the post it was decided from. */
+	grantedByUserId: MattermostIdSchema.nullable(),
+	grantedAt: TimestampSchema.nullable(),
+	evidencePostId: MattermostIdSchema.nullable(),
+});
+export type ConsoleAgentChannelAssignment = z.infer<typeof ConsoleAgentChannelAssignmentSchema>;
+
+export const ConsoleAgentChannelsResponseSchema = z.strictObject({
+	channels: z.array(ConsoleAgentChannelAssignmentSchema),
+});
+export type ConsoleAgentChannelsResponse = z.infer<typeof ConsoleAgentChannelsResponseSchema>;
+
+export const ConsoleRevokeGrantRequestSchema = z.strictObject({
+	channelId: MattermostIdSchema,
+});
+export type ConsoleRevokeGrantRequest = z.infer<typeof ConsoleRevokeGrantRequestSchema>;
+
+export const ConsoleRevokeGrantResponseSchema = z.strictObject({
+	channelId: MattermostIdSchema,
+	channelName: z.string().nullable(),
+	/** Whether the channel is still followed for someone else (another agent's grant, or it stays
+	 * configured) — the same thing `gateway agents revoke-grant` itself prints. */
+	stillFollowed: z.boolean(),
+});
+export type ConsoleRevokeGrantResponse = z.infer<typeof ConsoleRevokeGrantResponseSchema>;

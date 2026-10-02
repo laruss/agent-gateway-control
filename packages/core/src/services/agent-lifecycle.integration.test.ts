@@ -9,6 +9,7 @@ import type pg from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { AdminError, applyConfig } from "./admin.ts";
 import {
+	checkpointOperation,
 	completeOperation,
 	ensureAgentLifecycleAdoption,
 	failOperation,
@@ -18,6 +19,7 @@ import {
 	requestAgentCreate,
 	requestAgentRestore,
 	requestAgentRetire,
+	requestOperationRetry,
 	StaleLifecycleOperationError,
 } from "./agent-lifecycle.ts";
 import type { ControlPlaneDeps } from "./deps.ts";
@@ -757,6 +759,174 @@ describe("agent lifecycle service (ADR-026)", () => {
 				}
 			}
 		}
+	});
+
+	describe("retry (ADR-026)", () => {
+		it("retry after a failed create completes", async () => {
+			const created = await requestAgentCreate(deps, createInput("retry-create"));
+			await markProvisioning(deps, created.operationId, "test");
+			await failOperation(
+				deps,
+				created.operationId,
+				"test",
+				"the bot account could not be created",
+			);
+
+			const retried = await requestOperationRetry(deps, {
+				agentId: "retry-create",
+				actor: "test",
+				source: "cli",
+			});
+			expect(retried.kind).toBe("create");
+			expect(retried.operationId).not.toBe(created.operationId);
+
+			const [lifecycle] = (
+				await pool.query(
+					"select status, generation::int, operation_id, last_error from agent_lifecycle where agent_id = 'retry-create'",
+				)
+			).rows;
+			expect(lifecycle).toMatchObject({
+				status: "pending",
+				generation: 2,
+				operation_id: retried.operationId,
+				last_error: null,
+			});
+			// The superseded operation stays exactly as `failOperation` left it: the journal is
+			// append-only, so retry never resurrects it, only queues a fresh one.
+			const [oldOperation] = (
+				await pool.query("select state from agent_lifecycle_operations where id = $1", [
+					created.operationId,
+				])
+			).rows;
+			expect(oldOperation.state).toBe("failed");
+
+			await markProvisioning(deps, retried.operationId, "test");
+			await completeOperation(deps, retried.operationId, "test");
+			const [settled] = (
+				await pool.query("select status from agent_lifecycle where agent_id = 'retry-create'")
+			).rows;
+			expect(settled.status).toBe("ready");
+		});
+
+		it("carries the failed operation's own checkpoints forward, so a completed step is not repeated", async () => {
+			const created = await requestAgentCreate(deps, createInput("retry-checkpoints"));
+			await markProvisioning(deps, created.operationId, "test");
+			await checkpointOperation(deps, created.operationId, {
+				bot_user_id: "abcdefghijklmnopqrstuvwxyz",
+				token_ref: "/run/bot-secrets/mm_retry_checkpoints_token",
+			});
+			await failOperation(deps, created.operationId, "test", "team join failed");
+
+			const retried = await requestOperationRetry(deps, {
+				agentId: "retry-checkpoints",
+				actor: "test",
+				source: "cli",
+			});
+			const [operation] = (
+				await pool.query("select checkpoints from agent_lifecycle_operations where id = $1", [
+					retried.operationId,
+				])
+			).rows;
+			expect(operation.checkpoints).toMatchObject({
+				bot_user_id: "abcdefghijklmnopqrstuvwxyz",
+				token_ref: "/run/bot-secrets/mm_retry_checkpoints_token",
+			});
+		});
+
+		it("retry of a failed retire completes, leaving the agent retiring throughout", async () => {
+			const created = await requestAgentCreate(deps, createInput("retry-retire"));
+			await markProvisioning(deps, created.operationId, "test");
+			await completeOperation(deps, created.operationId, "test");
+
+			const retired = await requestAgentRetire(deps, {
+				agentId: "retry-retire",
+				actor: "test",
+				source: "cli",
+			});
+			await markProvisioning(deps, retired.operationId, "test");
+			await failOperation(deps, retired.operationId, "test", "the admin token was rejected");
+
+			const [beforeRetry] = (
+				await pool.query("select status from agent_lifecycle where agent_id = 'retry-retire'")
+			).rows;
+			expect(beforeRetry.status).toBe("retiring");
+
+			const retriedAgain = await requestOperationRetry(deps, {
+				agentId: "retry-retire",
+				actor: "test",
+				source: "cli",
+			});
+			expect(retriedAgain.kind).toBe("retire");
+
+			const [lifecycle] = (
+				await pool.query(
+					"select status, last_error from agent_lifecycle where agent_id = 'retry-retire'",
+				)
+			).rows;
+			expect(lifecycle).toMatchObject({ status: "retiring", last_error: null });
+
+			await markProvisioning(deps, retriedAgain.operationId, "test");
+			await completeOperation(deps, retriedAgain.operationId, "test");
+			const [settled] = (
+				await pool.query("select status from agent_lifecycle where agent_id = 'retry-retire'")
+			).rows;
+			expect(settled.status).toBe("retired");
+		});
+
+		it("refuses to retry an agent whose current operation is not actually failed", async () => {
+			const created = await requestAgentCreate(deps, createInput("retry-not-failed"));
+			// Still `pending`: nothing has failed yet.
+			await expect(
+				requestOperationRetry(deps, { agentId: "retry-not-failed", actor: "test", source: "cli" }),
+			).rejects.toThrow(/not failed; nothing to retry/);
+
+			await markProvisioning(deps, created.operationId, "test");
+			await completeOperation(deps, created.operationId, "test");
+			// Now `ready`, its operation `succeeded`.
+			await expect(
+				requestOperationRetry(deps, { agentId: "retry-not-failed", actor: "test", source: "cli" }),
+			).rejects.toThrow(AdminError);
+		});
+
+		it("refuses to retry an agent with no lifecycle record at all", async () => {
+			await expect(
+				requestOperationRetry(deps, { agentId: "finance", actor: "test", source: "cli" }),
+			).rejects.toThrow(/has no lifecycle record/);
+		});
+
+		it("replays a duplicate retry carrying the same idempotency key", async () => {
+			const created = await requestAgentCreate(deps, createInput("retry-idempotent"));
+			await markProvisioning(deps, created.operationId, "test");
+			await failOperation(
+				deps,
+				created.operationId,
+				"test",
+				"the bot account could not be created",
+			);
+
+			const idempotencyKey = randomUUID();
+			const first = await requestOperationRetry(deps, {
+				agentId: "retry-idempotent",
+				actor: "test",
+				source: "cli",
+				idempotencyKey,
+			});
+			const second = await requestOperationRetry(deps, {
+				agentId: "retry-idempotent",
+				actor: "test",
+				source: "cli",
+				idempotencyKey,
+			});
+			expect(second).toEqual(first);
+
+			const [{ n }] = (
+				await pool.query(
+					"select count(*)::int as n from agent_lifecycle_operations where agent_id = 'retry-idempotent'",
+				)
+			).rows;
+			// The original `create` plus the one retry — the replayed call inserted nothing further.
+			expect(n).toBe(2);
+		});
 	});
 
 	describe("retirement cleanup", () => {

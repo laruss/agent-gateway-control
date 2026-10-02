@@ -2082,6 +2082,9 @@ Status: **done**
 | Assignments read model (`configured`/`granted` provenance) and `gateway agents channels <id>` / `gateway agents revoke-grant <id> <channel>` / `gateway agents retire <id>` / `gateway agents restore <id>` | done | `packages/core/src/services/channel-grants.ts` (`loadAgentChannelAssignments`, `revokeChannelGrant`), `apps/cli/src/commands.ts` |
 | `config apply`'s whole-bundle replace runs the same `/run/bot-secrets/` ownership check and `reprovision` queuing a managed-configuration commit already did | done | `packages/core/src/services/admin.ts` (`applyConfig`) |
 | Queuing a `reprovision` locks affected agents' lifecycle rows before the `agents` table (matching `completeOperation`'s own order); a config edit during a running `reprovision` cancels it and queues a fresh one; the leaving-channels step re-checks grants immediately before each removal | done | `packages/core/src/services/management.ts` (`queueMembershipReprovisioning`, `lockLifecycleRows`), `apps/controller/src/agent-provisioner.ts` |
+| `requestOperationRetry`: refused unless an agent's current operation is actually `failed`; queues a fresh operation of the same kind, carrying its checkpoints forward, never resurrecting the terminal row (the journal stays append-only); the agent returns to `pending` (or stays `retiring`, for a retried retire). `gateway agents retry <id>` is its CLI surface | done | `packages/core/src/services/agent-lifecycle.ts` (`requestOperationRetry`), `apps/cli/src/commands.ts` |
+| Console management routes for the full lifecycle: `POST /api/agents` (create), `POST /api/agents/:id/{retry,retire,restore}`, `GET /api/agents/:id/lifecycle`, `GET /api/agents/:id/channels`, `POST /api/agents/:id/channels/revoke` — the same session/CSRF/exact-Origin protection and idempotency-key convention `preview`/`commit` already use; `AdminError`/`ManagementConflictError` map to `422`/`409` the same way | done | `apps/controller/src/console-management.ts`, `packages/core/src/services/console-management.ts`, `packages/contracts/src/console-management.ts` |
+| Console UI: a "New agent" dialog (id, display name, channels, role prompt, a runtime adapter/model picker restricted to adapters with a ready worker); a lifecycle status badge and live progress (polled checkpoints) on the agent page; Retry next to an actionable failure message; a Retire confirmation requiring a finance reassignment when applicable and warning (not blocking) for a system-flagged agent; Restore for a retired agent (which stays listed, filterable, specifically so Restore is reachable, falling back to a read-only lifecycle view since it has no editable configuration); a channel assignments view (configured/granted, with provenance) with a Revoke action | done | `apps/console/src/routes/agents-list-page.tsx`, `apps/console/src/routes/agents-list/new-agent-dialog.tsx`, `apps/console/src/routes/agent-detail/{lifecycle-panel,retire-dialog,retired-agent-view,channel-assignments}.tsx` |
 
 Acceptance:
 
@@ -2112,6 +2115,25 @@ Acceptance:
 - [x] A concurrent config edit and a running `reprovision` operation never deadlock and never lose
   the edit: the edit either rides an operation still `pending`, or cancels one already `running` and
   queues a fresh one that reads the edited configuration.
+- [x] Core integration coverage of `requestOperationRetry`: retry after a failed create completes
+  (reaching `ready`); retry of a failed retire completes (reaching `retired`, agent stays
+  `retiring` throughout); retry carries a failed operation's own checkpoints forward; refused for
+  an agent whose current operation is not actually failed, or with no lifecycle record at all; a
+  repeat with the same idempotency key replays rather than queuing a second operation.
+- [x] Controller integration coverage of every new console route: auth required (`401`), CSRF and
+  exact-Origin required on every mutation (`403`), `422` for a business-rule refusal (a duplicate
+  create id, retiring the finance agent without reassigning it, restoring/retrying an agent not in
+  the right state), an idempotent replay of create and of retire, and a secret-looking failure
+  message never reaching the lifecycle route's JSON body.
+- [x] Console unit coverage: the "New agent" dialog's own validation (id format, required fields)
+  and submission; the lifecycle panel's progress rendering from `pending`/`failed` operation
+  states and its Retry action; the retire dialog's required finance reassignment and its
+  non-blocking system-agent warning.
+- [x] Against a real, dev Mattermost server, through the console's own HTTP routes (no manual
+  YAML/bootstrap/reconcile): signing in, creating an agent, through to `ready`; a mention wakes it
+  and its own newly created bot replies; retiring it deactivates the bot. A separately simulated
+  permanent failure retried through the console's own retry route completes against the real
+  server.
 
 Deliberate choices here ([ADR-026](docs/adr/026-agent-lifecycle.md)):
 
@@ -2124,8 +2146,10 @@ Deliberate choices here ([ADR-026](docs/adr/026-agent-lifecycle.md)):
   subset of `organization.mattermost.channels`, so the provisioner only reads the directory entries
   bootstrap (or an earlier provisioner pass) already resolved, waiting rather than failing when one
   is not there yet.
-- No retry-from-`failed` command ships with this phase: a permanent failure needs an operator to
-  fix the underlying problem (a stray account, an invalid admin token) and create the agent fresh.
+- A retry queues a fresh operation rather than resetting the failed row in place: the operation
+  journal's own append-only guard (migration 0025) only ever lets `state` move forward, so a
+  terminal row can never become `pending` again — the same reason a superseded `create`/`restore`
+  is cancelled and replaced rather than rewound.
 - `secrets/controller-bots` needs no change to `backup.sh`/`restore.sh`: both already archive and
   restore the whole of `$GATEWAY_HOME` (minus `backups/` itself), so the new directory is included
   and restored automatically, the same as every other secrets directory.
@@ -2138,9 +2162,8 @@ Deliberate choices here ([ADR-026](docs/adr/026-agent-lifecycle.md)):
   bootstrap would adopt.
 - The assignments read model's third provenance, `member-unauthorized`, is live-only (what
   Mattermost itself currently reports) and so is not part of `loadAgentChannelAssignments`, which
-  reads only the database: a console page, or the CLI command itself, can add it the same way
-  `gateway mattermost reconcile` already computes its own live diff. The console page itself is
-  later work.
+  reads only the database, or of the console's own `GET /api/agents/:id/channels`: a live check
+  against Mattermost itself is `gateway mattermost reconcile`'s own job, not this read model's.
 - `gateway agents revoke-grant` queues a `reprovision` for a lifecycle-owned, `ready` agent so the
   bot's removal does not wait for an unrelated configuration change; a bootstrap-managed agent has
   no such operation, and is left to the membership synchronizer's own next pass (seconds away),

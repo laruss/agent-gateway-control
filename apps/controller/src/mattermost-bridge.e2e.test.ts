@@ -793,7 +793,7 @@ describe("Mattermost bridge against a real server", () => {
 				() => true,
 				() => false,
 			);
-		expect(await member(listener)).toBe(true);
+		await eventually(() => member(listener), 30_000, "the listener joined the granted channel");
 		const after = await say("garden", "@research please say hello", { channelId: garden });
 		const event = await eventOf(after);
 		const run = await finishedRun(event.id, "research run in the granted channel");
