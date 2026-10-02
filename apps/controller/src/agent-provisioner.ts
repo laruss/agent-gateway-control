@@ -1,6 +1,7 @@
 import type {
 	AgentLifecycleCheckpoints,
 	AgentLifecycleOperationKind,
+	MattermostId,
 } from "@agent-gateway/contracts";
 import {
 	type ControlPlaneDeps,
@@ -24,6 +25,7 @@ import {
 	type AdminMattermostClient,
 	BootstrapError,
 	ensureBot,
+	isExtraChannel,
 	MattermostApiError,
 	MattermostClient,
 	revokeAllTokens,
@@ -279,6 +281,23 @@ async function processOperation(
 			checkpoints = await checkpoint(deps, operation.id, checkpoints, {
 				channels_joined: [...joined],
 			});
+		}
+
+		// A `reprovision` operation's own membership step (ADR-026): channels the committed change
+		// took away are left, except ones an owner or admin granted this agent's bot directly (an
+		// ADR-022 grant, which `snapshot`'s own per-agent `channelIds` already folds in alongside its
+		// configured channels — checked here, never assumed, since a grant made after the operation
+		// was queued must still be honored). `create`/`restore` never reach this with anything to
+		// leave: their bot has only ever joined what the loop above just joined it to.
+		if (operation.kind === "reprovision") {
+			const allowed =
+				snapshot.agents.find((candidate) => candidate.id === operation.agentId)?.channelIds ??
+				new Set<MattermostId>();
+			for (const channel of await admin.userChannelsInTeam(botUserId, teamId)) {
+				if (isExtraChannel(channel, allowed)) {
+					await admin.removeChannelMember(channel.id, botUserId);
+				}
+			}
 		}
 
 		await completeOperation(deps, operation.id, actor, checkpoints);

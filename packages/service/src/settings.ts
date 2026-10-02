@@ -57,6 +57,29 @@ export function requireSetting(name: string, env: Environment = process.env): st
 	return value;
 }
 
+/**
+ * Like `requireSetting`, but with precedence reversed: an explicitly passed plain `<NAME>` value
+ * wins over a configured `<NAME>_FILE`. `gateway mattermost bootstrap` reads
+ * `MATTERMOST_ADMIN_TOKEN` this way: the documented workflow exports a temporary admin token as a
+ * plain environment variable for the one bootstrap run, and `gateway-cli` also names
+ * `MATTERMOST_ADMIN_TOKEN_FILE` so `gateway doctor`'s own optional read (`readOptionalFileSetting`)
+ * sees the same file the controller's provisioner does (ADR-026) — on a fresh install that file
+ * does not exist yet, so it must never shadow the token the operator just exported the way
+ * `requireSetting`'s own file-first precedence would. Falls back to the file only when it exists
+ * and holds a value; throws the same clear error as `requireSetting` when neither is set.
+ */
+export function requireSettingPreferEnv(name: string, env: Environment = process.env): string {
+	const direct = env[name];
+	if (direct !== undefined && direct !== "") {
+		return direct;
+	}
+	const fromFile = readOptionalFileSetting(name, env);
+	if (fromFile === undefined) {
+		throw new SettingError(`setting ${name} (or ${name}_FILE) is required`);
+	}
+	return fromFile;
+}
+
 export function intSetting(name: string, fallback: number, env: Environment = process.env): number {
 	const value = readSetting(name, env);
 	if (value === undefined) {

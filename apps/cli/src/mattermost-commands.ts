@@ -4,6 +4,7 @@ import { ROUTING_KEY_SECRET_FILE } from "@agent-gateway/contracts";
 import {
 	type ControlPlaneDeps,
 	loadConfigGeneration,
+	loadLifecycleOwnedAgentIds,
 	loadMattermostPlanSource,
 	mattermostBootstrapStore,
 	mattermostReconcileStore,
@@ -21,6 +22,7 @@ import {
 	readSecretFile,
 	readSetting,
 	requireSetting,
+	requireSettingPreferEnv,
 	resolveSecretPath,
 	secretFileState,
 	writeSecretFile,
@@ -49,15 +51,17 @@ async function versionedPlan(deps: ControlPlaneDeps, secretsDir: string | undefi
 	if (source === null) {
 		throw new MattermostCommandError("no active configuration; run 'gateway config apply' first");
 	}
-	// `mattermostPlan` already skips every lifecycle-created agent (its token is the provisioner's
-	// own, under bot-secrets); `botSecretsDirOf()` is passed regardless, so any reference this
-	// resolver does see under `/run/bot-secrets/` still maps into the gateway-cli container's own
-	// mount of that directory, never into `secretsDir`.
+	// `mattermostPlan` already skips every agent the lifecycle owns (its token is the
+	// provisioner's own, under bot-secrets); `botSecretsDirOf()` is passed regardless, so any
+	// reference this resolver does see under `/run/bot-secrets/` still maps into the gateway-cli
+	// container's own mount of that directory, never into `secretsDir`.
+	const lifecycleOwnedAgentIds = await loadLifecycleOwnedAgentIds(deps);
 	const plan = mattermostPlan(
 		source.organization,
 		source.agents,
 		(ref) => resolveSecretPath(ref, secretsDir, botSecretsDirOf()),
 		source.retired,
+		lifecycleOwnedAgentIds,
 	);
 	return { plan, version: source.version };
 }
@@ -98,7 +102,11 @@ export async function mattermostBootstrap(
 		throw new MattermostCommandError("pass --secrets-dir <dir> (or set SECRETS_DIR)");
 	}
 	const baseUrl = requireSetting("MATTERMOST_URL");
-	const adminToken = requireSetting("MATTERMOST_ADMIN_TOKEN");
+	// `requireSettingPreferEnv`, not `requireSetting`: `gateway-cli` also names
+	// `MATTERMOST_ADMIN_TOKEN_FILE` (for `gateway doctor`'s own read), which does not exist yet on a
+	// fresh install — the temporary token this command's own workflow exports must never be
+	// shadowed by that absent file.
+	const adminToken = requireSettingPreferEnv("MATTERMOST_ADMIN_TOKEN");
 	// One bootstrap at a time; one that ran on a configuration replaced meanwhile runs again, so
 	// no membership of the old plan outlives the new one.
 	await withBootstrapLock(deps, async () => {

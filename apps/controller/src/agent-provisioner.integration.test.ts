@@ -2,12 +2,15 @@ import { randomUUID } from "node:crypto";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { OrganizationConfig } from "@agent-gateway/contracts";
+import type { AgentConfig, OrganizationConfig } from "@agent-gateway/contracts";
 import { OrganizationConfigSchema } from "@agent-gateway/contracts";
 import {
+	activeConfigRevisionId,
 	applyConfig,
 	type ControlPlaneDeps,
 	checkpointOperation,
+	commitChange,
+	grantChannel,
 	markProvisioning,
 	recordWorkerStatus,
 	requestAgentCreate,
@@ -15,7 +18,12 @@ import {
 } from "@agent-gateway/core";
 import { createPool, migrateSchema } from "@agent-gateway/db";
 import { DEVELOPMENT_VERSION, type LogFields, silentLogger } from "@agent-gateway/logging";
-import { type ApiBot, type ApiUser, MattermostApiError } from "@agent-gateway/mattermost";
+import {
+	type ApiBot,
+	type ApiChannel,
+	type ApiUser,
+	MattermostApiError,
+} from "@agent-gateway/mattermost";
 import { createBoss, migrateQueues, transactionalJobSink } from "@agent-gateway/queue";
 import { secretFileState } from "@agent-gateway/service";
 import { startTestPostgres, type TestPostgres } from "@agent-gateway/testkit";
@@ -28,7 +36,16 @@ const TEAM_ID = "team0000000000000000000000";
 const CHANNEL_IDS = {
 	hq: "hqchanne1000000000000000aa",
 	research: "r3searchchanne10000000000a",
+	// Granted (ADR-022), never organization-configured: see the reprovision "keeps a granted
+	// channel" test below.
+	ops: "0pschanne1000000000000000a",
 } as const;
+
+/** A 26-lowercase-alphanumeric `MattermostId`-shaped id, for fixtures that need one but whose
+ * exact value is never read back. */
+function fixedId(prefix: string): string {
+	return (prefix + "0".repeat(26)).slice(0, 26);
+}
 
 function organization(): OrganizationConfig {
 	return OrganizationConfigSchema.parse({
@@ -243,6 +260,21 @@ class FakeAdminClient {
 		members.add(userId);
 		this.channelMembers.set(channelId, members);
 	};
+
+	removeChannelMember = async (channelId: string, userId: string): Promise<void> => {
+		const name = this.channelNamesById[channelId] ?? channelId;
+		this.maybeFail(`removeChannelMember:${name}`);
+		this.channelMembers.get(channelId)?.delete(userId);
+	};
+
+	/** Every managed channel `userId` is currently in, as `isExtraChannel` (`@agent-gateway/mattermost`)
+	 * expects: a public channel of this team, never deleted, never `town-square`. */
+	userChannelsInTeam = async (userId: string, teamId: string): Promise<ApiChannel[]> =>
+		Object.entries(this.channelNamesById).flatMap(([id, name]) =>
+			this.channelMembers.get(id)?.has(userId) === true
+				? [{ id, name, type: "O" as const, team_id: teamId, delete_at: 0 }]
+				: [],
+		);
 
 	userAccessTokenIds = async (userId: string): Promise<Readonly<string[]>> => [
 		...(this.tokensByUser.get(userId) ?? []),
@@ -601,6 +633,113 @@ describe("agent lifecycle provisioner (ADR-026)", () => {
 			await pool.query("select state from agent_lifecycle_operations where agent_id = 'analyst'")
 		).rows;
 		expect(operation.state).toBe("succeeded");
+	});
+
+	it("a committed channel change queues a reprovision operation; the provisioner joins the new channel and keeps the agent ready throughout", async () => {
+		const admin = new FakeAdminClient(CHANNEL_IDS);
+		await requestAgentCreate(deps, createInput("analyst", ["hq"]));
+		const { logger } = recordingLogger();
+		await pass(admin, logger);
+
+		const [ready] = (
+			await pool.query("select status from agent_lifecycle where agent_id = 'analyst'")
+		).rows;
+		expect(ready.status).toBe("ready");
+
+		const [{ config }] = (await pool.query("select config from agents where id = 'analyst'")).rows;
+		const after: AgentConfig = {
+			...config,
+			mattermost: { ...config.mattermost, allowed_channels: ["hq", "research"] },
+		};
+		const baseRevisionId = await activeConfigRevisionId(deps);
+		await commitChange(deps, {
+			changeSet: [{ type: "update_agent", agent: after }],
+			baseRevisionId,
+			actor: "owner",
+			source: "console",
+		});
+
+		const [queued] = (
+			await pool.query(
+				"select kind, state from agent_lifecycle_operations where agent_id = 'analyst' order by created_at desc limit 1",
+			)
+		).rows;
+		expect(queued).toMatchObject({ kind: "reprovision", state: "pending" });
+		// Queuing a reprovision never blocks scheduling: the agent stays `ready` the moment it is
+		// queued, not only once the provisioner finishes it.
+		const [stillReady] = (
+			await pool.query("select status from agent_lifecycle where agent_id = 'analyst'")
+		).rows;
+		expect(stillReady.status).toBe("ready");
+
+		await pass(admin, logger);
+
+		const [done] = (
+			await pool.query(
+				"select state from agent_lifecycle_operations where agent_id = 'analyst' order by created_at desc limit 1",
+			)
+		).rows;
+		expect(done.state).toBe("succeeded");
+		const [afterPass] = (
+			await pool.query("select status from agent_lifecycle where agent_id = 'analyst'")
+		).rows;
+		expect(afterPass.status).toBe("ready");
+		const [identity] = (
+			await pool.query(
+				"select mattermost_user_id from mattermost_identities where agent_id = 'analyst'",
+			)
+		).rows;
+		expect(admin.channelMembers.get(CHANNEL_IDS.hq)?.has(identity.mattermost_user_id)).toBe(true);
+		expect(admin.channelMembers.get(CHANNEL_IDS.research)?.has(identity.mattermost_user_id)).toBe(
+			true,
+		);
+	});
+
+	it("a committed channel removal leaves the channel, but keeps one granted via ADR-022", async () => {
+		const admin = new FakeAdminClient(CHANNEL_IDS);
+		await requestAgentCreate(deps, createInput("analyst", ["hq", "research"]));
+		const { logger } = recordingLogger();
+		await pass(admin, logger);
+
+		const [identity] = (
+			await pool.query(
+				"select mattermost_user_id from mattermost_identities where agent_id = 'analyst'",
+			)
+		).rows;
+		const botUserId: string = identity.mattermost_user_id;
+		// Granted directly by an owner adding the bot in Mattermost (ADR-022): never through the
+		// provisioner, never part of `allowed_channels`.
+		await admin.addChannelMember(CHANNEL_IDS.ops, botUserId);
+		const granted = await grantChannel(deps, {
+			agentId: "analyst",
+			botUserId,
+			teamId: TEAM_ID,
+			channelId: CHANNEL_IDS.ops,
+			channelName: "ops",
+			grantorUserId: fixedId("owner"),
+			evidencePostId: fixedId("evidence"),
+			sinceMs: Date.now(),
+		});
+		expect(granted).toBe(true);
+
+		const [{ config }] = (await pool.query("select config from agents where id = 'analyst'")).rows;
+		const after: AgentConfig = {
+			...config,
+			mattermost: { ...config.mattermost, allowed_channels: ["hq"] },
+		};
+		const baseRevisionId = await activeConfigRevisionId(deps);
+		await commitChange(deps, {
+			changeSet: [{ type: "update_agent", agent: after }],
+			baseRevisionId,
+			actor: "owner",
+			source: "console",
+		});
+
+		await pass(admin, logger);
+
+		expect(admin.channelMembers.get(CHANNEL_IDS.hq)?.has(botUserId)).toBe(true);
+		expect(admin.channelMembers.get(CHANNEL_IDS.research)?.has(botUserId)).toBe(false);
+		expect(admin.channelMembers.get(CHANNEL_IDS.ops)?.has(botUserId)).toBe(true);
 	});
 
 	it("stays idle with no admin token configured: the operation is left pending, untouched", async () => {

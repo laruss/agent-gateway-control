@@ -165,17 +165,20 @@ constrained in code to exactly the actions provisioning performs, never handed t
   reserves the routing key's: no bot's `token_secret_file` may equal either. Every token file is
   written atomically (a temporary file in the same directory, `fsync`, then renamed over the
   target, mode 0600) and never logged.
-- **Bootstrap and reconcile never touch a lifecycle-created agent.** `gateway mattermost
-  bootstrap`/`reconcile` build their plan from every configured agent, but skip any whose
-  `mattermost.token_secret_file` lives under `/run/bot-secrets/`: that bot is the provisioner's
-  own to create, token and reconcile, through its own checkpoints (`agent_lifecycle_operations`,
-  `gateway agents operations`), never bootstrap's — a client-run CLI container sees only
-  `/run/secrets/` reliably (see above), and even where it also sees `/run/bot-secrets/`, revoking
-  or rewriting a token the provisioner is mid-way through issuing is exactly the conflict this
-  rule avoids. The rule reads the agent's own configuration (a `token_secret_file` prefix), not
-  its lifecycle row's operation history: equally correct here (every lifecycle-created agent's
-  token path is always under `/run/bot-secrets/`, and nothing else's ever is) and simpler to check
-  without an extra join.
+- **Bootstrap and reconcile never touch a lifecycle-owned agent.** `gateway mattermost
+  bootstrap`/`reconcile` build their plan from every configured agent, but skip any that is
+  lifecycle-owned: that bot is the provisioner's own to create, token and reconcile, through its
+  own checkpoints (`agent_lifecycle_operations`, `gateway agents operations`), never bootstrap's —
+  revoking or rewriting a token the provisioner is mid-way through issuing is exactly the conflict
+  this rule avoids. An agent is lifecycle-owned iff its own operation journal names at least one
+  `create` or `restore` operation (never merely `adopt`, which the startup backfill writes for an
+  agent the lifecycle never asked for): the database, not a `token_secret_file` prefix, is this
+  decision's one source of truth, read by `mattermostPlan`'s caller (which has the database access
+  `mattermostPlan` itself, a pure function, does not). A prefix is only ever an artifact of
+  ownership and never the other way around: the managed-configuration service refuses a
+  `/run/bot-secrets/` path in any committed configuration (a console patch, a CLI import) for an
+  agent that is not lifecycle-owned, so YAML or a console edit can never claim the provisioner's
+  own directory for an agent it does not own.
 - **The provisioner.** A controller loop, alongside its other periodic work, takes
   `pending`/`running` `create`/`restore`/`reprovision` operations and drives each one through its
   steps — resolve or create the bot by username (refusing to adopt a stranger's account), issue it
@@ -189,6 +192,17 @@ constrained in code to exactly the actions provisioning performs, never handed t
   and replayed every pass, not only the one that first resolves the bot: a crash between
   persisting the `bot_user_id` checkpoint and that write completing must never let the operation
   reach `completeOperation` with no identity ever recorded.
+- **Membership reprovisioning.** When a committed configuration change (any path: a console patch,
+  a CLI import) alters a lifecycle-owned, `ready` agent's `allowed_channels`, the same transaction
+  queues a `reprovision` operation — deduped against one already `pending` for that agent, rather
+  than queuing a second — which the provisioner later drives like any other: keep the bot's
+  existing token if it still works (verified with it, `users/me`, before ever reissuing), join
+  every channel now configured, and leave every channel no longer configured, except one an owner
+  or admin granted the bot directly (ADR-022) — checked from the grant records, never assumed, so
+  a grant made after the operation was queued still holds. Unlike `create`/`restore`, a
+  `reprovision` operation never moves its agent out of `ready`: a membership-only change is never a
+  reason to pause scheduling, so `markProvisioning` leaves the agent `ready` while the operation
+  runs, and `completeOperation` leaves it `ready` once it finishes.
 - **Failure handling.** A step's failure is permanent — `failOperation`, with a redacted message,
   moving the agent to `failed` — only when a retry could never fix it: the bot's username is taken
   by an account that is not plausibly the Gateway's own, or the admin token is rejected or lacks

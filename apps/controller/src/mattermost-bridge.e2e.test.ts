@@ -8,6 +8,7 @@ import {
 	type ControlPlaneDeps,
 	loadConfigGeneration,
 	loadDirectoryEntry,
+	loadLifecycleOwnedAgentIds,
 	loadMattermostIdentity,
 	loadMattermostPlanSource,
 	mattermostBootstrapStore,
@@ -76,6 +77,7 @@ describe("Mattermost bridge against a real server", () => {
 			source.agents,
 			(ref) => resolveSecretPath(ref, secretsDir),
 			source.retired,
+			await loadLifecycleOwnedAgentIds(deps),
 		);
 		await bootstrapMattermost({
 			baseUrl: mm.url,

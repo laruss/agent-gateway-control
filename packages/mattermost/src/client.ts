@@ -364,6 +364,8 @@ export type AdminMattermostClient = Pick<
 	| "disableBot"
 	| "addTeamMember"
 	| "addChannelMember"
+	| "removeChannelMember"
+	| "userChannelsInTeam"
 	| "userAccessTokenIds"
 	| "revokeUserAccessToken"
 	| "createUserAccessToken"

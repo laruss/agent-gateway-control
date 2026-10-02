@@ -99,6 +99,12 @@ services:
       # `gateway doctor`'s 'mattermost_provisioning' check (ADR-026): read-only here too, the same
       # file `gateway mattermost admin-token set|rotate` writes through the mount below.
       MATTERMOST_ADMIN_TOKEN_FILE: /run/secrets/mattermost_admin_token
+      # `gateway mattermost bootstrap`'s own temporary admin token (docs/operations/mattermost.md):
+      # the operator exports it in the shell running `bin/agw`, which this interpolates at compose
+      # parse time, the same process environment `bin/agw` execs in — `docker compose run` forwards
+      # none of the caller's environment on its own. Empty when unset, read as "not configured"
+      # (`requireSettingPreferEnv`, @agent-gateway/service), never shadowed by the `_FILE` above.
+      MATTERMOST_ADMIN_TOKEN: ${MATTERMOST_ADMIN_TOKEN:-}
     volumes:
       - ${GATEWAY_HOME}/secrets/controller:/run/secrets
       - ${GATEWAY_HOME}/secrets:/secrets

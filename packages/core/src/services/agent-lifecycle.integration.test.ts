@@ -21,7 +21,7 @@ import {
 	StaleLifecycleOperationError,
 } from "./agent-lifecycle.ts";
 import type { ControlPlaneDeps } from "./deps.ts";
-import { activeConfigRevisionId } from "./management.ts";
+import { activeConfigRevisionId, commitChange } from "./management.ts";
 import { recordWorkerStatus } from "./runtime-health.ts";
 
 function organization(): OrganizationConfig {
@@ -227,6 +227,26 @@ describe("agent lifecycle service (ADR-026)", () => {
 			])
 		).rows;
 		expect(identity.token_secret_ref).toBe("/run/bot-secrets/mm_betagen_token");
+	});
+
+	it("refuses a /run/bot-secrets/ token path in configuration for an agent that is not lifecycle-owned", async () => {
+		// `finance` comes from `reset()` through `applyConfig` alone: no `agent_lifecycle` row at
+		// all, so it is certainly not lifecycle-owned (neither a `create` nor a `restore` operation
+		// ever named it).
+		const revisionId = await activeConfigRevisionId(deps);
+		const [{ config }] = (await pool.query("select config from agents where id = 'finance'")).rows;
+		const claimed: AgentConfig = {
+			...config,
+			mattermost: { ...config.mattermost, token_secret_file: "/run/bot-secrets/mm_finance_token" },
+		};
+		await expect(
+			commitChange(deps, {
+				changeSet: [{ type: "update_agent", agent: claimed }],
+				baseRevisionId: revisionId,
+				actor: "test",
+				source: "console",
+			}),
+		).rejects.toThrow(/not created or restored through the lifecycle/);
 	});
 
 	it("an invalid agent definition leaves no trace: no revision, no agent row, no lifecycle row", async () => {

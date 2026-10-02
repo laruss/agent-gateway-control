@@ -6,6 +6,7 @@ import type { JsonObject } from "@agent-gateway/contracts";
 import {
 	type ControlPlaneDeps,
 	loadConfigGeneration,
+	loadLifecycleOwnedAgentIds,
 	loadMattermostIdentity,
 	loadMattermostPlanSource,
 	mattermostBootstrapStore,
@@ -58,6 +59,7 @@ describe("agent lifecycle provisioner against a real server (ADR-026)", () => {
 			source.agents,
 			(ref) => resolveSecretPath(ref, secretsDir),
 			source.retired,
+			await loadLifecycleOwnedAgentIds(deps),
 		);
 		await bootstrapMattermost({
 			baseUrl: mm.url,

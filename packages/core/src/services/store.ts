@@ -11,6 +11,7 @@ import {
 import {
 	type AgentState,
 	agentLifecycle,
+	agentLifecycleOperations,
 	agentRuns,
 	agents,
 	auditLog,
@@ -182,6 +183,36 @@ export async function loadAgentLifecycleStatus(
 		.from(agentLifecycle)
 		.where(eq(agentLifecycle.agentId, agentId));
 	return row?.status ?? null;
+}
+
+/**
+ * Agent ids that were created or restored through the lifecycle (their own operation journal
+ * names at least one `create` or `restore` operation), regardless of their current status — never
+ * an agent merely adopted from a pre-existing configuration (adoption only ever writes a
+ * `succeeded` `adopt` operation). The database, not a `token_secret_file` prefix, is lifecycle
+ * ownership's one source of truth (ADR-026): `mattermostPlan`'s caller uses this to decide which
+ * agents bootstrap/reconcile leave entirely to the lifecycle provisioner, and the managed-
+ * configuration service uses it to refuse a `/run/bot-secrets/` token path for any agent that is
+ * not one of these, and to decide which ready agent gets a `reprovision` operation when its
+ * channels change. Scoped to `agentIds` when given, to avoid scanning the whole journal for a
+ * commit that only ever touches a handful of agents.
+ */
+export async function lifecycleOwnedAgentIds(
+	db: Db,
+	agentIds?: Readonly<string[]>,
+): Promise<ReadonlySet<string>> {
+	const rows = await db
+		.selectDistinct({ agentId: agentLifecycleOperations.agentId })
+		.from(agentLifecycleOperations)
+		.where(
+			agentIds === undefined
+				? inArray(agentLifecycleOperations.kind, ["create", "restore"])
+				: and(
+						inArray(agentLifecycleOperations.kind, ["create", "restore"]),
+						inArray(agentLifecycleOperations.agentId, agentIds),
+					),
+		);
+	return new Set(rows.map((row) => row.agentId));
 }
 
 export async function setAgentState(

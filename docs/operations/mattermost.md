@@ -123,6 +123,16 @@ ordinary restore. Only if that directory itself were ever lost without a backup 
 bot need a fresh token — created by hand in Mattermost and written to its
 `mattermost.token_secret_file`, or by retiring and restoring the agent once that cleanup exists.
 
+### Changing a lifecycle-created agent's channels
+
+Editing `allowed_channels` for a `ready`, lifecycle-created agent — the owner's console, or
+`gateway config import` — queues a `reprovision` operation the moment the change commits; no
+`gateway mattermost bootstrap` run touches this agent, so without it nothing would ever join or
+leave its bot to match. The provisioner picks it up like any other operation: it keeps the bot's
+existing token, joins every channel the edit added, and leaves every channel the edit removed
+(except one an owner or admin granted the bot directly, which stays). The agent itself stays
+`ready` throughout — a membership-only change is never a reason to pause its scheduling.
+
 ## Giving an agent a channel
 
 An owner (`owner_mattermost_usernames`) or a system admin adds the agent's bot to a channel in

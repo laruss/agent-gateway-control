@@ -1,5 +1,9 @@
+import { randomUUID } from "node:crypto";
 import {
 	type AgentConfig,
+	type AgentId,
+	type AgentLifecycleSource,
+	BOT_SECRET_FILE_PREFIX,
 	type ChangeOperation,
 	type ChangeSet,
 	type ChangeSetInput,
@@ -14,7 +18,14 @@ import {
 	type OrganizationConfig,
 	type TextChange,
 } from "@agent-gateway/contracts";
-import { agents, configRevisions, configSnapshots, gatewayControls } from "@agent-gateway/db";
+import {
+	agentLifecycle,
+	agentLifecycleOperations,
+	agents,
+	configRevisions,
+	configSnapshots,
+	gatewayControls,
+} from "@agent-gateway/db";
 import { canonicalHash } from "@agent-gateway/events";
 import { desc, eq, inArray, or } from "drizzle-orm";
 import {
@@ -28,6 +39,7 @@ import {
 	writeConfigRevisionIn,
 } from "./admin.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
+import { audit, lifecycleOwnedAgentIds } from "./store.ts";
 
 type Db = UnitOfWork["tx"]["db"];
 
@@ -670,6 +682,133 @@ function checkCommitChangeInput(
 }
 
 /**
+ * `/run/bot-secrets/` is the lifecycle provisioner's own directory (ADR-026): naming it in
+ * `token_secret_file` is refused for any agent that is not lifecycle-owned (its operation journal
+ * names a `create` or `restore`) or one `trustedAgentIds` names (the lifecycle's own commit of the
+ * very `create` that is about to own it, whose own `agent_lifecycle_operations` row this same
+ * transaction has not written yet). Every other agent naming it — a plain console edit, a CLI
+ * import, a YAML `config apply` — is refused: an operator or a model configuring a token path
+ * under the controller's own read-write directory could otherwise collide with, or silently steal,
+ * a token the provisioner manages.
+ */
+async function rejectUnownedBotSecretPaths(
+	db: Db,
+	draftAgents: Readonly<AgentConfig[]>,
+	trustedAgentIds: ReadonlySet<AgentId>,
+): Promise<Readonly<string[]>> {
+	const candidates = draftAgents.filter((agent) =>
+		agent.mattermost.token_secret_file.startsWith(BOT_SECRET_FILE_PREFIX),
+	);
+	if (candidates.length === 0) {
+		return [];
+	}
+	const owned = await lifecycleOwnedAgentIds(
+		db,
+		candidates.map((agent) => agent.id),
+	);
+	return candidates
+		.filter((agent) => !trustedAgentIds.has(agent.id) && !owned.has(agent.id))
+		.map(
+			(agent) =>
+				`agent ${agent.id}: token_secret_file '${agent.mattermost.token_secret_file}' is under ` +
+				"the lifecycle provisioner's own directory, but this agent was not created or restored " +
+				"through the lifecycle",
+		);
+}
+
+/** The nearest `AgentLifecycleSource` for a configuration commit's own `ConfigRevisionSource`: a
+ * console edit stays `console`, an agent's own proposal stays `agent`, and every CLI-driven source
+ * this journal has (`cli_apply`, `import`, `rollback`, `backfill`) maps to the lifecycle's own,
+ * narrower `cli` — the reverse of `configRevisionSourceOf` (`agent-lifecycle.ts`), kept local here
+ * since only this module's own auto-queued `reprovision` operations need it. */
+function agentLifecycleSourceOf(source: ConfigRevisionSource): AgentLifecycleSource {
+	return source === "console" || source === "agent" ? source : "cli";
+}
+
+/** Whether `a` and `b` name the same channels, regardless of order. */
+function sameChannels(a: Readonly<string[]>, b: Readonly<string[]>): boolean {
+	const setA = new Set(a);
+	const setB = new Set(b);
+	return setA.size === setB.size && [...setA].every((name) => setB.has(name));
+}
+
+/**
+ * Queues a `reprovision` operation for every lifecycle-owned, `ready` agent whose committed
+ * `allowed_channels` just changed (console patch, CLI import — any path `commitChangeIn` commits):
+ * the provisioner picks it up like any other pending operation, joining newly configured channels
+ * and leaving channels no longer configured (ADR-026). Deduped: an agent whose current operation is
+ * already a `pending` `reprovision` keeps it rather than queuing a second one — the provisioner
+ * reads the agent's live configuration when it finally runs, so one pending operation already
+ * covers every edit made before it starts. An agent not lifecycle-owned, or not currently `ready`
+ * (still being created or restored, already retiring or retired, or failed), is left alone: its own
+ * operation already owns reconciling its membership, or nothing here should touch it.
+ */
+async function queueMembershipReprovisioning(
+	uow: UnitOfWork,
+	base: ConfigDraftBundle,
+	draft: ConfigDraftBundle,
+	revisionId: number,
+	actor: string,
+	source: ConfigRevisionSource,
+): Promise<void> {
+	const { db } = uow.tx;
+	const beforeById = new Map(base.agents.map((agent) => [agent.id, agent]));
+	for (const after of draft.agents) {
+		const before = beforeById.get(after.id);
+		if (
+			before === undefined ||
+			sameChannels(before.mattermost.allowed_channels, after.mattermost.allowed_channels)
+		) {
+			continue;
+		}
+		const [lifecycle] = await db
+			.select()
+			.from(agentLifecycle)
+			.where(eq(agentLifecycle.agentId, after.id))
+			.for("update");
+		if (lifecycle === undefined || lifecycle.status !== "ready") {
+			continue;
+		}
+		const owned = await lifecycleOwnedAgentIds(db, [after.id]);
+		if (!owned.has(after.id)) {
+			continue;
+		}
+		if (lifecycle.operationId !== null) {
+			const [current] = await db
+				.select({ kind: agentLifecycleOperations.kind, state: agentLifecycleOperations.state })
+				.from(agentLifecycleOperations)
+				.where(eq(agentLifecycleOperations.id, lifecycle.operationId));
+			if (current?.kind === "reprovision" && current.state === "pending") {
+				continue;
+			}
+		}
+		const operationId = randomUUID();
+		const generation = lifecycle.generation + 1;
+		await db.insert(agentLifecycleOperations).values({
+			id: operationId,
+			agentId: after.id,
+			kind: "reprovision",
+			requestedBy: actor,
+			source: agentLifecycleSourceOf(source),
+			configRevisionId: revisionId,
+			generation,
+			state: "pending",
+			checkpoints: {},
+			createdAt: uow.now,
+			updatedAt: uow.now,
+		});
+		await db
+			.update(agentLifecycle)
+			.set({ operationId, generation })
+			.where(eq(agentLifecycle.agentId, after.id));
+		await audit(uow, actor, "agent_lifecycle.reprovision", "agent", after.id, {
+			operation_id: operationId,
+			revision_id: revisionId,
+		});
+	}
+}
+
+/**
  * {@link commitChange}'s own transactional body, taking an already-open `uow` instead of opening
  * one of its own: `requestAgentCreate`/`requestAgentRetire` (`agent-lifecycle.ts`) call this
  * directly so their own lifecycle rows commit or roll back in the exact same transaction as the
@@ -682,6 +821,15 @@ export async function commitChangeIn(
 	uow: UnitOfWork,
 	input: CommitChangeInput,
 	changeSet: ChangeSet,
+	/**
+	 * Agent ids this commit itself is about to make lifecycle-owned (a `create`'s own agent id),
+	 * trusted to claim `/run/bot-secrets/` even though no `agent_lifecycle_operations` row for them
+	 * exists yet this same transaction — it is written right after this commit returns
+	 * (`requestAgentCreate`). Never set by `commitChange`, the public entry point every untrusted
+	 * caller (a console patch, a CLI import) uses: only `agent-lifecycle.ts`'s own internal
+	 * `commitWithinLock` may pass this.
+	 */
+	trustedBotSecretAgentIds: ReadonlySet<AgentId> = new Set(),
 ): Promise<CommitOutcome> {
 	const { db } = uow.tx;
 	await db.insert(gatewayControls).values({ id: 1 }).onConflictDoNothing();
@@ -759,6 +907,14 @@ export async function commitChangeIn(
 	if (draft.organization === null) {
 		throw new AdminError("internal: a validated configuration always has an organization");
 	}
+	const botSecretProblems = await rejectUnownedBotSecretPaths(
+		db,
+		draft.agents,
+		trustedBotSecretAgentIds,
+	);
+	if (botSecretProblems.length > 0) {
+		throw new AdminError(`configuration is invalid:\n- ${botSecretProblems.join("\n- ")}`);
+	}
 	const resolvedInput: ConfigApplyInput = {
 		organization: draft.organization,
 		agents: draft.agents,
@@ -797,6 +953,14 @@ export async function commitChangeIn(
 		idempotencyKey: input.idempotencyKey ?? null,
 		changeHash: input.idempotencyKey === undefined ? null : canonicalHash(changeSet),
 	});
+	await queueMembershipReprovisioning(
+		uow,
+		base,
+		draft,
+		result.revisionId,
+		input.actor,
+		input.source,
+	);
 	return {
 		kind: "committed",
 		result: {

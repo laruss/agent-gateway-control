@@ -41,7 +41,7 @@ import {
 } from "./management.ts";
 import { WORKER_STALE_MS } from "./runtime-health.ts";
 import { scheduleAgent } from "./scheduler.ts";
-import { audit } from "./store.ts";
+import { audit, lifecycleOwnedAgentIds } from "./store.ts";
 
 type Db = UnitOfWork["tx"]["db"];
 type AgentLifecycleRow = typeof agentLifecycle.$inferSelect;
@@ -147,6 +147,9 @@ async function commitWithinLock(
 	actor: string,
 	source: ConfigRevisionSource,
 	reason?: string,
+	/** `requestAgentCreate`'s own agent id: trusted to claim `/run/bot-secrets/` even though its
+	 * `agent_lifecycle` row does not exist yet this same transaction (see `commitChangeIn`). */
+	trustedBotSecretAgentIds?: ReadonlySet<AgentId>,
 ): Promise<CommittedOutcome> {
 	let base = baseRevisionId;
 	for (let attempt = 1; attempt <= MAX_LIFECYCLE_COMMIT_ATTEMPTS; attempt += 1) {
@@ -160,6 +163,7 @@ async function commitWithinLock(
 				...(reason === undefined ? {} : { reason }),
 			},
 			changeSet,
+			trustedBotSecretAgentIds,
 		);
 		if (outcome.kind === "committed") {
 			return outcome;
@@ -327,6 +331,8 @@ export async function requestAgentCreate(
 			changeSet,
 			parsed.actor,
 			configRevisionSourceOf(parsed.source),
+			undefined,
+			new Set([agent.id]),
 		);
 
 		const operationId = randomUUID();
@@ -680,9 +686,10 @@ function readyStatusOf(kind: AgentLifecycleOperationKind): AgentLifecycleStatus 
 
 /**
  * Marks a `pending` operation `running` and its agent `reconciling` (a `retire` operation leaves
- * the agent `retiring`, already set by `requestAgentRetire`): the provisioner has started acting
- * on it. Refused for an operation that is not its agent's current one (superseded), or not
- * `pending`.
+ * the agent `retiring`, already set by `requestAgentRetire`; a `reprovision` operation — queued for
+ * a committed membership change alone, ADR-026 — leaves it `ready`: reconciling a lifecycle-owned
+ * agent's channels never makes it unschedulable). Refused for an operation that is not its agent's
+ * current one (superseded), or not `pending`.
  */
 export async function markProvisioning(
 	deps: ControlPlaneDeps,
@@ -701,7 +708,7 @@ export async function markProvisioning(
 			.update(agentLifecycleOperations)
 			.set({ state: "running", updatedAt: uow.now })
 			.where(eq(agentLifecycleOperations.id, operationId));
-		if (operation.kind !== "retire") {
+		if (operation.kind !== "retire" && operation.kind !== "reprovision") {
 			await db
 				.update(agentLifecycle)
 				.set({ status: "reconciling", statusChangedAt: uow.now })
@@ -903,6 +910,18 @@ export async function listLifecycleOperations(
 		updatedAt: row.updatedAt.toISOString(),
 		finishedAt: row.finishedAt === null ? null : row.finishedAt.toISOString(),
 	}));
+}
+
+/**
+ * Every agent id created or restored through the lifecycle (see {@link lifecycleOwnedAgentIds}):
+ * `mattermostPlan`'s caller uses this to decide which agents `gateway mattermost
+ * bootstrap`/`reconcile` leave entirely to the lifecycle provisioner (ADR-026) — the database,
+ * never a `token_secret_file` prefix, is lifecycle ownership's one source of truth.
+ */
+export async function loadLifecycleOwnedAgentIds(
+	deps: ControlPlaneDeps,
+): Promise<ReadonlySet<AgentId>> {
+	return inTransaction(deps, ({ tx }) => lifecycleOwnedAgentIds(tx.db));
 }
 
 // ---------------------------------------------------------------------------

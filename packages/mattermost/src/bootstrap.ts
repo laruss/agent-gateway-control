@@ -1,9 +1,8 @@
-import {
-	type AgentConfig,
-	type AgentId,
-	BOT_SECRET_FILE_PREFIX,
-	type MattermostId,
-	type OrganizationConfig,
+import type {
+	AgentConfig,
+	AgentId,
+	MattermostId,
+	OrganizationConfig,
 } from "@agent-gateway/contracts";
 import { type ApiChannel, isElevatedMember } from "./api-schemas.ts";
 import type { AdminMattermostClient, MattermostClientOptions } from "./client.ts";
@@ -35,23 +34,27 @@ export type MattermostPlan = Readonly<{
  * Every bot of a configuration: the listener in all managed channels, each agent in its own.
  * `tokenPath` maps a configured secret reference to the file that holds it.
  *
- * A lifecycle-created agent (ADR-026) is skipped entirely: its token lives under
- * `/run/bot-secrets/`, issued and owned by the controller's own provisioner, which checkpoints
- * and resumes its own provisioning independently. Bootstrap and reconcile never resolved that
- * path correctly from the CLI container to begin with (it has no reason to share the
- * provisioner's directory), and even where it does, revoking or rewriting that token out from
- * under the provisioner is exactly the conflict this plan must not create.
+ * An agent created or restored through the lifecycle (ADR-026, `lifecycleOwnedAgentIds`) is
+ * skipped entirely: its token lives under `/run/bot-secrets/`, issued and owned by the
+ * controller's own provisioner, which checkpoints and resumes its own provisioning independently.
+ * Bootstrap and reconcile never resolved that path correctly from the CLI container to begin with
+ * (it has no reason to share the provisioner's directory), and even where it does, revoking or
+ * rewriting that token out from under the provisioner is exactly the conflict this plan must not
+ * create. The caller decides this from the database (its own operation journal — never merely
+ * adopted), not from a `token_secret_file` prefix: a prefix is only ever an artifact of lifecycle
+ * ownership, and configuration itself may no longer claim it for any other agent (the
+ * managed-configuration service refuses that at commit time), but a database upgraded before that
+ * refusal existed could still hold one for an agent the lifecycle never actually owned.
  */
 export function mattermostPlan(
 	organization: OrganizationConfig,
 	agents: Readonly<AgentConfig[]>,
 	tokenPath: (ref: string) => string,
-	retiredBots: MattermostPlan["retiredBots"] = [],
+	retiredBots: MattermostPlan["retiredBots"],
+	lifecycleOwnedAgentIds: ReadonlySet<AgentId>,
 ): MattermostPlan {
 	const { mattermost } = organization;
-	const bootstrapManaged = agents.filter(
-		(agent) => !agent.mattermost.token_secret_file.startsWith(BOT_SECRET_FILE_PREFIX),
-	);
+	const bootstrapManaged = agents.filter((agent) => !lifecycleOwnedAgentIds.has(agent.id));
 	return {
 		team: mattermost.team,
 		channels: mattermost.channels,
@@ -244,10 +247,12 @@ function isPlainSystemRoles(roles: string): boolean {
 }
 
 /** Every team member stays in the team's default channel; Mattermost does not let it leave. */
-const DEFAULT_CHANNEL = "town-square";
+export const DEFAULT_CHANNEL = "town-square";
 
-/** A team channel (public or private) a bot is in but should not be. */
-function isExtraChannel(channel: ApiChannel, allowed: ReadonlySet<MattermostId>): boolean {
+/** A team channel (public or private) a bot is in but should not be: reused by the lifecycle
+ * provisioner's own reprovision step (ADR-026), which leaves a bot's channels the same way once a
+ * configuration change takes one away. */
+export function isExtraChannel(channel: ApiChannel, allowed: ReadonlySet<MattermostId>): boolean {
 	return (
 		(channel.type === "O" || channel.type === "P") &&
 		channel.delete_at === 0 &&
