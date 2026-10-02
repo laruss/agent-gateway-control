@@ -26,8 +26,11 @@ export type MattermostPlan = Readonly<{
 	channels: Readonly<string[]>;
 	owners: Readonly<string[]>;
 	bots: Readonly<BotSpec[]>;
-	/** Bots of agents removed from the configuration: deactivated, out of every channel. */
-	retiredBots: Readonly<Readonly<{ username: string; userId: MattermostId }>[]>;
+	/** Bots of agents removed from the configuration: deactivated, out of every channel. Never one
+	 * the lifecycle (ADR-026) owns: its own `retire` operation cleans that bot up through its own
+	 * checkpoints, and a bootstrap or reconcile run racing a restore must never revoke a token the
+	 * provisioner is mid-way through issuing. */
+	retiredBots: Readonly<Readonly<{ agentId: AgentId; username: string; userId: MattermostId }>[]>;
 }>;
 
 /**
@@ -45,6 +48,13 @@ export type MattermostPlan = Readonly<{
  * ownership, and configuration itself may no longer claim it for any other agent (the
  * managed-configuration service refuses that at commit time), but a database upgraded before that
  * refusal existed could still hold one for an agent the lifecycle never actually owned.
+ *
+ * `retiredBots` is filtered the same way: an agent's stale `agents` row (ADR-024's own
+ * retained-row case) outlives it leaving the active configuration, so a lifecycle-owned agent
+ * `requestAgentRetire` or `requestAgentRestore` is presently working through still shows up there
+ * — its own cleanup (or re-provisioning) is the provisioner's, through its own checkpoints, never
+ * this plan's; a bootstrap or reconcile run racing either would otherwise revoke a token the
+ * provisioner is mid-way through issuing, or deactivate a bot it just re-enabled.
  */
 export function mattermostPlan(
 	organization: OrganizationConfig,
@@ -59,7 +69,7 @@ export function mattermostPlan(
 		team: mattermost.team,
 		channels: mattermost.channels,
 		owners: organization.organization.owner_mattermost_usernames,
-		retiredBots,
+		retiredBots: retiredBots.filter((bot) => !lifecycleOwnedAgentIds.has(bot.agentId)),
 		bots: [
 			{
 				agentId: null,
@@ -299,15 +309,20 @@ export async function tokenOwner(
  * is, by default, somebody else's (an unrelated integration's, say) — adopting it would hand the
  * provisioner the next step's own token revocation and rewriting over an account it does not own.
  * Adoption is allowed only when the existing account is already this agent's own recorded identity
- * (`guard.knownUserId`) or was created by this Gateway's own admin account (`guard.adminUserId`,
- * checked against the bot's own `owner_id` — covers a `create` resuming after a crash between
- * `createBot` succeeding and its `bot_user_id` checkpoint ever being persisted); refused otherwise,
- * the same permanent "taken" failure an elevated-roles or regular-user collision already is.
+ * (`guard.knownUserId`) or was created by an admin account this Gateway has ever used for
+ * provisioning (`guard.knownAdminIds`, checked against the bot's own `owner_id` — covers a
+ * `create` resuming after a crash between `createBot` succeeding and its `bot_user_id` checkpoint
+ * ever being persisted, and the same account history retirement's own recovery already trusts,
+ * `findPlausibleGatewayBot`: an admin account rotated away from since this agent's own bot was
+ * created is still this Gateway's own as far as that bot is concerned, so a resumed `create` never
+ * fails permanently merely because an operator rotated the provisioning admin account in the
+ * meantime); refused otherwise, the same permanent "taken" failure an elevated-roles or
+ * regular-user collision already is.
  */
 export async function ensureBot(
 	admin: AdminMattermostClient,
 	bot: Readonly<Pick<BotSpec, "username" | "displayName">>,
-	guard?: Readonly<{ knownUserId: MattermostId | null; adminUserId: MattermostId }>,
+	guard?: Readonly<{ knownUserId: MattermostId | null; knownAdminIds: ReadonlySet<MattermostId> }>,
 ): Promise<MattermostId> {
 	const existing = await admin.userByUsername(bot.username);
 	if (existing === null) {
@@ -331,7 +346,7 @@ export async function ensureBot(
 	}
 	if (guard !== undefined && guard.knownUserId !== existing.id) {
 		const record = await admin.getBot(existing.id);
-		if (record?.owner_id !== guard.adminUserId) {
+		if (record === null || !guard.knownAdminIds.has(record.owner_id)) {
 			throw new BootstrapError(
 				`username '${bot.username}' is taken by a bot this Gateway did not create`,
 			);

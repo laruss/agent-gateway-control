@@ -103,6 +103,11 @@ below.
    guaranteed to be this command's own, so a plain hand-pasted token sitting in the file in place
    of this step would simply never come up in rotate's own revoke pass.
 
+Both `admin-token set` and `admin-token rotate` need `DATABASE_URL` reachable: each holds a
+database lock for its own create-verify-write-revoke sequence, so a second run against the same
+account started while one is already in flight fails fast with a clear message instead of racing
+it (each could otherwise revoke the token the other just minted before it was ever written).
+
 With no admin token configured yet, `create`/`restore`/`reprovision` operations simply stay
 `pending`; `gateway doctor`'s `mattermost_provisioning` check names this plainly rather than
 failing them.

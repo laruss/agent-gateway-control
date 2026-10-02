@@ -586,10 +586,11 @@ export async function doctor(session: Session, out: Output): Promise<boolean> {
 				(failedLifecycleCount === 0 ? "" : " ('gateway agents retry <id>')"),
 		});
 		// A retiring agent's own Mattermost-side cleanup was skipped because a plain bot at its
-		// configured username matched no admin account this Gateway has on record — but with no
-		// rotation history at all to check it against, so it could not be confirmed a stranger's
-		// either (`owner_unverified`, ADR-026). The agent is still correctly `retired` either way;
-		// this only flags that the skip itself is worth a human look.
+		// configured username matched no admin account this Gateway has on record, current or past
+		// (`owner_unverified`, ADR-026): a confirmed, legitimate outcome (the username belongs to a
+		// stranger's bot, or to an account that is not plausibly the Gateway's own plain bot at all),
+		// not an unresolved one — the agent is still correctly `retired` either way, and there is
+		// nothing left to clean up for it. Surfaced for a human look, never failing doctor over it.
 		const ambiguousRetirements = await pool.query<{ n: number }>(
 			`select count(*)::int as n
 			   from agent_lifecycle al
@@ -599,10 +600,11 @@ export async function doctor(session: Session, out: Output): Promise<boolean> {
 		const ambiguousRetirementCount = ambiguousRetirements.rows[0]?.n ?? 0;
 		checks.push({
 			name: "lifecycle_retire_ownership",
-			ok: ambiguousRetirementCount === 0,
+			ok: true,
 			detail:
-				`${ambiguousRetirementCount} retired agent(s) whose own bot's ownership could not be ` +
-				"confirmed either way (no provisioning-admin rotation history on record)",
+				`${ambiguousRetirementCount} retired agent(s) whose own bot's Mattermost-side cleanup ` +
+				"was skipped because its username belonged to an account this Gateway never created; " +
+				"nothing was left to clean up for them",
 		});
 		// `doctor` never runs `ensureConfigHistory` itself (it is read-only), so right after a
 		// forward upgrade the journal's latest entry can still look exactly as it did before the
@@ -921,26 +923,40 @@ export async function runCommand(args: Readonly<string[]>, out: Output): Promise
 	if (group === "mattermost" && action === "admin-token" && args[2] === "set") {
 		const secretsDirFlag = flag(args, "secrets-dir") ?? readSetting("SECRETS_DIR");
 		const secretsDir = secretsDirFlag === undefined ? undefined : resolve(secretsDirFlag);
-		await mattermostAdminTokenSet(
-			{
-				baseUrl: requireSetting("MATTERMOST_URL"),
-				secretPath: resolveSecretPath(MATTERMOST_ADMIN_TOKEN_SECRET_FILE, secretsDir),
-				reader: nodeHiddenReader(),
-			},
-			out.print,
-		);
+		// A lightweight pool of its own, like `db status`'s own one-off commands: this command needs
+		// the database only to hold the admin-token lock (ADR-026), never a full session.
+		const pool = createPool(requireSetting("DATABASE_URL"), 1);
+		try {
+			await mattermostAdminTokenSet(
+				{
+					baseUrl: requireSetting("MATTERMOST_URL"),
+					secretPath: resolveSecretPath(MATTERMOST_ADMIN_TOKEN_SECRET_FILE, secretsDir),
+					reader: nodeHiddenReader(),
+					pool,
+				},
+				out.print,
+			);
+		} finally {
+			await pool.end();
+		}
 		return 0;
 	}
 	if (group === "mattermost" && action === "admin-token" && args[2] === "rotate") {
 		const secretsDirFlag = flag(args, "secrets-dir") ?? readSetting("SECRETS_DIR");
 		const secretsDir = secretsDirFlag === undefined ? undefined : resolve(secretsDirFlag);
-		await mattermostAdminTokenRotate(
-			{
-				baseUrl: requireSetting("MATTERMOST_URL"),
-				secretPath: resolveSecretPath(MATTERMOST_ADMIN_TOKEN_SECRET_FILE, secretsDir),
-			},
-			out.print,
-		);
+		const pool = createPool(requireSetting("DATABASE_URL"), 1);
+		try {
+			await mattermostAdminTokenRotate(
+				{
+					baseUrl: requireSetting("MATTERMOST_URL"),
+					secretPath: resolveSecretPath(MATTERMOST_ADMIN_TOKEN_SECRET_FILE, secretsDir),
+					pool,
+				},
+				out.print,
+			);
+		} finally {
+			await pool.end();
+		}
 		return 0;
 	}
 	if (group === "runtime" && action === "doctor") {

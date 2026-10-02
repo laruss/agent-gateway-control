@@ -137,6 +137,12 @@ async function runTick(
 	await runProvisionerPass(deps, admin, options, actor, log, stopped);
 }
 
+/** Advisory lock key of one provisioner pass (ADR-026): two overlapping controllers (one still
+ * draining its old pass during an upgrade, say) must never drive the same operation's steps at
+ * once — one revoking the fresh token the other just issued, say — so a pass that cannot claim
+ * this lock skips this tick entirely, left for whichever controller is already running one. */
+const PROVISIONER_PASS_LOCK = "agent-gateway:agent-provisioner";
+
 /**
  * One pass over every operation this provisioner pursues, given an already-authenticated admin
  * client: validates the account, records it for routing exclusion, then drives each operation's
@@ -144,6 +150,11 @@ async function runTick(
  * tests can run this directly against a fake Mattermost client — `startAgentProvisioner`'s own
  * loop (`runTick`) is the only production caller, and it is the one that resolves the real admin
  * token and constructs the real client.
+ *
+ * Holds a session-level advisory lock (a dedicated pooled connection, held for the whole pass,
+ * the same pattern `runRetentionIfDue` already uses) around every step below: a concurrent pass —
+ * another controller, or this one's own next tick outlasting its interval — skips this tick
+ * rather than interleaving its own steps with one already running.
  */
 export async function runProvisionerPass(
 	deps: ControlPlaneDeps,
@@ -153,6 +164,42 @@ export async function runProvisionerPass(
 	log: Logger,
 	stopped: () => boolean = () => false,
 	resolveTokenOwner: typeof tokenOwner = tokenOwner,
+): Promise<void> {
+	const lock = await deps.pool.connect();
+	// A client whose unlock failed may still hold the lock: it is closed, not pooled (the same
+	// margin `runRetentionIfDue` leaves).
+	let unlocked = true;
+	try {
+		const locked = await lock.query<{ locked: boolean }>(
+			"select pg_try_advisory_lock(hashtextextended($1, 0)) as locked",
+			[PROVISIONER_PASS_LOCK],
+		);
+		if (locked.rows[0]?.locked !== true) {
+			log.info("agent provisioner: another pass is already running; skipping this tick");
+			return;
+		}
+		try {
+			await runLockedProvisionerPass(deps, admin, options, actor, log, stopped, resolveTokenOwner);
+		} finally {
+			unlocked = false;
+			await lock.query("select pg_advisory_unlock(hashtextextended($1, 0))", [
+				PROVISIONER_PASS_LOCK,
+			]);
+			unlocked = true;
+		}
+	} finally {
+		lock.release(!unlocked);
+	}
+}
+
+async function runLockedProvisionerPass(
+	deps: ControlPlaneDeps,
+	admin: AdminMattermostClient,
+	options: AgentProvisionerOptions,
+	actor: string,
+	log: Logger,
+	stopped: () => boolean,
+	resolveTokenOwner: typeof tokenOwner,
 ): Promise<void> {
 	let me: Awaited<ReturnType<AdminMattermostClient["me"]>>;
 	try {
@@ -272,10 +319,19 @@ async function processOperation(
 		let botUserId = checkpoints.bot_user_id;
 		if (botUserId === undefined) {
 			try {
+				// The current admin account plus every one this Gateway has ever recorded for itself
+				// (`loadKnownProvisioningAdminIds`): a resumed `create` whose bot was created under an
+				// admin account an operator has since rotated away from (`gateway mattermost
+				// admin-token set` pointed at a different account) must still be recognized as this
+				// Gateway's own, the same history retirement's own recovery already trusts.
+				const knownAdminIds = new Set([
+					adminUserId,
+					...(await loadKnownProvisioningAdminIds(deps)),
+				]);
 				botUserId = await ensureBot(
 					admin,
 					{ username: agentConfig.mattermost.username, displayName: agentConfig.display_name },
-					{ knownUserId: identity?.userId ?? null, adminUserId },
+					{ knownUserId: identity?.userId ?? null, knownAdminIds },
 				);
 			} catch (error) {
 				if (error instanceof BootstrapError) {
@@ -360,8 +416,10 @@ async function processOperation(
  * leaves every *other* team the bot is a live member of — straight to `removeTeamMember`, the same
  * way `bootstrapMattermost`'s own "one team only" step already does, without leaving the old team's
  * channels first: Mattermost ends a user's membership in every channel of a team the moment it ends
- * their membership in the team itself, the behaviour that step has always relied on (confirmed
- * against the real dev server `agent-provisioner.e2e.test.ts` runs against) — ADR-022 grants are
+ * their membership in the team itself, the behaviour this step relies on — confirmed against a
+ * real server by `agent-provisioner.e2e.test.ts`'s own "leaves a team the bot is a live member of"
+ * case: a second team, a bot added to one of its channels by hand, `removeTeamMember`, then the
+ * channel membership gone too, with no removal of its own ever asked for. ADR-022 grants are
  * never consulted for a team being left this way, only for the configured one (below), since a
  * grant only ever means anything within the team the organization actually manages. Then joins
  * every channel `allowedChannelNames` names that the bot is not already a live member of

@@ -1181,11 +1181,42 @@ export async function markProvisioning(
 }
 
 /**
+ * Keeps `channels_joined`/`channels_left` within their own schema bound
+ * (`AgentLifecycleCheckpointsSchema`, `@agent-gateway/contracts`: 32 and 64 respectively), trimming
+ * to the most recently added ids when a pass's own count exceeds it, rather than ever storing more
+ * than a later read could parse back out. `channels_joined` is already bounded in practice by
+ * `allowed_channels` itself (at most 32 configured channels), so this is only ever a backstop for
+ * it; `channels_left` has no such bound to inherit — a retiring bot's *live* channel memberships
+ * (ADR-022 grants, channels added by hand, never pruned by this release) are unbounded, so a
+ * resumed retire with more than 64 to leave could otherwise write an array
+ * `AgentLifecycleOperationSchema` can never read back, failing the console's lifecycle page and
+ * `gateway agents operations` alike. Trimming never loses correctness, only a little of this
+ * pass's own idempotent-skip optimism: nothing here ever decides whether a channel still needs
+ * joining or leaving from this array — only a live check against Mattermost does (ADR-026) — so a
+ * channel this trims away is, at worst, redundantly revisited next pass, never left undone or
+ * done twice.
+ */
+function clampCheckpointArrays(checkpoints: AgentLifecycleCheckpoints): AgentLifecycleCheckpoints {
+	const tail = (
+		ids: AgentLifecycleCheckpoints["channels_left"],
+		max: number,
+	): AgentLifecycleCheckpoints["channels_left"] =>
+		ids === undefined || ids.length <= max ? ids : ids.slice(ids.length - max);
+	return {
+		...checkpoints,
+		channels_joined: tail(checkpoints.channels_joined, 32),
+		channels_left: tail(checkpoints.channels_left, 64),
+	};
+}
+
+/**
  * Merges `checkpoints` into a `running` operation's own, without changing its state: the
  * provisioner's own record of one external step it just completed, written right after that step
  * and before the next one — never inside the same transaction as the Mattermost call that step
  * made — so a crash is resumed from exactly where it left off (ADR-026). Refused for a stale
  * operation (superseded) or one that is not `running`, like every other writer of this row.
+ * Clamped (`clampCheckpointArrays`) before it is ever written, so a stored checkpoint can never
+ * fail its own schema's read.
  */
 export async function checkpointOperation(
 	deps: ControlPlaneDeps,
@@ -1202,7 +1233,10 @@ export async function checkpointOperation(
 		}
 		await db
 			.update(agentLifecycleOperations)
-			.set({ checkpoints: { ...operation.checkpoints, ...checkpoints }, updatedAt: uow.now })
+			.set({
+				checkpoints: clampCheckpointArrays({ ...operation.checkpoints, ...checkpoints }),
+				updatedAt: uow.now,
+			})
 			.where(eq(agentLifecycleOperations.id, operationId));
 	});
 }
@@ -1243,7 +1277,10 @@ export async function completeOperation(
 		if (isTerminalOperationState(operation.state)) {
 			throw new AdminError(`lifecycle operation '${operationId}' is already '${operation.state}'`);
 		}
-		const finalCheckpoints = checkpoints ?? operation.checkpoints;
+		// Clamped the same way `checkpointOperation` clamps every other write of this column: a
+		// caller's own, locally accumulated `checkpoints` (never persisted through `checkpointOperation`
+		// itself) must never be the one path that lets a stored checkpoint outgrow its own schema.
+		const finalCheckpoints = clampCheckpointArrays(checkpoints ?? operation.checkpoints);
 		await db
 			.update(agentLifecycleOperations)
 			.set({

@@ -318,6 +318,67 @@ describe("agent lifecycle service (ADR-026)", () => {
 		expect(queued).toMatchObject({ kind: "reprovision", state: "pending" });
 	});
 
+	it("refuses changing a ready lifecycle-owned agent's token_secret_file via a managed commit: it is server-generated and immutable for it", async () => {
+		const created = await requestAgentCreate(deps, createInput("tokenpath-guard"));
+		await markProvisioning(deps, created.operationId, "test");
+		await completeOperation(deps, created.operationId, "test");
+
+		const revisionId = await activeConfigRevisionId(deps);
+		const [{ config }] = (
+			await pool.query("select config from agents where id = 'tokenpath-guard'")
+		).rows;
+		const redirected: AgentConfig = {
+			...config,
+			mattermost: {
+				...config.mattermost,
+				token_secret_file: "/run/bot-secrets/mm_tokenpath_guard_other_token",
+			},
+		};
+		await expect(
+			commitChange(deps, {
+				changeSet: [{ type: "update_agent", agent: redirected }],
+				baseRevisionId: revisionId,
+				actor: "test",
+				source: "console",
+			}),
+		).rejects.toThrow(/token_secret_file is server-generated/);
+	});
+
+	it("config apply (the deprecated whole-bundle path) refuses the same token_secret_file redirection for a ready lifecycle-owned agent", async () => {
+		const created = await requestAgentCreate(deps, createInput("tokenpath-guard-apply"));
+		await markProvisioning(deps, created.operationId, "test");
+		await completeOperation(deps, created.operationId, "test");
+
+		const [{ config: financeConfig }] = (
+			await pool.query("select config from agents where id = 'finance'")
+		).rows;
+		const [{ config }] = (
+			await pool.query("select config from agents where id = 'tokenpath-guard-apply'")
+		).rows;
+		const redirected: AgentConfig = {
+			...config,
+			mattermost: {
+				...config.mattermost,
+				token_secret_file: "/run/bot-secrets/mm_tokenpath_guard_apply_other_token",
+			},
+		};
+		await expect(
+			applyConfig(
+				deps,
+				{
+					organization: organization(),
+					agents: [financeConfig, redirected],
+					constitution: "Be helpful.",
+					rolePrompts: {
+						finance: "Role prompt for finance.",
+						"tokenpath-guard-apply": "Role prompt.",
+					},
+				},
+				"test",
+			),
+		).rejects.toThrow(/token_secret_file is server-generated/);
+	});
+
 	it("config apply that only changes the organization's Mattermost team queues a reprovision for a ready lifecycle-owned agent whose own channels never changed", async () => {
 		const created = await requestAgentCreate(
 			deps,

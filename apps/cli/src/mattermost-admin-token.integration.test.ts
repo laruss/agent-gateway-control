@@ -2,8 +2,11 @@ import { randomUUID } from "node:crypto";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createPool } from "@agent-gateway/db";
 import { secretFileState, writeSecretFile } from "@agent-gateway/service";
-import { afterEach, describe, expect, it } from "vitest";
+import { startTestPostgres, type TestPostgres } from "@agent-gateway/testkit";
+import type pg from "pg";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { HiddenLineReader } from "./console-commands.ts";
 import {
 	MattermostCommandError,
@@ -82,6 +85,13 @@ function startFakeMattermost() {
 	// own fakes.
 	let rigNextTokenOwner: string | null = null;
 
+	// Set by a test (`stallNextMe`) to hold the *next* `users/me` request open until released: both
+	// commands call `client.me()` as their very first Mattermost call, right after already holding
+	// the admin-token lock (ADR-026) — stalling it there lets a test deterministically observe a
+	// concurrent run failing fast against a lock the first call already holds, rather than racing a
+	// fixed delay. Consumed once.
+	let stalledMe: Readonly<{ notifyStarted: () => void; gate: Promise<void> }> | null = null;
+
 	const server = Bun.serve({
 		port: 0,
 		fetch: async (request) => {
@@ -90,6 +100,13 @@ function startFakeMattermost() {
 			const token = auth?.startsWith("Bearer ") ? auth.slice("Bearer ".length) : null;
 			const callerId = token === null ? undefined : accountByTokenValue.get(token);
 			const caller = callerId === undefined ? undefined : accountsById.get(callerId);
+
+			if (url.pathname === "/api/v4/users/me" && request.method === "GET" && stalledMe !== null) {
+				const { notifyStarted, gate } = stalledMe;
+				stalledMe = null;
+				notifyStarted();
+				await gate;
+			}
 
 			if (url.pathname === "/api/v4/users/me" && request.method === "GET") {
 				return caller === undefined
@@ -184,12 +201,41 @@ function startFakeMattermost() {
 		rigNextTokenOwner: (userId: string): void => {
 			rigNextTokenOwner = userId;
 		},
+		/** Holds the *next* `users/me` request open: `started` resolves once that request actually
+		 * arrives (the point a test can be sure the admin-token lock is already held), `release` lets
+		 * it proceed. */
+		stallNextMe: (): Readonly<{ started: Promise<void>; release: () => void }> => {
+			let notifyStarted: () => void = () => undefined;
+			const started = new Promise<void>((resolve) => {
+				notifyStarted = resolve;
+			});
+			let release: () => void = () => undefined;
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			stalledMe = { notifyStarted, gate };
+			return { started, release };
+		},
 		stop: () => server.stop(true),
 	};
 }
 
 describe("gateway mattermost admin-token set|rotate (ADR-026)", () => {
 	let fake: ReturnType<typeof startFakeMattermost> | null = null;
+	let postgres: TestPostgres;
+	let pool: pg.Pool;
+
+	// The admin-token lock (ADR-026) needs a real, reachable Postgres: `pg_try_advisory_lock` is a
+	// session-level primitive, needing no schema or migration of its own.
+	beforeAll(async () => {
+		postgres = await startTestPostgres();
+		pool = createPool(postgres.connectionString, 8);
+	});
+
+	afterAll(async () => {
+		await pool?.end();
+		await postgres?.stop();
+	});
 
 	afterEach(() => {
 		fake?.stop();
@@ -212,7 +258,7 @@ describe("gateway mattermost admin-token set|rotate (ADR-026)", () => {
 		const printed: string[] = [];
 
 		await mattermostAdminTokenSet(
-			{ baseUrl: fake.baseUrl, secretPath: path, reader: fakeReader(["admin-token-value"]) },
+			{ baseUrl: fake.baseUrl, secretPath: path, reader: fakeReader(["admin-token-value"]), pool },
 			(line) => printed.push(line),
 		);
 
@@ -250,7 +296,7 @@ describe("gateway mattermost admin-token set|rotate (ADR-026)", () => {
 		const printed: string[] = [];
 
 		await mattermostAdminTokenSet(
-			{ baseUrl: fake.baseUrl, secretPath: path, reader: fakeReader(["admin-token-value"]) },
+			{ baseUrl: fake.baseUrl, secretPath: path, reader: fakeReader(["admin-token-value"]), pool },
 			(line) => printed.push(line),
 		);
 
@@ -274,7 +320,7 @@ describe("gateway mattermost admin-token set|rotate (ADR-026)", () => {
 
 		await expect(
 			mattermostAdminTokenSet(
-				{ baseUrl: fake.baseUrl, secretPath: path, reader: fakeReader(["bot-token-value"]) },
+				{ baseUrl: fake.baseUrl, secretPath: path, reader: fakeReader(["bot-token-value"]), pool },
 				() => undefined,
 			),
 		).rejects.toThrow(MattermostCommandError);
@@ -294,7 +340,12 @@ describe("gateway mattermost admin-token set|rotate (ADR-026)", () => {
 
 		await expect(
 			mattermostAdminTokenSet(
-				{ baseUrl: fake.baseUrl, secretPath: path, reader: fakeReader(["plain-token-value"]) },
+				{
+					baseUrl: fake.baseUrl,
+					secretPath: path,
+					reader: fakeReader(["plain-token-value"]),
+					pool,
+				},
 				() => undefined,
 			),
 		).rejects.toThrow(MattermostCommandError);
@@ -312,7 +363,7 @@ describe("gateway mattermost admin-token set|rotate (ADR-026)", () => {
 		});
 		const path = secretPath();
 		await mattermostAdminTokenSet(
-			{ baseUrl: fake.baseUrl, secretPath: path, reader: fakeReader(["old-token-value"]) },
+			{ baseUrl: fake.baseUrl, secretPath: path, reader: fakeReader(["old-token-value"]), pool },
 			() => undefined,
 		);
 		// Already revoked by `set` itself (the account held exactly this one token): rotate below has
@@ -320,7 +371,7 @@ describe("gateway mattermost admin-token set|rotate (ADR-026)", () => {
 		expect(fake.worksNow("old-token-value")).toBe(false);
 
 		const printed: string[] = [];
-		await mattermostAdminTokenRotate({ baseUrl: fake.baseUrl, secretPath: path }, (line) =>
+		await mattermostAdminTokenRotate({ baseUrl: fake.baseUrl, secretPath: path, pool }, (line) =>
 			printed.push(line),
 		);
 
@@ -343,16 +394,22 @@ describe("gateway mattermost admin-token set|rotate (ADR-026)", () => {
 		});
 		const path = secretPath();
 		await mattermostAdminTokenSet(
-			{ baseUrl: fake.baseUrl, secretPath: path, reader: fakeReader(["token-a"]) },
+			{ baseUrl: fake.baseUrl, secretPath: path, reader: fakeReader(["token-a"]), pool },
 			() => undefined,
 		);
 		// A first rotate "crashes" conceptually right after writing the new token (simulated: the
 		// file already holds a second, newer token, but the first one was never revoked).
-		await mattermostAdminTokenRotate({ baseUrl: fake.baseUrl, secretPath: path }, () => undefined);
+		await mattermostAdminTokenRotate(
+			{ baseUrl: fake.baseUrl, secretPath: path, pool },
+			() => undefined,
+		);
 		expect(fake.worksNow("token-a")).toBe(false);
 		const afterFirstRotate = readFileSync(path, "utf8").trim();
 
-		await mattermostAdminTokenRotate({ baseUrl: fake.baseUrl, secretPath: path }, () => undefined);
+		await mattermostAdminTokenRotate(
+			{ baseUrl: fake.baseUrl, secretPath: path, pool },
+			() => undefined,
+		);
 		const afterSecondRotate = readFileSync(path, "utf8").trim();
 		expect(afterSecondRotate).not.toBe(afterFirstRotate);
 		expect(fake.worksNow(afterFirstRotate)).toBe(false);
@@ -379,7 +436,7 @@ describe("gateway mattermost admin-token set|rotate (ADR-026)", () => {
 		writeSecretFile(path, "untagged-token");
 		const printed: string[] = [];
 
-		await mattermostAdminTokenRotate({ baseUrl: fake.baseUrl, secretPath: path }, (line) =>
+		await mattermostAdminTokenRotate({ baseUrl: fake.baseUrl, secretPath: path, pool }, (line) =>
 			printed.push(line),
 		);
 
@@ -408,11 +465,14 @@ describe("gateway mattermost admin-token set|rotate (ADR-026)", () => {
 
 		const path = secretPath();
 		await mattermostAdminTokenSet(
-			{ baseUrl: fake.baseUrl, secretPath: path, reader: fakeReader(["token-a"]) },
+			{ baseUrl: fake.baseUrl, secretPath: path, reader: fakeReader(["token-a"]), pool },
 			() => undefined,
 		);
 
-		await mattermostAdminTokenRotate({ baseUrl: fake.baseUrl, secretPath: path }, () => undefined);
+		await mattermostAdminTokenRotate(
+			{ baseUrl: fake.baseUrl, secretPath: path, pool },
+			() => undefined,
+		);
 
 		const newToken = readFileSync(path, "utf8").trim();
 		expect(fake.worksNow("token-a")).toBe(false);
@@ -444,11 +504,14 @@ describe("gateway mattermost admin-token set|rotate (ADR-026)", () => {
 
 		const path = secretPath();
 		await mattermostAdminTokenSet(
-			{ baseUrl: fake.baseUrl, secretPath: path, reader: fakeReader(["token-a"]) },
+			{ baseUrl: fake.baseUrl, secretPath: path, reader: fakeReader(["token-a"]), pool },
 			() => undefined,
 		);
 
-		await mattermostAdminTokenRotate({ baseUrl: fake.baseUrl, secretPath: path }, () => undefined);
+		await mattermostAdminTokenRotate(
+			{ baseUrl: fake.baseUrl, secretPath: path, pool },
+			() => undefined,
+		);
 
 		expect(fake.worksNow("token-a")).toBe(false);
 		expect(fake.worksNow(unrelated)).toBe(true);
@@ -485,7 +548,12 @@ describe("gateway mattermost admin-token set|rotate (ADR-026)", () => {
 		const path = secretPath();
 		await expect(
 			mattermostAdminTokenSet(
-				{ baseUrl: fake.baseUrl, secretPath: path, reader: fakeReader(["admin-token-value"]) },
+				{
+					baseUrl: fake.baseUrl,
+					secretPath: path,
+					reader: fakeReader(["admin-token-value"]),
+					pool,
+				},
 				() => undefined,
 			),
 		).rejects.toThrow(MattermostCommandError);
@@ -520,11 +588,65 @@ describe("gateway mattermost admin-token set|rotate (ADR-026)", () => {
 
 		fake.rigNextTokenOwner(mallory);
 		await expect(
-			mattermostAdminTokenRotate({ baseUrl: fake.baseUrl, secretPath: path }, () => undefined),
+			mattermostAdminTokenRotate(
+				{ baseUrl: fake.baseUrl, secretPath: path, pool },
+				() => undefined,
+			),
 		).rejects.toThrow(MattermostCommandError);
 
 		expect(readFileSync(path, "utf8").trim()).toBe("admin-token-value");
 		expect(fake.worksNow("admin-token-value")).toBe(true);
 		expect(fake.tokenCount(mallory)).toBe(1);
+	});
+
+	it("a concurrent admin-token set/rotate against the same account fails fast rather than racing create-verify-write-revoke (ADR-026)", async () => {
+		fake = startFakeMattermost();
+		const adminId = mmId("admin");
+		fake.addAccount("admin-token-value", {
+			id: adminId,
+			username: "gateway-admin",
+			is_bot: false,
+			roles: "system_user system_admin",
+			delete_at: 0,
+		});
+		const path = secretPath();
+
+		// Stalls the first call right after it must already hold the admin-token lock (`client.me()`
+		// is the very first Mattermost call either command makes, once it holds the lock): a second
+		// run started while it is stalled there deterministically races a lock the first call already
+		// holds, never merely one it might hold by then. Both calls go through `set` (never `rotate`,
+		// which refuses outright before ever touching Mattermost or the lock when no token file
+		// exists yet) so the race is purely over the lock itself.
+		const stall = fake.stallNextMe();
+		const first = mattermostAdminTokenSet(
+			{ baseUrl: fake.baseUrl, secretPath: path, reader: fakeReader(["admin-token-value"]), pool },
+			() => undefined,
+		);
+		await stall.started;
+
+		await expect(
+			mattermostAdminTokenSet(
+				{
+					baseUrl: fake.baseUrl,
+					secretPath: path,
+					reader: fakeReader(["admin-token-value"]),
+					pool,
+				},
+				() => undefined,
+			),
+		).rejects.toThrow(/already running/);
+		// The second run never touched the account at all: still exactly the one token it started
+		// with (the lock refused it before it ever called Mattermost).
+		expect(fake.tokenCount(adminId)).toBe(1);
+
+		stall.release();
+		await first;
+
+		// The first call, uninterrupted by the second, completed its own create-verify-write-revoke
+		// sequence normally.
+		expect(secretFileState(path)).toBe("private");
+		const written = readFileSync(path, "utf8").trim();
+		expect(fake.worksNow(written)).toBe(true);
+		expect(fake.worksNow("admin-token-value")).toBe(false);
 	});
 });

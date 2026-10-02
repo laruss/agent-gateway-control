@@ -193,28 +193,45 @@ constrained in code to exactly the actions provisioning performs, never handed t
   lifecycle-owned: that bot is the provisioner's own to create, token and reconcile, through its
   own checkpoints (`agent_lifecycle_operations`, `gateway agents operations`), never bootstrap's —
   revoking or rewriting a token the provisioner is mid-way through issuing is exactly the conflict
-  this rule avoids. An agent is lifecycle-owned iff its own operation journal names at least one
-  `create` or `restore` operation (never merely `adopt`, which the startup backfill writes for an
-  agent the lifecycle never asked for): the database, not a `token_secret_file` prefix, is this
-  decision's one source of truth, read by `mattermostPlan`'s caller (which has the database access
+  this rule avoids. The same exclusion applies to the retired-cleanup half of the plan too (bots of
+  agents no longer in the active configuration, deactivated and revoked wholesale): a lifecycle-
+  owned agent's own `agents` row can outlive it leaving the active configuration the same way any
+  other agent's does (ADR-024's retained-row case) while `requestAgentRetire`/`requestAgentRestore`
+  are still working through it, so without this a bootstrap or reconcile run racing either would
+  revoke a token the provisioner is mid-way through issuing, or deactivate a bot it just
+  re-enabled — the provisioner's own `retire` operation is the one path trusted to clean that bot up.
+  An agent is lifecycle-owned iff its own operation journal names at least one `create` or
+  `restore` operation (never merely `adopt`, which the startup backfill writes for an agent the
+  lifecycle never asked for): the database, not a `token_secret_file` prefix, is this decision's
+  one source of truth, read by `mattermostPlan`'s caller (which has the database access
   `mattermostPlan` itself, a pure function, does not). A prefix is only ever an artifact of
   ownership and never the other way around: the managed-configuration service refuses a
   `/run/bot-secrets/` path in any committed configuration (a console patch, a CLI import) for an
   agent that is not lifecycle-owned, so YAML or a console edit can never claim the provisioner's
-  own directory for an agent it does not own.
+  own directory for an agent it does not own — nor can it redirect `token_secret_file` to anything
+  else, once the agent is lifecycle-owned: the field is server-generated and immutable outside the
+  provisioner's own writes (`requestAgentCreate`'s first issue, `requestAgentRestore`'s migration to
+  it), refused the same way in both committing paths for any other edit that tries to change it.
 - **The provisioner.** A controller loop, alongside its other periodic work, takes
   `pending`/`running` `create`/`restore`/`reprovision` operations and drives each one through its
   steps — resolve or create the bot by username (refusing to adopt a stranger's account: a regular
   user, a bot with elevated roles, or — for a fresh `create` with no identity of its own recorded
-  yet — a plain bot at that username neither this agent's own `mattermost_identities` row nor this
-  Gateway's own admin account (`owner_id`) can account for, so an unrelated integration's bot
-  sharing the same username is never silently taken over and its tokens revoked), issue it an
-  access token, add it to the team and its configured channels, record its resolved account the
-  way bootstrap already does — persisting a checkpoint in `agent_lifecycle_operations.checkpoints`
-  right after each external step and never holding a database transaction across a Mattermost call.
-  A controller restart resumes every `running` operation from its last checkpoint; a step already
-  checkpointed is not repeated. With no admin token configured, the loop stays idle and every such
-  operation simply stays `pending`, surfaced by `gateway doctor` rather than treated as a failure.
+  yet — a plain bot at that username neither this agent's own `mattermost_identities` row nor any
+  admin account this Gateway has ever provisioned under (`owner_id`, current or past — the same
+  rotation-tolerant history retirement's own recovery already trusts, below) can account for, so an
+  unrelated integration's bot sharing the same username is never silently taken over and its tokens
+  revoked, and a resumed `create` never fails permanently merely because an operator rotated the
+  provisioning admin account in the meantime), issue it an access token, add it to the team and its
+  configured channels, record its resolved account the way bootstrap already does — persisting a
+  checkpoint in `agent_lifecycle_operations.checkpoints` right after each external step and never
+  holding a database transaction across a Mattermost call. Every pass runs holding a session-level
+  Postgres advisory lock of its own, taken for the whole pass and skipped (never waited for) when
+  already held: two overlapping controllers — one still draining its own pass during an upgrade,
+  say — must never drive the same operation's steps at once, one revoking the fresh token the
+  other just issued. A controller restart resumes every `running` operation from its last
+  checkpoint; a step already checkpointed is not repeated. With no admin token configured, the loop
+  stays idle and every such operation simply stays `pending`, surfaced by `gateway doctor` rather
+  than treated as a failure.
   Recording the resolved account (`mattermost_identities`, bootstrap's own counterpart) is checked
   and replayed every pass, not only the one that first resolves the bot: a crash between
   persisting the `bot_user_id` checkpoint and that write completing must never let the operation
@@ -300,7 +317,11 @@ constrained in code to exactly the actions provisioning performs, never handed t
   must never touch. A crash between any two of those steps leaves a token that still works, never a
   provisioning path with no working credential at all, and a re-run after such a crash simply
   revokes whatever the interrupted attempt left stranded, since nothing but the file itself says
-  which token is current. The account's tokens are listed a page at a time until a page comes back
+  which token is current. `admin-token set`/`rotate`'s own create-verify-switch(-revoke) sequence
+  runs holding a session-level Postgres advisory lock of its own, failing fast rather than waiting
+  when another run against the same account already holds it: unserialized, two overlapping runs
+  could each revoke the token the other just minted before ever writing it, leaving the file holding
+  one already revoked. The account's tokens are listed a page at a time until a page comes back
   short, so an account with more of them than one page holds is still seen in full; revoking is
   itself listed and repeated, bounded, until none of its own remain but the newly written token. A
   rotation that ends up revoking none of them prints a warning rather than reporting success
@@ -379,7 +400,13 @@ The Mattermost-side half is the provisioner's: a `retire` operation is now one m
 and the bot account deactivated *first* (together, that ends all its access on their own), *then*
 every channel it is currently a member of left (cosmetic from that point on — a crash partway
 through leaves no working access behind, only channels still physically listing a deactivated,
-token-less bot until the next pass finishes the list), and finally, only for a lifecycle-created
+token-less bot until the next pass finishes the list) — `channels_left` itself trimmed to its own
+schema bound (64 ids, the most recently left kept) whenever a pass's own live membership exceeds
+it, since a retiring bot's live channels, unlike a configured agent's `allowed_channels`, are never
+bounded by anything this release controls (ADR-022 grants, channels added by hand): trimming the
+stored checkpoint never undoes a removal already made, or repeats one Mattermost itself no longer
+lists the bot a member of, so it costs at most a little redundant work on a later pass, never a
+channel left behind — and finally, only for a lifecycle-created
 agent, its own `/run/bot-secrets/` token file removed (a bootstrap-managed agent's
 `/run/secrets/` file is never touched — the CLI owns it; this only revokes the token server-side
 and leaves the file for `gateway doctor` to report as stale). An agent retired before its

@@ -24,6 +24,7 @@ export * from "./services/console-sessions.ts";
 export * from "./services/deps.ts";
 export * from "./services/gmail.ts";
 export * from "./services/ingest.ts";
+export * from "./services/lifecycle-guards.ts";
 export * from "./services/management.ts";
 export * from "./services/mattermost-bridge.ts";
 export { decideMemory, listMemory, MEMORY_REVIEW_STATUSES } from "./services/memory.ts";

@@ -92,4 +92,20 @@ describe("mattermostPlan", () => {
 		const plan = mattermostPlan(organization(), [stray], (ref) => `/secrets/${ref}`, [], new Set());
 		expect(plan.bots.map((bot) => bot.username)).toContain("stray");
 	});
+
+	it("excludes a lifecycle-owned agent from the retired-cleanup plan too, even though its stale 'agents' row still names it", () => {
+		const plan = mattermostPlan(
+			organization(),
+			[],
+			(ref) => `/secrets/${ref}`,
+			[
+				{ agentId: "restoring", username: "restoring", userId: "user0000000000000000000001" },
+				{ agentId: "gone", username: "gone", userId: "user0000000000000000000002" },
+			],
+			new Set(["restoring"]),
+		);
+		const retiredUsernames = plan.retiredBots.map((bot) => bot.username);
+		expect(retiredUsernames).not.toContain("restoring");
+		expect(retiredUsernames).toContain("gone");
+	});
 });

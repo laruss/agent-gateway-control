@@ -243,7 +243,7 @@ describe("gateway doctor: 'mattermost_provisioning' sees the admin token the sam
 		expect(check?.detail).toContain("1 agent(s)");
 	});
 
-	it("reports a retirement whose bot's ownership could not be confirmed either way (owner_unverified, ADR-026)", async () => {
+	it("surfaces a retirement whose bot's username belonged to an account this Gateway never created, without failing doctor (owner_unverified, ADR-026)", async () => {
 		await requestAgentCreate(deps, {
 			agent: {
 				id: "unverified-agent",
@@ -268,8 +268,9 @@ describe("gateway doctor: 'mattermost_provisioning' sees the admin token the sam
 		await completeOperation(deps, createOperationId, "test");
 
 		// Simulates the provisioner's own retire recovery finding a plain bot at this agent's own
-		// username that matches no provisioning admin account on record at all (`owner_unverified`):
-		// cleanup is skipped (never adopted on a guess), but flagged here for an operator's own look.
+		// username that matches no provisioning admin account on record at all (`owner_unverified`): a
+		// legitimate outcome (the username belongs to a stranger's bot) — cleanup is skipped (never
+		// adopted on a guess), but still surfaced here for an operator's own look.
 		const retired = await requestAgentRetire(deps, {
 			agentId: "unverified-agent",
 			actor: "test",
@@ -282,7 +283,9 @@ describe("gateway doctor: 'mattermost_provisioning' sees the admin token the sam
 		process.env.MATTERMOST_ADMIN_TOKEN_FILE = join(tokenDir, "mattermost_admin_token");
 		const checks = await runDoctor(session);
 		const check = checks.find((c) => c.name === "lifecycle_retire_ownership");
-		expect(check).toMatchObject({ ok: false });
+		// A legitimate, confirmed outcome (the username belongs to an account this Gateway never
+		// created), never a reason to fail doctor — only worth a look, still printed in the detail.
+		expect(check).toMatchObject({ ok: true });
 		expect(check?.detail).toContain("1 retired agent(s)");
 	});
 });

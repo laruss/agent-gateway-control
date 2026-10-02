@@ -613,6 +613,60 @@ describe("agent lifecycle provisioner (ADR-026)", () => {
 		expect(auditRows).toBe(1);
 	});
 
+	it("two overlapping passes: the second skips its own tick instead of interleaving with the first (ADR-026 cross-process lock)", async () => {
+		const admin = new FakeAdminClient(CHANNEL_IDS);
+		const created = await requestAgentCreate(deps, createInput("analyst", ["hq"]));
+		const { logger: logger1 } = recordingLogger();
+		const { logger: logger2, calls: calls2 } = recordingLogger();
+
+		// Gates the first pass right after it must already hold the advisory lock (`me()` is the
+		// very first thing a locked pass does): `meStarted` only resolves once that point is
+		// reached, so waiting on it (rather than a fixed delay) makes the second pass's own lock
+		// attempt deterministically race against a lock the first pass already holds, never one it
+		// merely might hold by then.
+		let meStarted: () => void = () => undefined;
+		const meWasCalled = new Promise<void>((resolve) => {
+			meStarted = resolve;
+		});
+		let releaseGate: () => void = () => undefined;
+		const gate = new Promise<void>((resolve) => {
+			releaseGate = resolve;
+		});
+		const realMe = admin.me.bind(admin);
+		admin.me = async () => {
+			meStarted();
+			await gate;
+			return realMe();
+		};
+
+		const first = pass(admin, logger1);
+		await meWasCalled;
+
+		await pass(admin, logger2);
+		expect(calls2.some((call) => call.message.includes("another pass is already running"))).toBe(
+			true,
+		);
+		// Nothing of the second pass's own ran: the first pass has not even claimed the operation yet
+		// (gated at `me()`, before it ever lists or claims one), and the second never got the chance
+		// to either.
+		const [stillPending] = (
+			await pool.query("select state from agent_lifecycle_operations where id = $1", [
+				created.operationId,
+			])
+		).rows;
+		expect(stillPending.state).toBe("pending");
+
+		releaseGate();
+		await first;
+
+		const [finished] = (
+			await pool.query("select state from agent_lifecycle_operations where id = $1", [
+				created.operationId,
+			])
+		).rows;
+		expect(finished.state).toBe("succeeded");
+	});
+
 	it("provisions a new agent end to end: bot, token, team and channel membership, then ready", async () => {
 		const admin = new FakeAdminClient(CHANNEL_IDS);
 		const created = await requestAgentCreate(deps, createInput("analyst", ["hq", "research"]));
@@ -1238,6 +1292,39 @@ describe("agent lifecycle provisioner (ADR-026)", () => {
 		expect(operation.checkpoints.bot_user_id).toBe(bot.user_id);
 	});
 
+	it("still adopts a bot created by an earlier, now-rotated-away provisioning admin account for a fresh create (resumed with no recorded identity yet)", async () => {
+		const admin = new FakeAdminClient(CHANNEL_IDS);
+		const OLD_ADMIN_ID = fixedId("oldadmin");
+		// Simulates a tick from before the admin account was rotated (`gateway mattermost
+		// admin-token set` pointed at a different account): this Gateway's own
+		// `#provisioning-admin` directory entry named a different account back then.
+		await setDirectoryEntry(deps, "user", "#provisioning-admin", OLD_ADMIN_ID, "test");
+
+		const created = await requestAgentCreate(deps, createInput("analyst", ["hq"]));
+		// The create never got far enough to resolve a bot of its own (no checkpoint, no identity) —
+		// but a bot already exists at its configured username, created by this very Gateway back
+		// when `OLD_ADMIN_ID` was its provisioning admin.
+		const bot = admin.seedUser("analyst", { is_bot: true }, OLD_ADMIN_ID);
+		const { logger } = recordingLogger();
+
+		// This same pass resolves (and records) the current admin account (`admin.adminId`), rotated
+		// away from `OLD_ADMIN_ID` — the directory/audit now holds both, and this bot's `owner_id`
+		// matches the older one, so the create must adopt it rather than fail "taken".
+		await pass(admin, logger);
+
+		const [operation] = (
+			await pool.query("select state, checkpoints from agent_lifecycle_operations where id = $1", [
+				created.operationId,
+			])
+		).rows;
+		expect(operation.state).toBe("succeeded");
+		expect(operation.checkpoints.bot_user_id).toBe(bot.id);
+		const [lifecycle] = (
+			await pool.query("select status from agent_lifecycle where agent_id = 'analyst'")
+		).rows;
+		expect(lifecycle.status).toBe("ready");
+	});
+
 	it("fails permanently when the bot's username is taken by a non-Gateway account", async () => {
 		const admin = new FakeAdminClient(CHANNEL_IDS);
 		admin.seedUser("analyst", { is_bot: false });
@@ -1622,6 +1709,55 @@ describe("agent lifecycle provisioner (ADR-026)", () => {
 			expect(admin.channelMembers.get(CHANNEL_IDS.hq)?.has(botUserId)).toBe(false);
 			expect(admin.channelMembers.get(CHANNEL_IDS.research)?.has(botUserId)).toBe(false);
 			expect(secretFileExists(tokenPath)).toBe(false);
+		});
+
+		it("retires a bot that is a live member of more than 64 channels (unbounded grants/manual adds) without ever storing a checkpoint past its own contract bound", async () => {
+			const admin = new FakeAdminClient(CHANNEL_IDS);
+			await requestAgentCreate(deps, createInput("analyst", ["hq"]));
+			const { logger } = recordingLogger();
+			await pass(admin, logger);
+
+			const [{ mattermost_user_id: botUserId }] = (
+				await pool.query(
+					"select mattermost_user_id from mattermost_identities where agent_id = 'analyst'",
+				)
+			).rows;
+			// Simulates a bot whose live Mattermost membership has grown past its own 64-channel
+			// checkpoint bound — ADR-022 grants and channels added by hand are never pruned by this
+			// release, so this is unbounded in practice, unlike `allowed_channels` itself (at most 32).
+			const extraChannels = manyChannels("extra", 70);
+			for (const channelId of Object.values(extraChannels)) {
+				await admin.addChannelMember(channelId, botUserId);
+			}
+
+			const retired = await requestAgentRetire(deps, {
+				agentId: "analyst",
+				actor: "test",
+				source: "cli",
+			});
+			await pass(admin, logger);
+
+			const [lifecycle] = (
+				await pool.query("select status from agent_lifecycle where agent_id = 'analyst'")
+			).rows;
+			expect(lifecycle.status).toBe("retired");
+			const [operation] = (
+				await pool.query(
+					"select state, checkpoints from agent_lifecycle_operations where id = $1",
+					[retired.operationId],
+				)
+			).rows;
+			expect(operation.state).toBe("succeeded");
+			expect(operation.checkpoints.channels_left.length).toBeLessThanOrEqual(64);
+			expect(AgentLifecycleCheckpointsSchema.safeParse(operation.checkpoints).success).toBe(true);
+			// Every live channel was actually left, the clamp trimming only the stored checkpoint's own
+			// memory of it, never the actual cleanup: sampled across the ones most likely to have been
+			// trimmed from a bounded, tail-kept list (`hq`, the very first channel processed) and ones
+			// certainly still in it (the last few added).
+			expect(admin.channelMembers.get(CHANNEL_IDS.hq)?.has(botUserId)).toBe(false);
+			for (const channelId of Object.values(extraChannels)) {
+				expect(admin.channelMembers.get(channelId)?.has(botUserId)).toBe(false);
+			}
 		});
 
 		it("recovers the bot id from a superseded create operation's own checkpoint when the identity was never recorded, instead of skipping cleanup", async () => {

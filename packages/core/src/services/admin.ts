@@ -50,6 +50,11 @@ import { grantedChannels } from "../channel-access.ts";
 import { nextAgentState, requireTransition } from "../state-machine.ts";
 import { revokeQueuedActions, sweepApprovals, withdrawOpenApprovals } from "./approvals.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
+import {
+	rejectLifecycleOwnedRemovals,
+	rejectLifecycleOwnedTokenPathChanges,
+	rejectRetiredAgentReadditions,
+} from "./lifecycle-guards.ts";
 import { type RuntimeHealth, runtimeHealth } from "./runtime-health.ts";
 import { type ScheduleResult, scheduleAgent } from "./scheduler.ts";
 import {
@@ -799,13 +804,18 @@ export async function writeConfigRevisionIn(
 }
 
 // ---------------------------------------------------------------------------
-// Shared with the managed-configuration service (`management.ts`'s own `commitChangeIn`): kept as
-// a second copy here, rather than imported, so neither module depends on the other (Biome refuses
-// an import cycle between them; `management.ts` already imports `writeConfigRevisionIn` from this
-// one). Every committing path — `applyConfig`'s whole-bundle replace and `commitChangeIn`'s
-// finer-grained operations — runs the same two checks before it writes: a lifecycle-owned-only
-// `/run/bot-secrets/` token path, and a `reprovision` queued for any lifecycle-owned, `ready`
-// agent whose `allowed_channels` just changed (ADR-026).
+// Shared with the managed-configuration service (`management.ts`'s own `commitChangeIn`). Every
+// committing path — `applyConfig`'s whole-bundle replace and `commitChangeIn`'s finer-grained
+// operations — runs the same checks before it writes: a lifecycle-owned-only `/run/bot-secrets/`
+// token path, a lifecycle-owned agent never dropped or re-added outside its own request, its
+// `token_secret_file` never redirected outside its own request, and a `reprovision` queued for any
+// lifecycle-owned, `ready` agent whose `allowed_channels` just changed (ADR-026).
+// `rejectLifecycleOwnedRemovals`, `rejectRetiredAgentReadditions` and
+// `rejectLifecycleOwnedTokenPathChanges` live in `./lifecycle-guards.ts`, a module neither this one
+// nor `management.ts` owns, so each can import it without the other — `rejectUnownedBotSecretPathsIn`
+// and the rest below stay a second copy here instead, for the same reason: Biome refuses the import
+// cycle a shared definition in either file would need (`management.ts` already imports
+// `writeConfigRevisionIn` from this one).
 // ---------------------------------------------------------------------------
 
 /**
@@ -864,72 +874,6 @@ function channelsChangedAgentIdsIn(
 		})
 		.map((agent) => agent.id)
 		.sort();
-}
-
-/** Refuses a commit that drops a lifecycle-owned agent out of the active configuration any way
- * but `requestAgentRetire`'s own `remove_agent` — see `management.ts`'s own
- * `rejectLifecycleOwnedRemovals` for the full rationale; kept as a second copy here for the same
- * reason as `rejectUnownedBotSecretPathsIn` above. */
-async function rejectLifecycleOwnedRemovalsIn(
-	db: Db,
-	before: Readonly<AgentConfig[]>,
-	after: Readonly<AgentConfig[]>,
-	trustedAgentIds: ReadonlySet<AgentId>,
-): Promise<Readonly<string[]>> {
-	const afterIds = new Set(after.map((agent) => agent.id));
-	const removedIds = before
-		.map((agent) => agent.id)
-		.filter((id) => !afterIds.has(id) && !trustedAgentIds.has(id));
-	if (removedIds.length === 0) {
-		return [];
-	}
-	const owned = await lifecycleOwnedAgentIds(db, removedIds);
-	if (owned.size === 0) {
-		return [];
-	}
-	const rows = await db
-		.select({ agentId: agentLifecycle.agentId, status: agentLifecycle.status })
-		.from(agentLifecycle)
-		.where(inArray(agentLifecycle.agentId, [...owned]));
-	return rows
-		.filter((row) => row.status !== "retiring" && row.status !== "retired")
-		.map(
-			(row) =>
-				`agent ${row.agentId} is lifecycle-owned and still '${row.status}'; removing it from the ` +
-				"configuration this way would leave its Mattermost identity active — use " +
-				`'gateway agents retire ${row.agentId}' instead`,
-		);
-}
-
-/** Refuses a commit that adds (or re-adds) an agent id whose lifecycle is `retiring`/`retired` —
- * see `management.ts`'s own `rejectRetiredAgentReadditions` for the full rationale; kept as a
- * second copy here for the same reason as `rejectUnownedBotSecretPathsIn` above. `config apply`
- * never has a trusted id of its own, so it always calls this with an empty set. */
-async function rejectRetiredAgentReadditionsIn(
-	db: Db,
-	before: Readonly<AgentConfig[]>,
-	after: Readonly<AgentConfig[]>,
-	trustedAgentIds: ReadonlySet<AgentId>,
-): Promise<Readonly<string[]>> {
-	const beforeIds = new Set(before.map((agent) => agent.id));
-	const addedIds = after
-		.map((agent) => agent.id)
-		.filter((id) => !beforeIds.has(id) && !trustedAgentIds.has(id));
-	if (addedIds.length === 0) {
-		return [];
-	}
-	const rows = await db
-		.select({ agentId: agentLifecycle.agentId, status: agentLifecycle.status })
-		.from(agentLifecycle)
-		.where(inArray(agentLifecycle.agentId, addedIds));
-	return rows
-		.filter((row) => row.status === "retiring" || row.status === "retired")
-		.map(
-			(row) =>
-				`agent ${row.agentId} is lifecycle-owned and '${row.status}'; adding it to the ` +
-				"configuration this way would leave it enabled but never provisioned — use " +
-				`'gateway agents restore ${row.agentId}' instead`,
-		);
 }
 
 /**
@@ -1119,7 +1063,7 @@ export async function applyConfig(
 		// for real right after). Scoped to the currently *active* version, never every row the table
 		// still holds: `agents` retains a removed (or retired) agent's own last configuration rather
 		// than deleting its row (ADR-024), so an unscoped read would make a retired agent look
-		// already "there" to `rejectRetiredAgentReadditionsIn`'s own before/after diff below, even
+		// already "there" to `rejectRetiredAgentReadditions`'s own before/after diff below, even
 		// though it is not part of the active configuration at all — exactly the reintroduction that
 		// check exists to refuse.
 		const priorAgents =
@@ -1131,9 +1075,9 @@ export async function applyConfig(
 							.from(agents)
 							.where(eq(agents.configVersion, controls.version))
 					).map((row) => row.config);
-		// `config apply` never has a trusted removal id of its own (see `rejectLifecycleOwnedRemovalsIn`):
+		// `config apply` never has a trusted removal id of its own (see `rejectLifecycleOwnedRemovals`):
 		// an agent's retirement always runs through `requestAgentRetire`, never a whole-bundle replace.
-		const removalProblems = await rejectLifecycleOwnedRemovalsIn(
+		const removalProblems = await rejectLifecycleOwnedRemovals(
 			db,
 			priorAgents,
 			input.agents,
@@ -1145,7 +1089,7 @@ export async function applyConfig(
 		// Every committing path behaves the same way (ADR-026): a plain `config apply` is refused a
 		// retired agent reintroduced this way too, exactly like `commitChangeIn` already refuses it
 		// for a console patch, a CLI import or a rollback.
-		const readditionProblems = await rejectRetiredAgentReadditionsIn(
+		const readditionProblems = await rejectRetiredAgentReadditions(
 			db,
 			priorAgents,
 			input.agents,
@@ -1153,6 +1097,18 @@ export async function applyConfig(
 		);
 		if (readditionProblems.length > 0) {
 			throw new AdminError(`configuration is invalid:\n- ${readditionProblems.join("\n- ")}`);
+		}
+		// Every committing path behaves the same way (ADR-026): a plain `config apply` is refused a
+		// redirected `token_secret_file` for a lifecycle-owned agent too, exactly like
+		// `commitChangeIn` already refuses it for a console patch or a CLI import.
+		const tokenPathProblems = await rejectLifecycleOwnedTokenPathChanges(
+			db,
+			priorAgents,
+			input.agents,
+			new Set(),
+		);
+		if (tokenPathProblems.length > 0) {
+			throw new AdminError(`configuration is invalid:\n- ${tokenPathProblems.join("\n- ")}`);
 		}
 		const priorOrganization = await loadOrganizationIn(db, parentRevisionId);
 		const channelsChangedIds = organizationTeamChangedIn(priorOrganization, input.organization)

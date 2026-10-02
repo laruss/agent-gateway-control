@@ -227,6 +227,48 @@ All notable changes are documented here. The project follows Semantic Versioning
 - `gateway mattermost admin-token set`/`rotate` left a freshly minted token on the account,
   unrevoked and unused, when it failed to verify against the same account it was just created for
   (the one case nothing was supposed to have changed). Both now revoke it before raising the error.
+- The lifecycle provisioner's pass was serialized only within one controller process: two
+  overlapping controllers (a rolling upgrade, say) could each process the same operation at once,
+  one revoking the fresh token the other had just issued and leaving the agent `ready` with a
+  revoked token file. Every pass now runs holding a Postgres session-level advisory lock for its
+  whole duration; a pass that cannot claim it skips that tick entirely, left for whichever
+  controller already holds it.
+- `gateway mattermost admin-token set`/`rotate` run concurrently against the same account could
+  each revoke the other's freshly minted token before it was ever written, leaving the file holding
+  one already revoked. Both commands now hold a database advisory lock for their own
+  create-verify-write-revoke sequence and fail fast, with a clear message, when another run already
+  holds it.
+- Bootstrap's and reconcile's retired-cleanup plan still named a lifecycle-owned agent whose own
+  `agents` row had not yet aged out (a `retire` or `restore` still working through it), so a
+  bootstrap or reconcile run racing either could revoke a token the provisioner was mid-way through
+  issuing, or deactivate a bot it had just re-enabled. The plan now excludes a lifecycle-owned agent
+  from retired cleanup the same way it already excludes one from the active bot list — the
+  provisioner owns its Mattermost-side cleanup either way.
+- A managed commit or `config apply` could redirect a lifecycle-owned agent's
+  `mattermost.token_secret_file` to a different path, leaving Mattermost delivery reading a file
+  the provisioner never wrote a token to. The field is server-generated and immutable for a
+  lifecycle-owned agent in both committing paths now, the same way `/run/bot-secrets/` itself is
+  already refused for one the lifecycle does not own; `requestAgentRestore`'s own migration of it
+  to the provisioner's path remains the one trusted exception.
+- A fresh `create`'s own bot resolution (`ensureBot`) checked a candidate bot's `owner_id` against
+  only the *current* provisioning admin account, so a resumed create whose bot had been created
+  under an admin account an operator had since rotated away from failed permanently with "username
+  taken" — even though the bot was this Gateway's own. It now checks every admin account this
+  Gateway has ever recorded for itself, the same rotation-tolerant history retirement's own
+  recovery already trusted.
+- A retiring agent's own `channels_left` checkpoint could grow past its own contract bound: a
+  bot's live channel memberships (ADR-022 grants, channels added by hand) are never bounded the way
+  a configured agent's `allowed_channels` is, so retiring one that belonged to more than 64 live
+  channels wrote an array the console's lifecycle page and `gateway agents operations` could no
+  longer parse back. Every checkpoint write now trims `channels_joined`/`channels_left` to their
+  own schema bound before it is ever stored, keeping the most recently added ids; no cleanup is
+  ever skipped by this, since what still needs joining or leaving is always decided from a live
+  Mattermost check, never from this array.
+- `gateway doctor`'s `lifecycle_retire_ownership` check failed doctor outright for a legitimate,
+  confirmed outcome (a retiring agent's configured username belonged to an account this Gateway
+  never created, so its Mattermost-side cleanup was rightly skipped) and its detail text described
+  that outcome as unresolved ("could not be confirmed either way") when it is in fact a definite
+  one. It is now a warning that never fails doctor, with detail text naming the outcome correctly.
 
 ## [0.5.0] - 2026-10-02
 

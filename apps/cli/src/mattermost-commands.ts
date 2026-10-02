@@ -27,6 +27,7 @@ import {
 	secretFileState,
 	writeSecretFile,
 } from "@agent-gateway/service";
+import type pg from "pg";
 import type { HiddenLineReader } from "./console-commands.ts";
 
 export class MattermostCommandError extends Error {
@@ -184,11 +185,53 @@ export async function mattermostReconcile(
  * carries: not a secret, just a marker distinct from a bot's own tokens (`TOKEN_DESCRIPTION`). */
 const ADMIN_TOKEN_DESCRIPTION = "agent-gateway-admin";
 
+/** Advisory lock key serializing `admin-token set`/`rotate`'s own create-verify-write-revoke
+ * sequence (ADR-026): run concurrently against the same account — two operators, or a stray
+ * second process — either could revoke the other's freshly minted token before it is ever
+ * written, leaving the file holding one already revoked. One key for both commands, since either
+ * can revoke the other's own in-flight token. */
+const ADMIN_TOKEN_LOCK = "agent-gateway:admin-token";
+
+/**
+ * Runs `work` holding the admin-token lock (a session-level advisory lock on its own connection),
+ * so a concurrent `admin-token set`/`rotate` never interleaves its own create-verify-write-revoke
+ * steps with this one. Fails fast, rather than waiting, when another run already holds it.
+ */
+async function withAdminTokenLock<T>(pool: pg.Pool, work: () => Promise<T>): Promise<T> {
+	const client = await pool.connect();
+	// A client whose unlock failed may still hold the lock: it is closed, not pooled (the same
+	// margin `withBootstrapLock`/`runRetentionIfDue` leave).
+	let unlocked = true;
+	try {
+		const locked = await client.query<{ locked: boolean }>(
+			"select pg_try_advisory_lock(hashtextextended($1, 0)) as locked",
+			[ADMIN_TOKEN_LOCK],
+		);
+		if (locked.rows[0]?.locked !== true) {
+			throw new MattermostCommandError(
+				"another 'admin-token set' or 'rotate' is already running against this account; wait for it to finish",
+			);
+		}
+		try {
+			return await work();
+		} finally {
+			unlocked = false;
+			await client.query("select pg_advisory_unlock(hashtextextended($1, 0))", [ADMIN_TOKEN_LOCK]);
+			unlocked = true;
+		}
+	} finally {
+		client.release(!unlocked);
+	}
+}
+
 export type MattermostAdminTokenSetOptions = Readonly<{
 	baseUrl: string;
 	/** The controller secret file, already resolved against the secrets directory in effect. */
 	secretPath: string;
 	reader: HiddenLineReader;
+	/** Where the admin-token lock is taken (ADR-026): never the controller's own `ControlPlaneDeps`,
+	 * which this CLI-only command has no other reason to build. */
+	pool: pg.Pool;
 }>;
 
 /**
@@ -229,53 +272,57 @@ export async function mattermostAdminTokenSet(
 	if (pasted.length === 0) {
 		throw new MattermostCommandError("the token must not be empty");
 	}
-	const client = new MattermostClient({ baseUrl: options.baseUrl, token: pasted });
-	const me = await client.me();
-	if (me.is_bot) {
-		throw new MattermostCommandError(
-			`'${me.username}' is a bot account; Mattermost bots cannot create other bots, so the ` +
-				"admin token must belong to a dedicated, non-bot human-managed account",
-		);
-	}
-	if (!me.roles.split(/\s+/).includes("system_admin")) {
-		throw new MattermostCommandError(`'${me.username}' does not have the 'system_admin' role`);
-	}
-	const existingBefore = await client.userAccessTokenIds(me.id);
-	const created = await client.createUserAccessToken(me.id, ADMIN_TOKEN_DESCRIPTION);
-	// Every call from here on authenticates with the newly minted token, never the pasted one about
-	// to be revoked: see `mattermostAdminTokenRotate`'s own identical reasoning.
-	const next = new MattermostClient({ baseUrl: options.baseUrl, token: created.token });
-	const verified = await next.me();
-	if (verified.id !== me.id) {
-		// Revoked before throwing: a token minted but never written to the file must never be left
-		// stranded, working, on the account — the same margin every other step here leaves none of
-		// its own credentials unaccounted for.
-		await next.revokeUserAccessToken(created.id);
-		throw new MattermostCommandError(
-			"the newly minted token did not verify against the same account; nothing was changed",
-		);
-	}
-	writeSecretFile(options.secretPath, created.token);
-	if (existingBefore.length === 1) {
-		const [pastedTokenId] = existingBefore;
-		if (pastedTokenId !== undefined) {
-			await next.revokeUserAccessToken(pastedTokenId);
+	await withAdminTokenLock(options.pool, async () => {
+		const client = new MattermostClient({ baseUrl: options.baseUrl, token: pasted });
+		const me = await client.me();
+		if (me.is_bot) {
+			throw new MattermostCommandError(
+				`'${me.username}' is a bot account; Mattermost bots cannot create other bots, so the ` +
+					"admin token must belong to a dedicated, non-bot human-managed account",
+			);
 		}
-		print(`admin token set for account '${me.username}'; the token you entered was revoked`);
-	} else if (existingBefore.length === 0) {
-		print(`admin token set for account '${me.username}'`);
-	} else {
-		print(
-			`admin token set for account '${me.username}'; warning: it already held ` +
-				`${existingBefore.length} token(s) before this one — the token you entered was left in ` +
-				"place; revoke it by hand in Mattermost once you have confirmed the new one works",
-		);
-	}
+		if (!me.roles.split(/\s+/).includes("system_admin")) {
+			throw new MattermostCommandError(`'${me.username}' does not have the 'system_admin' role`);
+		}
+		const existingBefore = await client.userAccessTokenIds(me.id);
+		const created = await client.createUserAccessToken(me.id, ADMIN_TOKEN_DESCRIPTION);
+		// Every call from here on authenticates with the newly minted token, never the pasted one
+		// about to be revoked: see `mattermostAdminTokenRotate`'s own identical reasoning.
+		const next = new MattermostClient({ baseUrl: options.baseUrl, token: created.token });
+		const verified = await next.me();
+		if (verified.id !== me.id) {
+			// Revoked before throwing: a token minted but never written to the file must never be
+			// left stranded, working, on the account — the same margin every other step here leaves
+			// none of its own credentials unaccounted for.
+			await next.revokeUserAccessToken(created.id);
+			throw new MattermostCommandError(
+				"the newly minted token did not verify against the same account; nothing was changed",
+			);
+		}
+		writeSecretFile(options.secretPath, created.token);
+		if (existingBefore.length === 1) {
+			const [pastedTokenId] = existingBefore;
+			if (pastedTokenId !== undefined) {
+				await next.revokeUserAccessToken(pastedTokenId);
+			}
+			print(`admin token set for account '${me.username}'; the token you entered was revoked`);
+		} else if (existingBefore.length === 0) {
+			print(`admin token set for account '${me.username}'`);
+		} else {
+			print(
+				`admin token set for account '${me.username}'; warning: it already held ` +
+					`${existingBefore.length} token(s) before this one — the token you entered was left ` +
+					"in place; revoke it by hand in Mattermost once you have confirmed the new one works",
+			);
+		}
+	});
 }
 
 export type MattermostAdminTokenRotateOptions = Readonly<{
 	baseUrl: string;
 	secretPath: string;
+	/** Where the admin-token lock is taken (ADR-026); see `MattermostAdminTokenSetOptions`. */
+	pool: pg.Pool;
 }>;
 
 /**
@@ -301,52 +348,57 @@ export async function mattermostAdminTokenRotate(
 		);
 	}
 	const current = readSecretFile(options.secretPath);
-	const client = new MattermostClient({ baseUrl: options.baseUrl, token: current });
-	const me = await client.me();
-	const created = await client.createUserAccessToken(me.id, ADMIN_TOKEN_DESCRIPTION);
-	// Every call from here on authenticates with the new token, never the one about to be
-	// revoked: revoking the old token (and any other stray one) must never invalidate the
-	// credential still doing the revoking.
-	const next = new MattermostClient({ baseUrl: options.baseUrl, token: created.token });
-	const verified = await next.me();
-	if (verified.id !== me.id) {
-		// Revoked before throwing: see `mattermostAdminTokenSet`'s own identical guard.
-		await next.revokeUserAccessToken(created.id);
-		throw new MattermostCommandError(
-			"the newly created token did not verify against the same account; nothing was changed",
-		);
-	}
-	writeSecretFile(options.secretPath, created.token);
-	// `userAccessTokens` already pages through every token the account has; listed and revoked
-	// again, bounded, until none of its own (`ADMIN_TOKEN_DESCRIPTION`) remain but the one just
-	// written — the same margin `revokeAllTokens` (bootstrap's own retirement cleanup) leaves for a
-	// token appearing mid-revoke. Only a token carrying this description is ever touched: the
-	// account may hold others of its own, unrelated to the Gateway, which must never be revoked by
-	// a rotation that merely meant to replace its own.
-	let revoked = 0;
-	for (let round = 0; round < 1000; round += 1) {
-		const remaining = (await next.userAccessTokens(me.id)).filter(
-			(token) => token.id !== created.id && token.description === ADMIN_TOKEN_DESCRIPTION,
-		);
-		if (remaining.length === 0) {
-			// 0 revoked is expected on a routine rotate that crashed right after writing its own new
-			// token (nothing of this description was left stranded) — but it is also exactly what a
-			// stale, never-tagged token left in the file would produce every time, forever: called out
-			// plainly rather than folded into the same line as a normal rotate, so a token that should
-			// have been revoked but structurally could not be (`admin-token set`'s own "more than one
-			// token already" case, say) is never silently mistaken for "nothing needed doing".
-			print(
-				revoked === 0
-					? `admin token rotated for account '${me.username}'; warning: revoked 0 old token(s) — ` +
-							"if a previous token is still meant to be retired, revoke it by hand in Mattermost"
-					: `admin token rotated for account '${me.username}'; revoked ${revoked} old token(s)`,
+	await withAdminTokenLock(options.pool, async () => {
+		const client = new MattermostClient({ baseUrl: options.baseUrl, token: current });
+		const me = await client.me();
+		const created = await client.createUserAccessToken(me.id, ADMIN_TOKEN_DESCRIPTION);
+		// Every call from here on authenticates with the new token, never the one about to be
+		// revoked: revoking the old token (and any other stray one) must never invalidate the
+		// credential still doing the revoking.
+		const next = new MattermostClient({ baseUrl: options.baseUrl, token: created.token });
+		const verified = await next.me();
+		if (verified.id !== me.id) {
+			// Revoked before throwing: see `mattermostAdminTokenSet`'s own identical guard.
+			await next.revokeUserAccessToken(created.id);
+			throw new MattermostCommandError(
+				"the newly created token did not verify against the same account; nothing was changed",
 			);
-			return;
 		}
-		for (const token of remaining) {
-			await next.revokeUserAccessToken(token.id);
-			revoked += 1;
+		writeSecretFile(options.secretPath, created.token);
+		// `userAccessTokens` already pages through every token the account has; listed and revoked
+		// again, bounded, until none of its own (`ADMIN_TOKEN_DESCRIPTION`) remain but the one just
+		// written — the same margin `revokeAllTokens` (bootstrap's own retirement cleanup) leaves for
+		// a token appearing mid-revoke. Only a token carrying this description is ever touched: the
+		// account may hold others of its own, unrelated to the Gateway, which must never be revoked
+		// by a rotation that merely meant to replace its own.
+		let revoked = 0;
+		for (let round = 0; round < 1000; round += 1) {
+			const remaining = (await next.userAccessTokens(me.id)).filter(
+				(token) => token.id !== created.id && token.description === ADMIN_TOKEN_DESCRIPTION,
+			);
+			if (remaining.length === 0) {
+				// 0 revoked is expected on a routine rotate that crashed right after writing its own new
+				// token (nothing of this description was left stranded) — but it is also exactly what a
+				// stale, never-tagged token left in the file would produce every time, forever: called
+				// out plainly rather than folded into the same line as a normal rotate, so a token that
+				// should have been revoked but structurally could not be (`admin-token set`'s own "more
+				// than one token already" case, say) is never silently mistaken for "nothing needed
+				// doing".
+				print(
+					revoked === 0
+						? `admin token rotated for account '${me.username}'; warning: revoked 0 old token(s) — ` +
+								"if a previous token is still meant to be retired, revoke it by hand in Mattermost"
+						: `admin token rotated for account '${me.username}'; revoked ${revoked} old token(s)`,
+				);
+				return;
+			}
+			for (const token of remaining) {
+				await next.revokeUserAccessToken(token.id);
+				revoked += 1;
+			}
 		}
-	}
-	throw new MattermostCommandError(`could not revoke every old token of account '${me.username}'`);
+		throw new MattermostCommandError(
+			`could not revoke every old token of account '${me.username}'`,
+		);
+	});
 }
