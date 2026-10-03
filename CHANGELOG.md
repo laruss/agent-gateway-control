@@ -336,6 +336,24 @@ All notable changes are documented here. The project follows Semantic Versioning
   the same as a preview too large to show in full — previously it silently fell back to no preview
   at all, which could have let a custom tool call reach an approvable card with nothing showing the
   owner what it would actually do.
+- A native dependency's implied tool whose own catalog entry is deleted is now also added to the
+  compiled `deny` list, not merely left out of `allow`: a runtime-side inference that reads only a
+  policy snapshot's three lists (`nativeToolGrants`, deriving file-read access from a granted
+  `workspace.write`) previously re-derived the very grant the deletion was supposed to revoke —
+  reachable through a rollback or restore that brings back an attachment implying the deleted
+  prerequisite, with no attachment naming the deleted entry itself for either of them to drop. Every
+  tool that would otherwise imply the same deleted dependency is still reported as missing it, not
+  only the first one a fixed-point pass happens to reach.
+- A version 3 turn input's `capabilities` now also stays within a fixed byte budget (a quarter of
+  the turn input's own overall limit), counted per capability's own serialized size: previously only
+  the count of described capabilities was bounded (128), so a handful of parameterized tools with
+  many enum parameters of many long choices could serialize to several megabytes on their own and
+  fail every turn with `context_unavailable`. A capability that would push the running total over
+  budget is left out whole, counted in the existing omitted count, never truncated partway through
+  its own parameter contract.
+- A parameterized capability's enum choices are now rendered in the prompt as individual JSON string
+  literals rather than joined with a bare comma — a choice that itself contains a comma (e.g. `"in
+  progress, blocked"`) previously rendered indistinguishably from two separate choices.
 
 ## [0.6.0] - 2026-10-02
 

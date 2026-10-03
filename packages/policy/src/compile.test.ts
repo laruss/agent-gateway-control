@@ -112,6 +112,10 @@ describe("compileAttachments", () => {
 			expect(compiled.allow).not.toContain("workspace.write");
 			expect(compiled.impliedBy["workspace.write"]).toBeUndefined();
 			expect(compiled.missingPrerequisites["tests.run"]).toEqual(["workspace.write"]);
+			// Explicit, not merely absent from `allow`: a runtime-side inference reading only the
+			// compiled policy's own three lists (`nativeToolGrants`, deriving `read` from a granted
+			// `write`) must see this withheld too, never silently re-derive it (ADR-027).
+			expect(compiled.deny).toContain("workspace.write");
 		});
 
 		it("still withholds a transitively-implied tool once its own direct implier's entry is also deleted", () => {
@@ -131,6 +135,28 @@ describe("compileAttachments", () => {
 				"repository.read",
 				"workspace.write",
 			]);
+			expect(compiled.deny).toEqual(expect.arrayContaining(["repository.read", "workspace.write"]));
+		});
+
+		it("every tool that would imply a deleted dependency reports it, not only the first one the fixed-point loop reaches", () => {
+			// Both `workspace.write` and `tests.run` are attached directly, and both independently
+			// imply `repository.read` (`tests.run` also implies `workspace.write`, already granted).
+			// Before ADR-027's fix, once the first implier's own `deny.add` landed, the second implier
+			// would see `repository.read` already in `deny` and read that as "an explicit restriction
+			// already won", silently skipping its own report.
+			const withoutRepositoryRead = new Map(CATALOG);
+			withoutRepositoryRead.delete("native-repository-read");
+			const compiled = compileAttachments({
+				...BASE,
+				attachments: [
+					attachment("native-workspace-write", "allow"),
+					attachment("native-tests-run", "allow"),
+				],
+				catalog: withoutRepositoryRead,
+			});
+			expect(compiled.missingPrerequisites["workspace.write"]).toEqual(["repository.read"]);
+			expect(compiled.missingPrerequisites["tests.run"]).toEqual(["repository.read"]);
+			expect(compiled.deny).toContain("repository.read");
 		});
 	});
 

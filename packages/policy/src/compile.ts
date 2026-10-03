@@ -130,8 +130,11 @@ export type CompiledToolPermissions = Readonly<{
 	 * withholds the capability. (2) a tool in `allow` whose native dependency
 	 * (`NATIVE_TOOL_DEPENDENCIES`) names a tool with no live catalog entry at all (deleted, or never
 	 * seeded) — the implication could not be applied, so the named tool is never in `allow` either,
-	 * unlike case (1)'s own prerequisite (which may simply not be attached yet, not deleted). Neither
-	 * case ever removes anything from `allow` itself. */
+	 * unlike case (1)'s own prerequisite (which may simply not be attached yet, not deleted); case (2)
+	 * also adds the named tool to `deny`, explicitly, so a runtime-side inference reading only the
+	 * compiled result's three lists (`nativeToolGrants`) withholds it too, rather than re-deriving the
+	 * very grant the deletion was supposed to revoke. Neither case ever removes anything from `allow`
+	 * itself. */
 	missingPrerequisites: Readonly<Record<string, Readonly<ToolName[]>>>;
 	/** `"memory.write"` is in `allow`: the agent may propose memory writes at all. */
 	memoryWriteAllowed: boolean;
@@ -199,6 +202,13 @@ export function compileAttachments(input: CompileAttachmentsInput): CompiledTool
 	// Reported as a missing prerequisite of the tool(s) that would have implied it, the same shape
 	// (and the same field) `ADAPTER_NATIVE_PREREQUISITES` below already reports a granted-but-inert
 	// tool with — a caller does not need two different reasons a tool is listed there to react to it.
+	// It is also added to `deny`, explicitly, not merely left out of `allow`: a runtime-side
+	// inference that reads only the compiled result's three lists, never `missingPrerequisites`
+	// (`packages/runtime-sdk`'s `nativeToolGrants`, deriving `read` from a granted `write`) must see
+	// this withheld too, or it silently re-derives the very grant the deleted entry was supposed to
+	// revoke. This can never collide with an explicit attachment of the same key: a deleted entry
+	// has no live catalog row left to attach, so `catalog.get` above already skips any attachment
+	// naming it, before `allow`/`requireApproval`/`deny` are ever populated from attachments at all.
 	const impliedBy: Record<string, Set<ToolName>> = {};
 	const missingPrerequisites: Record<string, Set<ToolName>> = {};
 	const addMissingPrerequisite = (tool: string, missing: ToolName): void => {
@@ -212,12 +222,20 @@ export function compileAttachments(input: CompileAttachmentsInput): CompiledTool
 		changed = false;
 		for (const tool of [...allow]) {
 			for (const implied of NATIVE_TOOL_DEPENDENCIES[tool] ?? []) {
-				if (deny.has(implied) || requireApproval.has(implied)) {
-					// An explicit restriction on the implied tool wins over an implied grant.
-					continue;
-				}
+				// Checked before the explicit-restriction check below, deliberately: a dead dependency
+				// must be reported for *every* tool that would otherwise imply it, not only the first
+				// one the fixed-point loop happens to reach. Once any tool records it, `deny` already
+				// carries it — if liveness were checked second, every later implier would see its own
+				// `deny.add` reflected back as "already explicitly restricted" and skip reporting itself
+				// as a missing prerequisite at all, silently undercounting which attached tools are
+				// actually affected.
 				if (!liveImplementationKeys.has(implied)) {
 					addMissingPrerequisite(tool, implied);
+					deny.add(implied);
+					continue;
+				}
+				if (deny.has(implied) || requireApproval.has(implied)) {
+					// An explicit restriction on the implied tool wins over an implied grant.
 					continue;
 				}
 				if (!allow.has(implied)) {

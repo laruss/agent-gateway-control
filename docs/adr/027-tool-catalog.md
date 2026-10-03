@@ -464,6 +464,19 @@ imply has no live entry at all (`transitiveNativeDependencies`, `checkAttachable
 depth alongside the compiler's own, identical rule, which still catches a prerequisite deleted
 *after* the attachment already exists.
 
+A withheld implied tool is also added to the compiled `deny` list itself, not only left out of
+`allow`: a runtime-side inference that reads a policy snapshot's three lists directly, never
+`missingPrerequisites` (`packages/runtime-sdk`'s `nativeToolGrants`, which derives file-read access
+from a granted `workspace.write` independently of this compiler) would otherwise re-derive the very
+grant the deletion was supposed to revoke — reachable precisely through the "bare attachment
+predating the deletion" and "rollback/bundle import bringing an implying attachment back" cases
+above, neither of which ever attaches the deleted entry itself for either of them to drop. Checked
+before the explicit-restriction check in the same fixed-point pass (an implied tool already denied
+wins over an implied grant, above), so every attached tool that would separately imply the same
+deleted dependency is reported as missing it — not only the first one the pass happens to reach,
+once that first one's own `deny.add` would otherwise read back as "already explicitly restricted"
+to every tool processed after it.
+
 **`memory.write` is always explicit, in `allow` or in `deny`, never silently absent from both.**
 Authority (`writableMemoryNamespaces`, `packages/core/src/turn-context.ts`) and the rendered prompt
 (`memoryWriteDenied`, `packages/runtime-sdk/src/prompt.ts`) both derive deniability from `deny`
@@ -596,6 +609,21 @@ implies it, then by name) and truncates, reporting how many it left out as `capa
 actually reads — are never trimmed, only this read model is; the runtime prompt notes the omitted
 count as a trailing line once `capabilities` itself is shown.
 
+**`capabilities` also stays within its own aggregate byte budget**, a fixed quarter of
+`MAX_TURN_INPUT_BYTES` (`CAPABILITIES_BYTES_BUDGET`): `MAX_CAPABILITIES` bounds how many capabilities
+are described, never how large each one's own serialized form is, and a parameterized capability's
+parameter contract (below) can itself run to hundreds of kilobytes — ten tools with
+`MAX_CUSTOM_TOOL_PARAMS` enum parameters of fifty long, multi-byte choices each serialize to several
+megabytes together, long before 128 capabilities would ever trim anything, which previously meant a
+turn input built from them exceeded `MAX_TURN_INPUT_BYTES` and the turn failed closed
+(`context_unavailable`) on every attempt. `buildCapabilityDescriptions` walks its same deterministic
+order accumulating each candidate's own serialized UTF-8 byte size (never the whole array's) and
+stops once including the next one would exceed the budget, counting everything past that point in
+the same `capabilitiesOmitted` field `MAX_CAPABILITIES` already uses — a caller does not need two
+different reasons a capability is missing to react to it. A capability that would not fit is left
+out whole, never truncated partway through its own parameter contract: a partial enum would mislead
+the model about which choices are actually valid.
+
 **A parameterized capability's own non-secret parameter contract travels with it.** A `custom_https`
 tool's description alone (prose) never told the model what to actually pass: `capabilities.parameters`
 (`CapabilityParameterSchema`, bounded like a definition's own `parameters` by
@@ -607,7 +635,9 @@ value lands in) and every named secret slot are never part of it: an execution d
 the model must never see or supply, respectively (`capabilityParametersFromCustomToolParams`,
 `@agent-gateway/contracts`). Omitted entirely for a tool with no typed parameters, never an empty
 array. The runtime prompt renders it as an indented "required parameters" line beneath the
-capability's own description.
+capability's own description, each enum choice as its own JSON string literal (`JSON.stringify`)
+rather than joined with a bare comma — a choice that itself contains one (`"in progress, blocked"`)
+would otherwise render indistinguishably from two separate choices.
 
 ### Custom HTTPS tools: definitions, egress and outcomes
 

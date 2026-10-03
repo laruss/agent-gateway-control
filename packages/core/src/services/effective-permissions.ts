@@ -24,6 +24,7 @@ import {
 	NATIVE_TOOL_DEPENDENCIES,
 } from "@agent-gateway/policy";
 import { and, eq, inArray, isNull } from "drizzle-orm";
+import { MAX_TURN_INPUT_BYTES } from "../turn-context.ts";
 import type { UnitOfWork } from "./deps.ts";
 
 type Db = UnitOfWork["tx"]["db"];
@@ -301,10 +302,25 @@ function catalogForCompile(
 
 const CAPABILITY_DESCRIPTION_MAX = 200;
 
+/**
+ * Capability descriptions' own share of the turn input's overall byte budget
+ * (`MAX_TURN_INPUT_BYTES`): a fixed quarter of it. A parameterized capability's own parameter
+ * contract (`CapabilityDescription.parameters`) can be large on its own — up to
+ * `MAX_CUSTOM_TOOL_PARAMS` enum parameters, each up to 50 choices of up to 100 characters, which a
+ * long-enough run of multi-byte UTF-8 characters (CJK, say) can turn into several hundred kilobytes
+ * for one capability alone — and `MAX_CAPABILITIES` bounds how many are described, never how large
+ * each one is. A quarter is generous for the pathological case this guards against while leaving
+ * most of the budget for everything else a turn input carries (thread context, memories, pending
+ * events), none of which this module bounds.
+ */
+const CAPABILITIES_BYTES_BUDGET = Math.floor(MAX_TURN_INPUT_BYTES / 4);
+
 export type CapabilityDescriptions = Readonly<{
 	descriptions: Readonly<CapabilityDescription[]>;
-	/** How many further capabilities had to be left out to stay within `MAX_CAPABILITIES` — a
-	 * wildcard resolving to more entries than that bound, never a reason to fail the turn. */
+	/** How many further capabilities had to be left out to stay within `MAX_CAPABILITIES` or
+	 * `CAPABILITIES_BYTES_BUDGET` — a wildcard resolving to more entries than the former, or a
+	 * parameter-heavy entry resolving to more bytes than the latter, neither ever a reason to fail
+	 * the turn. */
 	omitted: number;
 }>;
 
@@ -319,7 +335,12 @@ export type CapabilityDescriptions = Readonly<{
  * Bounded to `MAX_CAPABILITIES` (`AgentTurnInputSchema`'s own limit, ADR-027): a wildcard
  * resolving to more known entries than that would otherwise fail the whole turn input's own
  * schema parse the moment any attached pattern's coverage grows past it — never a reason to stop
- * an agent from running at all, only to describe fewer of its tools structurally.
+ * an agent from running at all, only to describe fewer of its tools structurally. Bounded, too, by
+ * `CAPABILITIES_BYTES_BUDGET`: counted as each capability's own serialized UTF-8 byte size, never
+ * the whole array at once, so one capability's own contract never accounts for more than its own
+ * share. A capability that would push the running total over the budget is left out whole, never
+ * truncated partway — a partial enum would mislead the model about which choices are actually
+ * valid — so the same deterministic ordering below simply stops earlier.
  * `toolPolicy.allow`/`requireHumanApproval` (the lists enforcement actually reads) are never
  * trimmed; only this read model is. Deterministic: a capability attached in its own right (never
  * `impliedBy`) sorts before one only present because another implies it, then by name — so a
@@ -373,9 +394,22 @@ function buildCapabilityDescriptions(
 		const bImplied = b.impliedBy === undefined ? 0 : 1;
 		return aImplied !== bImplied ? aImplied - bImplied : a.name < b.name ? -1 : 1;
 	});
+	const bounded: CapabilityDescription[] = [];
+	let usedBytes = 0;
+	for (const description of ordered) {
+		if (bounded.length >= MAX_CAPABILITIES) {
+			break;
+		}
+		const bytes = Buffer.byteLength(JSON.stringify(description), "utf8");
+		if (usedBytes + bytes > CAPABILITIES_BYTES_BUDGET) {
+			break;
+		}
+		usedBytes += bytes;
+		bounded.push(description);
+	}
 	return {
-		descriptions: ordered.slice(0, MAX_CAPABILITIES),
-		omitted: Math.max(0, ordered.length - MAX_CAPABILITIES),
+		descriptions: bounded,
+		omitted: ordered.length - bounded.length,
 	};
 }
 

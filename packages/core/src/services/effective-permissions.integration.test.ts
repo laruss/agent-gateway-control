@@ -16,6 +16,7 @@ import { createBoss, migrateQueues, transactionalJobSink } from "@agent-gateway/
 import { startTestPostgres, type TestPostgres } from "@agent-gateway/testkit";
 import type pg from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { MAX_TURN_INPUT_BYTES } from "../turn-context.ts";
 import {
 	applyConfig,
 	configSnapshotBundle,
@@ -35,6 +36,7 @@ import {
 	adoptAgentToolAttachments,
 	attachTool,
 	createCustomHttpsTool,
+	deleteCatalogEntry,
 	detachTool,
 	editCatalogEntry,
 	ensureToolCatalogSeeded,
@@ -426,6 +428,75 @@ describe("effective permissions: compiled attachments as the single source of tr
 		expect(effective.toolPolicy.allow).toEqual(["custom.*"]);
 		expect(effective.capabilities.length).toBe(MAX_CAPABILITIES);
 		expect(effective.capabilitiesOmitted).toBe(1);
+	});
+
+	it("bounds capability descriptions to an aggregate byte budget, omitting whole capabilities rather than failing the turn (ADR-027)", async () => {
+		// Ten `custom_https` tools, each with sixteen enum parameters (`MAX_CUSTOM_TOOL_PARAMS`) of
+		// fifty long, multi-byte choices (`CustomEnumParamSchema`'s own bounds): serialized, each
+		// capability's own parameter contract alone is a few hundred kilobytes, and all ten together
+		// would be several megabytes — past `MAX_TURN_INPUT_BYTES` long before `MAX_CAPABILITIES`
+		// (128) would ever trim anything.
+		const longChoice = (i: number) => `${"字".repeat(97)}${String(i).padStart(2, "0")}`;
+		const parameters = Array.from({ length: 16 }, (_, p) => ({
+			name: `choice_${p}`,
+			slot: "query" as const,
+			slotName: `q${p}`,
+			type: "enum" as const,
+			values: Array.from({ length: 50 }, (_, i) => longChoice(i)),
+		}));
+		const definition: CustomHttpsDefinition = {
+			host: "api.example.test",
+			pathTemplate: "/items",
+			method: "GET",
+			parameters,
+			secretSlots: [],
+			idempotency: null,
+			responseLimits: {
+				maxResponseBytes: 65_536,
+				allowedContentTypes: ["application/json"],
+				timeoutMs: 5000,
+				includeBodyPreview: true,
+			},
+		};
+		const entryIds = Array.from({ length: 10 }, (_, i) => `enum-heavy-${i}`);
+		for (const entryId of entryIds) {
+			await createCustomHttpsTool(deps, {
+				entryId,
+				name: entryId,
+				description: `Test tool ${entryId}.`,
+				httpsDefinition: definition,
+				actor: "test",
+			});
+			await attachTool(deps, {
+				agentId: "alpha",
+				entryId,
+				pinnedVersion: null,
+				mode: "require_approval",
+				settings: {},
+				actor: "test",
+				source: "console",
+			});
+		}
+		const effective = await effectiveFor("alpha");
+		// `toolPolicy` (what enforcement actually reads) is never trimmed: every attached tool is
+		// still there, described or not.
+		for (const entryId of entryIds) {
+			expect(effective.toolPolicy.requireHumanApproval).toContain(`custom.${entryId}`);
+		}
+		expect(effective.capabilitiesOmitted).toBeGreaterThan(0);
+		expect(effective.capabilities.length).toBeLessThan(entryIds.length);
+		// Never a single parameter contract truncated partway: every described capability still
+		// carries its own complete set of sixteen parameters, each with all fifty choices.
+		for (const capability of effective.capabilities) {
+			expect(capability.parameters).toHaveLength(16);
+			for (const parameter of capability.parameters ?? []) {
+				expect(parameter.type === "enum" ? parameter.values : []).toHaveLength(
+					parameter.type === "enum" ? 50 : 0,
+				);
+			}
+		}
+		const serializedBytes = Buffer.byteLength(JSON.stringify(effective.capabilities), "utf8");
+		expect(serializedBytes).toBeLessThan(MAX_TURN_INPUT_BYTES);
 	});
 
 	describe("gateway tools adopt: explicit migration", () => {
@@ -904,5 +975,80 @@ describe("effective permissions: compiled attachments as the single source of tr
 		expect(capability?.parameters).toEqual([
 			{ name: "id", type: "string", required: true, minLength: 1, maxLength: 50 },
 		]);
+	});
+
+	// Last in the file, deliberately: unlike every other test here, this one permanently tombstones
+	// a built-in (`deleteCatalogEntry` on a built-in writes `catalog_entry_tombstones`, which
+	// `reset()`'s own reseed never undoes, ADR-027) — every test above still needs
+	// `native-repository-read` attachable.
+	it("a prerequisite's entry deleted after rollback/restore brings back the implying attachment stays explicitly denied, never silently re-granted (ADR-027)", async () => {
+		// `workspace.write` implies `repository.read`; attaching it, then detaching it again, so the
+		// delete below is not itself refused as "still implicitly held" (`agentsImplicitlyHoldingTool`,
+		// a narrower, separate guard this test is not about).
+		const attach = await attachTool(deps, {
+			agentId: "alpha",
+			entryId: "native-workspace-write",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "console",
+		});
+		await detachTool(deps, {
+			agentId: "alpha",
+			entryId: "native-workspace-write",
+			actor: "test",
+			source: "console",
+		});
+		await deleteCatalogEntry(deps, "native-repository-read", "test");
+
+		// Rolling back to the attach revision restores exactly alpha's `workspace.write` attachment —
+		// never one naming `repository.read` directly (it was only ever implied, never attached), so
+		// "any attachment naming a deleted entry is dropped from what a rollback actually commits"
+		// (ADR-027) does not apply here: that rule only drops an attachment of the deleted entry
+		// itself, not one that merely implies it.
+		const { bundle: attachBundle } = await inTransaction(deps, ({ tx }) =>
+			loadActiveBundle(tx.db, attach.revisionId),
+		);
+		if (attachBundle.organization === null) {
+			throw new Error("expected an organization");
+		}
+		const rolledBack = await commitChange(deps, {
+			changeSet: [
+				{
+					type: "replace_bundle",
+					bundle: configSnapshotBundle({
+						organization: attachBundle.organization,
+						agents: attachBundle.agents,
+						constitution: attachBundle.constitution,
+						rolePrompts: attachBundle.rolePrompts,
+					}),
+					toolAttachments: attachBundle.toolAttachments,
+				},
+			],
+			baseRevisionId: await activeConfigRevisionId(deps),
+			actor: "test",
+			source: "rollback",
+		});
+		const { bundle: rolledBackBundle } = await inTransaction(deps, ({ tx }) =>
+			loadActiveBundle(tx.db, rolledBack.revisionId),
+		);
+		expect(rolledBackBundle.toolAttachments.alpha).toEqual(
+			expect.arrayContaining([
+				{ entryId: "native-workspace-write", pinnedVersion: null, mode: "allow", settings: {} },
+			]),
+		);
+
+		const afterRollback = await effectiveFor("alpha");
+		// `workspace.write` is still directly attached `allow` (the read model never strips a direct
+		// attachment, ADR-027), but its implied `repository.read` has no live entry any more: both the
+		// explicit denial this compiles into, and any runtime-side inference reading only these three
+		// lists (`nativeToolGrants`, `packages/runtime-sdk`, deriving `read` from a granted `write`),
+		// must withhold it — never silently re-grant it just because `workspace.write` alone is still
+		// in `allow`.
+		expect(afterRollback.toolPolicy.allow).toContain("workspace.write");
+		expect(afterRollback.toolPolicy.allow).not.toContain("repository.read");
+		expect(afterRollback.toolPolicy.deny).toContain("repository.read");
+		expect(afterRollback.missingPrerequisites["workspace.write"]).toEqual(["repository.read"]);
 	});
 });

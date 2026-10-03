@@ -84,7 +84,12 @@ function parameterSummary(param: CapabilityParameter): string {
 		case "boolean":
 			return `${param.name} (boolean)`;
 		case "enum":
-			return `${param.name} (one of: ${param.values.join(", ")})`;
+			// Each choice as its own JSON string literal, never a bare, comma-joined list: a choice
+			// that itself contains a comma (`"in progress, blocked"`) would otherwise render
+			// indistinguishably from two separate choices. `JSON.stringify` also escapes anything
+			// else that could blur a boundary (quotes, control characters), and the quotes around
+			// every choice make the boundary exact even when no choice happens to contain a comma.
+			return `${param.name} (one of: ${param.values.map((value) => JSON.stringify(value)).join(", ")})`;
 	}
 }
 
