@@ -1343,7 +1343,9 @@ export async function attachTool(
 			baseRevisionId,
 			actor: input.actor,
 			source: input.source,
-			requestIdentity: attach,
+			// `[attach]`, the exact change set a hub-managed agent's attachment commits: its replay hash is
+			// the same either way.
+			requestIdentity: [attach],
 			...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
 			...(input.reason === undefined ? {} : { reason: input.reason }),
 		});
