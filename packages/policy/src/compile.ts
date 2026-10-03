@@ -55,14 +55,16 @@ export const ADAPTER_NATIVE_PREREQUISITES: Readonly<
  * enforcement point that can pause a turn mid-flight for a human's decision, so `require_approval`
  * is refused for them — only `allow`/`disabled` are. A tool-broker executor action always needs a
  * human (its risk floor is already `require_approval`; `riskFloorAllows` refuses `allow` for it),
- * so only `require_approval`/`disabled` are supported. `custom_https` is reserved: nothing is ever
- * attachable against it, so it supports no mode at all.
+ * so only `require_approval`/`disabled` are supported — `custom_https` (an owner's own HTTPS tool)
+ * and `utility` (a packaged, image-shipped implementation) are both executed the same way, through
+ * the tool broker and its approval flow, so they support exactly the same two modes.
  */
 const MODES_BY_KIND: Readonly<Record<ToolCatalogEntryKind, ReadonlySet<ToolAttachmentMode>>> = {
 	native: new Set(["allow", "disabled"]),
 	gateway: new Set(["allow", "disabled"]),
 	executor: new Set(["require_approval", "disabled"]),
-	custom_https: new Set(),
+	custom_https: new Set(["require_approval", "disabled"]),
+	utility: new Set(["require_approval", "disabled"]),
 };
 
 /**

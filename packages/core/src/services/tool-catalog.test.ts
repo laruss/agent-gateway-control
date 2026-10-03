@@ -217,12 +217,14 @@ describe("computeCatalogEntryAvailability", () => {
 			computeCatalogEntryAvailability(entry, {
 				installedAdapters: new Set(["claude-code"]),
 				registeredExecutorActionTypes: new Set(),
+				registeredNamespaces: new Set(),
 			}),
 		).toBe(true);
 		expect(
 			computeCatalogEntryAvailability(entry, {
 				installedAdapters: new Set(["grok"]),
 				registeredExecutorActionTypes: new Set(),
+				registeredNamespaces: new Set(),
 			}),
 		).toBe(false);
 	});
@@ -231,7 +233,11 @@ describe("computeCatalogEntryAvailability", () => {
 		expect(
 			computeCatalogEntryAvailability(
 				{ kind: "gateway", implementationKey: "mattermost.post", supportedAdapters: [] },
-				{ installedAdapters: new Set(), registeredExecutorActionTypes: new Set() },
+				{
+					installedAdapters: new Set(),
+					registeredExecutorActionTypes: new Set(),
+					registeredNamespaces: new Set(),
+				},
 			),
 		).toBe(true);
 	});
@@ -246,25 +252,59 @@ describe("computeCatalogEntryAvailability", () => {
 			computeCatalogEntryAvailability(entry, {
 				installedAdapters: new Set(),
 				registeredExecutorActionTypes: new Set(),
+				registeredNamespaces: new Set(),
 			}),
 		).toBe(false);
 		expect(
 			computeCatalogEntryAvailability(entry, {
 				installedAdapters: new Set(),
 				registeredExecutorActionTypes: new Set(["finance.payment.create"]),
+				registeredNamespaces: new Set(),
 			}),
 		).toBe(true);
 	});
 
-	it("a custom_https entry is never available yet (reserved, no definitions ship this release)", () => {
+	it("a utility entry is unavailable until its action type is actually registered", () => {
+		const entry = {
+			kind: "utility" as const,
+			implementationKey: "utility.text-transform",
+			supportedAdapters: [],
+		};
 		expect(
-			computeCatalogEntryAvailability(
-				{ kind: "custom_https", implementationKey: "custom.whatever", supportedAdapters: [] },
-				{
-					installedAdapters: new Set(["mock", "codex"]),
-					registeredExecutorActionTypes: new Set(["custom.whatever"]),
-				},
-			),
+			computeCatalogEntryAvailability(entry, {
+				installedAdapters: new Set(),
+				registeredExecutorActionTypes: new Set(),
+				registeredNamespaces: new Set(),
+			}),
 		).toBe(false);
+		expect(
+			computeCatalogEntryAvailability(entry, {
+				installedAdapters: new Set(),
+				registeredExecutorActionTypes: new Set(["utility.text-transform"]),
+				registeredNamespaces: new Set(),
+			}),
+		).toBe(true);
+	});
+
+	it("a custom_https entry is available once a tool runner serves the 'custom' namespace", () => {
+		const entry = {
+			kind: "custom_https" as const,
+			implementationKey: "custom.whatever",
+			supportedAdapters: [],
+		};
+		expect(
+			computeCatalogEntryAvailability(entry, {
+				installedAdapters: new Set(["mock", "codex"]),
+				registeredExecutorActionTypes: new Set(["custom.whatever"]),
+				registeredNamespaces: new Set(),
+			}),
+		).toBe(false);
+		expect(
+			computeCatalogEntryAvailability(entry, {
+				installedAdapters: new Set(),
+				registeredExecutorActionTypes: new Set(),
+				registeredNamespaces: new Set(["custom"]),
+			}),
+		).toBe(true);
 	});
 });

@@ -41,9 +41,14 @@ An attachment's `mode` is bounded by its catalog entry's own `kind`, not only it
 | `native` | `repository.read`, `tests.run` | `allow`, `disabled` |
 | `gateway` | `mattermost.post`, `memory.write` | `allow`, `disabled` |
 | `executor` | `finance.payment.create` | `require_approval`, `disabled` |
+| `custom_https` | an owner-defined HTTPS tool | `require_approval`, `disabled` |
+| `utility` | `utility.text-transform` | `require_approval`, `disabled` |
 
-`require_approval` on a native or gateway capability, or `allow` on an executor action, is refused
-at attach time: neither has an enforcement point that can pause a turn mid-flight for a human.
+`require_approval` on a native or gateway capability, or `allow` on a `custom_https`/`executor`/
+`utility` action, is refused at attach time: the broker-executed kinds have no enforcement point
+that can pause a turn mid-flight for a human on their own, and this release adds no second,
+approval-free path through the broker — so every one of them always needs a human, side-effect-free
+or not.
 
 Two things an attachment does **not** need restating:
 
@@ -124,6 +129,109 @@ Each agent's own resolved attachments and the revision they are committed agains
 together, right before committing: a concurrent change elsewhere (another attach, a YAML edit to
 the same agent's `permissions`) between when `tools adopt` reads an agent and when it commits is
 refused as a conflict, rather than silently overwritten by a commit built from the stale read.
+
+## Custom HTTPS tools
+
+An owner can define their own HTTPS-backed tool — "create a ticket in service X" — without a code
+change: a fixed destination and method, typed parameters mapped into encoded path/query/header/body
+slots, named secrets the tool runner alone resolves, and response limits. See
+[ADR-027](../adr/027-tool-catalog.md)'s custom HTTPS tools section for the full model and the
+egress guard; this is the day-to-day how-to.
+
+### 1. Write the definition
+
+A JSON file matching `CustomHttpsDefinitionSchema`:
+
+```json
+{
+  "host": "api.example.com",
+  "pathTemplate": "/tickets/{priority}",
+  "method": "POST",
+  "parameters": [
+    { "name": "priority", "slot": "path", "slotName": "priority", "type": "enum",
+      "values": ["low", "high"] },
+    { "name": "summary", "slot": "body", "slotName": "summary", "type": "string",
+      "minLength": 1, "maxLength": 500 }
+  ],
+  "secretSlots": [
+    { "alias": "ticket_api_key", "slot": "header", "slotName": "Authorization" }
+  ],
+  "idempotency": { "headerName": "Idempotency-Key" },
+  "responseLimits": {
+    "maxResponseBytes": 65536,
+    "allowedContentTypes": ["application/json"],
+    "timeoutMs": 10000
+  }
+}
+```
+
+A few rules the definition can never work around:
+
+- Every `{placeholder}` in `pathTemplate` names exactly one `path`-slot parameter, and vice versa.
+- No two parameters (or a parameter and a secret) ever target the same slot.
+- A secret may never sit in the `path` (it would be visible, and the approval card shows the
+  resolved path).
+- A write (anything but `GET`) must declare `idempotency`; a `GET` must not — a write without a
+  provider-supported idempotency mechanism is refused as a definition outright, before it is ever
+  saved.
+- `host` is a DNS hostname, never a literal address — not that it would help: the egress guard
+  classifies every literal and resolved address alike at execution time regardless (below).
+
+### 2. Set its secret
+
+```bash
+gateway tools secret set ticket_api_key
+```
+
+Hidden entry, confirmed, written verbatim to the tool runner's own secrets mount
+(`$GATEWAY_HOME/secrets/custom-tools/<alias>` in the release bundle, `/run/custom-tool-secrets/`
+inside the container) — never the model, the database, logs, an approval or an error. Restart the
+tool runner (`bin/agw restart gateway-tool-runner`) to pick it up.
+
+### 3. Create and attach it
+
+```bash
+gateway tools custom create zendesk-ticket \
+  --name "Create Zendesk ticket" --description "Files a support ticket." \
+  --definition ticket-definition.json
+gateway tools adopt finance --dry-run   # or attach it directly through `gateway config`
+```
+
+Its action type is `custom.<entry-id>` (`custom.zendesk-ticket` here); a tool runner must serve the
+`custom` namespace for it to be reachable at all (`TOOL_RUNNER_NAMESPACES=custom`, `gateway db
+grant-tool-runner <role> custom`).
+
+### 4. Editing invalidates a pending request
+
+`gateway tools custom edit zendesk-ticket --definition updated.json` publishes a new, immutable
+version. An approval still pending against the previous version is refused at grant time — the
+owner sees "this custom tool was edited... it must be requested again", never a silent execution
+against the new definition instead of what was actually shown and hashed.
+
+### Egress, outcomes and the response the agent sees
+
+The tool runner resolves `host` once, refuses a private, loopback, link-local, carrier-grade-NAT,
+multicast, reserved, documentation or IPv6-unique-local/mapped address in any notation (dotted,
+decimal, octal, hex), and connects to exactly the address it resolved — never re-resolving, which
+is what defeats DNS rebinding. Redirects are never followed. A response over its own size limit is
+aborted mid-stream.
+
+An action's outcome is always one of: `succeeded` (a receipt — status code and a redacted response
+preview, never a secret value even if the destination echoes one back), `failed` (a clean, known
+refusal — blocked address, bad content type, the destination's own 4xx/5xx), or `unknown` (a
+timeout or connection reset **after** the request was already sent — never retried automatically;
+settle it by hand with `gateway tools settle` after checking the provider by the action's own
+idempotency key).
+
+## Packaged utilities
+
+`utility.text-transform` is this release's one packaged utility: a fixed, image-shipped
+implementation (not an arbitrary worker command) with a typed input and a bounded,
+side-effect-free output, proving the path a future utility would also take. It attaches and
+approves exactly like a `custom_https`/`executor` action (see the mode table above) — being
+side-effect-free does not exempt it from a human turn, because the broker has no second,
+approval-free execution path. Its availability reflects whether a currently running tool runner
+actually serves the `utility` namespace.
 
 ## Rollback safety
 

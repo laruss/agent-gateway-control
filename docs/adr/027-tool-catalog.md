@@ -19,10 +19,9 @@ that holds it.
 This decision gives the catalog a durable data model: entries, their immutable version history,
 the availability a listing of them computes (never stores), and agents' attachments to them — the
 Instruments & Utils hub's "what exists" and "who has it", not yet "what runs" or "what a console
-shows". No UI reads any of this yet, and `custom_https` (an owner's own HTTPS-backed tool) is
-reserved as a `kind` with no definition — both are later work this decision anticipates and
-prepares storage for, the same way ADR-026 anticipated automated Mattermost provisioning without
-performing it.
+shows". No UI reads any of this yet — that is still later work — but `custom_https` (an owner's own
+HTTPS-backed tool) and `utility` (a fixed, image-shipped implementation) are both fully defined and
+executable: "Custom HTTPS tools" and "Packaged utilities" below.
 
 The data model alone made no change to tool enforcement, deliberately (see "Alternatives" below):
 attaching, detaching or editing an attachment was pure bookkeeping until "Effective permissions:
@@ -37,8 +36,9 @@ A catalog entry (`catalog_entries`) has a stable, never-reused id, an immutable 
 (a runtime's own built-in tool: reading or writing the run workspace, running commands, web
 search/fetch — `packages/runtime-sdk`'s `NativeTool`s), `gateway` (a capability the Gateway itself
 performs, never a runtime or the tool broker: posting to Mattermost, writing memory),
-`executor` (a tool-broker action backed by a registered executor), or `custom_https` (reserved,
-undefined this release) — and an immutable `implementationKey` naming the concrete capability
+`executor` (a tool-broker action backed by a registered executor), `custom_https` (an owner's own
+HTTPS-backed tool, "Custom HTTPS tools" below), or `utility` (a fixed, image-shipped implementation,
+"Packaged utilities" below) — and an immutable `implementationKey` naming the concrete capability
 behind it (a `ToolName` such as `repository.read`, `mattermost.post` or
 `finance.payment.create`). `isBuiltin` marks an entry this release itself ships, never editable
 and governing what `ensureToolCatalogSeeded`/deletion do (below).
@@ -59,9 +59,12 @@ leaves unset; a built-in entry may only have its `name`/`description` edited thi
 `configSchema`/`riskFloor`/`supportedAdapters` are refused when they differ from the current
 version (`builtInEditProblems`, unit-tested without a database): those fields describe what the
 real integration actually does, not something an edit should be able to silently redefine for a
-capability the owner did not build. A `kind`/`implementationKey` pairing that is not built in has
-no creation path yet — `custom_https` is reserved, not defined — so this rule has no non-built-in
-case to exercise this release. Every field an edit does supply (`name`, `description`,
+capability the owner did not build. At the time this rule was written, no `kind`/`implementationKey`
+pairing that was not built in had a creation path yet, so it had no non-built-in case to exercise;
+`custom_https` ("Custom HTTPS tools" below) is now that case, and `editCatalogEntry` applies this
+same restriction to it unchanged — `kind`/`implementationKey` stay immutable, only a non-built-in
+entry may also change `configSchema`/`riskFloor`/`supportedAdapters` (`custom_https` never sets the
+latter two itself; see below). Every field an edit does supply (`name`, `description`,
 `configSchema`, `riskFloor`, `supportedAdapters`) is validated against its own contract schema
 before a new version is ever inserted (`editCatalogEntryInputProblems`): `EditCatalogEntryInput` is
 a plain TypeScript type, never itself runtime-checked, so a caller handing this service data
@@ -79,8 +82,10 @@ Whether an entry is actually usable right now is never written to a column: a `n
 available once at least one of its `supportedAdapters` is actually installed (a fresh, ready
 worker — `runtimeHealth`'s own `available`, reduced by `installedAdaptersFromHealth`); a `gateway`
 entry is always available (the Gateway itself performs it, not an optional external process); an
-`executor` entry is available only once its action type is actually registered by a running tool
-runner; `custom_https` is never available (reserved). `computeCatalogEntryAvailability` is a pure
+`executor`/`utility` entry is available only once its action type is actually registered by a
+running tool runner; a `custom_https` entry is available once a currently healthy tool runner
+serves the `custom` namespace (every such entry, not individually enumerable the way a fixed action
+type is — "Custom HTTPS tools" below). `computeCatalogEntryAvailability` is a pure
 function of an entry and a `ToolCatalogAvailabilityContext` (`installedAdapters`,
 `registeredExecutorActionTypes`) the caller supplies — `packages/core` depends on no runtime or
 tool-broker package (`docs/project-structure.md`'s own boundary), and a tool runner's registered
@@ -279,7 +284,8 @@ for a human mid-flight:
 | `native` | `allow`, `disabled` | A runtime's own built-in tool runs inside the turn; nothing can intercept it to ask a human first. |
 | `gateway` | `allow`, `disabled` | `mattermost.post`/`memory.write` are direct Gateway actions with no approval flow of their own. |
 | `executor` | `require_approval`, `disabled` | A tool-broker action's risk floor is already `require_approval` (`riskFloorAllows` already refuses `allow` for it); this makes the bound explicit and kind-driven rather than an accident of every executor's own floor. |
-| `custom_https` | none | Reserved; nothing is ever attachable against it. |
+| `custom_https` | `require_approval`, `disabled` | An owner's own HTTPS-backed tool reaches an external address through the broker; the broker has no approval-free execution path ("Custom HTTPS tools" below). |
+| `utility` | `require_approval`, `disabled` | Side-effect-free does not mean approval-free: the broker has only one execution path, and every kind it executes shares it ("Packaged utilities" below). |
 
 An attachment whose mode its entry's `kind` does not support is refused at the same shared write
 boundary that already checks `riskFloor` (`attachmentCatalogProblems`, reused rather than
@@ -405,6 +411,131 @@ that make it effectively usable. `packages/runtime-sdk`'s prompt renders them as
 alternative to the bare tool-name lists it already shows. See ADR-023 for the exact schema rule and
 its rollback consequence.
 
+### Custom HTTPS tools: definitions, egress and outcomes
+
+A `custom_https` entry is the one non-built-in kind with a creation path (`createCustomHttpsTool`):
+the owner picks its id (its action type is `custom.<entry-id>`, immutable from then on) and supplies
+the first version's `httpsDefinition` — a fixed destination host, path template and method; typed
+parameters (string/number/boolean/enum, with bounds) mapped explicitly into exactly one slot each
+(a path placeholder, a query key, a header or a JSON body field); named secrets the definition
+references by alias, mapped into their own slot the same way; response limits (max bytes, allowed
+content types, a timeout); and, for anything but `GET`, a required idempotency header name.
+`customHttpsDefinitionProblems` (`@agent-gateway/contracts`, pure) refuses a definition whose path
+placeholders and path parameters do not match exactly, whose slots collide, that puts a secret in
+the path, or that is a write without an idempotency mechanism — a write cannot be saved at all
+without one. Editing a `custom_https` entry (`editCatalogEntry`) publishes a new version precisely
+like a built-in's `name`/`description` edit, except every field — `httpsDefinition` included — may
+change, since nothing here is a real integration's own fixed fact the way a built-in's `riskFloor`
+is. `riskFloor` is always `require_approval` and `supportedAdapters` always empty for this kind;
+`utility` (below) is the same. `MODES_BY_KIND` (`@agent-gateway/policy`) therefore supports only
+`require_approval`/`disabled` for both — the broker has no approval-free execution path, so neither
+kind can ever be attached `allow`, side-effect-free or not.
+
+**No value, ever, except through an encoded slot.** There is no JavaScript evaluation and no shell:
+every parameter value is percent-encoded into its one path segment or query entry, or placed as one
+header value or one JSON field — never interpolated into a larger string. A path value that is
+itself `.`/`..`, contains `/` or `\`, or carries a control character is refused at the validation
+layer (`customToolParamIssues`, `@agent-gateway/policy`) before an approval is ever created, and
+`resolveCustomHttpRequest`'s own percent-encoding keeps a value that somehow reached execution
+anyway (a forged job) confined to its one segment regardless — encoding, not re-validation, is what
+the execution layer itself relies on.
+
+**The broker namespace.** `custom` is a fixed `ToolNamespace` (`TOOL_NAMESPACES`) that every
+`custom_https` entry's action type routes through — one shared queue
+(`tool.execute.custom`/`tool.report.custom`), not one per entry: a tool runner's database role is
+granted the namespace, not an individual entry, exactly like `finance`. The runner dispatches
+dynamically, through `DynamicExecutor` (`@agent-gateway/tool-broker`'s `processToolJob`): a static
+`ToolExecutors` map cannot enumerate an owner-created, unbounded set of action types the way it
+enumerates `finance.payment.create`, so a job whose action type no static executor claims falls
+through to the dynamic one when the runner serves `custom`. `gateway_custom_tool_definition(entry
+id, version)` is the one additional `SECURITY DEFINER` function (migration `0034`) the runner may
+call, symmetrical with `gateway_begin_tool_action`: read-only, it returns one immutable version's
+own `https_definition` and nothing else of the catalog, and only to a role that can settle the
+`custom` namespace's own execute jobs — a runner of another namespace gets no row, the same
+`wrong_namespace` boundary `begin` already enforces for execution itself.
+
+**Pinning an approval to the exact version it was resolved against.** A `needs_human` request
+naming a `custom_https` action is never approved against "whatever the entry currently is": the
+controller (`prepareCustomApprovalDraft`, `packages/core`) validates the model's own parameters
+against the entry's *current* definition and, only once they pass, adds a synthetic parameter,
+`__custom_definition_version`, pinned to that version — before the draft is ever hashed, shown on
+the card, or stored. Because this parameter is part of `actionParams` like any other, it is covered
+by the same immutable `approvalActionHash` every other action already uses, with no schema change
+to `ApprovalRequestSchema` or `ToolActionJobSchema` at all. At grant time (`customGrantTimeIssues`,
+re-run inside `executionIssues` alongside every other live policy check — never the run's stale
+snapshot) the pinned version is compared against the entry's version *now*: a mismatch — the
+definition was edited since the request was made — refuses the grant outright
+(`customDefinitionVersionIssues`), and the model's parameters are re-validated against the current
+definition too, independently of the version check. The tool runner, once an action is granted,
+reads the exact pinned version by (entry id, version) through `gateway_custom_tool_definition` —
+never "current" — so execution is always what was actually approved, immutable version content
+making that guarantee free rather than a race against a concurrent edit.
+
+**Egress.** `resolvePinnedAddress` (`@agent-gateway/tool-broker`'s `egress.ts`) is the one gate
+every `custom_https` call passes through before a socket ever opens: `host` is resolved once (an
+injectable `DnsResolver`, the real one backed by `dns.lookup` in production), and the connection is
+made to exactly the address that resolution returned — never re-resolved, which is what defeats DNS
+rebinding (a second answer, from this process or the destination's own resolver, can never change
+what a call already pinned to). Before resolving at all, `host` (and every candidate address DNS
+returns) is classified by `@agent-gateway/policy`'s `ip-guard.ts`: private (RFC 1918), loopback,
+link-local (169.254/16, the cloud metadata range included), carrier-grade NAT (100.64/10),
+multicast, reserved, the documentation/benchmark ranges, and the IPv6 forms that alias any of these
+(unique-local, link-local, an IPv4-mapped address, NAT64) are all refused — classified from the
+literal numeric value regardless of notation (dotted, decimal, octal, hex for IPv4; compressed
+`::` forms and embedded-IPv4 forms for IPv6), since a hostname that is itself a numeric literal in
+an unusual base is exactly the classic SSRF bypass this guard exists to close. The TLS SNI and the
+HTTP `Host` header stay the definition's own hostname throughout — only the TCP/TLS connection
+target is the resolved address — so the destination sees an ordinary request. Redirects are never
+followed (`sendPinnedRequest` simply never looks at one); a response over `responseLimits`'s own
+cap is aborted mid-stream.
+
+**Outcomes.** `succeeded` carries a receipt (status code, a redacted response preview — every
+resolved secret value is replaced outright before anything is read into a receipt or an error, even
+one a destination echoes back); `failed` is a clean, known refusal with nothing left uncertain — a
+blocked address, an unexpected content type, an oversized `GET` response, the destination's own
+4xx/5xx. `unknown` is reserved for what the brief among tool actions already means it to be
+(ADR-018): a timeout or a connection reset **after** the request was already fully sent, when the
+destination may or may not have acted on it — the egress client distinguishes this by whether the
+request finished writing before the failure, and throws rather than returning `failed`, so
+`processToolJob` records it as `unknown` exactly like any other executor's unexplained crash. An
+oversized response is the one case decided by the method: a `GET`'s own abort is always `failed`
+(nothing but a read was ever at stake); a write's is `unknown`, since the request itself had already
+been sent by the time the response proved too large to trust. Neither `failed` nor `unknown` is ever
+retried automatically — an `unknown` custom-tool action is settled by hand
+(`gateway tools settle`), the same as any other namespace's.
+
+**Secrets never reach anywhere but the request.** A definition names a secret by alias only; the
+runner resolves it from its own secrets directory (file per alias, `gateway tools secret set
+<alias>`, read-only to the runner) at the moment it builds the request, and the value is used to
+fill exactly the slot the definition names — never logged, never part of a receipt or an error
+(scrubbed outright even from a destination's own echo), never part of the approval hash (only the
+*slot* a secret fills is ever part of what gets resolved and shown — never a value, since none
+exists yet at approval time), and never written to any table this release's schema has a column
+for.
+
+### Packaged utilities
+
+`utility` is a second broker-executed, approval-gated kind, for a capability that is fixed,
+image-shipped code — never owner-defined, never an arbitrary worker command. It exists alongside
+`executor`/`custom_https` rather than folding into either: unlike `executor`, nothing registers a
+utility's implementation at a tool runner's own discretion (it ships in this release's own image,
+the same way a built-in native capability ships in a runtime adapter's own code); unlike
+`custom_https`, nothing about it is owner-configurable. `BUILT_IN_UTILITY_ACTIONS`
+(`@agent-gateway/contracts`) is the same kind of static, compile-time-known list
+`BUILT_IN_EXECUTOR_ACTIONS` already is, seeded the same way (`ensureToolCatalogSeeded`) and routed
+through its own fixed `utility` namespace and queue, with its own static `ToolExecutor`
+registration in the tool runner (`utilityExecutor`) — no dynamic dispatch, since there is no
+unbounded, owner-created set to enumerate the way `custom` has. Availability reflects whether a
+currently healthy tool runner actually registers the action type, exactly like `executor`.
+
+This release ships one utility, `utility.text-transform`, to prove the path: a deterministic,
+side-effect-free string transform (trim/case/reverse/slugify) with a bounded input and output —
+genuinely useful (producing a slug or a normalized form of a short piece of text), and deliberately
+minimal. Being side-effect-free does not exempt it from a human turn: `MODES_BY_KIND` gives
+`utility` the identical `require_approval`/`disabled` pair `executor`/`custom_https` have, because
+the broker's approval gate is not a risk-based convenience this kind happens to clear on its own
+merits — it is the only execution path the broker has at all.
+
 ## Alternatives
 
 - **Attachments derived from `permissions`, never stored separately.** Rejected: a bare permission
@@ -459,6 +590,10 @@ its rollback consequence.
   before `settings` drives anything real.
 - `catalog_entry_versions` grows without bound, like the configuration journal and the audit log;
   nothing here adds its own retention pass.
+- No console route creates or edits a `custom_https` tool either — `gateway tools custom
+  create|edit` and `gateway tools secret set` are the only way, this release; the console surface
+  for all of this (built-in and owner-defined alike) is the same later work the first bullet above
+  already names.
 - Rolling back to a release before this one keeps every existing table fully readable (ADR-020's
   expand-migration guarantee); `catalog_entries`/`catalog_entry_versions`/`catalog_attachments`/
   `catalog_entry_tombstones`/`config_attachment_snapshots` are simply additional tables (and, for
@@ -467,4 +602,9 @@ its rollback consequence.
   older release's own copy of that schema parses every snapshot this release ever writes exactly as
   it always has. A `config export` directory predating `tool-attachments.json` (or any directory
   simply missing that file) resolves to every agent's attachments carrying forward unchanged, never
-  to `{}` unconditionally — see "Attachments: a document of their own" above.
+  to `{}` unconditionally — see "Attachments: a document of their own" above. Rolling back past the
+  `custom_https`/`utility` migrations (`0033`/`0034`) the same way leaves a custom tool's own
+  `https_definition` column and `gateway_custom_tool_definition` simply unused rather than
+  unreadable; a queued custom-tool action an older release's own tool runner cannot execute (it
+  knows no `custom`/`utility` namespace) is settled by hand, the same as any action a decommissioned
+  executor left behind.

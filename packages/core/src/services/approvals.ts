@@ -35,6 +35,7 @@ import {
 	resolveApproval,
 	type ToolActionRow,
 } from "./approval-store.ts";
+import { customGrantTimeIssues } from "./custom-tools.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
 import { loadEffectivePermissionsIn } from "./effective-permissions.ts";
 import {
@@ -237,6 +238,11 @@ async function executionIssues(uow: UnitOfWork, approval: ApprovalRow): Promise<
 	const action = { actionType: approval.actionType, actionParams: approval.actionParams };
 	const issues = [
 		...approvedActionIssues(effective.toolPolicy, { agentId: agent.id, financeAgentId }, action),
+		// A `custom_https` action only: refuses a grant once its pinned definition version no
+		// longer matches the entry's current one (edited since the request was made), or once its
+		// parameters no longer pass the current definition's own typed rules. `[]` for any other
+		// action type.
+		...(await customGrantTimeIssues(uow.tx.db, action)),
 	];
 	if (approvalActionHash(action) !== approval.immutableActionHash) {
 		issues.push("the stored action no longer matches its hash");

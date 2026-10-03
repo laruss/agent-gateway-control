@@ -10,6 +10,7 @@ import type {
 	ConfigAttachmentsSnapshot,
 	ConfigRevisionSource,
 	ConfigSnapshotBundle,
+	CustomHttpsDefinition,
 	GatewayEventType,
 	GmailMode,
 	JsonObject,
@@ -457,6 +458,9 @@ export const catalogEntryVersions = pgTable(
 			.$type<RuntimeAdapterId[]>()
 			.notNull()
 			.default([]),
+		/** A `custom_https` version's own fixed destination/parameters/secrets/limits; null for
+		 * every other kind. */
+		httpsDefinition: jsonb("https_definition").$type<CustomHttpsDefinition | null>(),
 		createdBy: text("created_by").notNull(),
 		createdAt: createdAt(),
 	},

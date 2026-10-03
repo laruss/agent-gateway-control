@@ -5,16 +5,26 @@ import {
 	RuntimeAdapterIdSchema,
 	ToolNameSchema,
 } from "./common.ts";
+import { CustomHttpsDefinitionSchema, UTILITY_TEXT_TRANSFORM } from "./custom-tool.ts";
 
 /**
  * What backs a catalog entry. `native` is a runtime's own built-in tool (reading or writing the
  * run workspace, running commands, web search/fetch — `packages/runtime-sdk`'s `NativeTool`s).
  * `gateway` is a capability the Gateway itself performs, never a runtime or the tool broker
  * (posting to Mattermost, writing memory). `executor` is a tool-broker action backed by a
- * registered executor (`@agent-gateway/tool-broker`). `custom_https` is reserved for an owner's
- * own HTTPS-backed tool definition; nothing creates one yet (a later phase defines its shape).
+ * registered executor (`@agent-gateway/tool-broker`). `custom_https` is an owner's own
+ * HTTPS-backed tool definition (`CustomHttpsDefinitionSchema`, `custom-http.ts`), executed by the
+ * tool runner's `custom` namespace. `utility` is a fixed, image-shipped implementation with a
+ * typed input and a bounded output, executed by the tool runner's `utility` namespace — not an
+ * arbitrary worker command, and never owner-defined (only this release's own code ships one).
  */
-export const TOOL_CATALOG_ENTRY_KINDS = ["native", "gateway", "executor", "custom_https"] as const;
+export const TOOL_CATALOG_ENTRY_KINDS = [
+	"native",
+	"gateway",
+	"executor",
+	"custom_https",
+	"utility",
+] as const;
 export const ToolCatalogEntryKindSchema = z.enum(TOOL_CATALOG_ENTRY_KINDS);
 export type ToolCatalogEntryKind = z.infer<typeof ToolCatalogEntryKindSchema>;
 
@@ -99,6 +109,12 @@ export const ToolCatalogEntryVersionSchema = z.strictObject({
 	/** Adapters this capability works under; empty for `gateway`/`executor` (not adapter-scoped —
 	 * every agent regardless of its runtime may hold it). */
 	supportedAdapters: ToolCatalogSupportedAdaptersSchema,
+	/** A `custom_https` version's own fixed destination, parameters, secrets and limits; null for
+	 * every other kind. Immutable like the rest of the version: editing a custom tool publishes a
+	 * new version with a new `httpsDefinition`, never changes this one in place — which is exactly
+	 * what lets a stale approval be detected at grant time (`customDefinitionVersionIssues`,
+	 * `@agent-gateway/policy`). */
+	httpsDefinition: CustomHttpsDefinitionSchema.nullable(),
 	createdBy: z.string().min(1).max(200),
 	createdAt: z.iso.datetime({ offset: true }),
 });
@@ -205,4 +221,16 @@ export const BUILT_IN_GATEWAY_TOOLS: Readonly<z.infer<typeof ToolNameSchema>[]> 
 export const BUILT_IN_EXECUTOR_ACTIONS: Readonly<z.infer<typeof ToolNameSchema>[]> = [
 	"finance.payment.create",
 	"finance.subscription.create",
+];
+
+/**
+ * Packaged utilities this release's tool runner image actually implements
+ * (`@agent-gateway/tool-broker`'s utility registry): fixed code, a typed input and a bounded,
+ * side-effect-free output, never an arbitrary worker command. One utility ships this release,
+ * proving the path; its availability still reflects whether its action type is actually
+ * registered by a running tool runner (ADR-027's "computed, never stored" rule applies to it
+ * exactly as it does to an `executor` entry — both are static, enumerable action-type lists).
+ */
+export const BUILT_IN_UTILITY_ACTIONS: Readonly<z.infer<typeof ToolNameSchema>[]> = [
+	UTILITY_TEXT_TRANSFORM,
 ];

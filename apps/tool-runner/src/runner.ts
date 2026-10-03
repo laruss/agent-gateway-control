@@ -1,4 +1,6 @@
+import { promises as dns } from "node:dns";
 import {
+	type CustomHttpsDefinition,
 	type ToolNamespace,
 	type ToolReport,
 	toolExecuteQueue,
@@ -10,7 +12,13 @@ import { createBoss, directJobSink } from "@agent-gateway/queue";
 import { gauge, type HealthCheck, MetricsRegistry } from "@agent-gateway/service";
 import {
 	type BeginToolAction,
+	type CustomToolDefinitionLookup,
+	type DnsResolver,
+	type DynamicExecutor,
+	executeCustomHttpsAction,
 	processToolJob,
+	type SecretResolver,
+	sendEgressRequest,
 	type ToolExecutors,
 } from "@agent-gateway/tool-broker";
 import pg from "pg";
@@ -26,6 +34,19 @@ export type ToolRunnerOptions = Readonly<{
 	pollingIntervalSeconds?: number;
 	/** Where the runner's metrics go; a registry of its own by default. */
 	metrics?: MetricsRegistry;
+	/**
+	 * Resolves a `custom_https` tool's own secret aliases, from the runner's own secrets
+	 * directory; required only when `namespaces` includes `custom`. The value it returns never
+	 * reaches anywhere else this process touches — not a log line, not a report, not the database.
+	 */
+	customToolSecrets?: SecretResolver;
+	/** Resolves a hostname for the egress guard (`@agent-gateway/tool-broker`'s
+	 * `resolvePinnedAddress`); the real DNS resolver by default, overridden in tests for a
+	 * scripted or rebinding-simulating one. */
+	customToolDnsResolver?: DnsResolver;
+	/** Extra trusted CA certificates for custom-tool egress; a local test server's own in tests,
+	 * never set in production (the platform's trust store). */
+	customToolCa?: Readonly<(string | Buffer)[]>;
 }>;
 
 export type RunningToolRunner = Readonly<{
@@ -36,6 +57,17 @@ export type RunningToolRunner = Readonly<{
 
 /** How often a report that could not be sent is tried again before the job gives up. */
 const REPORT_ATTEMPTS = 5;
+
+/**
+ * Resolves a hostname once, every address the OS resolver returns — `resolvePinnedAddress`
+ * (`@agent-gateway/tool-broker`) picks the first public one and never looks the name up again, so
+ * a second answer (a DNS record whose TTL expired, a rebinding attempt) can never change which
+ * address this call actually connects to.
+ */
+export const nodeDnsResolver: DnsResolver = async (hostname) => {
+	const records = await dns.lookup(hostname, { all: true, verbatim: true });
+	return records.map((record) => ({ address: record.address, family: record.family as 4 | 6 }));
+};
 
 /**
  * Serves the execute queues of its namespaces. It holds its executors' credentials and nothing
@@ -107,6 +139,42 @@ export async function startToolRunner(options: ToolRunnerOptions): Promise<Runni
 		return result.rows[0]?.stop ?? true;
 	};
 
+	// A `custom_https` entry's content, by (entry id, version) — the narrow, read-only window
+	// `gateway_custom_tool_definition` gives the runner into the catalog (ADR-027). Built only when
+	// the runner actually serves `custom`: a runner of other namespaces never touches it.
+	const servesCustom = options.namespaces.includes("custom");
+	const customToolLookup: CustomToolDefinitionLookup = async (entryId, version) => {
+		const result = await pool.query<{ definition: CustomHttpsDefinition | null }>(
+			"select gateway_custom_tool_definition($1, $2) as definition",
+			[entryId, version],
+		);
+		return result.rows[0]?.definition ?? null;
+	};
+	const dynamicExecutor: DynamicExecutor | undefined = !servesCustom
+		? undefined
+		: (job, context) => {
+				if (options.customToolSecrets === undefined) {
+					throw new Error(
+						"TOOL_RUNNER_NAMESPACES includes 'custom' but no secret resolver was set",
+					);
+				}
+				return executeCustomHttpsAction(
+					{ actionType: job.actionType, actionParams: job.actionParams },
+					{
+						lookup: customToolLookup,
+						secrets: options.customToolSecrets,
+						send: (request) =>
+							sendEgressRequest(
+								options.customToolCa === undefined
+									? request
+									: { ...request, ca: options.customToolCa },
+								options.customToolDnsResolver ?? nodeDnsResolver,
+							),
+					},
+					context,
+				);
+			};
+
 	for (const namespace of options.namespaces) {
 		const report = async (data: ToolReport) => {
 			for (let attempt = 1; ; attempt += 1) {
@@ -142,6 +210,7 @@ export async function startToolRunner(options: ToolRunnerOptions): Promise<Runni
 						{
 							namespace,
 							executors: options.executors,
+							dynamicExecutor: namespace === "custom" ? dynamicExecutor : undefined,
 							begin,
 							stopRequested,
 							report,

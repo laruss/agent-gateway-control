@@ -259,8 +259,12 @@ describe("modeSupportedByKind", () => {
 		expect(modeSupportedByKind("executor", "allow")).toBe(false);
 	});
 
-	it("custom_https supports no mode at all (reserved)", () => {
+	it("custom_https and utility kinds support require_approval/disabled only, like executor", () => {
+		expect(modeSupportedByKind("custom_https", "require_approval")).toBe(true);
+		expect(modeSupportedByKind("custom_https", "disabled")).toBe(true);
 		expect(modeSupportedByKind("custom_https", "allow")).toBe(false);
-		expect(modeSupportedByKind("custom_https", "disabled")).toBe(false);
+		expect(modeSupportedByKind("utility", "require_approval")).toBe(true);
+		expect(modeSupportedByKind("utility", "disabled")).toBe(true);
+		expect(modeSupportedByKind("utility", "allow")).toBe(false);
 	});
 });

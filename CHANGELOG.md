@@ -7,7 +7,7 @@ All notable changes are documented here. The project follows Semantic Versioning
 ### Added
 
 - A tool catalog data model (ADR-027): catalog entries (a stable id, an immutable `kind` —
-  `native`/`gateway`/`executor`, `custom_https` reserved — and implementation key), append-only
+  `native`/`gateway`/`executor`/`custom_https`/`utility` — and implementation key), append-only
   immutable versions (name, description, a bounded config schema, a risk floor, supported runtime
   adapters), and per-agent attachments (a pinned version or "current", an `allow`/
   `require_approval`/`disabled` mode, bounded settings). A revision's attachments are their own
@@ -68,6 +68,32 @@ All notable changes are documented here. The project follows Semantic Versioning
   because another implies it — which one) of an agent's effective tools for the runtime prompt to
   describe structurally, each resolved against the exact catalog version it is actually pinned to;
   versions 1 and 2 are still accepted, for a job a release before this one already queued.
+- Custom HTTPS tools and packaged utilities (ADR-027): an owner now defines their own HTTPS-backed
+  tool (`gateway tools custom create|edit <entry-id>`, a JSON definition — fixed destination host,
+  path template and method; typed string/number/boolean/enum parameters mapped explicitly into
+  encoded path/query/header/body slots, never interpolated as a string; named secrets resolved only
+  by the tool runner, never a value anywhere else; response limits; a required idempotency header
+  for any write) and sets its secret (`gateway tools secret set <alias>`, a new, dedicated
+  secrets mount). It attaches and is approved exactly like any other broker action — `custom_https`
+  and the new `utility` kind (one packaged, image-shipped utility, `utility.text-transform`, ships
+  to prove the path) both support only `require_approval`/`disabled`: the broker has no
+  approval-free execution path, side-effect-free or not. A request is pinned to the exact
+  definition version it was resolved against; editing the tool afterward refuses the grant
+  ("this custom tool was edited... it must be requested again") rather than silently executing a
+  different request than the one shown and hashed. Execution goes through a new egress guard
+  (`@agent-gateway/tool-broker`): a hostname is resolved once and the connection made to exactly
+  that address, never re-resolved (defeats DNS rebinding); every literal or resolved address is
+  classified and refused if private, loopback, link-local (the cloud metadata address included),
+  carrier-grade NAT, multicast, reserved, a documentation/benchmark range, or an IPv6 form aliasing
+  any of these (unique-local, link-local, an IPv4-mapped address) — in any notation, including
+  decimal/octal/hex IPv4 literals, the classic SSRF bypass this guard exists to close. Redirects are
+  never followed; an oversized response is aborted mid-stream. A call settles as `succeeded` (a
+  receipt with every secret value scrubbed, even one a destination echoes back), `failed` (a clean,
+  known refusal), or `unknown` (a timeout or reset **after** the request was already sent) — never
+  retried automatically, settled by hand like any other namespace's. A new `custom` broker namespace
+  dispatches dynamically to an owner-created entry's own definition (fetched by exact approved
+  version through a new, narrow `gateway_begin_tool_action`-style function, migration `0034`);
+  `utility` stays a fully static executor, like any other namespace.
 
 ## [0.6.0] - 2026-10-02
 

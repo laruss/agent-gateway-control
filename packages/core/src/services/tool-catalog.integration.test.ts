@@ -139,6 +139,7 @@ describe("tool catalog service (ADR-027)", () => {
 		const entries = await listCatalogEntries(deps, {
 			installedAdapters: new Set(),
 			registeredExecutorActionTypes: new Set(),
+			registeredNamespaces: new Set(),
 		});
 		const builtinIds = entries
 			.filter((e) => e.isBuiltin)
@@ -155,6 +156,7 @@ describe("tool catalog service (ADR-027)", () => {
 				"native-web-fetch",
 				"native-web-search",
 				"native-workspace-write",
+				"utility-utility-text-transform",
 			].sort(),
 		);
 		const versionIdsBefore = entries.map((e) => e.currentVersion.id).sort();
@@ -164,6 +166,7 @@ describe("tool catalog service (ADR-027)", () => {
 		const again = await listCatalogEntries(deps, {
 			installedAdapters: new Set(),
 			registeredExecutorActionTypes: new Set(),
+			registeredNamespaces: new Set(),
 		});
 		expect(again.map((e) => e.id).sort()).toEqual(entries.map((e) => e.id).sort());
 		expect(again.map((e) => e.currentVersion.id).sort()).toEqual(versionIdsBefore);
@@ -177,11 +180,13 @@ describe("tool catalog service (ADR-027)", () => {
 		const deleted = await getCatalogEntry(deps, "executor-finance-subscription-create", {
 			installedAdapters: new Set(),
 			registeredExecutorActionTypes: new Set(),
+			registeredNamespaces: new Set(),
 		});
 		expect(deleted).toBeNull();
 		const survivor = await getCatalogEntry(deps, "executor-finance-payment-create", {
 			installedAdapters: new Set(),
 			registeredExecutorActionTypes: new Set(),
+			registeredNamespaces: new Set(),
 		});
 		expect(survivor).not.toBeNull();
 
@@ -268,6 +273,7 @@ describe("tool catalog service (ADR-027)", () => {
 			await getCatalogEntry(deps, "gateway-mattermost-post", {
 				installedAdapters: new Set(),
 				registeredExecutorActionTypes: new Set(),
+				registeredNamespaces: new Set(),
 			}),
 		).toBeNull();
 	});

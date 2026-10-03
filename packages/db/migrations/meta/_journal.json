@@ -232,6 +232,20 @@
       "when": 1790980954251,
       "tag": "0032_agent_tool_attachments_managed",
       "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1790990092452,
+      "tag": "0033_custom_https_tools",
+      "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1790990149238,
+      "tag": "0034_gateway_custom_tool_definition",
+      "breakpoints": true
     }
   ]
 }

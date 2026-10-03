@@ -9,7 +9,7 @@ import {
 } from "@agent-gateway/contracts";
 import { errorFields, type Logger, redactForStorage, traceFields } from "@agent-gateway/logging";
 import { actionParamIssues, approvalActionHash } from "@agent-gateway/policy";
-import type { ToolExecutors } from "./executor.ts";
+import type { ToolExecutionContext, ToolExecutionResult, ToolExecutors } from "./executor.ts";
 
 /** What `gateway_begin_tool_action` answered. */
 export type BeginVerdict =
@@ -25,9 +25,22 @@ export type BeginToolAction = (
 	hash: string,
 ) => Promise<BeginVerdict>;
 
+/**
+ * Runs one job whose action type is not a statically registered executor's own — a `custom_https`
+ * entry's `custom.<entry-id>`, dynamic and owner-created, so no fixed `ToolExecutors` map could
+ * ever enumerate it in advance the way `finance.payment.create` is known at startup. Tried only
+ * once the static `executors` map has no entry for the job's exact action type.
+ */
+export type DynamicExecutor = (
+	job: ToolActionJob,
+	context: ToolExecutionContext,
+) => Promise<ToolExecutionResult>;
+
 export type ToolJobDeps = Readonly<{
 	namespace: ToolNamespace;
 	executors: ToolExecutors;
+	/** Resolves a job whose action type `executors` has no entry for; see `DynamicExecutor`. */
+	dynamicExecutor?: DynamicExecutor;
 	begin: BeginToolAction;
 	/** Whether a running action was asked to stop (kill-all, the agent disabled). */
 	stopRequested: (actionId: string) => Promise<boolean>;
@@ -105,7 +118,7 @@ export async function processToolJob(
 	const failed = (error: string) =>
 		send({ kind: "failed", actionId: job.actionId, attempt: job.attempt, error: errorText(error) });
 	const executor = deps.executors.get(job.actionType);
-	if (executor === undefined) {
+	if (executor === undefined && deps.dynamicExecutor === undefined) {
 		// Nothing can run it here; a known failure, nothing was sent.
 		return failed(`no executor for '${job.actionType}' in this tool runner`);
 	}
@@ -139,8 +152,16 @@ export async function processToolJob(
 				checking = false;
 			});
 	}, deps.stopPollMs ?? STOP_POLL_MS);
+	const run: (context: ToolExecutionContext) => Promise<ToolExecutionResult> =
+		executor !== undefined
+			? (context) =>
+					executor.execute(
+						Object.fromEntries(job.actionParams.map((param) => [param.name, param.value])),
+						context,
+					)
+			: (context) => (deps.dynamicExecutor as DynamicExecutor)(job, context);
 	try {
-		return send(await execute(job, begun.idempotencyKey, executor, stop.signal, log));
+		return send(await execute(job, begun.idempotencyKey, run, stop.signal, log));
 	} finally {
 		clearInterval(poll);
 		signal.removeEventListener("abort", abort);
@@ -150,16 +171,13 @@ export async function processToolJob(
 async function execute(
 	job: ToolActionJob,
 	idempotencyKey: string,
-	executor: NonNullable<ReturnType<ToolExecutors["get"]>>,
+	run: (context: ToolExecutionContext) => Promise<ToolExecutionResult>,
 	signal: AbortSignal,
 	log: Logger,
 ): Promise<ToolReport> {
 	const base = { actionId: job.actionId, attempt: job.attempt };
 	try {
-		const result = await executor.execute(
-			Object.fromEntries(job.actionParams.map((param) => [param.name, param.value])),
-			{ idempotencyKey, signal },
-		);
+		const result = await run({ idempotencyKey, signal });
 		if (result.kind === "failed") {
 			return { ...base, kind: "failed", error: errorText(result.error) };
 		}

@@ -2,6 +2,14 @@ import type { ToolName } from "@agent-gateway/contracts";
 import type { ToolExecutionResult, ToolExecutor } from "./executor.ts";
 
 export { type RecordedExecution, type RecordingExecutor, recordingExecutor } from "./sandbox.ts";
+export {
+	generateTestTls,
+	type RunningTestServer,
+	startTestHttpsServer,
+	TEST_CUSTOM_TOOL_HOST,
+	type TestHttpsHandler,
+	type TestTls,
+} from "./testing-tls.ts";
 
 /** An executor whose provider always says no. */
 export function failingExecutor(actionType: ToolName, error: string): ToolExecutor {

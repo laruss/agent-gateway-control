@@ -2,7 +2,13 @@ import { mkdtempSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { readSecretFile, resolveSecretPath, secretFileState, writeSecretFile } from "./secrets.ts";
+import {
+	readSecretFile,
+	resolveCustomToolSecretPath,
+	resolveSecretPath,
+	secretFileState,
+	writeSecretFile,
+} from "./secrets.ts";
 import { SettingError } from "./settings.ts";
 
 describe("secret files", () => {
@@ -61,5 +67,15 @@ describe("secret files", () => {
 		const path = join(dir, "empty");
 		writeFileSync(path, "\n");
 		expect(() => readSecretFile(path)).toThrow(SettingError);
+	});
+
+	it("resolves a custom tool's secret by alias, a third mount distinct from the other two", () => {
+		expect(resolveCustomToolSecretPath("ticket_api_key", undefined)).toBe(
+			"/run/custom-tool-secrets/ticket_api_key",
+		);
+		expect(resolveCustomToolSecretPath("ticket_api_key", "/tmp/s")).toBe("/tmp/s/ticket_api_key");
+		expect(() => resolveCustomToolSecretPath("../etc/passwd", undefined)).toThrow(SettingError);
+		expect(() => resolveCustomToolSecretPath("a/b", "/tmp/s")).toThrow(SettingError);
+		expect(() => resolveCustomToolSecretPath("", undefined)).toThrow(SettingError);
 	});
 });

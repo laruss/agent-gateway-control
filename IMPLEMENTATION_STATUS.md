@@ -2201,12 +2201,12 @@ Released as 0.6.0 (migrations `0024_agent_lifecycle` to `0027_lifecycle_retry_of
 
 ## Phase 15 - Tool catalog: entries, versions and attachments
 
-Status: **in progress** (the catalog data model, the compiler and enforcement are complete; a
-console surface and `custom_https` definitions are later work)
+Status: **in progress** (the catalog data model, the compiler, enforcement, custom HTTPS tools and
+packaged utilities are complete; a console surface is later work)
 
 | Item | State | Evidence |
 |------|-------|----------|
-| Catalog entry/version/attachment contracts: `kind` (`native`/`gateway`/`executor`, `custom_https` reserved), immutable `implementationKey`, bounded `configSchema`/`settings`, `riskFloor`, `supportedAdapters`, `ToolAttachment` (`entryId`/`pinnedVersion`/`mode`/`settings`), `riskFloorAllows` | done | `packages/contracts/src/tool-catalog.ts` |
+| Catalog entry/version/attachment contracts: `kind` (`native`/`gateway`/`executor`/`custom_https`/`utility`), immutable `implementationKey`, bounded `configSchema`/`settings`, `riskFloor`, `supportedAdapters`, `ToolAttachment` (`entryId`/`pinnedVersion`/`mode`/`settings`), `riskFloorAllows` | done | `packages/contracts/src/tool-catalog.ts` |
 | Attachments are their own content-addressed document (`ConfigAttachmentsSnapshotSchema`), named by a revision alongside its bundle (`attachmentsSnapshotHash`), never a `ConfigSnapshotBundle` field — an older release's own `strictObject` schema still parses every snapshot this release writes. `replace_bundle`/`add_agent` carry an optional sibling `toolAttachments` (omitted: carry forward unchanged; given, even `{}`/`[]`: replaces in full). A richer `ConfigDiff.toolAttachments` (added/removed/changed, per agent per entry, naming which fields changed) | done | `packages/contracts/src/management.ts` |
 | Schema: `catalog_entries` (`deleted_at`/`deleted_by`: deleting marks, never removes, the row), `catalog_entry_versions` (append-only — migration `0029` guards it), `catalog_attachments` (the active revision's current-state projection), `catalog_entry_tombstones`, `config_attachment_snapshots` (append-only — migration `0031` guards it) | done | `packages/db/src/schema.ts`, migrations `0028_tool_catalog`/`0029_tool_catalog_guards`/`0030_config_attachment_snapshots`/`0031_config_attachment_snapshots_guards` |
 | `ensureToolCatalogSeeded`: idempotent, seeds every built-in this release ships, never re-adds a tombstoned one; run at controller startup and every CLI session | done | `packages/core/src/services/tool-catalog.ts`, `apps/controller/src/controller.ts`, `apps/cli/src/commands.ts` |
@@ -2223,11 +2223,21 @@ console surface and `custom_https` definitions are later work)
 | `adoptAgentToolAttachments` / `gateway tools adopt <agent>\|--all [--dry-run]`: explicit, never-implicit migration of a legacy agent's `permissions` into real attachments, one committed revision per agent, reporting unresolved patterns, before/after effective permissions and any mode a resolved pattern's entry `kind` cannot support | done | `packages/core/src/services/tool-catalog.ts`, `apps/cli/src/commands.ts` |
 | `revokeQueuedActions` also withdraws a still-pending approval (not only an already-granted, queued tool action) once the live, recompiled policy no longer permits it, with an audit entry | done | `packages/core/src/services/approvals.ts` |
 | `AgentTurnInput.schemaVersion` 3 (ADR-023): bounded capability descriptions (`name`/`description`/`mode`), decoupled from `systemStatus`'s own presence rule; versions 1/2 still accepted for an already-queued job; the rendered prompt describes capabilities structurally when present | done | `packages/contracts/src/turn.ts`, `packages/core/src/turn-context.ts`, `packages/runtime-sdk/src/prompt.ts` |
+| `custom_https` definitions (`CustomHttpsDefinitionSchema`, `customHttpsDefinitionProblems`): fixed host/path template/method, typed parameters mapped into one encoded path/query/header/body slot each, named secret slots, a required idempotency header for any write; `createCustomHttpsTool`/`editCatalogEntry` (publishes a new immutable version); `MODES_BY_KIND` gives `custom_https`/`utility` only `require_approval`/`disabled` | done | `packages/contracts/src/custom-tool.ts`, `packages/core/src/services/tool-catalog.ts`, `packages/policy/src/compile.ts` |
+| A request naming a `custom_https` action is pinned to the entry's current definition version (`prepareCustomApprovalDraft`) before the card is ever shown or hashed; grant time re-checks the pin and the parameters against the entry's *current* definition (`customGrantTimeIssues`/`customDefinitionVersionIssues`), refusing a grant once the definition moved on | done | `packages/core/src/services/custom-tools.ts`, `packages/core/src/services/runs.ts`, `packages/core/src/services/approvals.ts` |
+| Egress guard: resolves a hostname once (injectable `DnsResolver`) and connects to exactly that address, never re-resolving (defeats DNS rebinding); classifies every literal/resolved address (dotted/decimal/octal/hex IPv4, compressed/mapped IPv6) and refuses private/loopback/link-local (incl. the cloud metadata address)/CGNAT/multicast/reserved/documentation/unique-local/mapped; redirects never followed; a response over its size limit aborted mid-stream, `GET` → `failed`, a write → `unknown` (the request may already have been sent) | done | `packages/policy/src/ip-guard.ts`, `packages/tool-broker/src/egress.ts` |
+| `executeCustomHttpsAction`: resolves the model's parameters and the definition's named secrets into the concrete request (percent-encoded path, never free interpolation), fills the idempotency header from the action's own stored key, scrubs every secret value from the receipt/error even if the destination echoes it back | done | `packages/tool-broker/src/custom-https-executor.ts` |
+| A new `custom` broker namespace routes every `custom_https` entry's action type through one shared queue; a tool runner serving it dispatches dynamically (`DynamicExecutor`, tried once the static registry has no exact match) to the exact approved definition version, read through `gateway_custom_tool_definition` — a narrow, read-only `SECURITY DEFINER` function symmetrical with `gateway_begin_tool_action`, granted only to a role that can settle `custom`'s own execute jobs | done | `packages/tool-broker/src/tool-job.ts`, `apps/tool-runner/src/runner.ts`, migration `0034_gateway_custom_tool_definition` |
+| Packaged utilities: a new `utility` kind, fully static (like `executor`) — `utility.text-transform` (trim/case/reverse/slugify, bounded input/output) ships to prove the path; availability reflects whether a running tool runner actually registers it | done | `packages/contracts/src/custom-tool.ts`, `packages/tool-broker/src/utility.ts`, `apps/tool-runner/src/main.ts` |
+| `gateway tools secret set <alias>` (hidden entry, confirmed, written verbatim to a dedicated custom-tool secrets mount — never hashed, never the model, the database, logs, an approval or an error) and `gateway tools custom create\|edit <entry-id>` (a JSON definition file) | done | `apps/cli/src/custom-tool-commands.ts`, `apps/cli/src/commands.ts` |
+| Release configuration: a third secrets mount (`$GATEWAY_HOME/secrets/custom-tools`, `/run/custom-tool-secrets` read-only in the tool runner), `init-home.sh` creates it (0700, owner 10001), the CLI's own `/secrets` mount already covers writing to it, backed up the same way every other secret under `$GATEWAY_HOME` already is (no special-casing needed) | done | `deploy/release/compose.yaml`, `deploy/release/bin/init-home.sh` |
 
-Not yet done: no console route surfaces the catalog or an agent's effective permissions to an
-owner (the CLI does: `gateway tools adopt --dry-run`, `gateway agents show`); `custom_https` has no
-definition; executor availability has no live signal from a running tool runner yet
-(`registeredExecutorActionTypes` is supplied by the caller, always empty in production today).
+Not yet done: no console route surfaces the catalog, an agent's effective permissions, or a custom
+HTTPS tool's own definition to an owner (the CLI does: `gateway tools adopt --dry-run`,
+`gateway agents show`, `gateway tools custom create|edit`); executor/utility/`custom_https`
+availability all have the same gap — no live signal from a running tool runner yet
+(`registeredExecutorActionTypes`/`registeredNamespaces` are supplied by the caller, always empty in
+production today, same as before this step).
 
 Acceptance:
 
@@ -2281,5 +2291,32 @@ Acceptance:
   scheduled turn is version 3 regardless of `observe_system`; `systemStatus` presence still follows
   observation alone; old queued jobs are not re-exercised here (versions 1/2 remain
   schema-acceptable, unit-tested in `packages/contracts/src/contracts.test.ts`).
+- [x] Unit (`packages/policy/src/ip-guard.test.ts`): every literal address form (dotted, decimal,
+  octal, hex IPv4; compressed, mapped, unique-local, link-local IPv6) classified correctly;
+  ordinary public addresses allowed; a real hostname is never treated as a literal.
+- [x] Unit (`packages/tool-broker/src/egress.test.ts`): a literal or resolved private/loopback/
+  link-local/CGNAT/multicast address refused before any connection; a resolver called exactly
+  once (DNS-rebinding defeated by construction, not by re-checking a second answer); against a
+  real local HTTPS test server with a throwaway CA — the definition's own SNI/Host reach the
+  destination, not the resolved address; an unexpected content type and an oversized `GET`
+  response are clean `failed` outcomes; an oversized write response and a post-send timeout both
+  throw (recorded as `unknown` by the caller); the idempotency header reaches the destination.
+- [x] Unit (`packages/tool-broker/src/custom-https-executor.test.ts`): resolves by (entry id,
+  version), fills a secret header and never leaks it (even echoed back by the destination);
+  refuses a mismatched entry id (cross-namespace/cross-entry denial) and a pinned version with no
+  matching definition; a path-traversal attempt (`../../etc/passwd`) is percent-encoded into
+  exactly one segment, never escaping it, and a secret reaches a query parameter, never the path.
+- [x] Unit (`packages/policy/src/custom-tool.test.ts`): typed parameter validation per type (string
+  bounds, number range, boolean, enum) and per slot (a path value that is `.`/`..`/contains a
+  separator is refused); `resolveCustomHttpRequest` resolves every value into its declared slot,
+  secret-filled slots carrying only their wire name; `customDefinitionVersionIssues` refuses a
+  pinned version that no longer matches the current one.
+- [x] Integration (`apps/tool-runner/src/custom-tools.integration.test.ts`): a `custom_https` entry
+  created and attached through the real database, requested and approved through the real decision
+  path, resolves its exact approved definition through `gateway_custom_tool_definition` in a real
+  running tool runner — and the egress guard refuses its (necessarily loopback, for a test with no
+  external network) destination, never touching it; a runner serving a different namespace can
+  neither begin the action nor read the definition at all (cross-namespace denial, enforced by the
+  database, not only by the application).
 
 Not yet released; see the Changelog's `[Unreleased]` section.

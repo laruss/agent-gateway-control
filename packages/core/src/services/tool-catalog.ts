@@ -4,8 +4,13 @@ import {
 	BUILT_IN_EXECUTOR_ACTIONS,
 	BUILT_IN_GATEWAY_TOOLS,
 	BUILT_IN_NATIVE_CAPABILITIES,
+	BUILT_IN_UTILITY_ACTIONS,
 	type ChangeSet,
 	type ConfigRevisionSource,
+	type CustomHttpsDefinition,
+	CustomHttpsDefinitionSchema,
+	customHttpsDefinitionProblems,
+	customToolActionType,
 	type JsonObject,
 	type RuntimeAdapterId,
 	riskFloorAllows,
@@ -15,6 +20,7 @@ import {
 	type ToolCatalogEntry,
 	ToolCatalogEntryDescriptionSchema,
 	type ToolCatalogEntryId,
+	ToolCatalogEntryIdSchema,
 	type ToolCatalogEntryKind,
 	ToolCatalogEntryNameSchema,
 	type ToolCatalogEntryVersion,
@@ -23,6 +29,7 @@ import {
 	ToolCatalogRiskFloorSchema,
 	ToolCatalogSupportedAdaptersSchema,
 	type ToolName,
+	type ToolNamespace,
 } from "@agent-gateway/contracts";
 import {
 	catalogAttachments,
@@ -120,6 +127,20 @@ function executorSeed(actionType: ToolName, name: string, description: string): 
 	};
 }
 
+/** A packaged utility: image-shipped, never owner-defined, always approval-gated like every other
+ * broker-executed action (ADR-027's `custom_https`/`utility` section). */
+function utilitySeed(actionType: ToolName, name: string, description: string): BuiltInSeed {
+	return {
+		id: builtInEntryId("utility", actionType),
+		kind: "utility",
+		implementationKey: actionType,
+		name,
+		description,
+		riskFloor: "require_approval",
+		supportedAdapters: [],
+	};
+}
+
 /**
  * Every built-in this release ships, computed from the same facts `BUILT_IN_NATIVE_CAPABILITIES`/
  * `BUILT_IN_GATEWAY_TOOLS`/`BUILT_IN_EXECUTOR_ACTIONS` declare — `name`/`description` are product
@@ -153,14 +174,23 @@ function builtInSeeds(): Readonly<BuiltInSeed[]> {
 			"Create a subscription through the finance tool runner.",
 		),
 	];
-	const seeds = [...native, ...gateway, ...executor];
+	const utility = [
+		utilitySeed(
+			"utility.text-transform",
+			"Text transform",
+			"Apply a fixed, deterministic transform (upper/lower/trim/pretty-print JSON) to text.",
+		),
+	];
+	const seeds = [...native, ...gateway, ...executor, ...utility];
 	const knownNative = new Set(BUILT_IN_NATIVE_CAPABILITIES.map((c) => c.toolName));
 	const knownGateway = new Set(BUILT_IN_GATEWAY_TOOLS);
 	const knownExecutor = new Set(BUILT_IN_EXECUTOR_ACTIONS);
+	const knownUtility = new Set(BUILT_IN_UTILITY_ACTIONS);
 	if (
 		knownNative.size !== native.length ||
 		knownGateway.size !== gateway.length ||
-		knownExecutor.size !== executor.length
+		knownExecutor.size !== executor.length ||
+		knownUtility.size !== utility.length
 	) {
 		// Defends against the two lists silently drifting apart: a capability contracts declares
 		// that this file forgot to seed (or vice versa) fails loudly instead of being skipped.
@@ -252,15 +282,23 @@ export type ToolCatalogAvailabilityContext = Readonly<{
 	/** Adapters with a fresh, ready worker right now (`runtimeHealth`'s own `available`); see
 	 * `installedAdaptersFromHealth`. */
 	installedAdapters: ReadonlySet<RuntimeAdapterId>;
-	/** Executor action types this deployment's tool runner(s) actually registered; empty in
-	 * production today (no real integration ships yet — `sandboxExecutors` is development/test
-	 * only), supplied by whoever can see that live fact, never guessed here. */
+	/** Executor and utility action types this deployment's tool runner(s) actually registered;
+	 * empty in production today (no real integration ships yet — `sandboxExecutors` is
+	 * development/test only), supplied by whoever can see that live fact, never guessed here. Both
+	 * kinds are static, enumerable lists of concrete action types known at code level, exactly like
+	 * `sandboxExecutors`' own registry, so one set serves both. */
 	registeredExecutorActionTypes: ReadonlySet<ToolName>;
+	/** Namespaces a currently healthy tool runner serves; the live fact `custom_https`
+	 * availability needs instead of a per-entry registered action type, since a `custom_https`
+	 * entry's `implementationKey` (`custom.<entry-id>`) is owner-created and dynamic, never a fixed
+	 * list a runner's code could enumerate the way `registeredExecutorActionTypes` does. */
+	registeredNamespaces: ReadonlySet<ToolNamespace>;
 }>;
 
 export const EMPTY_AVAILABILITY_CONTEXT: ToolCatalogAvailabilityContext = {
 	installedAdapters: new Set(),
 	registeredExecutorActionTypes: new Set(),
+	registeredNamespaces: new Set(),
 };
 
 /** `runtimeHealth`'s own result, reduced to the set `ToolCatalogAvailabilityContext` wants. */
@@ -273,8 +311,10 @@ export function installedAdaptersFromHealth(
 /**
  * Whether an entry is actually usable in this release/deployment, right now — never stored:
  * `native` needs at least one supported adapter installed; `gateway` is always available (the
- * Gateway itself performs it, not an optional process); `executor` needs its action type actually
- * registered by a running tool runner; `custom_https` is reserved, never available yet.
+ * Gateway itself performs it, not an optional process); `executor` and `utility` need their action
+ * type actually registered by a running tool runner; `custom_https` needs a tool runner currently
+ * serving the `custom` namespace (every owner-defined entry in it, dynamic and not individually
+ * enumerable the way a static executor or utility action type is).
  */
 export function computeCatalogEntryAvailability(
 	entry: Readonly<{
@@ -290,9 +330,10 @@ export function computeCatalogEntryAvailability(
 		case "gateway":
 			return true;
 		case "executor":
+		case "utility":
 			return context.registeredExecutorActionTypes.has(entry.implementationKey);
 		case "custom_https":
-			return false;
+			return context.registeredNamespaces.has("custom");
 	}
 }
 
@@ -328,6 +369,7 @@ function toEntry(row: {
 	configSchema: JsonObject;
 	riskFloor: ToolCatalogRiskFloor;
 	supportedAdapters: RuntimeAdapterId[];
+	httpsDefinition: CustomHttpsDefinition | null;
 	versionCreatedBy: string;
 	versionCreatedAt: Date;
 }): ToolCatalogEntry {
@@ -348,6 +390,7 @@ function toEntry(row: {
 			configSchema: row.configSchema,
 			riskFloor: row.riskFloor,
 			supportedAdapters: row.supportedAdapters,
+			httpsDefinition: row.httpsDefinition,
 			createdBy: row.versionCreatedBy,
 			createdAt: row.versionCreatedAt.toISOString(),
 		},
@@ -369,6 +412,7 @@ const ENTRY_WITH_CURRENT_VERSION_COLUMNS = {
 	configSchema: catalogEntryVersions.configSchema,
 	riskFloor: catalogEntryVersions.riskFloor,
 	supportedAdapters: catalogEntryVersions.supportedAdapters,
+	httpsDefinition: catalogEntryVersions.httpsDefinition,
 	versionCreatedBy: catalogEntryVersions.createdBy,
 	versionCreatedAt: catalogEntryVersions.createdAt,
 } as const;
@@ -437,6 +481,7 @@ export async function listCatalogEntryVersions(
 			configSchema: row.configSchema,
 			riskFloor: row.riskFloor,
 			supportedAdapters: row.supportedAdapters,
+			httpsDefinition: row.httpsDefinition,
 			createdBy: row.createdBy,
 			createdAt: row.createdAt.toISOString(),
 		}));
@@ -454,6 +499,11 @@ export type EditCatalogEntryInput = Readonly<{
 	configSchema?: JsonObject;
 	riskFloor?: ToolCatalogRiskFloor;
 	supportedAdapters?: Readonly<RuntimeAdapterId[]>;
+	/** A `custom_https` entry's own fixed destination/parameters/secrets/limits; refused for any
+	 * other kind (`editCatalogEntry`'s own kind check — never a built-in, since no `custom_https`
+	 * entry ever is). Replaces the whole definition: there is no partial field update, the same way
+	 * `supportedAdapters` replaces the whole list. */
+	httpsDefinition?: CustomHttpsDefinition;
 	actor: string;
 }>;
 
@@ -519,6 +569,18 @@ export function editCatalogEntryInputProblems(input: EditCatalogEntryInput): Rea
 			problems.push(...parsed.error.issues.map((issue) => `supportedAdapters: ${issue.message}`));
 		}
 	}
+	if (input.httpsDefinition !== undefined) {
+		const parsed = CustomHttpsDefinitionSchema.safeParse(input.httpsDefinition);
+		if (!parsed.success) {
+			problems.push(...parsed.error.issues.map((issue) => `httpsDefinition: ${issue.message}`));
+		} else {
+			problems.push(
+				...customHttpsDefinitionProblems(parsed.data).map(
+					(problem) => `httpsDefinition: ${problem}`,
+				),
+			);
+		}
+	}
 	return problems;
 }
 
@@ -543,6 +605,7 @@ export async function editCatalogEntry(
 		const [entryRow] = await db
 			.select({
 				id: catalogEntries.id,
+				kind: catalogEntries.kind,
 				isBuiltin: catalogEntries.isBuiltin,
 				deletedAt: catalogEntries.deletedAt,
 			})
@@ -559,6 +622,11 @@ export async function editCatalogEntry(
 					`editing built-in catalog entry '${input.entryId}':\n- ${problems.join("\n- ")}`,
 				);
 			}
+		}
+		if (input.httpsDefinition !== undefined && entryRow.kind !== "custom_https") {
+			throw new AdminError(
+				`catalog entry '${input.entryId}' is not a custom_https entry; httpsDefinition cannot be set`,
+			);
 		}
 		const current = await loadEntry(db, input.entryId);
 		if (current === null) {
@@ -578,6 +646,7 @@ export async function editCatalogEntry(
 				supportedAdapters: [
 					...(input.supportedAdapters ?? current.currentVersion.supportedAdapters),
 				],
+				httpsDefinition: input.httpsDefinition ?? current.currentVersion.httpsDefinition,
 				createdBy: input.actor,
 				createdAt: uow.now,
 			})
@@ -597,6 +666,136 @@ export async function editCatalogEntry(
 			throw new AdminError("internal: edited catalog entry vanished within its own transaction");
 		}
 		return updated;
+	});
+}
+
+// ---------------------------------------------------------------------------
+// Creating a `custom_https` entry: the one non-built-in kind with a creation path
+// ---------------------------------------------------------------------------
+
+export type CreateCustomHttpsToolInput = Readonly<{
+	/** The entry's own stable id (`ToolCatalogEntryIdSchema`); its action type is
+	 * `custom.<entryId>` (`customToolActionType`). Chosen once, by the owner, never changed. */
+	entryId: string;
+	name: string;
+	description: string;
+	httpsDefinition: CustomHttpsDefinition;
+	actor: string;
+}>;
+
+/** Everything wrong with `input` on its own terms, before any database access: the id's own
+ * shape, `name`/`description` against the same bounds every version's fields keep, and the
+ * definition's structural and cross-field rules (`customHttpsDefinitionProblems`) — a write
+ * without a declared idempotency mechanism among them. Pure. */
+export function createCustomHttpsToolInputProblems(
+	input: CreateCustomHttpsToolInput,
+): Readonly<string[]> {
+	const problems: string[] = [];
+	const id = ToolCatalogEntryIdSchema.safeParse(input.entryId);
+	if (!id.success) {
+		problems.push(...id.error.issues.map((issue) => `entryId: ${issue.message}`));
+	}
+	const name = ToolCatalogEntryNameSchema.safeParse(input.name);
+	if (!name.success) {
+		problems.push(...name.error.issues.map((issue) => `name: ${issue.message}`));
+	}
+	const description = ToolCatalogEntryDescriptionSchema.safeParse(input.description);
+	if (!description.success) {
+		problems.push(...description.error.issues.map((issue) => `description: ${issue.message}`));
+	}
+	const definition = CustomHttpsDefinitionSchema.safeParse(input.httpsDefinition);
+	if (!definition.success) {
+		problems.push(...definition.error.issues.map((issue) => `httpsDefinition: ${issue.message}`));
+	} else {
+		problems.push(
+			...customHttpsDefinitionProblems(definition.data).map(
+				(problem) => `httpsDefinition: ${problem}`,
+			),
+		);
+	}
+	return problems;
+}
+
+/**
+ * Creates a new, owner-defined `custom_https` catalog entry (ADR-027): the one non-built-in kind
+ * with a creation path at all, since `custom_https` was reserved, not defined, until this step.
+ * Its action type (`custom.<entryId>`) is immutable from here on, like a built-in's own
+ * `implementationKey`; unlike a built-in, every field of its first version — including the
+ * definition itself — is owner-chosen from the start. `riskFloor` is always `require_approval`
+ * (ADR-027's `MODES_BY_KIND`: `custom_https` supports no looser mode) and `supportedAdapters` is
+ * always empty (not adapter-scoped, like `gateway`/`executor`); neither is ever part of this
+ * input, so there is nothing to validate or carry forward for them.
+ */
+export async function createCustomHttpsTool(
+	deps: ControlPlaneDeps,
+	input: CreateCustomHttpsToolInput,
+): Promise<ToolCatalogEntry> {
+	const problems = createCustomHttpsToolInputProblems(input);
+	if (problems.length > 0) {
+		throw new AdminError(
+			`creating custom HTTPS tool '${input.entryId}':\n- ${problems.join("\n- ")}`,
+		);
+	}
+	return inTransaction(deps, async (uow) => {
+		const { db } = uow.tx;
+		const [existing] = await db
+			.select({ id: catalogEntries.id })
+			.from(catalogEntries)
+			.where(eq(catalogEntries.id, input.entryId));
+		if (existing !== undefined) {
+			throw new AdminError(`catalog entry '${input.entryId}' already exists`);
+		}
+		const [tombstoned] = await db
+			.select({ entryId: catalogEntryTombstones.entryId })
+			.from(catalogEntryTombstones)
+			.where(eq(catalogEntryTombstones.entryId, input.entryId));
+		if (tombstoned !== undefined) {
+			throw new AdminError(
+				`catalog entry id '${input.entryId}' was deleted before; choose another`,
+			);
+		}
+		const implementationKey = customToolActionType(input.entryId) as ToolName;
+		await db.insert(catalogEntries).values({
+			id: input.entryId,
+			kind: "custom_https",
+			implementationKey,
+			isBuiltin: false,
+			createdAt: uow.now,
+		});
+		const [version] = await db
+			.insert(catalogEntryVersions)
+			.values({
+				entryId: input.entryId,
+				version: 1,
+				kind: "custom_https",
+				implementationKey,
+				name: input.name,
+				description: input.description,
+				configSchema: {},
+				riskFloor: "require_approval",
+				supportedAdapters: [],
+				httpsDefinition: input.httpsDefinition,
+				createdBy: input.actor,
+				createdAt: uow.now,
+			})
+			.returning({ id: catalogEntryVersions.id });
+		if (version === undefined) {
+			throw new AdminError(
+				`creating custom HTTPS tool '${input.entryId}' did not return its version id`,
+			);
+		}
+		await db
+			.update(catalogEntries)
+			.set({ currentVersionId: version.id })
+			.where(eq(catalogEntries.id, input.entryId));
+		await audit(uow, input.actor, "tool_catalog.create", "catalog_entry", input.entryId, {
+			kind: "custom_https",
+		});
+		const created = await loadEntry(db, input.entryId);
+		if (created === null) {
+			throw new AdminError("internal: created catalog entry vanished within its own transaction");
+		}
+		return created;
 	});
 }
 

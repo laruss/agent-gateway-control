@@ -98,6 +98,7 @@ import {
 	readOptionalFileSetting,
 	readSetting,
 	requireSetting,
+	resolveCustomToolSecretPath,
 	resolveSecretPath,
 	secretFileExists,
 	writeSecretFile,
@@ -118,6 +119,7 @@ import {
 	nodeHiddenReader,
 	revokeConsoleSessionsAfterRotation,
 } from "./console-commands.ts";
+import { createCustomTool, customToolSecretSet, editCustomTool } from "./custom-tool-commands.ts";
 import { gmailAuthorize } from "./gmail-commands.ts";
 import {
 	mattermostAdminTokenRotate,
@@ -231,6 +233,23 @@ export const USAGE = `gateway <command>
                                       patterns and the before/after effective permissions;
                                       --dry-run previews without committing; an agent already
                                       managed through the hub is left untouched
+  tools secret set <alias> [--secrets-dir <dir>]
+                                      hidden entry, confirmed: set a custom HTTPS tool's named
+                                      secret (an API key, a bearer token), written verbatim to
+                                      the tool runner's custom-tool secrets mount; restart the
+                                      tool runner to pick it up
+  tools custom create <entry-id> --name <name> --description <text>
+                --definition <file.json>
+                                      defines a new owner-managed custom HTTPS tool (ADR-027):
+                                      fixed destination/method, typed parameters mapped into
+                                      encoded path/query/header/body slots, named secrets (by
+                                      alias, never a value), response limits; a write without a
+                                      declared idempotency header is refused
+  tools custom edit <entry-id> [--name <name>] [--description <text>]
+                [--definition <file.json>]
+                                      publishes a new immutable version; any approval still
+                                      pending against the entry's previous version is refused
+                                      at grant time, never silently executed against this one
   budgets                             today's usage (UTC) per agent and in total, and holds
   memory list [--status <status>] [--namespace <ns>] [--limit <n>] [--offset <n>]
   memory accept <id> | reject <id>    review memory proposals to shared namespaces
@@ -930,6 +949,23 @@ export async function runCommand(args: Readonly<string[]>, out: Output): Promise
 		}
 		return 0;
 	}
+	if (group === "tools" && action === "secret" && args[2] === "set") {
+		const alias = args[3];
+		if (alias === undefined) {
+			throw new UsageError("missing <alias>");
+		}
+		const secretsDirFlag = flag(args, "secrets-dir") ?? readSetting("CUSTOM_TOOL_SECRETS_DIR");
+		const secretsDir = secretsDirFlag === undefined ? undefined : resolve(secretsDirFlag);
+		await customToolSecretSet(
+			{
+				alias,
+				secretPath: resolveCustomToolSecretPath(alias, secretsDir),
+				reader: nodeHiddenReader(),
+			},
+			out.print,
+		);
+		return 0;
+	}
 	if (group === "mattermost" && action === "admin-token" && args[2] === "set") {
 		const secretsDirFlag = flag(args, "secrets-dir") ?? readSetting("SECRETS_DIR");
 		const secretsDir = secretsDirFlag === undefined ? undefined : resolve(secretsDirFlag);
@@ -1422,6 +1458,47 @@ export async function dispatchSessionCommand(
 			});
 			out.print(json(results));
 			return results.some((result) => result.problems.length > 0) ? 1 : 0;
+		}
+		case "tools custom": {
+			const subcommand = args[2];
+			const entryId = args[3];
+			if (entryId === undefined || entryId.startsWith("--")) {
+				throw new UsageError("usage: tools custom create|edit <entry-id> ...");
+			}
+			const name = flag(args, "name");
+			const description = flag(args, "description");
+			const definitionFile = flag(args, "definition");
+			if (subcommand === "create") {
+				if (name === null || description === null || definitionFile === null) {
+					throw new UsageError(
+						"missing --name <name>, --description <text> or --definition <file.json>",
+					);
+				}
+				await createCustomTool(deps, {
+					entryId,
+					name,
+					description,
+					definitionFile: resolve(definitionFile),
+					actor: who,
+				});
+				out.print(`custom HTTPS tool '${entryId}' created`);
+				return 0;
+			}
+			if (subcommand === "edit") {
+				if (name === null && description === null && definitionFile === null) {
+					throw new UsageError("nothing to edit: give --name, --description or --definition");
+				}
+				await editCustomTool(deps, {
+					entryId,
+					actor: who,
+					...(name === null ? {} : { name }),
+					...(description === null ? {} : { description }),
+					...(definitionFile === null ? {} : { definitionFile: resolve(definitionFile) }),
+				});
+				out.print(`custom HTTPS tool '${entryId}' edited`);
+				return 0;
+			}
+			throw new UsageError("usage: tools custom create|edit <entry-id> ...");
 		}
 		case "budgets":
 			out.print(json(await budgetReport(deps)));

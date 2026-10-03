@@ -55,6 +55,7 @@ import { clampWaitTimeout, isThreadBound } from "../waits.ts";
 import { approvalCorrelation } from "./approval-store.ts";
 import { budgetHoldFor, recordRunUsage, reportedUsage } from "./budgets.ts";
 import { parseThreadRef, recordThreadSummary, threadCorrelationOf } from "./context-store.ts";
+import { prepareCustomApprovalDraft } from "./custom-tools.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
 import { lockMemoryKey, supersedeMemory } from "./memory.ts";
 import { enqueueAttempt, enqueueRunDeadline, scheduleAgent, sessionScope } from "./scheduler.ts";
@@ -527,13 +528,36 @@ async function applyCompletion(
 	}
 
 	let approvers: MattermostId[] = [];
+	let preparedApprovalDraft: ApprovalRequestDraft | null = null;
 	if (result.nextState.kind === "needs_human") {
+		// A `custom_https` action is pinned to its entry's *current* definition version here,
+		// before anything else sees the draft: the synthetic parameter this adds is what lets a
+		// definition edited after this point invalidate the request at grant time
+		// (`customGrantTimeIssues`), never the model's own concern.
+		const prepared = await prepareCustomApprovalDraft(db, result.nextState.approvalRequest);
+		if (prepared.kind === "refused") {
+			await raiseAlert(
+				uow,
+				`approval-policy:${run.id}`,
+				`Run ${run.id} of @${agent.id} asked to approve a custom tool action that is refused; no approval card was posted.`,
+				{ action_type: result.nextState.approvalRequest.actionType },
+			);
+			return applyFailure(
+				uow,
+				run,
+				agent,
+				{ code: "invalid_output", retryable: false, detail: prepared.issues.join("; ") },
+				runtimeVersion,
+				result.usage,
+			);
+		}
+		preparedApprovalDraft = prepared.draft;
 		const refusal = await approvalPolicyIssues(
 			uow,
 			run,
 			agent.id,
 			snapshot.authority.toolPolicy,
-			result.nextState.approvalRequest,
+			preparedApprovalDraft,
 		);
 		if (refusal.length > 0) {
 			await raiseAlert(
@@ -623,7 +647,13 @@ async function applyCompletion(
 			);
 			break;
 		case "needs_human": {
-			await createApproval(uow, run, agent.id, result.nextState.approvalRequest, approvers);
+			await createApproval(
+				uow,
+				run,
+				agent.id,
+				preparedApprovalDraft ?? result.nextState.approvalRequest,
+				approvers,
+			);
 			await setAgentState(
 				uow,
 				agent.id,

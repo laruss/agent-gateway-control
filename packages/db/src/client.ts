@@ -296,10 +296,16 @@ export async function grantWorkerRole(
 	await grantQueueRole(pool, role, [queues], []);
 }
 
-/** The functions a tool runner may call: the `begin` gate and the stop check (ADR-018). */
+/**
+ * The functions a tool runner may call: the `begin` gate, the stop check (ADR-018), and reading
+ * one immutable `custom_https` definition by (entry id, version) — the one piece of catalog state
+ * a runner serving the `custom` namespace needs, through the same narrow, read-only door every
+ * other domain fact is kept behind (ADR-027).
+ */
 const TOOL_RUNNER_FUNCTIONS = [
 	"gateway_begin_tool_action(uuid, integer, text)",
 	"gateway_tool_action_stop_requested(uuid)",
+	"gateway_custom_tool_definition(text, integer)",
 ] as const;
 
 /**

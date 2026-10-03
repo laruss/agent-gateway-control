@@ -231,6 +231,32 @@
   posts route by their own mentions only. Bots are plain members, added only to their
   channels ([ADR-012](../adr/012-mattermost-bridge.md)).
 
+### T10. SSRF through an owner-defined custom HTTPS tool
+
+- An owner's own HTTPS tool (ADR-027) names a destination host the Gateway did not choose; a
+  malicious or compromised definition — or a hostname whose DNS answer changes after the
+  definition was approved — could otherwise reach the host's loopback, the LAN, or a cloud
+  metadata endpoint instead of the intended external API.
+- Status (Phase 15): the tool runner's egress guard resolves a definition's host exactly once
+  and connects only to that resolved address, never re-resolving — a second answer (the
+  destination's own DNS TTL expiring, an attacker racing it) can never redirect an
+  already-approved call. Every literal and resolved address is classified before a socket ever
+  opens and refused if private (RFC 1918), loopback, link-local (the cloud metadata address,
+  `169.254.169.254`, included), carrier-grade NAT, multicast, reserved, a documentation/
+  benchmark range, or an IPv6 form aliasing any of these (unique-local, link-local, an
+  IPv4-mapped address, NAT64) — classified from the literal numeric value regardless of
+  notation (dotted, decimal, octal, hex for IPv4), closing the classic bypass of a hostname
+  that is itself a numeric literal in an unusual base. Redirects are never followed. Every
+  parameter is mapped into exactly one encoded slot (a path segment, a query entry, a header,
+  a JSON body field) — never interpolated as a string, and never evaluated as code or a shell
+  command — so even a value that reached execution unvalidated (a forged job) cannot escape
+  its own slot. A definition's own secrets are named by alias only and resolved by the tool
+  runner alone, from a dedicated, read-only secrets mount; a value is scrubbed from a receipt
+  or an error even where a destination echoes it back, and is never part of the approval hash,
+  a log line or a database row. Editing a definition after a request was made invalidates it
+  at grant time, so a request is always executed exactly as it was shown and approved
+  ([ADR-027](../adr/027-tool-catalog.md)).
+
 ## Open questions
 
 - None open. Provider session ids (decided in Phase 4) are stored in plain text. A session id is

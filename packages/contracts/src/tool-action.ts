@@ -14,9 +14,21 @@ import {
 /**
  * Namespaces the tool broker executes: the first segment of an approved action type. Each has
  * its own execute, report and dead letter queue, so a tool runner's database role, and the
- * credentials it holds, can be limited to the namespaces it serves (ADR-018).
+ * credentials it holds, can be limited to the namespaces it serves (ADR-018). `custom` serves
+ * every owner-defined `custom_https` catalog entry (`custom.<entry-id>`, ADR-027); `utility`
+ * serves fixed, image-shipped utility implementations (`utility.<slug>`) — both namespaces route
+ * every one of their action types to a single tool runner process, which resolves the specific
+ * entry or implementation dynamically rather than through a statically registered executor.
  */
-export const TOOL_NAMESPACES = ["finance", "mail", "deploy", "publish", "issue"] as const;
+export const TOOL_NAMESPACES = [
+	"finance",
+	"mail",
+	"deploy",
+	"publish",
+	"issue",
+	"custom",
+	"utility",
+] as const;
 export const ToolNamespaceSchema = z.enum(TOOL_NAMESPACES);
 export type ToolNamespace = z.infer<typeof ToolNamespaceSchema>;
 

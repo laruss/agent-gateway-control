@@ -17,6 +17,10 @@ done
 # (operator-managed, read-only to the controller) — it generates and writes lifecycle-created
 # agents' bot tokens here itself, at /run/bot-secrets.
 install -d -m 0700 -o 10001 -g 10001 "$home/secrets/controller-bots"
+# ADR-027: a custom HTTPS tool's own named secrets, file per alias — `gateway tools secret set`
+# (uid 10001, through the CLI's /secrets mount) is the only writer; the tool runner mounts this
+# read-only at /run/custom-tool-secrets.
+install -d -m 0700 -o 10001 -g 10001 "$home/secrets/custom-tools"
 install -d -m 0700 -o 70 -g 70 "$home/secrets/postgres"
 password_file="$home/secrets/postgres/postgres_password"
 if [ ! -s "$password_file" ]; then

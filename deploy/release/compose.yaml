@@ -96,6 +96,10 @@ services:
       # @agent-gateway/service) — SECRETS_DIR must never collapse a lifecycle-created agent's bot
       # token path into the operator-managed secrets directory above.
       BOT_SECRETS_DIR: /run/bot-secrets
+      # ADR-027: where `gateway tools secret set <alias>` writes, through the `/secrets` mount
+      # below — the same host directory the tool runner mounts read-only at
+      # /run/custom-tool-secrets.
+      CUSTOM_TOOL_SECRETS_DIR: /secrets/custom-tools
       # `gateway doctor`'s 'mattermost_provisioning' check (ADR-026): read-only here too, the same
       # file `gateway mattermost admin-token set|rotate` writes through the mount below.
       MATTERMOST_ADMIN_TOKEN_FILE: /run/secrets/mattermost_admin_token
@@ -319,6 +323,9 @@ services:
       HEALTH_PORT: "8083"
     volumes:
       - ${GATEWAY_HOME}/secrets/tool-runner:/run/secrets:ro
+      # A custom HTTPS tool's own named secrets (ADR-027): file per alias, read-only here —
+      # `gateway tools secret set <alias>` is the only writer, from the CLI container.
+      - ${GATEWAY_HOME}/secrets/custom-tools:/run/custom-tool-secrets:ro
     tmpfs:
       - /tmp:size=32m,nosuid,nodev,noexec
     networks: [agent-control, egress]
