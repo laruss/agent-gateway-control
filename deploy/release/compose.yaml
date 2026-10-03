@@ -96,6 +96,10 @@ services:
       # @agent-gateway/service) — SECRETS_DIR must never collapse a lifecycle-created agent's bot
       # token path into the operator-managed secrets directory above.
       BOT_SECRETS_DIR: /run/bot-secrets
+      # ADR-027: where `gateway tools secret set <alias>` writes, through the `/secrets` mount
+      # below — the same host directory the tool runner mounts read-only at
+      # /run/custom-tool-secrets.
+      CUSTOM_TOOL_SECRETS_DIR: /secrets/custom-tools
       # `gateway doctor`'s 'mattermost_provisioning' check (ADR-026): read-only here too, the same
       # file `gateway mattermost admin-token set|rotate` writes through the mount below.
       MATTERMOST_ADMIN_TOKEN_FILE: /run/secrets/mattermost_admin_token
@@ -148,12 +152,17 @@ services:
       # The exact Origin every console login and mutation must carry (ADR-025): the home
       # server's own Caddy site, never derived from a forwarded header.
       CONSOLE_ORIGIN: ${CONSOLE_ORIGIN:-https://gateway.local}
+      # ADR-027: read-only here too (the Instruments & Utils hub shows whether a custom tool's own
+      # named secret alias is set, never its value — `gateway tools secret set`, run through
+      # gateway-cli's own read-write mount of the same host directory, is the only writer).
+      CUSTOM_TOOL_SECRETS_DIR: /run/custom-tool-secrets
     volumes:
       - ${GATEWAY_HOME}/secrets/controller:/run/secrets:ro
       # ADR-026: where the lifecycle provisioner writes a lifecycle-created agent's bot token
       # (generated server-side, `mm_<agent>_token`), read-write, distinct from the operator-managed
       # secrets above — the controller never writes there, only here.
       - ${GATEWAY_HOME}/secrets/controller-bots:/run/bot-secrets
+      - ${GATEWAY_HOME}/secrets/custom-tools:/run/custom-tool-secrets:ro
     tmpfs:
       - /tmp:size=64m,nosuid,nodev,noexec
     networks:
@@ -319,6 +328,9 @@ services:
       HEALTH_PORT: "8083"
     volumes:
       - ${GATEWAY_HOME}/secrets/tool-runner:/run/secrets:ro
+      # A custom HTTPS tool's own named secrets (ADR-027): file per alias, read-only here —
+      # `gateway tools secret set <alias>` is the only writer, from the CLI container.
+      - ${GATEWAY_HOME}/secrets/custom-tools:/run/custom-tool-secrets:ro
     tmpfs:
       - /tmp:size=32m,nosuid,nodev,noexec
     networks: [agent-control, egress]

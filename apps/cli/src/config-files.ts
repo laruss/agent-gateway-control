@@ -5,6 +5,8 @@ import {
 	AgentConfigSchema,
 	OrganizationConfigSchema,
 	RolePromptSchema,
+	type ToolAttachmentsBundle,
+	ToolAttachmentsBundleSchema,
 } from "@agent-gateway/contracts";
 import type { ConfigApplyInput } from "@agent-gateway/core";
 import { sha256Hex } from "@agent-gateway/events";
@@ -16,6 +18,13 @@ export class ConfigFileError extends Error {
 		this.name = "ConfigFileError";
 	}
 }
+
+/** Where `config export`/`config import` round-trip every agent's catalog attachments (ADR-027).
+ * Optional: a directory from before this file existed (an older export, or hand-written YAML)
+ * simply has none, and `loadConfigDirectory` leaves `toolAttachments` unresolved (`undefined`) —
+ * `config apply`'s own carry-forward semantics then apply (ADR-027): every agent's existing
+ * attachments stay exactly as they are, never silently cleared. */
+export const TOOL_ATTACHMENTS_FILE = "tool-attachments.json";
 
 /**
  * A generous ceiling on any single file read directly from an operator-supplied directory or
@@ -77,6 +86,33 @@ export function readPromptFile(root: string, promptPath: string): string {
 	return readFileSync(current, "utf8");
 }
 
+/** Reads `<dir>/tool-attachments.json`, or `undefined` when the file does not exist (an export
+ * from before ADR-027, or a hand-written directory that never had one) — distinct from `{}` (the
+ * file exists and explicitly names no attachments for anyone), so `applyConfig`/`commitChange` can
+ * tell "no document supplied, carry forward" from "this document, which happens to be empty"
+ * (ADR-027). */
+function loadToolAttachments(dir: string): ToolAttachmentsBundle | undefined {
+	const path = join(dir, TOOL_ATTACHMENTS_FILE);
+	if (!existsSync(path)) {
+		return undefined;
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(readFileSync(path, "utf8"));
+	} catch (error) {
+		throw new ConfigFileError(
+			`cannot parse '${path}': ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	const result = ToolAttachmentsBundleSchema.safeParse(parsed);
+	if (!result.success) {
+		throw new ConfigFileError(
+			`${TOOL_ATTACHMENTS_FILE} is invalid:\n- ${issues(path, result.error).join("\n- ")}`,
+		);
+	}
+	return result.data;
+}
+
 function parseYaml(path: string) {
 	try {
 		return Bun.YAML.parse(readFileSync(path, "utf8"));
@@ -129,6 +165,7 @@ export function loadConfigDirectory(dir: string, root: string): ConfigApplyInput
 		agents,
 		constitution: readPromptFile(root, organization.data.organization.constitution_file),
 		rolePrompts,
+		toolAttachments: loadToolAttachments(dir),
 	};
 }
 

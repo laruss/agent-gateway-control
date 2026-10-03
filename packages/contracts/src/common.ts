@@ -78,6 +78,12 @@ export const ToolPatternSchema = z
 	);
 export type ToolPattern = z.infer<typeof ToolPatternSchema>;
 
+/** The only tool pattern that ever names every finance capability at once. A single shared
+ * constant so `@agent-gateway/contracts`' own finance rule, `@agent-gateway/policy`'s compiler
+ * and `core`'s agent-lifecycle service (restore/retire normalization) can never drift apart on
+ * what "finance" means as a tool pattern. */
+export const FINANCE_TOOLS: ToolPattern = "finance.*";
+
 /** True when `pattern` matches every tool that `other` matches. */
 export function toolPatternCovers(pattern: ToolPattern, other: ToolPattern): boolean {
 	if (!pattern.endsWith(".*")) {
@@ -261,6 +267,99 @@ export function safeText(max: number, safety: TextSafety) {
 			(value) => !hasUnsafeCharacters(value, safety),
 			"control or invisible characters are not allowed",
 		);
+}
+
+/** `true` for a character `safeText(_, "verbatim")` would accept on its own (ignoring the
+ * whole-string NFKC/spacing rules `hasUnsafeCharacters` also checks) — a letter, digit,
+ * punctuation or symbol, and not one of the blank lookalikes. */
+function isVerbatimSafeCharacter(char: string): boolean {
+	return VERBATIM_ALLOWED.test(char) && !VERBATIM_BLANK_LOOKALIKES.has(char);
+}
+
+/**
+ * `value`, collapsed into a single line any `safeText(max, "verbatim")` schema accepts: every
+ * character the allowlist would reject (controls, newlines/tabs, bidi overrides, emoji
+ * modifiers that render blank, ...) becomes one space, runs of spaces collapse to one, and the
+ * ends are trimmed — never dropped outright, so words on either side of a stripped character
+ * never run together. Longer than `max` once collapsed, it is cut and marked with the same `…`
+ * truncation marker `@agent-gateway/logging`'s `truncateText` already uses elsewhere; genuinely
+ * empty (nothing but unsafe characters, or blank to start with) becomes `"(empty)"` — `safeText`
+ * never accepts blank. Built to satisfy the schema by construction, but a value this function
+ * cannot make to fit (an astral character's surrogate pair split by truncation, the one case
+ * construction alone cannot rule out) is shrunk one code unit at a time, re-checked against the
+ * real schema rule each time, until it does: correctness is verified, not merely argued for.
+ * For a result a human approves or reads back verbatim (a tool receipt field, a response
+ * preview) — never for `"text"` safety, which already tolerates newlines/tabs and so never needs
+ * this collapsing.
+ */
+export function toVerbatimPreview(value: string, max: number): string {
+	let collapsed = "";
+	for (const char of value.normalize("NFKC")) {
+		const piece = isVerbatimSafeCharacter(char) ? char : " ";
+		if (piece === " " && collapsed.endsWith(" ")) {
+			continue;
+		}
+		collapsed += piece;
+	}
+	collapsed = collapsed.trim();
+	const marker = "…";
+	let candidate =
+		collapsed.length <= max
+			? collapsed
+			: `${collapsed.slice(0, Math.max(0, max - marker.length)).replace(/ +$/, "")}${marker}`;
+	while (
+		candidate !== "" &&
+		(candidate.length > max || hasUnsafeCharacters(candidate, "verbatim"))
+	) {
+		candidate = candidate.slice(0, -1);
+	}
+	return candidate === "" ? "(empty)" : candidate;
+}
+
+/**
+ * `value` cut to at most `max` characters, marked with the same `…` truncation marker once cut —
+ * for `"text"`-safety content that must never end mid percent-escape (`%XX`): a custom tool's
+ * resolved path or query value is percent-encoded, and cutting right after its `%` or its first
+ * hex digit would leave a dangling, misleading fragment where either the whole escape or none of
+ * it reads correctly. Also shared by `fitApprovalCard` (`@agent-gateway/contracts`'s own
+ * `approval.ts`) to shrink a model-written `actionSummary`, which is ordinary `"text"`-safety
+ * content, not percent-encoded, but can still contain any character that safety level allows,
+ * emoji included — so the cut point is also never left splitting a UTF-16 surrogate pair, the one
+ * other way a cut here could produce a string that does not mean what it looks like it means.
+ * Unlike {@link toVerbatimPreview}, this never collapses characters (`"text"` safety already
+ * tolerates newlines/tabs) and never re-verifies against a schema; only the cut point is adjusted.
+ */
+export function truncateRequestPreview(value: string, max: number): string {
+	if (value.length <= max) {
+		return value;
+	}
+	const marker = "…";
+	if (max <= marker.length) {
+		return value.slice(0, Math.max(0, max));
+	}
+	let cut = max - marker.length;
+	// A percent-escape is three characters (`%` plus two hex digits); if the boundary falls one or
+	// two characters past its own `%`, the escape is only partially included — back up to before
+	// the `%` so it is either whole or entirely omitted, never dangling.
+	for (const back of [1, 2]) {
+		if (cut - back >= 0 && value[cut - back] === "%") {
+			cut -= back;
+			break;
+		}
+	}
+	// `value` is indexed in UTF-16 code units, not code points: a character outside the Basic
+	// Multilingual Plane (most emoji included) is two code units, a "surrogate pair" — cutting
+	// between them leaves a lone high surrogate behind, a code unit with no valid meaning on its
+	// own. Backing up the one further code unit this takes excludes the whole character instead,
+	// never half of it; a percent-escape's own code units (`%` and hex digits) are never in the
+	// high-surrogate range, so this can never reopen the dangling-escape case the loop above
+	// already closed. Grapheme clusters (a multi-code-point emoji sequence joined by ZWJ, a base
+	// letter plus a combining mark) are not covered — cutting one of those apart can still change
+	// how it renders, but never leaves a lone surrogate, the one failure mode this guards.
+	if (cut > 0 && value.charCodeAt(cut - 1) >= 0xd800 && value.charCodeAt(cut - 1) <= 0xdbff) {
+		cut -= 1;
+	}
+	return `${value.slice(0, cut)}${marker}`;
 }
 
 /** Mention tokens as Mattermost reads them: `@name` not preceded by a letter, digit or `_`. */

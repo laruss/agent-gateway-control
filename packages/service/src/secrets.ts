@@ -56,6 +56,25 @@ function resolveWithinMount(ref: string, mount: string, dir: string | undefined)
 	return dir === undefined ? ref : join(dir, basename(ref));
 }
 
+/** Where a custom HTTPS tool's own secrets are mounted (ADR-027): one file per alias, read-only
+ * to the tool runner, written only by `gateway tools secret set <alias>`. A third mount, distinct
+ * from both `SECRET_MOUNT` (the controller's operator-managed config) and `BOT_SECRET_MOUNT` (the
+ * controller's own provisioned-token directory) — none of the three are interchangeable. */
+export const CUSTOM_TOOL_SECRET_MOUNT = "/run/custom-tool-secrets/";
+
+/**
+ * The file behind one alias's custom-tool secret: `basename`-only, so an alias naming anything but
+ * a single path segment (a traversal attempt included) is refused, the same way `resolveSecretPath`
+ * already refuses one for `/run/secrets/`/`/run/bot-secrets/`. `dir` overrides the mount directory
+ * for local development and tests, exactly like `resolveSecretPath`'s own `secretsDir`.
+ */
+export function resolveCustomToolSecretPath(alias: string, dir: string | undefined): string {
+	if (basename(alias) !== alias || alias === "") {
+		throw new SettingError(`secret alias '${alias}' must be a single path segment`);
+	}
+	return dir === undefined ? join(CUSTOM_TOOL_SECRET_MOUNT, alias) : join(dir, alias);
+}
+
 /** Reads a secret file; an empty file is an error, never an empty credential. */
 export function readSecretFile(path: string): string {
 	const value = readFileSync(path, "utf8").trim();

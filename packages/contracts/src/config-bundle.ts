@@ -1,6 +1,7 @@
 import type { AgentConfig, AgentPermissions } from "./agent-config.ts";
 import {
 	type AgentId,
+	FINANCE_TOOLS,
 	MATTERMOST_ADMIN_TOKEN_SECRET_FILE,
 	ROUTING_KEY_SECRET_FILE,
 	toolPatternsOverlap,
@@ -17,7 +18,6 @@ export type ConfigBundleIssue = Readonly<{
 	message: string;
 }>;
 
-const FINANCE_TOOLS = "finance.*";
 /** The only finance tool that may run without a human approval. */
 const FINANCE_READ_ONLY_TOOL = "finance.read";
 

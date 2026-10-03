@@ -49,6 +49,7 @@ function previewResponseFor(patch: AgentPatch): ConsolePreviewResponse {
 			],
 			organizationFieldPaths: [],
 			constitution: { changed: false, beforeSize: 0, afterSize: 0 },
+			toolAttachments: [],
 		},
 	};
 }

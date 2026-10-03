@@ -21,6 +21,8 @@ export { type BudgetReport, budgetHoldFor, budgetReport } from "./services/budge
 export * from "./services/channel-grants.ts";
 export * from "./services/console-management.ts";
 export * from "./services/console-sessions.ts";
+export * from "./services/console-tools.ts";
+export * from "./services/custom-tools.ts";
 export * from "./services/deps.ts";
 export * from "./services/gmail.ts";
 export * from "./services/ingest.ts";
@@ -43,6 +45,7 @@ export {
 	raiseAlert,
 } from "./services/store.ts";
 export * from "./services/system-status.ts";
+export * from "./services/tool-catalog.ts";
 export * from "./services/wait-timeouts.ts";
 export * from "./state-machine.ts";
 export * from "./turn-context.ts";

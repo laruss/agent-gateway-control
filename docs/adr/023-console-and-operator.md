@@ -89,6 +89,31 @@ from the console or through this permission is out of scope: both are read-only.
   this release requires turning `observe_system` off and settling or cancelling outstanding
   version 2 work first, so no version 2 job is left for a release that cannot read it.
 
+### Turn input version 3 (ADR-027)
+
+- `AgentTurnInput.schemaVersion` is `1 | 2 | 3`. Version 3 adds `capabilities`: bounded, structured
+  descriptions (`name`, a short catalog-sourced `description`, `mode`) of the agent's own effective
+  tools, compiled from its attachments (ADR-027) the same way for a hub-managed or a legacy agent.
+  Unlike version 2, whose own version number doubled as the `observe_system` discriminant (version 1
+  never carries `systemStatus`, version 2 always does), version 3 decouples the two: a version 3
+  input always carries `capabilities`, and separately carries `systemStatus` exactly when the agent
+  observes the system — the same rule version 1/2 already had for that field, now freed from also
+  having to signal the version number. This is why version 3, not a conditional version 2, is what
+  every new turn carries from this release on: `capabilities` has nothing to do with observation,
+  and tying it to the same version number `systemStatus` used would reintroduce the very
+  either-or-by-version-number encoding ADR-010 already avoids for structural fields.
+- **Which release first accepts version 3.** This release's `AgentTurnInputSchema` accepts
+  versions 1, 2 and 3; every new turn this release schedules is version 3
+  (`packages/core/src/turn-context.ts`'s `buildTurnContext` no longer chooses 1 vs. 2 by
+  `observe_system` — it always produces 3). Versions 1 and 2 are accepted only so a job already
+  queued by a release before this one (still in flight across the upgrade) is not rejected; this
+  release's own workers never construct one.
+- **Rollback consequence.** The same shape as version 2's: an older release's own
+  `AgentTurnInputSchema` accepts only versions 1 and 2 and rejects a version 3 run job outright.
+  Rolling back past this release requires settling or cancelling outstanding version 3 work first
+  (every run this release has scheduled but not yet completed), the same deploy-runbook step
+  version 2's own rollback already needed, now for one more version.
+
 ### Context measurements
 
 - Neither the console nor a turn's own status ever shows a context-window fill percentage: the

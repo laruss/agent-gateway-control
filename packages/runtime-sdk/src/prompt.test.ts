@@ -91,6 +91,60 @@ describe("renderTurnPrompt", () => {
 		expect(confined).toContain("read files: not available");
 		expect(confined).toContain("web search: allowed");
 	});
+
+	it("renders a parameterized capability's own non-secret parameter contract, never a secret", () => {
+		const base = contractTurnInput({ runId: RUN_ID, message: "hi", deadlineMs: 1000 });
+		const prompt = renderTurnPrompt({
+			...base,
+			schemaVersion: 3,
+			toolPolicy: { ...base.toolPolicy, requireHumanApproval: ["custom.zendesk"] },
+			capabilities: [
+				{
+					name: "custom.zendesk",
+					description: "Creates a Zendesk ticket.",
+					mode: "require_approval",
+					parameters: [
+						{ name: "id", type: "string", required: true, minLength: 1, maxLength: 50 },
+						{ name: "priority", type: "enum", required: true, values: ["low", "high"] },
+						{ name: "votes", type: "number", required: true, minimum: 0, maximum: 100 },
+						{ name: "urgent", type: "boolean", required: true },
+					],
+				},
+			],
+		});
+		expect(prompt).toContain(
+			'custom.zendesk (needs approval): Creates a Zendesk ticket.\n  required parameters: id (string, 1-50 characters), priority (one of: "low", "high"), votes (number, min 0, max 100), urgent (boolean)',
+		);
+		expect(prompt).not.toContain("slotName");
+		expect(prompt).not.toContain("secretSlot");
+	});
+
+	it("renders each enum choice as its own JSON string literal, so a choice containing a comma never reads as two choices", () => {
+		const base = contractTurnInput({ runId: RUN_ID, message: "hi", deadlineMs: 1000 });
+		const prompt = renderTurnPrompt({
+			...base,
+			schemaVersion: 3,
+			toolPolicy: { ...base.toolPolicy, requireHumanApproval: ["custom.tracker"] },
+			capabilities: [
+				{
+					name: "custom.tracker",
+					description: "Updates a tracker issue.",
+					mode: "require_approval",
+					parameters: [
+						{
+							name: "status",
+							type: "enum",
+							required: true,
+							values: ["in progress, blocked", "done"],
+						},
+					],
+				},
+			],
+		});
+		expect(prompt).toContain('status (one of: "in progress, blocked", "done")');
+		// Never the ambiguous, unquoted rendering that would read as three choices.
+		expect(prompt).not.toContain("one of: in progress, blocked, done");
+	});
 });
 
 describe("renderTurnPrompt with a denied memory.write (ADR-023)", () => {

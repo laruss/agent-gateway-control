@@ -46,6 +46,7 @@ import {
 	staticContentType,
 } from "./console-static.ts";
 import type { ConsoleSnapshot, ConsoleStatusCache } from "./console-status.ts";
+import { isAgentToolsPath, routeConsoleTools } from "./console-tools.ts";
 
 // ---------------------------------------------------------------------------
 // The owner's console listener (ADR-025): a separate Bun.serve, authenticated with a server-side
@@ -189,6 +190,12 @@ export type ConsoleServerOptions = Readonly<{
 	 * release image bakes it into. A missing or incomplete build is logged once and served as a
 	 * plain 503 for the UI only — `/api/*` is unaffected. */
 	staticDir?: string;
+	/** Where `gateway tools secret set <alias>` writes (`CUSTOM_TOOL_SECRETS_DIR`), read-only here
+	 * so the Instruments & Utils hub can show whether a custom tool's own named secret aliases are
+	 * set — never a value, only presence (ADR-027). Left unset, the tool runner's own well-known
+	 * mount path (`resolveCustomToolSecretPath`'s own default) is assumed, same as every other
+	 * caller. */
+	customToolSecretsDir?: string;
 	clock?: () => Date;
 	maxConcurrentVerifications?: number;
 	/** Active sessions kept at once; the oldest beyond this are revoked on the next login. */
@@ -436,11 +443,14 @@ export function startConsoleServer(options: ConsoleServerOptions): RunningConsol
 	}
 
 	/**
-	 * The Agents hub's management API (`console-management.ts`): every route needs a valid
-	 * session, and — `GET`/`HEAD` read the active configuration, nothing more — a mutation
-	 * (`POST`) additionally needs the exact configured Origin and a matching CSRF header, exactly
-	 * like `DELETE /api/session` above. `console-management.ts` itself never sees a `Request`: it
-	 * is hand a parsed method/path/query/body and returns a status plus a JSON-serializable body.
+	 * The Agents hub's management API (`console-management.ts`) and the Instruments & Utils hub's
+	 * own (`console-tools.ts`): every route needs a valid session, and — `GET`/`HEAD` read the
+	 * active configuration, nothing more — a mutation (`POST`) additionally needs the exact
+	 * configured Origin and a matching CSRF header, exactly like `DELETE /api/session` above.
+	 * Neither routing module ever sees a `Request`: each is handed a parsed method/path/query/body
+	 * and returns a status plus a JSON-serializable body. `isAgentToolsPath` is what tells an
+	 * agent's own `/tools*` sub-path apart from the rest of `/api/agents/*`, which
+	 * `console-management.ts` still owns.
 	 */
 	async function handleManagement(request: Request, pathname: string): Promise<Response> {
 		const session = await authenticate(request);
@@ -470,6 +480,16 @@ export function startConsoleServer(options: ConsoleServerOptions): RunningConsol
 			}
 			bodyText = bounded.text;
 		}
+		if (pathname.startsWith("/api/tools") || isAgentToolsPath(pathname)) {
+			const result = await routeConsoleTools({
+				method,
+				pathname,
+				bodyText,
+				deps: options.deps,
+				customToolSecretsDir: options.customToolSecretsDir,
+			});
+			return jsonResponse(result.body, result.status);
+		}
 		const url = new URL(request.url);
 		const result = await routeConsoleManagement({
 			method,
@@ -489,7 +509,11 @@ export function startConsoleServer(options: ConsoleServerOptions): RunningConsol
 		if (pathname === "/api/session") {
 			return handleSession(request);
 		}
-		if (pathname.startsWith("/api/agents") || pathname.startsWith("/api/config/")) {
+		if (
+			pathname.startsWith("/api/agents") ||
+			pathname.startsWith("/api/config/") ||
+			pathname.startsWith("/api/tools")
+		) {
 			return handleManagement(request, pathname);
 		}
 		if (pathname.startsWith("/api/")) {

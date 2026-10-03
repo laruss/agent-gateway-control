@@ -32,3 +32,4 @@ rewritten in substance: a changed decision gets a new ADR that references the ol
 | [024](024-managed-configuration.md) | Managed configuration: immutable snapshots and a revision journal | Accepted |
 | [025](025-management-console.md) | The management console: sessions, CSRF and exact Origin | Accepted |
 | [026](026-agent-lifecycle.md) | Agent lifecycle: durable provisioning state, separate from desired configuration | Accepted |
+| [027](027-tool-catalog.md) | Tool catalog: entries, immutable versions, attachments and legacy conversion | Accepted |

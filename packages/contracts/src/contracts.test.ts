@@ -1,11 +1,18 @@
 import { describe, expect, it } from "vitest";
 import { AgentConfigSchema, AgentPermissionsSchema, WakeRuleSchema } from "./agent-config.ts";
 import {
+	type ApprovalCardFields,
 	type ApprovalRequest,
 	ApprovalRequestDraftSchema,
 	ApprovalRequestSchema,
+	fitApprovalCard,
 } from "./approval.ts";
-import { AgentIdSchema, PromptPathSchema, ToolPatternSchema } from "./common.ts";
+import {
+	AgentIdSchema,
+	PromptPathSchema,
+	ToolPatternSchema,
+	truncateRequestPreview,
+} from "./common.ts";
 import { validateConfigBundle } from "./config-bundle.ts";
 import { type GatewayEvent, GatewayEventSchema } from "./event.ts";
 import { OrganizationMattermostSchema } from "./organization.ts";
@@ -28,6 +35,7 @@ import {
 	AgentTurnInputSchema,
 	AgentTurnResultSchema,
 	type ArtifactDescriptor,
+	capabilityParametersFromCustomToolParams,
 	MemoryItemSchema,
 	ThreadPostSchema,
 	ToolPolicySnapshotSchema,
@@ -252,6 +260,101 @@ describe("AgentTurnInput", () => {
 		expect(issuePaths(AgentTurnInputSchema, v2)).toEqual(["schemaVersion"]);
 		expect(issuePaths(AgentTurnInputSchema, { ...v2, systemStatus: systemStatus() })).toEqual([]);
 	});
+
+	it("rejects version 1 or version 2 carrying capabilities (version 3 only)", () => {
+		expect(issuePaths(AgentTurnInputSchema, { ...input, capabilities: [] })).toEqual([
+			"schemaVersion",
+		]);
+		const v2 = agentTurnInput({ schemaVersion: 2, systemStatus: systemStatus() });
+		expect(issuePaths(AgentTurnInputSchema, { ...v2, capabilities: [] })).toEqual([
+			"schemaVersion",
+		]);
+	});
+
+	it("requires version 3 to carry capabilities; systemStatus there stays governed by observation alone, not the version number", () => {
+		const v3 = agentTurnInput({ schemaVersion: 3 });
+		expect(issuePaths(AgentTurnInputSchema, v3)).toEqual(["schemaVersion"]);
+		expect(issuePaths(AgentTurnInputSchema, { ...v3, capabilities: [] })).toEqual([]);
+		expect(
+			issuePaths(AgentTurnInputSchema, {
+				...v3,
+				capabilities: [],
+				systemStatus: systemStatus(),
+			}),
+		).toEqual([]);
+	});
+
+	it("rejects duplicate capability names", () => {
+		const v3 = agentTurnInput({ schemaVersion: 3 });
+		const capability = { name: "repository.read", description: "Read files.", mode: "allow" };
+		expect(
+			issuePaths(AgentTurnInputSchema, { ...v3, capabilities: [capability, capability] }),
+		).toEqual(["capabilities"]);
+	});
+
+	it("carries a parameterized capability's own non-secret parameter contract", () => {
+		const v3 = agentTurnInput({ schemaVersion: 3 });
+		const capability = {
+			name: "custom.zendesk",
+			description: "Creates a Zendesk ticket.",
+			mode: "require_approval",
+			parameters: [
+				{ name: "id", type: "string", required: true, minLength: 1, maxLength: 50 },
+				{ name: "priority", type: "enum", required: true, values: ["low", "high"] },
+				{ name: "votes", type: "number", required: true, minimum: 0, maximum: 100 },
+				{ name: "urgent", type: "boolean", required: true },
+			],
+		};
+		expect(issuePaths(AgentTurnInputSchema, { ...v3, capabilities: [capability] })).toEqual([]);
+	});
+
+	it("rejects an empty parameters array (omit the field instead of an empty list)", () => {
+		const v3 = agentTurnInput({ schemaVersion: 3 });
+		const capability = {
+			name: "custom.zendesk",
+			description: "Creates a Zendesk ticket.",
+			mode: "require_approval",
+			parameters: [],
+		};
+		expect(issuePaths(AgentTurnInputSchema, { ...v3, capabilities: [capability] })).toEqual([
+			"capabilities.0.parameters",
+		]);
+	});
+});
+
+describe("capabilityParametersFromCustomToolParams", () => {
+	it("returns undefined for a definition with no typed parameters", () => {
+		expect(capabilityParametersFromCustomToolParams([])).toBeUndefined();
+	});
+
+	it("marks every parameter required and drops slot/slotName, never a secret", () => {
+		const params = capabilityParametersFromCustomToolParams([
+			{ name: "id", slot: "path", slotName: "id", type: "string", minLength: 1, maxLength: 50 },
+			{
+				name: "votes",
+				slot: "body",
+				slotName: "votes",
+				type: "number",
+				minimum: 0,
+				maximum: 100,
+			},
+			{ name: "urgent", slot: "query", slotName: "urgent", type: "boolean" },
+			{
+				name: "priority",
+				slot: "header",
+				slotName: "x-priority",
+				type: "enum",
+				values: ["low", "high"],
+			},
+		]);
+		expect(params).toEqual([
+			{ name: "id", type: "string", required: true, minLength: 1, maxLength: 50 },
+			{ name: "votes", type: "number", required: true, minimum: 0, maximum: 100 },
+			{ name: "urgent", type: "boolean", required: true },
+			{ name: "priority", type: "enum", required: true, values: ["low", "high"] },
+		]);
+		expect(JSON.stringify(params)).not.toContain("slot");
+	});
 });
 
 describe("ToolPolicySnapshot", () => {
@@ -400,6 +503,126 @@ describe("ApprovalRequestDraft", () => {
 				JSON.stringify(value),
 			).toEqual(["actionParams.0.value"]);
 		}
+	});
+});
+
+/** `true` once `text` contains a UTF-16 code unit that is half of a surrogate pair with no
+ * matching other half beside it — the one way a naive, code-unit-indexed string cut can produce
+ * a result that does not round-trip to the characters it looks like it contains. */
+function hasLoneSurrogate(text: string): boolean {
+	for (let i = 0; i < text.length; i++) {
+		const code = text.charCodeAt(i);
+		if (code >= 0xd800 && code <= 0xdbff) {
+			const next = text.charCodeAt(i + 1);
+			if (!(next >= 0xdc00 && next <= 0xdfff)) {
+				return true;
+			}
+			i++;
+		} else if (code >= 0xdc00 && code <= 0xdfff) {
+			return true;
+		}
+	}
+	return false;
+}
+
+describe("truncateRequestPreview", () => {
+	it("never splits a UTF-16 surrogate pair at the cut (surrogate-safe; grapheme-safe is not required)", () => {
+		// "😀" is `😀` — two UTF-16 code units; `max` is chosen so the naive cut
+		// (`max - "…".length`) lands exactly between them.
+		const value = `${"a".repeat(5)}😀${"b".repeat(5)}`;
+		const result = truncateRequestPreview(value, 7);
+		expect(result).toBe("aaaaa…");
+		expect(hasLoneSurrogate(result)).toBe(false);
+	});
+
+	it("still backs up out of a dangling percent-escape when nothing but ASCII is involved (unchanged)", () => {
+		const value = `abc${"%E4".repeat(10)}`;
+		expect(truncateRequestPreview(value, 8)).toBe("abc%E4…");
+	});
+});
+
+describe("fitApprovalCard (ADR-027: the owner always sees the complete request preview)", () => {
+	const baseFields: ApprovalCardFields = {
+		riskLevel: "medium",
+		expiresAt: "2026-01-01T00:00:00.000Z",
+		requestedByAgentId: "finance",
+		actionType: "custom.ticket-tool",
+		actionSummary: "A short, ordinary summary.",
+		actionParams: [{ name: "note", value: "hello" }],
+		approvalCode: "ABCD-EFGH-JKLM",
+		approvalId: "0d7bc6f6-58a4-4a4b-8b7e-8b7c1f0d0a11",
+		immutableActionHash: "a".repeat(64),
+	};
+	const POST_MAX = 16_383;
+
+	it("returns the full card untouched once it already fits", () => {
+		const preview = "GET https://api.example.com/status";
+		const text = fitApprovalCard(baseFields, preview);
+		expect(text).not.toBeNull();
+		expect(text).toContain(baseFields.actionSummary);
+		expect(text).toContain(preview);
+		expect(text).toContain("note = hello");
+	});
+
+	it("never refuses a non-custom approval (no preview at all) at ordinary, schema-bounded sizes", () => {
+		const fields: ApprovalCardFields = {
+			...baseFields,
+			actionSummary: "S".repeat(2000),
+			actionParams: Array.from({ length: 5 }, (_, n) => ({
+				name: `p${n}`,
+				value: "v".repeat(2000),
+			})),
+		};
+		expect(fitApprovalCard(fields, null)).not.toBeNull();
+	});
+
+	it("shrinks only the summary to fit, leaving the full preview and parameters untouched", () => {
+		// A percent-encoded CJK path segment, comfortably under the preview's own
+		// `CUSTOM_REQUEST_PREVIEW_MAX` bound (4000) on its own, paired with a summary large enough
+		// (on its own, the same defensive-sizing precedent `render.test.ts` already uses) that the
+		// full card overflows unless the summary — never the preview, never the parameters — gives
+		// way.
+		const preview = `GET https://api.example.com/items/${"%E4%B8%AD".repeat(400)}`;
+		const fields: ApprovalCardFields = { ...baseFields, actionSummary: "S".repeat(14_000) };
+		const text = fitApprovalCard(fields, preview);
+		expect(text).not.toBeNull();
+		const rendered = text ?? "";
+		expect(rendered.length).toBeLessThanOrEqual(POST_MAX);
+		expect(rendered).toContain(preview);
+		expect(rendered).toContain("note = hello");
+		expect(rendered).not.toContain("S".repeat(14_000));
+	});
+
+	it("never splits a UTF-16 surrogate pair while shrinking a summary full of emoji to fit", () => {
+		// Every character here is a two-code-unit emoji: whatever single code unit the naive
+		// (`max - "…".length`) cut lands on, it has a 50% chance of falling inside one of these
+		// pairs rather than between two of them — `repeat(8000)` makes that happen on some shrink
+		// pass regardless of this file's own other fields' exact lengths.
+		const fields: ApprovalCardFields = { ...baseFields, actionSummary: "😀".repeat(8000) };
+		const text = fitApprovalCard(fields, null);
+		expect(text).not.toBeNull();
+		const rendered = text ?? "";
+		expect(rendered.length).toBeLessThanOrEqual(POST_MAX);
+		expect(hasLoneSurrogate(rendered)).toBe(false);
+	});
+
+	it("refuses (returns null) once the parameters and preview alone cannot fit, even with the summary dropped entirely", () => {
+		// Six 1900-character header-slot values and one 2000-character body-slot value: individually
+		// within every per-parameter bound, comfortably under the draft's own combined 15,000-
+		// character budget, and yet — alongside a preview near its own 4000-character bound — too
+		// large for one Mattermost post once rendered, with or without a summary at all.
+		const actionParams = [
+			{ name: "h1", value: "x".repeat(1900) },
+			{ name: "h2", value: "x".repeat(1900) },
+			{ name: "h3", value: "x".repeat(1900) },
+			{ name: "h4", value: "x".repeat(1900) },
+			{ name: "h5", value: "x".repeat(1900) },
+			{ name: "h6", value: "x".repeat(1900) },
+			{ name: "body1", value: "x".repeat(2000) },
+		];
+		const preview = "P".repeat(4000);
+		const fields: ApprovalCardFields = { ...baseFields, actionSummary: "short", actionParams };
+		expect(fitApprovalCard(fields, preview)).toBeNull();
 	});
 });
 

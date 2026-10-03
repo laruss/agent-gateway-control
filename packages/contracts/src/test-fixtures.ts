@@ -59,7 +59,8 @@ export function idleResult(): AgentTurnResult {
 	};
 }
 
-/** A version 1 `AgentTurnInput` without a Mattermost thread; pass `schemaVersion: 2` for version 2. */
+/** A version 1 `AgentTurnInput` without a Mattermost thread; pass `schemaVersion: 2` (with
+ * `systemStatus`) for version 2, or `schemaVersion: 3` (with `capabilities`) for version 3. */
 export function agentTurnInput(overrides: Partial<AgentTurnInput> = {}): AgentTurnInput {
 	return {
 		schemaVersion: 1,

@@ -231,6 +231,65 @@
   posts route by their own mentions only. Bots are plain members, added only to their
   channels ([ADR-012](../adr/012-mattermost-bridge.md)).
 
+### T10. SSRF through an owner-defined custom HTTPS tool
+
+- An owner's own HTTPS tool (ADR-027) names a destination host the Gateway did not choose; a
+  malicious or compromised definition — or a hostname whose DNS answer changes after the
+  definition was approved — could otherwise reach the host's loopback, the LAN, or a cloud
+  metadata endpoint instead of the intended external API.
+- Status (Phase 15): the tool runner's egress guard resolves a definition's host exactly once
+  and connects only to that resolved address, never re-resolving — a second answer (the
+  destination's own DNS TTL expiring, an attacker racing it) can never redirect an
+  already-approved call. Every literal and resolved address is classified before a socket ever
+  opens, from the literal numeric value regardless of notation (dotted, decimal, octal, hex for
+  IPv4), closing the classic bypass of a hostname that is itself a numeric literal in an unusual
+  base: IPv4 is refused if private (RFC 1918), loopback, link-local (the cloud metadata address,
+  `169.254.169.254`, included), carrier-grade NAT, multicast, reserved or a documentation/
+  benchmark range; IPv6 is an allow-list the other way around — only global unicast (`2000::/3`)
+  may ever pass, and only once it matches none of the special-purpose ranges carved out of it or
+  aliases a non-global address (unique-local, link-local, an IPv4-mapped or IPv4-compatible
+  address, either NAT64 well-known prefix, ...) — so a range this guard does not yet name is
+  refused by default rather than passed through unnoticed. Redirects are never followed. Every
+  parameter is mapped into exactly one encoded slot (a path segment, a query entry, a header,
+  a JSON body field) — never interpolated as a string, and never evaluated as code or a shell
+  command — so even a value that reached execution unvalidated (a forged job) cannot escape
+  its own slot; a header or query value carrying a control character, or a header value outside
+  Latin-1, is refused at approval time rather than left for the HTTP client to throw on. A
+  definition's own secrets are named by alias only and resolved by the tool runner alone, from a
+  dedicated, read-only secrets mount; a value — and the encoded forms this executor's own
+  request-building could have put it on the wire in — is scrubbed from a receipt or an error even
+  where a destination echoes it back, best-effort against a destination that echoes the
+  credential (a hostile destination already holds it and gains nothing from a scrub missing some
+  further transformation), and is never part of the approval hash, a log line or a database row.
+  A definition may also withhold its response body preview entirely (`includeBodyPreview: false`),
+  for a body an owner never wants an agent to see regardless of how well a scrub works. Editing a
+  definition after a request was made invalidates it at grant time, so a request is always
+  executed exactly as it was shown and approved ([ADR-027](../adr/027-tool-catalog.md)). The
+  approval card's own request preview renders a query (and path) value with the exact same
+  encoding the executor sends on the wire (one shared function, `encodedQueryParams`), so an owner
+  approving the card can never be shown a request that reads differently from the one that
+  actually runs. A write (`POST`/`PUT`/`PATCH`/`DELETE`) the destination answers with a server
+  error or a timeout *after* it was already fully sent is recorded `unknown` (manual settlement)
+  rather than a clean `failed`, since the destination may already have acted on it — a `failed`
+  outcome here would be exactly what invites a retry that duplicates an already-done write.
+
+### T11. Permission widening through a deleted catalog entry's own native dependency
+
+- A native tool can imply another is effectively usable without its own attachment
+  (`tests.run` implying `repository.read`/`workspace.write`, [ADR-027](../adr/027-tool-catalog.md)).
+  Deleting the implied tool's own catalog entry while something still implies it — nobody holds
+  it directly, an attachment predating the deletion, a restored retired agent whose own explicit
+  suppression of it was dropped, or a config rollback/bundle import bringing the implying
+  attachment back — must never let the implication grant it anyway: an owner who deleted a
+  capability's catalog entry removed it for every agent, not only the ones that happened to hold
+  it directly.
+- Status (Phase 15): `compileAttachments` is given every live catalog entry a native dependency
+  could ever target, not only the ones an attachment names, so it can tell "live but unattached"
+  (the ordinary case) apart from "deleted" — an implied tool whose own entry is absent is never
+  added to `allow`, however many attached tools would otherwise imply it, and is reported as a
+  missing prerequisite instead. Attaching a native tool is also refused up front once any
+  dependency it would imply has no live entry at all, before the attachment ever exists.
+
 ## Open questions
 
 - None open. Provider session ids (decided in Phase 4) are stored in plain text. A session id is

@@ -131,6 +131,10 @@ const consoleAddress = consoleEnabled
  * release image bakes it into. Overridden in development and tests to point at a local build or
  * a fixture. */
 const consoleStaticDir = readSetting("CONSOLE_STATIC_DIR");
+/** Where `gateway tools secret set <alias>` writes (ADR-027); read-only here, same as every other
+ * reader of this mount, so the Instruments & Utils hub can show whether a custom tool's own named
+ * secret aliases are set. */
+const customToolSecretsDir = readSetting("CUSTOM_TOOL_SECRETS_DIR");
 const ownerConsole =
 	consoleAddress !== null &&
 	consolePasswordHash !== null &&
@@ -146,6 +150,7 @@ const ownerConsole =
 				cache: createConsoleStatusCache((now) => collectConsoleStatus(controller.deps.pool, now)),
 				log,
 				...(consoleStaticDir === undefined ? {} : { staticDir: consoleStaticDir }),
+				...(customToolSecretsDir === undefined ? {} : { customToolSecretsDir }),
 			})
 		: null;
 if (ownerConsole !== null) {

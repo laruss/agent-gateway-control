@@ -10,14 +10,23 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { AgentConfigSchema, OrganizationConfigSchema } from "@agent-gateway/contracts";
 import {
 	AdminError,
 	activeConfigRevisionId,
+	adoptAgentToolAttachments,
 	applyConfig,
+	attachTool,
 	type ControlPlaneDeps,
 	commitChange,
 	configBundleProblems,
 	configSnapshotBundle,
+	deleteCatalogEntry,
+	detachTool,
+	ensureConfigHistory,
+	ensureToolCatalogSeeded,
+	inTransaction,
+	loadActiveBundle,
 	ManagementConflictError,
 	prepareChange,
 } from "@agent-gateway/core";
@@ -622,4 +631,828 @@ describe("config export: a stored snapshot predating the shared-path validation"
 			await harness.stop();
 		}
 	});
+});
+
+describe("config export/import: tool attachments round-trip (ADR-027)", () => {
+	let harness: Awaited<ReturnType<typeof startHarness>>;
+
+	beforeAll(async () => {
+		harness = await startHarness();
+		await applyConfig(harness.deps, exampleInput(), "test");
+		await ensureToolCatalogSeeded(harness.deps, "test");
+	});
+
+	afterAll(async () => {
+		await harness.stop();
+	});
+
+	it("pre-change export imports: a directory with no tool-attachments.json converts to empty, not refused", async () => {
+		// `EXAMPLES_DIR` is exactly what a directory from before ADR-027 looks like: it has no
+		// `tool-attachments.json` at all.
+		const expectedRevision = await activeConfigRevisionId(harness.deps);
+		const result = await configImport(
+			harness.deps,
+			{ dir: EXAMPLES_DIR, root: repoRoot, expectedRevision, reason: null, actor: "test" },
+			noopPrint,
+		);
+		const { bundle } = await inTransaction(harness.deps, ({ tx }) =>
+			loadActiveBundle(tx.db, result.revisionId),
+		);
+		expect(bundle.toolAttachments).toEqual({});
+	});
+
+	it("an attachment round-trips through export and import, losslessly, at the same hash", async () => {
+		// `director`'s own example permissions (`config/examples/agents/director.yaml`:
+		// `tools_allow: [mattermost.post, memory.read, memory.write]`,
+		// `tools_deny: [finance.*, deploy.*, mail.send]`) also carry `memory.read`, `deploy.*` and
+		// `mail.send`, none of which resolve to a catalog entry this release seeds —
+		// `attachTool`'s own first-attach conversion refuses outright the moment any pattern is
+		// unresolved, rather than silently converting only what does resolve (ADR-027), so those
+		// three are trimmed here, once (the previous test's own `configImport` of `EXAMPLES_DIR`
+		// reset every agent back to its example file, undoing anything committed before it): every
+		// resolvable pattern (`mattermost.post`, `memory.write`, `finance.*`) stays exactly as the
+		// example ships it.
+		const active = await activeConfigRevisionId(harness.deps);
+		const { bundle } = await inTransaction(harness.deps, ({ tx }) =>
+			loadActiveBundle(tx.db, active),
+		);
+		const directorBefore = bundle.agents.find((agent) => agent.id === "director");
+		if (directorBefore === undefined) {
+			throw new Error("expected the director example agent");
+		}
+		await commitChange(harness.deps, {
+			changeSet: [
+				{
+					type: "update_agent",
+					agent: {
+						...directorBefore,
+						permissions: {
+							tools_allow: ["mattermost.post", "memory.write"],
+							tools_require_human_approval: [],
+							tools_deny: ["finance.*"],
+						},
+					},
+				},
+			],
+			baseRevisionId: active,
+			actor: "test",
+			source: "cli_apply",
+		});
+
+		// `director` is still legacy the first time anything ever attaches to it: `attachTool`
+		// converts its own (now-trimmed) `permissions` the same way `gateway tools adopt` would, in
+		// this same revision, alongside the one attachment actually requested here — never just that
+		// one attachment on its own, which would otherwise make `director` hub-managed while
+		// silently dropping everything its legacy permissions covered (ADR-027).
+		const attach = await attachTool(harness.deps, {
+			agentId: "director",
+			entryId: "gateway-memory-write",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: { note: "integration test" },
+			actor: "test",
+			source: "cli_apply",
+		});
+		expect(attach.noop).toBe(false);
+		// Every pattern `director`'s own legacy `permissions` resolve to — `memory.write` included,
+		// which the explicit attachment then overwrites with its own settings.
+		expect(attach.legacyConversion.map((a) => a.entryId).sort()).toEqual([
+			"executor-finance-payment-create",
+			"executor-finance-subscription-create",
+			"gateway-mattermost-post",
+			"gateway-memory-write",
+		]);
+
+		const dir = exportDir();
+		await configExport(harness.deps, { dir, revisionId: attach.revisionId }, noopPrint);
+		const written = JSON.parse(readFileSync(join(dir, "tool-attachments.json"), "utf8"));
+		expect(written).toEqual({
+			director: [
+				{
+					entryId: "executor-finance-payment-create",
+					pinnedVersion: null,
+					mode: "disabled",
+					settings: {},
+				},
+				{
+					entryId: "executor-finance-subscription-create",
+					pinnedVersion: null,
+					mode: "disabled",
+					settings: {},
+				},
+				{
+					entryId: "gateway-mattermost-post",
+					pinnedVersion: null,
+					mode: "allow",
+					settings: {},
+				},
+				{
+					entryId: "gateway-memory-write",
+					pinnedVersion: null,
+					mode: "allow",
+					settings: { note: "integration test" },
+				},
+			],
+		});
+
+		const reloaded = loadConfigDirectory(dir, dir);
+		expect(reloaded.toolAttachments).toEqual(written);
+
+		const reimportDir = exportDir();
+		rmSync(reimportDir, { recursive: true, force: true });
+		cpSync(dir, reimportDir, { recursive: true });
+		const imported = await configImport(
+			harness.deps,
+			{
+				dir: reimportDir,
+				root: reimportDir,
+				expectedRevision: attach.revisionId,
+				reason: null,
+				actor: "test",
+			},
+			noopPrint,
+		);
+		expect(imported.noop).toBe(true);
+		expect(imported.hash).toBe(attach.hash);
+	});
+
+	it("an untouched export/import round-trips to a no-op even when attachments were made in a different order than export's own sort (ADR-027)", async () => {
+		// Attached in reverse alphabetical order of entryId: an export that sorts
+		// `tool-attachments.json` (`toolAttachmentsText`) but a stored bundle that still hashes them
+		// in attach order would make this untouched round-trip manufacture a new revision instead of
+		// a no-op.
+		await attachTool(harness.deps, {
+			agentId: "director",
+			entryId: "native-web-search",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+		const attached = await attachTool(harness.deps, {
+			agentId: "director",
+			entryId: "gateway-mattermost-post",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+
+		const dir = exportDir();
+		await configExport(harness.deps, { dir, revisionId: attached.revisionId }, noopPrint);
+		const imported = await configImport(
+			harness.deps,
+			{
+				dir,
+				root: dir,
+				expectedRevision: attached.revisionId,
+				reason: null,
+				actor: "test",
+			},
+			noopPrint,
+		);
+		expect(imported.noop).toBe(true);
+		expect(imported.hash).toBe(attached.hash);
+	});
+
+	it("rollback restores a prior revision's own attachments, not merely whatever is live now", async () => {
+		const before = await activeConfigRevisionId(harness.deps);
+		if (before === null) {
+			throw new Error("expected an active revision");
+		}
+		const { bundle: beforeBundle } = await inTransaction(harness.deps, ({ tx }) =>
+			loadActiveBundle(tx.db, before),
+		);
+		// `gateway-mattermost-post` is a `gateway`-kind entry: `allow`/`disabled` only
+		// (`modeSupportedByKind`) — no enforcement point pauses a turn mid-flight for a human to
+		// approve a direct Gateway action.
+		await attachTool(harness.deps, {
+			agentId: "director",
+			entryId: "gateway-mattermost-post",
+			pinnedVersion: null,
+			mode: "disabled",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+		const afterAttach = await activeConfigRevisionId(harness.deps);
+		const result = await configRollback(
+			harness.deps,
+			{ revisionId: before, expectedRevision: afterAttach ?? before, reason: null, actor: "test" },
+			noopPrint,
+		);
+		const { bundle: rolledBack } = await inTransaction(harness.deps, ({ tx }) =>
+			loadActiveBundle(tx.db, result.revisionId),
+		);
+		expect(rolledBack.toolAttachments.director).toEqual(
+			beforeBundle.toolAttachments.director ?? [],
+		);
+	});
+
+	it("retrying an import whose attachments are merely reordered replays it instead of refusing key reuse", async () => {
+		const base = await activeConfigRevisionId(harness.deps);
+		if (base === null) {
+			throw new Error("expected an active revision");
+		}
+		await attachTool(harness.deps, {
+			agentId: "director",
+			entryId: "gateway-mattermost-post",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+		const attached = await attachTool(harness.deps, {
+			agentId: "director",
+			entryId: "native-web-search",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+		const dir = exportDir();
+		await configExport(harness.deps, { dir, revisionId: attached.revisionId }, noopPrint);
+		const file = join(dir, "tool-attachments.json");
+		// Edited by hand below: the export's own manifest would refuse the changed file first.
+		rmSync(join(dir, "manifest.json"));
+		const exported: Record<string, { settings: Record<string, string> }[]> = JSON.parse(
+			readFileSync(file, "utf8"),
+		);
+		const director = exported.director ?? [];
+		expect(director.length).toBeGreaterThanOrEqual(2);
+		const edited = director.map((attachment) => ({ ...attachment, settings: { note: "edited" } }));
+		writeFileSync(file, `${JSON.stringify({ ...exported, director: edited }, null, 2)}\n`);
+		const options = {
+			dir,
+			root: dir,
+			expectedRevision: attached.revisionId,
+			reason: null,
+			actor: "test",
+		};
+		const first = await configImport(harness.deps, options, noopPrint);
+		expect(first.noop).toBe(false);
+
+		writeFileSync(
+			file,
+			`${JSON.stringify({ ...exported, director: [...edited].reverse() }, null, 2)}\n`,
+		);
+		const retry = await configImport(harness.deps, options, noopPrint);
+		expect(retry.revisionId).toBe(first.revisionId);
+	});
+
+	it("config apply refuses a directory that still attaches a since-deleted catalog entry", async () => {
+		// Not `native-web-fetch`/`native-web-search` (legacy-covered by `research`'s own
+		// `tools_allow`, `config/examples/agents/research.yaml`) or any other built-in an example
+		// agent's hand-authored permissions still grant: `deleteCatalogEntry` now refuses those
+		// outright until the covering agent adopts (this file's own
+		// "deleteCatalogEntry refuses while a legacy agent's permissions still grant the entry" test
+		// below). `utility-utility-text-transform` is the one built-in no example agent names.
+		const attached = await attachTool(harness.deps, {
+			agentId: "director",
+			entryId: "utility-utility-text-transform",
+			pinnedVersion: null,
+			mode: "require_approval",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+		const dir = exportDir();
+		await configExport(harness.deps, { dir, revisionId: attached.revisionId }, noopPrint);
+		await deleteCatalogEntry(harness.deps, "utility-utility-text-transform", "test");
+
+		await expect(applyConfig(harness.deps, loadConfigDirectory(dir, dir), "test")).rejects.toThrow(
+			/utility-utility-text-transform' does not exist/,
+		);
+	});
+
+	it("deleteCatalogEntry refuses while a legacy agent's permissions still grant the entry", async () => {
+		// `research` (`config/examples/agents/research.yaml`) is legacy: its own `tools_allow`
+		// grants `web.fetch` directly, unaffected by anything the hub does to the catalog entry
+		// behind it.
+		await expect(deleteCatalogEntry(harness.deps, "native-web-fetch", "test")).rejects.toThrow(
+			/legacy permissions of: research.*gateway tools adopt/s,
+		);
+	});
+});
+
+describe("config rollback: never grants a deleted entry's capability through implication (ADR-027)", () => {
+	// A minimal org/agent, never loaded from `config/examples` (`developer` there legacy-grants
+	// `workspace.write`/`tests.run`/`repository.read` directly, which would make
+	// `deleteCatalogEntry` below refuse outright for an unrelated reason — this test needs a
+	// database where nothing but the hub attachments constructed here ever touches these tools).
+	let harness: Awaited<ReturnType<typeof startHarness>>;
+
+	beforeAll(async () => {
+		harness = await startHarness();
+		const organization = OrganizationConfigSchema.parse({
+			schema_version: 1,
+			organization: {
+				id: "lab",
+				display_name: "Lab",
+				global_goal: "goal",
+				constitution_file: "prompts/constitution.md",
+				owner_mattermost_usernames: ["owner"],
+				finance_agent_id: "solo",
+				rules: [],
+				default_limits: {
+					max_agent_hops: 8,
+					max_turns_per_cascade: 20,
+					max_runs_per_agent_per_hour: 30,
+					default_run_timeout_seconds: 1800,
+				},
+			},
+			mattermost: {
+				team: "lab",
+				channels: ["hq"],
+				approvals_channel: "hq",
+				alerts_channel: "hq",
+				listener: {
+					username: "gateway-listener",
+					token_secret_file: "/run/secrets/mm_listener_token",
+				},
+			},
+		});
+		const solo = AgentConfigSchema.parse({
+			schema_version: 1,
+			id: "solo",
+			display_name: "solo",
+			enabled: true,
+			mattermost: { username: "solo", token_secret_file: "/run/secrets/mm_solo_token" },
+			runtime: { adapter: "mock", session_policy: "stateless", timeout_seconds: 60 },
+			prompts: { role_file: "prompts/solo.md" },
+			wake_rules: [],
+			concurrency: { while_running: "enqueue" },
+			permissions: { tools_allow: [], tools_require_human_approval: [], tools_deny: [] },
+			memory: { private_namespace: "agents/solo", shared_namespaces: [] },
+		});
+		await applyConfig(
+			harness.deps,
+			{
+				organization,
+				agents: [solo],
+				constitution: "Be helpful.",
+				rolePrompts: { solo: "Role prompt for solo." },
+			},
+			"test",
+		);
+		await ensureToolCatalogSeeded(harness.deps, "test");
+	});
+
+	afterAll(async () => {
+		await harness.stop();
+	});
+
+	it("rollback to a revision attaching tests.run does not grant workspace.write once that entry is deleted", async () => {
+		// `solo` attaches `tests.run` (allow) and explicitly suppresses the native dependency it
+		// would otherwise imply (`workspace.write`, disabled) — the revision this test rolls back to.
+		await attachTool(harness.deps, {
+			agentId: "solo",
+			entryId: "native-tests-run",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+		const target = await attachTool(harness.deps, {
+			agentId: "solo",
+			entryId: "native-workspace-write",
+			pinnedVersion: null,
+			mode: "disabled",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+
+		// Detaching `tests.run` first only ever narrows (nothing it implied stays allowed once it is
+		// gone), never a widening; with it gone, detaching `workspace.write`'s own disabled
+		// attachment next changes nothing either (absence and an explicit deny are the same access
+		// level) — both detaches commit without `acceptWidening`, leaving nobody attached to, or
+		// implying, `native-workspace-write` any more.
+		await detachTool(harness.deps, {
+			agentId: "solo",
+			entryId: "native-tests-run",
+			actor: "test",
+			source: "cli_apply",
+		});
+		await detachTool(harness.deps, {
+			agentId: "solo",
+			entryId: "native-workspace-write",
+			actor: "test",
+			source: "cli_apply",
+		});
+		await deleteCatalogEntry(harness.deps, "native-workspace-write", "test");
+
+		const beforeRollback = await activeConfigRevisionId(harness.deps);
+		const printed: string[] = [];
+		const result = await configRollback(
+			harness.deps,
+			{
+				revisionId: target.revisionId,
+				expectedRevision: beforeRollback ?? target.revisionId,
+				reason: null,
+				actor: "test",
+			},
+			(line) => printed.push(line),
+		);
+		expect(printed.some((line) => line.includes("solo:native-workspace-write"))).toBe(true);
+
+		const { bundle: rolledBack } = await inTransaction(harness.deps, ({ tx }) =>
+			loadActiveBundle(tx.db, result.revisionId),
+		);
+		// The disabled `workspace.write` attachment never comes back (its own entry is deleted), but
+		// `tests.run`'s own allow attachment is restored unchanged.
+		expect(rolledBack.toolAttachments.solo).toEqual([
+			{ entryId: "native-tests-run", pinnedVersion: null, mode: "allow", settings: {} },
+		]);
+		// The bundle-mirror invariant (ADR-027): `permissions` is exactly the compiled result of
+		// this same revision's attachments — `workspace.write` never silently granted through
+		// `tests.run`'s own implication just because nothing explicit opposes it any more; its own
+		// catalog entry is gone, so the implication cannot be applied at all (`compileAttachments`'s
+		// own `missingPrerequisites`, not a bare, unexplained absence).
+		const soloConfig = rolledBack.agents.find((a) => a.id === "solo");
+		expect(soloConfig?.permissions.tools_allow).toContain("tests.run");
+		expect(soloConfig?.permissions.tools_allow).toContain("repository.read");
+		expect(soloConfig?.permissions.tools_allow).not.toContain("workspace.write");
+	});
+
+	it("attachTool itself refuses at admission once the implied prerequisite's own entry is deleted (defence in depth)", async () => {
+		// `native-workspace-write` is already gone, deleted by the previous test in this file; an
+		// attach of `native-tests-run` (even a replay of the one `solo` already holds) is refused
+		// before it ever commits, rather than silently leaving the implication withheld only once
+		// something later happens to recompile it.
+		await expect(
+			attachTool(harness.deps, {
+				agentId: "solo",
+				entryId: "native-tests-run",
+				pinnedVersion: null,
+				mode: "allow",
+				settings: {},
+				actor: "test",
+				source: "cli_apply",
+			}),
+		).rejects.toThrow(/implies workspace\.write.*no live catalog entry.*deleted/s);
+	});
+});
+
+describe("attachTool: a retry of the attachment that converted a legacy agent replays it", () => {
+	let harness: Awaited<ReturnType<typeof startHarness>>;
+
+	beforeAll(async () => {
+		harness = await startHarness();
+		await applyConfig(harness.deps, exampleInput(), "test");
+		await ensureToolCatalogSeeded(harness.deps, "test");
+		// `research`, `operator` and `mail-follower`'s own example permissions each also carry
+		// `deploy.*` (and, for `mail-follower`, `mail.read`/`mail.send`/`mail.forward`) — none
+		// resolve to a catalog entry this release seeds, so `attachTool`'s own first-attach
+		// conversion would refuse each of them outright the moment it is actually exercised below
+		// (ADR-027: an unresolved allow or approval pattern refuses the conversion).
+		// Trimmed here, once, before any test below attaches to them — every resolvable pattern
+		// stays exactly as each example ships it, and none of the three gains an attachments
+		// document of its own from this (an `update_agent` never creates one; only attaching,
+		// detaching or adopting does), so each one stays exactly as legacy as it already was.
+		const active = await activeConfigRevisionId(harness.deps);
+		const { bundle } = await inTransaction(harness.deps, ({ tx }) =>
+			loadActiveBundle(tx.db, active),
+		);
+		const byId = (id: string) => {
+			const found = bundle.agents.find((agent) => agent.id === id);
+			if (found === undefined) {
+				throw new Error(`expected the '${id}' example agent`);
+			}
+			return found;
+		};
+		await commitChange(harness.deps, {
+			changeSet: [
+				{
+					type: "update_agent",
+					agent: {
+						...byId("research"),
+						permissions: {
+							tools_allow: ["mattermost.post", "web.search", "web.fetch"],
+							tools_require_human_approval: [],
+							tools_deny: ["finance.*", "workspace.write"],
+						},
+					},
+				},
+				{
+					type: "update_agent",
+					agent: {
+						...byId("operator"),
+						permissions: {
+							tools_allow: ["mattermost.post"],
+							tools_require_human_approval: [],
+							tools_deny: ["finance.*", "workspace.write", "memory.write"],
+							observe_system: true,
+						},
+					},
+				},
+				{
+					type: "update_agent",
+					agent: {
+						...byId("mail-follower"),
+						permissions: {
+							tools_allow: ["mattermost.post"],
+							tools_require_human_approval: [],
+							tools_deny: ["finance.*"],
+						},
+					},
+				},
+			],
+			baseRevisionId: active,
+			actor: "test",
+			source: "cli_apply",
+		});
+	});
+
+	afterAll(async () => {
+		await harness.stop();
+	});
+
+	it("returns the first commit, not a key-reuse refusal, once the agent is hub-managed", async () => {
+		const input = {
+			agentId: "research",
+			entryId: "native-repository-read",
+			pinnedVersion: null,
+			mode: "allow" as const,
+			actor: "test",
+			source: "cli_apply" as const,
+			idempotencyKey: "attach-research-repository-read",
+		};
+		const first = await attachTool(harness.deps, input);
+		expect(first.replayed).toBe(false);
+		expect(first.legacyConversion.length).toBeGreaterThan(0);
+
+		const retry = await attachTool(harness.deps, input);
+		expect(retry.replayed).toBe(true);
+		expect(retry.revisionId).toBe(first.revisionId);
+	});
+
+	it("keeps an explicit legacy denial that another attachment would otherwise imply", async () => {
+		// `tests.run` implies `repository.read`; this agent denies the latter explicitly. Converting
+		// it must carry that denial, never leave it to a later revision. `developer`'s own example
+		// `tools_deny` (`finance.*`, `deploy.*`, `mail.*`) is replaced outright here, never spread
+		// forward: `deploy.*`/`mail.*` resolve to no catalog entry this release seeds, which would
+		// otherwise be dropped by the conversion below (ADR-027)
+		// refuse before ever reaching the one denial this test is actually about.
+		const active = await activeConfigRevisionId(harness.deps);
+		const { bundle } = await inTransaction(harness.deps, ({ tx }) =>
+			loadActiveBundle(tx.db, active),
+		);
+		const developer = bundle.agents.find((agent) => agent.id === "developer");
+		if (developer === undefined) {
+			throw new Error("expected the developer example agent");
+		}
+		const restricted = await commitChange(harness.deps, {
+			changeSet: [
+				{
+					type: "update_agent",
+					agent: {
+						...developer,
+						permissions: {
+							tools_allow: ["mattermost.post", "tests.run"],
+							tools_require_human_approval: [],
+							tools_deny: ["finance.*", "repository.read"],
+						},
+					},
+				},
+			],
+			baseRevisionId: active,
+			actor: "test",
+			source: "cli_apply",
+		});
+		const result = await attachTool(harness.deps, {
+			agentId: "developer",
+			entryId: "native-repository-read",
+			pinnedVersion: null,
+			mode: "disabled",
+			actor: "test",
+			source: "cli_apply",
+		});
+		const last = result.activeRevisionId ?? restricted.revisionId;
+		expect(last).toBeGreaterThan(restricted.revisionId);
+		// Every revision written along the way, the conversion's own included: none may ever let
+		// a turn read the repository.
+		for (let revisionId = restricted.revisionId + 1; revisionId <= last; revisionId += 1) {
+			const { bundle: written } = await inTransaction(harness.deps, ({ tx }) =>
+				loadActiveBundle(tx.db, revisionId),
+			);
+			const mirrored = written.agents.find((agent) => agent.id === "developer")?.permissions;
+			expect(mirrored?.tools_allow).not.toContain("repository.read");
+			expect(mirrored?.tools_deny).toContain("repository.read");
+		}
+	});
+
+	it("replays an attachment the legacy agent already had, even after it was revoked since", async () => {
+		const input = {
+			agentId: "operator",
+			entryId: "gateway-mattermost-post",
+			pinnedVersion: null,
+			mode: "allow" as const,
+			actor: "test",
+			source: "cli_apply" as const,
+			idempotencyKey: "attach-operator-post",
+		};
+		const first = await attachTool(harness.deps, input);
+		expect(first.noop).toBe(false);
+		await detachTool(harness.deps, {
+			agentId: "operator",
+			entryId: "gateway-mattermost-post",
+			actor: "test",
+			source: "cli_apply",
+		});
+		const retry = await attachTool(harness.deps, input);
+		expect(retry.replayed).toBe(true);
+		expect(retry.revisionId).toBe(first.revisionId);
+		const { bundle } = await inTransaction(harness.deps, ({ tx }) =>
+			loadActiveBundle(tx.db, retry.activeRevisionId),
+		);
+		expect(
+			(bundle.toolAttachments.operator ?? []).some(
+				(attachment) => attachment.entryId === "gateway-mattermost-post",
+			),
+		).toBe(false);
+	});
+
+	it("refuses an oversized key before converting anything", async () => {
+		const before = await activeConfigRevisionId(harness.deps);
+		await expect(
+			attachTool(harness.deps, {
+				agentId: "operator",
+				entryId: "gateway-mattermost-post",
+				pinnedVersion: null,
+				mode: "allow",
+				actor: "test",
+				source: "cli_apply",
+				idempotencyKey: "k".repeat(201),
+			}),
+		).rejects.toThrow();
+		expect(await activeConfigRevisionId(harness.deps)).toBe(before);
+	});
+
+	it("accepts a maximum-length key for an agent that is still legacy", async () => {
+		const result = await attachTool(harness.deps, {
+			agentId: "mail-follower",
+			entryId: "native-web-search",
+			pinnedVersion: null,
+			mode: "allow",
+			actor: "test",
+			source: "cli_apply",
+			idempotencyKey: "k".repeat(200),
+		});
+		expect(result.noop).toBe(false);
+	});
+
+	it("adopts several legacy agents under one key, each in its own revision", async () => {
+		const results = await adoptAgentToolAttachments(harness.deps, {
+			agentIds: ["director", "finance"],
+			dryRun: false,
+			actor: "test",
+			idempotencyKey: "adopt-director-finance",
+		});
+		expect(results.map((result) => result.commit?.revisionId ?? null)).not.toContain(null);
+		const retry = await adoptAgentToolAttachments(harness.deps, {
+			agentIds: ["director", "finance"],
+			dryRun: false,
+			actor: "test",
+			idempotencyKey: "adopt-director-finance",
+		});
+		expect(retry.every((result) => result.alreadyHubManaged)).toBe(true);
+	});
+
+	it("refuses the same key for a different attachment", async () => {
+		await expect(
+			attachTool(harness.deps, {
+				agentId: "research",
+				entryId: "native-repository-read",
+				pinnedVersion: null,
+				mode: "disabled",
+				actor: "test",
+				source: "cli_apply",
+				idempotencyKey: "attach-research-repository-read",
+			}),
+		).rejects.toThrow(/different change set/);
+	});
+
+	it("replays a committed attachment even after its catalog entry was deleted", async () => {
+		const input = {
+			agentId: "finance",
+			entryId: "native-web-fetch",
+			pinnedVersion: null,
+			mode: "allow" as const,
+			actor: "test",
+			source: "cli_apply" as const,
+			idempotencyKey: "attach-finance-web-fetch",
+		};
+		const first = await attachTool(harness.deps, input);
+		await deleteCatalogEntry(harness.deps, "native-web-fetch", "test");
+		const retry = await attachTool(harness.deps, input);
+		expect(retry.replayed).toBe(true);
+		expect(retry.revisionId).toBe(first.revisionId);
+	});
+});
+
+describe("ensureConfigHistory: backfill carries attachments forward (ADR-027)", () => {
+	it(
+		"a backfill triggered only by agents.enabled drifting carries the stale revision's own " +
+			"attachments document forward, never demoting a hub-managed agent to legacy on its own",
+		async () => {
+			const harness = await startHarness();
+			try {
+				await applyConfig(harness.deps, exampleInput(), "test");
+				await ensureToolCatalogSeeded(harness.deps, "test");
+				// `director`'s own example permissions also carry `memory.read`, `deploy.*` and
+				// `mail.send`, none of which resolve to a catalog entry this release seeds —
+				// `attachTool`'s own first-attach conversion below refuses outright the moment any
+				// pattern is unresolved (ADR-027), so those three are trimmed here first, keeping
+				// every resolvable pattern exactly as the example ships it.
+				const beforeActive = await activeConfigRevisionId(harness.deps);
+				const { bundle: beforeBundle } = await inTransaction(harness.deps, ({ tx }) =>
+					loadActiveBundle(tx.db, beforeActive),
+				);
+				const directorBefore = beforeBundle.agents.find((agent) => agent.id === "director");
+				if (directorBefore === undefined) {
+					throw new Error("expected the director example agent");
+				}
+				await commitChange(harness.deps, {
+					changeSet: [
+						{
+							type: "update_agent",
+							agent: {
+								...directorBefore,
+								permissions: {
+									tools_allow: ["mattermost.post", "memory.write"],
+									tools_require_human_approval: [],
+									tools_deny: ["finance.*"],
+								},
+							},
+						},
+					],
+					baseRevisionId: beforeActive,
+					actor: "test",
+					source: "cli_apply",
+				});
+				const attached = await attachTool(harness.deps, {
+					agentId: "director",
+					entryId: "gateway-mattermost-post",
+					pinnedVersion: null,
+					mode: "allow",
+					actor: "test",
+					source: "cli_apply",
+				});
+				const [beforeRow] = (
+					await harness.pool.query<{ hash: string | null }>(
+						"select attachments_snapshot_hash as hash from config_revisions where id = $1",
+						[attached.revisionId],
+					)
+				).rows;
+				expect(beforeRow?.hash).not.toBeNull();
+
+				// An older release toggling `agents.enabled` directly, bypassing the revision journal
+				// entirely (never touching any attachment): `config_generation` stays exactly where it
+				// was, but the live column now disagrees with what the active revision's own snapshot
+				// recorded for `operator` — `ensureConfigHistoryIn`'s own trigger for a backfill.
+				await harness.pool.query(
+					"update agents set enabled = false, state = 'disabled' where id = 'operator'",
+				);
+
+				await ensureConfigHistory(harness.deps, "test");
+				const [controls] = (
+					await harness.pool.query<{ revision: number }>(
+						"select active_config_revision as revision from gateway_controls where id = 1",
+					)
+				).rows;
+				const backfilledRevisionId = controls?.revision;
+				expect(backfilledRevisionId).not.toBe(attached.revisionId);
+
+				const [afterRow] = (
+					await harness.pool.query<{ hash: string | null }>(
+						"select attachments_snapshot_hash as hash from config_revisions where id = $1",
+						[backfilledRevisionId],
+					)
+				).rows;
+				// The fix: a backfill never carries a null attachments hash just because this write
+				// path otherwise never touches attachments — it carries the stale revision's own
+				// document forward, filtered to the agents still configured.
+				expect(afterRow?.hash).not.toBeNull();
+				expect(afterRow?.hash).toBe(beforeRow?.hash);
+
+				const { bundle } = await inTransaction(harness.deps, ({ tx }) =>
+					loadActiveBundle(tx.db, backfilledRevisionId ?? null),
+				);
+				expect(bundle.toolAttachments.director).toContainEqual({
+					entryId: "gateway-mattermost-post",
+					pinnedVersion: null,
+					mode: "allow",
+					settings: {},
+				});
+			} finally {
+				await harness.stop();
+			}
+		},
+	);
 });

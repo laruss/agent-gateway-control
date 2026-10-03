@@ -38,6 +38,7 @@ import { RetireAgentDialog } from "./agent-detail/retire-dialog.tsx";
 import { RetiredAgentView } from "./agent-detail/retired-agent-view.tsx";
 import { ReviewChangesDialog } from "./agent-detail/review-dialog.tsx";
 import { RuntimeTab } from "./agent-detail/runtime-tab.tsx";
+import { ToolsTab } from "./agent-detail/tools-tab.tsx";
 import type { AgentDetailTabProps } from "./agent-detail/types.ts";
 
 type LoadState =
@@ -280,6 +281,7 @@ export function AgentDetailPage(): React.ReactElement {
 					<TabsTrigger value="runtime">Runtime</TabsTrigger>
 					<TabsTrigger value="assignments">Assignments</TabsTrigger>
 					<TabsTrigger value="permissions">Permissions</TabsTrigger>
+					<TabsTrigger value="tools">Tools</TabsTrigger>
 					<TabsTrigger value="history">History</TabsTrigger>
 				</TabsList>
 				<TabsContent value="overview">
@@ -300,6 +302,9 @@ export function AgentDetailPage(): React.ReactElement {
 				</TabsContent>
 				<TabsContent value="permissions">
 					<PermissionsTab {...tabProps} />
+				</TabsContent>
+				<TabsContent value="tools">
+					<ToolsTab agentId={agent.id} />
 				</TabsContent>
 				<TabsContent value="history">
 					<HistoryTab agentId={agent.id} />

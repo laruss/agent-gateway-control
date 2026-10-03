@@ -4,6 +4,357 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## [Unreleased]
 
+### Added
+
+- A tool catalog data model (ADR-027): catalog entries (a stable id, an immutable `kind` —
+  `native`/`gateway`/`executor`/`custom_https`/`utility` — and implementation key), append-only
+  immutable versions (name, description, a bounded config schema, a risk floor, supported runtime
+  adapters), and per-agent attachments (a pinned version or "current", an `allow`/
+  `require_approval`/`disabled` mode, bounded settings). A revision's attachments are their own
+  content-addressed document, named alongside its configuration bundle — never a field of the
+  bundle itself, so an older release's own schema still parses every snapshot this release writes,
+  rollback included — versioned, rolled back and exported/imported as one unit with it.
+  `ensureToolCatalogSeeded` (controller startup, every CLI session) idempotently seeds every
+  built-in this release actually has — five native runtime capabilities, `mattermost.post` and
+  `memory.write`, and the two sandbox tool-broker executor actions — skipping one the owner already
+  deleted (a tombstone survives reseeding, forever). Editing a built-in entry may only change its
+  name/description (a new immutable version, every field validated against its own bound before
+  insert); deleting one removes every agent's attachment of it atomically, in the same transaction
+  as (for a built-in) its tombstone, and marks the entry's own row deleted rather than removing it —
+  its past versions, and any historical revision that once attached it, stay inspectable and
+  rollback-safe. `attachTool`/`detachTool`/`updateAttachment` commit through the same
+  managed-configuration writer every other configuration change does, so a revision records them and
+  rollback covers them; every attachment any write path commits is checked against the live catalog
+  (entry exists and is not deleted, pinned version exists, mode respects risk floor) at that same
+  shared boundary, not only through `attachTool`'s own earlier check. A plain YAML `config apply`
+  carries every agent's existing attachments forward unchanged rather than clearing them; `config
+  rollback` and restoring a retired agent each carry their own target's attachments forward too,
+  minus any naming a catalog entry deleted since (dropped and reported, never resurrected).
+  `legacyAttachmentsFromPermissions` converts an agent's existing `permissions` lists to what its
+  attachments would look like, read-only, against catalog entries known right now — a pattern
+  matching none of them is reported unresolved, never dropped. `config diff`/`config rollback` show
+  every attachment added, removed or changed (mode, pinned version, settings) per agent per entry.
+- Attachments now compile into enforcement (ADR-027): `compileAttachments`
+  (`@agent-gateway/policy`) turns one agent's attachments into disjoint `allow`/`requireApproval`/
+  `deny` tool lists, applying native dependencies (`tests.run` implies `repository.read`/
+  `workspace.write`), surfacing an adapter-specific prerequisite Codex needs for `repository.read`
+  without silently granting or revoking it, keeping `memory.write` always explicit (`deny` when not
+  `allow`, never silently absent from both), and excluding every finance capability for any agent
+  but the organization's own finance agent. A mode an entry's own `kind` cannot express
+  (`require_approval` for a native/gateway capability, `allow` for a broker executor action) is
+  refused at the same shared write boundary `attachTool`/`updateAttachment` already check.
+  `loadEffectivePermissionsIn` is the single source of truth every enforcement point now reads
+  instead of `agent.config.permissions` directly: a hub-managed agent (the active revision's
+  attachments document has an entry for it, even an explicitly empty one — the live
+  `agents.tool_attachments_managed` column, migration `0032`) gets only its compiled attachments;
+  every other agent keeps today's behaviour, its `permissions` lists unchanged. Whenever a
+  hub-managed agent's attachments could have changed, its `permissions` field is replaced with the
+  compiled result before anything is hashed or stored — enforced inside the single shared
+  configuration writer every committing path ends in (a plain YAML `config apply` included), so no
+  path can skip it — and always in the same revision, never a separate write, so a binary rollback
+  to 0.6.0 still enforces the same effective permissions. The Agents hub's own console editor shows
+  a hub-managed agent's tool lists read-only, with a hint to use the hub instead, and refuses
+  (preview and commit alike) a patch that edits them directly, rather than silently discarding it
+  on commit; `observe_system` is untouched by compiled attachments and stays directly editable even
+  for a hub-managed agent, and a legacy agent's `permissions` stay fully editable there. `gateway tools adopt
+  <agent>|--all [--dry-run]` is the explicit, never-implicit migration from a legacy agent's
+  `permissions` into real attachments, one committed revision per agent (including an agent whose
+  conversion resolves to zero attachments, marked hub-managed with an explicitly empty list),
+  reporting unresolved patterns and the before/after effective permissions; each agent's own read
+  and its commit are resolved together, so a concurrent change elsewhere is refused as a conflict
+  rather than silently overwritten by a commit built from a stale read. A queued tool action or a
+  still-pending approval for a capability just detached or turned `disabled` is revoked or refused,
+  with an audit entry, before it can execute. `AgentTurnInput.schemaVersion` 3 (ADR-023) carries
+  bounded capability descriptions (name, short description, mode, and — for a tool only usable
+  because another implies it — which one) of an agent's effective tools for the runtime prompt to
+  describe structurally, each resolved against the exact catalog version it is actually pinned to;
+  versions 1 and 2 are still accepted, for a job a release before this one already queued.
+- Custom HTTPS tools and packaged utilities (ADR-027): an owner now defines their own HTTPS-backed
+  tool (`gateway tools custom create|edit <entry-id>`, a JSON definition — fixed destination host,
+  path template and method; typed string/number/boolean/enum parameters mapped explicitly into
+  encoded path/query/header/body slots, never interpolated as a string, a header or query value
+  never carrying a control character, a header value never outside Latin-1, and a number never
+  overflowing to `Infinity`; named secrets resolved only by the tool runner, never a value anywhere
+  else; response limits, including whether a response body preview is ever shown at all; a required
+  idempotency header for any write, which no parameter or secret may also target, case-insensitively)
+  and sets its secret (`gateway tools secret set <alias>`, a new, dedicated secrets mount). It
+  attaches and is approved exactly like any other broker action — `custom_https` and the new
+  `utility` kind (one packaged, image-shipped utility, `utility.text-transform`, ships to prove the
+  path) both support only `require_approval`/`disabled`: the broker has no approval-free execution
+  path, side-effect-free or not. A request is pinned to the exact definition version it was resolved
+  against — a model-supplied copy of that pin is never trusted, only the controller's own, exactly
+  one of which is ever stored; a definition with no typed parameters of its own (a fixed call whose
+  only moving part is a secret) is still approvable. Editing the tool afterward refuses the grant
+  ("this custom tool was edited... it must be requested again") rather than silently executing a
+  different request than the one shown and hashed. Execution goes through a new egress guard
+  (`@agent-gateway/tool-broker`): a hostname is resolved once and the connection made to exactly
+  that address, never re-resolved (defeats DNS rebinding); every literal or resolved IPv4 address is
+  classified and refused if private, loopback, link-local (the cloud metadata address included),
+  carrier-grade NAT, multicast, reserved or a documentation/benchmark range, in any notation
+  including decimal/octal/hex literals; IPv6 is an allow-list instead — only global unicast
+  (`2000::/3`) may ever pass, refusing every special-purpose range carved out of it (6to4, Teredo,
+  documentation, benchmarking, ORCHIDv2, both NAT64 prefixes) and every non-global form the IPv4
+  rules already cover (unique-local, link-local, IPv4-mapped/-compatible, site-local, SIIT,
+  discard-only) by default, rather than only the ones a deny-list happened to name. Redirects are
+  never followed; an oversized response settles the moment the cap is actually exceeded, never
+  waiting on a stream event that might not come. One overall deadline (DNS through the response
+  body) replaces a socket-idle timeout a trickling response could defeat, and also carries the
+  executor's own cancellation (kill-all, the agent disabled, the runner stopping), so a call still
+  resolving its destination can be stopped, not only one already connected. A call settles as
+  `succeeded` (a receipt with every secret value — and the encoded forms this executor's own
+  request-building could have put it on the wire in — scrubbed, best-effort, even from a
+  destination's own echo; a write that was fully sent and got back a 2xx the definition's own
+  content type does not allow stays `succeeded`, its body withheld, rather than a clean `failed` an
+  owner would retry under a new idempotency key), `failed` (a clean, known refusal), or `unknown` (an
+  abort or a reset **after** the request was already sent, sent now meaning the TLS handshake itself
+  completed, not merely that the body was handed to the socket) — never retried automatically,
+  settled by hand like any other namespace's. A response preview is collapsed to a single safe line
+  and bounded rather than built in a shape the receipt could reject outright and withhold entirely;
+  `utility.text-transform` refuses an input whose transform (`upper`/`lower` can grow it, e.g.
+  `"ß"` to `"SS"`) would not fit one, rather than silently handing back a truncated answer. A new
+  `custom` broker namespace dispatches dynamically to an owner-created entry's own definition
+  (fetched by exact approved version through a new, narrow `gateway_begin_tool_action`-style
+  function, migration `0034`); `utility` stays a fully static executor, like any other namespace.
+  Attaching a tool to a still-legacy agent (no attachments document of its own yet) converts its
+  existing `permissions` lists into attachments first, in the same revision — the same conversion
+  `gateway tools adopt` performs — rather than making it hub-managed with only the one attachment
+  just requested and silently dropping everything else its `permissions` used to cover; a bundle
+  the shared configuration writer is about to commit is validated once more just before it is
+  written (no two attachments of the same catalog entry, no agent's compiled permissions left
+  overlapping), not only at whichever call site happens to check first.
+- An **Instruments & utils** hub in the console (a new sidebar entry, alongside Agents and Skills):
+  a searchable catalog list grouped by kind with availability badges; an entry's own detail page
+  (version history, every agent currently attached with its mode and pinned version, an "Attach to
+  agent" action); create/edit for a `custom_https` tool (every field the definition needs, with
+  client-side validation reusing `customHttpsDefinitionProblems` directly and a review step before
+  committing) and a metadata-only edit for a built-in; delete with its impact (which agents would
+  lose it) shown before confirming. The Agents hub's own editor gains a **Tools** tab: requested
+  attachments against effective, compiled access side by side, implied capabilities and an unmet
+  adapter prerequisite shown explicitly, unresolved legacy patterns, attach/detach/mode-change
+  acting immediately (no preview/commit round trip — attachments are their own document), and
+  "Adopt into the tools hub" with a dry-run preview before committing. A secret alias a
+  `custom_https` definition needs is shown by name and whether it is set — a boolean only, read
+  from the same mount `gateway tools secret set` writes through, read-only here, the exact command
+  printed for an alias still unset; no value is ever collected or shown. Every mutation reuses the
+  Agents hub's own session/CSRF/exact-Origin model and `prepareChange`/`commitChange` underneath —
+  no new way to write configuration, only a typed surface over the same catalog and attachment
+  functions the CLI already used (see [ADR-025](docs/adr/025-management-console.md) and
+  [ADR-027](docs/adr/027-tool-catalog.md), and the updated
+  [tool-catalog operations guide](docs/operations/tool-catalog.md)).
+
+### Fixed
+
+- A binary rollback to a release before ADR-027, a configuration change under that older release,
+  and a re-upgrade no longer resurrects (or keeps withholding) whatever access a hub-managed
+  agent's attachments granted before the rollback: `catalog_attachments`/
+  `agents.tool_attachments_managed` are reconciled against the active revision's own attachments
+  document at every controller/CLI startup, never trusted as already agreeing with it (see
+  [ADR-027](docs/adr/027-tool-catalog.md)'s rollback section and the
+  [tool-catalog operations guide](docs/operations/tool-catalog.md)).
+- The Agents hub's Tools tab no longer errors for a legacy agent whose `permissions` still name a
+  wildcard pattern (the shipped `research` example agent's `tools_deny: [finance.*, ...]`
+  included): its effective lists now accept a tool pattern, not only a concrete name.
+- "Adopt into the tools hub" now commits against exactly the revision its own preview was read
+  from — refused as a conflict (`409`), like every other preview/commit pair, rather than silently
+  committing attachments the preview never showed.
+- A custom HTTPS tool's missing secret file (or any other failure preparing the request before it
+  is sent) is now a clean `failed` outcome, instead of an uncaught error `processToolJob` would
+  otherwise record as `unknown` — manual settlement — for a request that was never actually sent.
+- `gateway tools adopt --all` now resolves agent ids from the active configuration rather than
+  every row of the `agents` projection, so a retired agent kept there for history no longer aborts
+  the batch.
+- A legacy agent whose permissions resolve to many attachments (a wide wildcard like `custom.*`
+  covering dozens of owner-created tools) now adopts, and attaches, through one bounded
+  `set_tool_attachments` operation instead of one `attach_tool` per attachment — the one shape
+  `MAX_CHANGE_SET_OPERATIONS` could not bound; a resolution past `MAX_ATTACHMENTS_PER_AGENT` is now
+  reported as a problem, dry-run included, instead of only failing opaquely at commit.
+- Retrying an attachment's `update` call after the entry it targeted was deleted since now replays
+  its already-committed idempotency key, instead of refusing it as if the first call had never
+  committed.
+- The Tools hub's custom tool form no longer mangles a comma-separated enum field while typing
+  (`low,high` turning into `lowhigh`); its value is validated on blur instead of on every keystroke.
+  A submission error (an invalid entry id, a network failure, any non-`422` response) now shows in
+  the dialog instead of leaving it silently stuck; the entry id is also validated client-side
+  against the same rule the create request's own schema enforces.
+- Restoring a retired agent that was both hub-managed and a former finance agent no longer leaves
+  its carried-forward attachments claiming a finance-kind mode (`allow`/`require_approval`) it has
+  no right to once it is restored as anyone but the organization's finance agent — they are now
+  forced `disabled`, the attachment-level counterpart of the permission normalization this already
+  did.
+- Deleting a catalog entry now refuses (listing which agents, and pointing at `gateway tools adopt`)
+  while any legacy agent's own `permissions` still grant it directly — catalog deletion only ever
+  revoked a hub-managed agent's attachment, silently leaving a legacy agent's equivalent coverage
+  untouched and the hub showing the entry as gone everywhere regardless. The entry detail page shows
+  the same agents as part of the deletion's impact, alongside attached agents; the delete itself now
+  also returns (and can be bound to) the agents actually affected, read fresh at commit time rather
+  than from an earlier, separately-read preview.
+- A custom HTTPS tool's 3xx response is no longer reported `succeeded`: redirects are never
+  followed, so a `GET` answered with one is now a clean `failed`, and a write already fully sent is
+  `unknown` (settled by hand) rather than assumed to have succeeded.
+- A version 3 turn input's `capabilities` is now bounded to 128 entries even when a legacy wildcard
+  resolves to more known catalog entries than that — reporting the rest as an omitted count instead
+  of failing the turn's own schema and stopping the agent from running at all.
+- `utility.text-transform` now refuses a transform result that fits a receipt's length but is not
+  otherwise representable there (e.g. a Unicode case fold producing a combining mark), instead of
+  reporting success and having the receipt silently withheld once re-validated.
+- "Adopt into the tools hub"'s confirm step now also binds itself to the exact conversion its
+  preview showed (not only the config revision): a catalog entry created, edited or deleted in
+  between — which moves no config revision on its own — is now a conflict too, rather than silently
+  committing a different resolution than the one reviewed. Attaching a tool to a still-legacy agent
+  now accepts the same kind of binding to the console's own last-loaded state.
+- Editing a catalog entry now accepts an expected version, refusing (`409`) once someone else's edit
+  already published a different one, instead of silently merging the two edits' fields
+  last-writer-wins with no warning either one happened.
+- A configuration-history backfill triggered only by `agents.enabled` drifting (an older release's
+  own direct toggle, no attachment ever touched) no longer demotes every hub-managed agent to legacy
+  on its own: the stale revision's own attachments document now carries forward into the backfill,
+  filtered to the agents still configured, the same as a plain YAML `config apply` already does.
+- The custom tool form's parameter and secret-slot rows now key by a stable id assigned at
+  creation instead of their array position: deleting one no longer reuses the next row's position
+  for an enum field's own uncommitted text, corrupting its values the moment it next lost focus.
+  The secret-slot remove button also now has an accessible name.
+- Deleting a catalog entry, or detaching one agent's own attachment of it, can no longer silently
+  widen what an agent may actually do: clearing a `disabled`/`require_approval` attachment can be
+  the only thing suppressing a native dependency's implication (`tests.run` implying
+  `workspace.write`), which would otherwise let it through the moment nothing explicit governs the
+  implied tool any more. This is now enforced once, at the shared configuration-commit boundary
+  itself — under its own lock, against the exact revision actually being committed — for a
+  `detach_tool`/`clear_tool_attachments` or a `set_tool_attachments` that replaces an already
+  hub-managed agent's list, rather than by a separate, earlier read `detachTool`/`deleteCatalogEntry`
+  each used to take outside any transaction (a concurrent attach landing between that read and the
+  actual commit previously went unnoticed, and a keyed retry after the state changed was refused by
+  that same stale precheck instead of replaying its own already-committed result). The commit refuses
+  — naming the agent and the tool it would gain — the moment any agent would gain anything; detaching
+  one attachment can be confirmed anyway by resubmitting the exact hash of the widening the console
+  just displayed (`acceptWidening`, the Tools tab's own "Detach anyway" — no longer a bare
+  `confirmWidening` flag unbound to what the owner actually saw), refused once it no longer matches
+  what the commit computes fresh. Deleting an entry has no such override at all, and is now also
+  refused while any agent effectively holds the entry's capability only *implicitly*, through another
+  attached tool's own dependency, with no attachment of the deleted entry's own — previously this
+  case returned `affected: []` and deleted the entry cleanly while the compiler went on granting it
+  regardless.
+- A custom tool's approval is now resolved, hashed and (at grant time) executed against the
+  requesting agent's own selected version — its attachment's pinned version, or the entry's current
+  one when unpinned — instead of always the entry's current version: an agent pinned to an older
+  version no longer silently moves onto a newer one the entry has since published, which previously
+  let the approval card, the grant-time re-check and execution all agree with each other while
+  disagreeing with what the attachment and its capability description actually promised. The
+  approval card also now shows an authoritative, secret-free request preview (method, resolved
+  path, query/header/body field names, a secret-filled slot named but never its value) in its own
+  block, separate from the model's own free-text summary.
+- Attaching to a still-legacy agent no longer silently drops an unresolved legacy grant (an allow
+  or approval pattern naming no catalog entry known right now, e.g. `mail.send`): the automatic
+  conversion this performs now refuses the whole attach outright, with a pointer to
+  `gateway tools adopt <agent-id>` first, which shows every unresolved pattern before committing
+  anything instead of silently narrowing what the conversion actually covers. It also now binds
+  itself to the exact conversion the console's agent-tools read showed (the same
+  `attachmentsConversionHash` binding "Adopt into the tools hub"'s own confirm step already has),
+  refused as a conflict once a catalog entry created, edited or deleted since changes what it
+  resolves to.
+- An agent id of `constructor` (a valid, if unusual, lowercase agent id) no longer throws on every
+  committed configuration change, nor gets misread as hub-managed when it is legacy: every
+  attachment-bundle lookup now checks the dictionary's own property (`Object.hasOwn`) rather than
+  bare bracket access, which previously resolved such a lookup to `Object.prototype.constructor`
+  (a function, not `undefined`) whenever the agent had no attachment entry of its own yet. The same
+  fix now also covers every other plain-object dictionary keyed by agent id across the codebase that
+  had the identical gap: a config diff/export's own attachment and role-prompt lookups, the hourly
+  and pairwise rate limits in routing, a role prompt's own "missing or empty" check (previously
+  checked with `in`, which walks the prototype chain exactly like bracket access does), and a
+  historical snapshot's own role-prompt read used when restoring a retired agent — each previously
+  either crashed, silently exempted the agent from a limit, or fed a function where a string was
+  expected, specifically for an agent named `constructor`.
+- A custom HTTPS tool definition now refuses two parameters sharing the same `name` even across
+  different slots (a path parameter and a header parameter both called `id`, say): a request
+  resolves a value by `name` alone, so the model's one supplied value would otherwise silently land
+  in both places, never the two independent values a definition author likely intended.
+- A custom tool's approval card always shows the owner the complete request preview: a preview that
+  does not fit the stored payload's own schema limit (a resolved path or query value,
+  percent-encoded, can run well past 4000 characters for a long non-ASCII value) refuses the whole
+  draft at request time instead of being cut to fit — the owner either sees exactly what will run,
+  or is never asked to approve it at all. The finished card is also checked against Mattermost's own
+  post limit before the approval is ever created, sharing one layout function with the renderer
+  (`fitApprovalCard`, `@agent-gateway/contracts`) so the two can never disagree: if the full card
+  (full preview, full summary) does not fit, only the model's own summary is shortened to make room
+  — never the preview, never the parameters (already bounded, and refused rather than trimmed,
+  before the request is ever created) — and if the card still does not fit even with the summary
+  dropped entirely, the request is refused outright, nothing created. The renderer mirrors this
+  exactly and never trims or omits a stored preview; the one case it still renders a short,
+  non-approvable "too large" notice instead of a card is data a release before this rule shipped
+  already created.
+- The agent capability editor's own "Attach a tool" dialogs (the agent detail page's and the hub's
+  "Attach to agent") now only ever offer a mode the selected entry's own `kind` actually supports
+  — previously they offered every mode its risk floor alone would allow, regardless of kind, so
+  `require_approval` on a `native`/`gateway` entry (nothing can pause a turn mid-flight for a human
+  on either) or `allow` on an `executor`/`custom_https`/`utility` one (the broker has no
+  approval-free execution path) was always refused with a `422` the moment it was actually attached.
+- `legacyAgentsGrantingTool` (behind `deleteCatalogEntry`'s own refusal while a legacy agent still
+  grants the entry) now also finds an enabled agent whose own `config_version` simply lags the
+  active one, matching the same active-configuration rule `admin.ts` already applies elsewhere —
+  previously it missed exactly that row, while its own doc comment still described the narrower
+  "enabled agents only" rule it had already moved past. It also now excludes an agent whose own
+  `tools_deny` covers the entry (denying a tool is not "holding" it), which it previously ignored.
+- A custom HTTPS write (`POST`/`PUT`/`PATCH`/`DELETE`) answered with a server error (5xx) or a 408
+  (Request Timeout) after the request was already fully sent is now reported `unknown` — manual
+  settlement, never a retryable `failed` — since the destination may already have acted on it
+  before its own answer failed; a read (`GET`) and a write's definitive 4xx rejection are
+  unaffected. The same ambiguity is now also honored for an unreadable or unexpected-content-type
+  response body on a write already sent, matching the existing redirect/connection-error handling.
+- The runtime now sees each parameterized custom tool's own non-secret parameter contract (name,
+  type, whether it is required, and its bounds, format or enum choices) in both the turn's
+  structured capability list and the rendered prompt, resolved against the exact definition
+  version the capability's own mode and description already reflect (pinned or current) — never a
+  secret slot's name or value. Previously the model had to guess a custom tool's own parameters
+  from its free-text description alone.
+- Compiling an agent's attachments no longer grants a capability whose own catalog entry is
+  deleted or tombstoned just because another attached tool still names it as a native dependency
+  (`tests.run` implying `workspace.write`): the implication is now reported as a missing
+  prerequisite instead of silently applied. This closes three ways a deleted entry's capability
+  could previously still reach an agent — attaching a tool that implies it while nobody holds the
+  implied entry any more (now also refused at attach time, before it ever commits), restoring a
+  retired agent whose disabled attachment of the deleted entry is dropped, and a config rollback or
+  bundle import/apply bringing back an attachment that implies it.
+- A custom tool's approval-card preview now serializes a query (and path) parameter's value with
+  the exact encoding the executor itself sends on the wire, sharing one encoder between them: a
+  value containing `&`, a space, `%` or `#` previously rendered in the preview as if it introduced
+  a second parameter or otherwise disagreed with what was actually sent.
+- Previewing (or committing) a legacy agent's adoption into the tools hub now also validates its
+  resolved attachments' compiled permission lists against the same per-list bound (64) the write
+  boundary itself enforces — a wide pattern resolving to, say, 65 tools all compiling into the same
+  list previously showed an empty problem list and only failed once a real commit was attempted;
+  a batch `gateway tools adopt --all` now reports that one agent's problem and still adopts every
+  other agent in the batch, rather than throwing past it.
+- Reporting a run's approval request whose assembled Mattermost card unexpectedly fails its own
+  schema (a defensive re-check that should not fire in practice) now fails that one run cleanly
+  (`invalid_output`), with nothing — not an approval row, not a wait — left behind half-created,
+  instead of throwing an uncaught error out of the job handler to be retried forever against a card
+  that will never parse any differently.
+- Shrinking an approval card's own free-text summary to fit Mattermost's post limit no longer cuts
+  a UTF-16 surrogate pair in half (e.g. an emoji right at the cut point), which previously left a
+  lone, unpaired surrogate in the stored and rendered text.
+- A custom tool approval whose request preview cannot be resolved at all (a missing or invalid
+  pinned-version parameter, or one naming a version that no longer exists) is now refused outright,
+  the same as a preview too large to show in full — previously it silently fell back to no preview
+  at all, which could have let a custom tool call reach an approvable card with nothing showing the
+  owner what it would actually do.
+- A native dependency's implied tool whose own catalog entry is deleted is now also added to the
+  compiled `deny` list, not merely left out of `allow`: a runtime-side inference that reads only a
+  policy snapshot's three lists (`nativeToolGrants`, deriving file-read access from a granted
+  `workspace.write`) previously re-derived the very grant the deletion was supposed to revoke —
+  reachable through a rollback or restore that brings back an attachment implying the deleted
+  prerequisite, with no attachment naming the deleted entry itself for either of them to drop. Every
+  tool that would otherwise imply the same deleted dependency is still reported as missing it, not
+  only the first one a fixed-point pass happens to reach.
+- A version 3 turn input's `capabilities` now also stays within a fixed byte budget (a quarter of
+  the turn input's own overall limit), counted per capability's own serialized size: previously only
+  the count of described capabilities was bounded (128), so a handful of parameterized tools with
+  many enum parameters of many long choices could serialize to several megabytes on their own and
+  fail every turn with `context_unavailable`. A capability that would push the running total over
+  budget is left out whole, counted in the existing omitted count, never truncated partway through
+  its own parameter contract.
+- A parameterized capability's enum choices are now rendered in the prompt as individual JSON string
+  literals rather than joined with a bare comma — a choice that itself contains a comma (e.g. `"in
+  progress, blocked"`) previously rendered indistinguishably from two separate choices.
+
 ## [0.6.0] - 2026-10-02
 
 ### Added

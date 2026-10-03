@@ -21,7 +21,10 @@ import {
 	toolReportQueue,
 } from "@agent-gateway/contracts";
 import {
+	type AdoptAgentResult,
 	ackConfigRevision,
+	activeConfigRevisionId,
+	adoptAgentToolAttachments,
 	applyConfig,
 	budgetReport,
 	type CancelledJob,
@@ -33,7 +36,10 @@ import {
 	decideMemory,
 	ensureAgentLifecycleAdoption,
 	ensureConfigHistory,
+	ensureToolAttachmentsReconciled,
+	ensureToolCatalogSeeded,
 	ingestEvent,
+	inTransaction,
 	killAll,
 	listAgents,
 	listApprovals,
@@ -44,6 +50,7 @@ import {
 	listRuns,
 	listToolActions,
 	listWaits,
+	loadActiveBundle,
 	loadAgentChannelAssignments,
 	MAINTENANCE_STALE_MS,
 	MEMORY_REVIEW_STATUSES,
@@ -95,6 +102,7 @@ import {
 	readOptionalFileSetting,
 	readSetting,
 	requireSetting,
+	resolveCustomToolSecretPath,
 	resolveSecretPath,
 	secretFileExists,
 	writeSecretFile,
@@ -115,6 +123,7 @@ import {
 	nodeHiddenReader,
 	revokeConsoleSessionsAfterRotation,
 } from "./console-commands.ts";
+import { createCustomTool, customToolSecretSet, editCustomTool } from "./custom-tool-commands.ts";
 import { gmailAuthorize } from "./gmail-commands.ts";
 import {
 	mattermostAdminTokenRotate,
@@ -221,6 +230,30 @@ export const USAGE = `gateway <command>
   tools settle <action-id> <succeeded|failed|cancelled> --note <text>
                                       record what an unknown action did, after checking the
                                       provider by its idempotency key
+  tools adopt <agent-id>|--all [--dry-run] [--reason <text>]
+                                      explicit migration (ADR-027): converts a legacy agent's
+                                      permissions into real catalog attachments, one committed
+                                      revision per agent (never implicit); prints unresolved
+                                      patterns and the before/after effective permissions;
+                                      --dry-run previews without committing; an agent already
+                                      managed through the hub is left untouched
+  tools secret set <alias> [--secrets-dir <dir>]
+                                      hidden entry, confirmed: set a custom HTTPS tool's named
+                                      secret (an API key, a bearer token), written verbatim to
+                                      the tool runner's custom-tool secrets mount; restart the
+                                      tool runner to pick it up
+  tools custom create <entry-id> --name <name> --description <text>
+                --definition <file.json>
+                                      defines a new owner-managed custom HTTPS tool (ADR-027):
+                                      fixed destination/method, typed parameters mapped into
+                                      encoded path/query/header/body slots, named secrets (by
+                                      alias, never a value), response limits; a write without a
+                                      declared idempotency header is refused
+  tools custom edit <entry-id> [--name <name>] [--description <text>]
+                [--definition <file.json>]
+                                      publishes a new immutable version; any approval still
+                                      pending against the entry's previous version is refused
+                                      at grant time, never silently executed against this one
   budgets                             today's usage (UTC) per agent and in total, and holds
   memory list [--status <status>] [--namespace <ns>] [--limit <n>] [--offset <n>]
   memory accept <id> | reject <id>    review memory proposals to shared namespaces
@@ -920,6 +953,23 @@ export async function runCommand(args: Readonly<string[]>, out: Output): Promise
 		}
 		return 0;
 	}
+	if (group === "tools" && action === "secret" && args[2] === "set") {
+		const alias = args[3];
+		if (alias === undefined) {
+			throw new UsageError("missing <alias>");
+		}
+		const secretsDirFlag = flag(args, "secrets-dir") ?? readSetting("CUSTOM_TOOL_SECRETS_DIR");
+		const secretsDir = secretsDirFlag === undefined ? undefined : resolve(secretsDirFlag);
+		await customToolSecretSet(
+			{
+				alias,
+				secretPath: resolveCustomToolSecretPath(alias, secretsDir),
+				reader: nodeHiddenReader(),
+			},
+			out.print,
+		);
+		return 0;
+	}
 	if (group === "mattermost" && action === "admin-token" && args[2] === "set") {
 		const secretsDirFlag = flag(args, "secrets-dir") ?? readSetting("SECRETS_DIR");
 		const secretsDir = secretsDirFlag === undefined ? undefined : resolve(secretsDirFlag);
@@ -1030,8 +1080,14 @@ async function runSessionCommand(
 			// command past this point — not just `config apply` — sees an up-to-date base revision
 			// (a console or `gateway agents enable|disable` reads it through `prepareChange`).
 			await ensureConfigHistory(session.deps, actor());
+			// ADR-027: reconciles `catalog_attachments`/`agents.tool_attachments_managed` back to the
+			// active revision's own attachments document, in case a release before ADR-027 changed
+			// the active configuration during a rollback interval.
+			await ensureToolAttachmentsReconciled(session.deps, actor());
 			// ADR-026: adopts every configured agent that has no `agent_lifecycle` row yet.
 			await ensureAgentLifecycleAdoption(session.deps, actor());
+			// ADR-027: seeds every built-in catalog entry this release ships.
+			await ensureToolCatalogSeeded(session.deps, actor());
 		}
 		return await dispatchSessionCommand(session, command, args, out);
 	} finally {
@@ -1039,7 +1095,12 @@ async function runSessionCommand(
 	}
 }
 
-async function dispatchSessionCommand(
+/** Exported so integration tests can exercise one command's dispatch (argument parsing, the
+ * actual service call, its printed output and exit code) directly against a manually-built
+ * `Session`, the same way `doctor` already is — without `runCommand`'s own `DATABASE_URL`/
+ * deployment-lock machinery, which exists for the real CLI entrypoint, not for testing one
+ * command's own logic in isolation. */
+export async function dispatchSessionCommand(
 	session: Session,
 	command: string,
 	args: Readonly<string[]>,
@@ -1387,6 +1448,77 @@ async function dispatchSessionCommand(
 			const settled = await settleToolAction(deps, arg(args, 2, "action-id"), outcome, who, note);
 			out.print(`tool action ${settled.id} settled as ${settled.status}`);
 			return 0;
+		}
+		case "tools adopt": {
+			const target = args[2];
+			if (target === undefined || (target.startsWith("--") && target !== "--all")) {
+				throw new UsageError("missing <agent-id>|--all");
+			}
+			const dryRun = args.includes("--dry-run");
+			const reason = flag(args, "reason");
+			// `listAgents` reads every row of the `agents` projection, retired ones kept for history
+			// (ADR-026) included; `--all` means every agent the *active configuration* actually
+			// names, or adopting one no longer in it throws mid-batch (`adoptOneAgent`'s own "agent
+			// does not exist", since it resolves against the active bundle, not the `agents` table).
+			let agentIds: Readonly<string[]>;
+			if (target === "--all") {
+				const activeRevisionId = await activeConfigRevisionId(deps);
+				const { bundle } = await inTransaction(deps, ({ tx }) =>
+					loadActiveBundle(tx.db, activeRevisionId),
+				);
+				agentIds = bundle.agents.map((agent) => agent.id);
+			} else {
+				agentIds = [target];
+			}
+			const results: Readonly<AdoptAgentResult[]> = await adoptAgentToolAttachments(deps, {
+				agentIds,
+				dryRun,
+				actor: who,
+				...(reason === null ? {} : { reason }),
+			});
+			out.print(json(results));
+			return results.some((result) => result.problems.length > 0) ? 1 : 0;
+		}
+		case "tools custom": {
+			const subcommand = args[2];
+			const entryId = args[3];
+			if (entryId === undefined || entryId.startsWith("--")) {
+				throw new UsageError("usage: tools custom create|edit <entry-id> ...");
+			}
+			const name = flag(args, "name");
+			const description = flag(args, "description");
+			const definitionFile = flag(args, "definition");
+			if (subcommand === "create") {
+				if (name === null || description === null || definitionFile === null) {
+					throw new UsageError(
+						"missing --name <name>, --description <text> or --definition <file.json>",
+					);
+				}
+				await createCustomTool(deps, {
+					entryId,
+					name,
+					description,
+					definitionFile: resolve(definitionFile),
+					actor: who,
+				});
+				out.print(`custom HTTPS tool '${entryId}' created`);
+				return 0;
+			}
+			if (subcommand === "edit") {
+				if (name === null && description === null && definitionFile === null) {
+					throw new UsageError("nothing to edit: give --name, --description or --definition");
+				}
+				await editCustomTool(deps, {
+					entryId,
+					actor: who,
+					...(name === null ? {} : { name }),
+					...(description === null ? {} : { description }),
+					...(definitionFile === null ? {} : { definitionFile: resolve(definitionFile) }),
+				});
+				out.print(`custom HTTPS tool '${entryId}' edited`);
+				return 0;
+			}
+			throw new UsageError("usage: tools custom create|edit <entry-id> ...");
 		}
 		case "budgets":
 			out.print(json(await budgetReport(deps)));

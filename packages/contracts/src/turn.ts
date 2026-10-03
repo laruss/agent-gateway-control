@@ -14,6 +14,7 @@ import {
 	Sha256HexSchema,
 	safeText,
 	TimestampSchema,
+	ToolNameSchema,
 	ToolPatternSchema,
 	TrustLevelSchema,
 	toolPatternOverlaps,
@@ -21,6 +22,11 @@ import {
 	type Visibility,
 	VisibilitySchema,
 } from "./common.ts";
+import {
+	CustomParamNameSchema,
+	type CustomToolParam,
+	MAX_CUSTOM_TOOL_PARAMS,
+} from "./custom-tool.ts";
 import { GatewayEventSchema, mattermostPostTrustIssue } from "./event.ts";
 import { OrganizationLimitsSchema, OrganizationRuleSchema } from "./organization.ts";
 import { SystemStatusSchema } from "./system-status.ts";
@@ -405,14 +411,140 @@ export const ChannelRefSchema = z.strictObject({
 });
 export type ChannelRef = z.infer<typeof ChannelRefSchema>;
 
+/** How a capability may be used, as `capabilities` describes it; `disabled` tools are never
+ * listed at all (there is nothing to describe). */
+export const CapabilityModeSchema = z.enum(["allow", "require_approval"]);
+export type CapabilityMode = z.infer<typeof CapabilityModeSchema>;
+
+/** A bounded, short description for `CapabilityDescriptionSchema`: enough for a runtime's prompt
+ * to explain a capability in one line, never a catalog entry's own longer description verbatim. */
+export const CapabilityDescriptionTextSchema = z.string().min(1).max(200);
+
 /**
- * Version 1 is every turn; version 2 adds the Gateway's system status for agents that observe
- * the system (ADR-023). A version 1 reader refuses version 2, so an older release fails such a
- * run instead of silently dropping the status.
+ * One typed parameter of a parameterized capability (a `custom_https` tool's own definition,
+ * ADR-027), as the model must see it to call the capability correctly: name, type, whether it is
+ * required, and its own bounds or enum choices — never a secret slot, and never which wire slot
+ * (path/query/header/body) a value lands in, which is an execution detail the model does not need.
+ * Every field here comes from the definition version an attachment is actually resolved against
+ * (pinned or current), the same version its compiled mode and description already describe.
+ */
+export const CapabilityParameterSchema = z.discriminatedUnion("type", [
+	z.strictObject({
+		name: CustomParamNameSchema,
+		type: z.literal("string"),
+		required: z.boolean(),
+		minLength: z.int().min(0).max(2000),
+		maxLength: z.int().min(1).max(2000),
+	}),
+	z.strictObject({
+		name: CustomParamNameSchema,
+		type: z.literal("number"),
+		required: z.boolean(),
+		minimum: z.number().finite().optional(),
+		maximum: z.number().finite().optional(),
+	}),
+	z.strictObject({
+		name: CustomParamNameSchema,
+		type: z.literal("boolean"),
+		required: z.boolean(),
+	}),
+	z.strictObject({
+		name: CustomParamNameSchema,
+		type: z.literal("enum"),
+		required: z.boolean(),
+		values: z.array(z.string().min(1).max(100)).min(1).max(50),
+	}),
+]);
+export type CapabilityParameter = z.infer<typeof CapabilityParameterSchema>;
+
+/**
+ * A `custom_https` definition's own `parameters` (`CustomToolParam[]`), reduced to what the model
+ * must see (`CapabilityParameterSchema`): every declared parameter is required (the definition has
+ * no optional-parameter concept — `customToolParamIssues` refuses a missing value outright), and
+ * `slot`/`slotName` are dropped — which wire location a value lands in is an execution detail, not
+ * something the model chooses. `undefined` for a definition with no typed parameters of its own,
+ * never an empty array (`CapabilityDescriptionSchema.parameters` itself refuses one).
+ */
+function capabilityParameterFromCustomToolParam(param: CustomToolParam): CapabilityParameter {
+	switch (param.type) {
+		case "string":
+			return {
+				name: param.name,
+				type: "string",
+				required: true,
+				minLength: param.minLength,
+				maxLength: param.maxLength,
+			};
+		case "number":
+			return {
+				name: param.name,
+				type: "number",
+				required: true,
+				...(param.minimum === undefined ? {} : { minimum: param.minimum }),
+				...(param.maximum === undefined ? {} : { maximum: param.maximum }),
+			};
+		case "boolean":
+			return { name: param.name, type: "boolean", required: true };
+		case "enum":
+			return { name: param.name, type: "enum", required: true, values: [...param.values] };
+	}
+}
+
+export function capabilityParametersFromCustomToolParams(
+	params: Readonly<CustomToolParam[]>,
+): Readonly<CapabilityParameter[]> | undefined {
+	if (params.length === 0) {
+		return undefined;
+	}
+	return params.map(capabilityParameterFromCustomToolParam);
+}
+
+/**
+ * One effective tool the agent's turn carries a name, short description and mode for (version 3,
+ * ADR-023): a bounded, structured alternative to the runtime inferring what a bare tool name
+ * means. `name` is the concrete tool (`repository.read`, `finance.payment.create`), never a
+ * wildcard pattern.
+ */
+export const CapabilityDescriptionSchema = z.strictObject({
+	name: ToolNameSchema,
+	description: CapabilityDescriptionTextSchema,
+	mode: CapabilityModeSchema,
+	/** The tool(s) that make this one effectively usable without it being attached in its own
+	 * right (`compileAttachments`'s own `impliedBy`, ADR-027 — e.g. `repository.read` implied by
+	 * `tests.run`). Omitted for a capability attached (or legacy-resolved) in its own right. */
+	impliedBy: z.array(ToolNameSchema).max(16).optional(),
+	/** A parameterized capability's own non-secret parameter contract (`custom_https`, ADR-027) —
+	 * what the model must supply to call it, resolved against the exact definition version this
+	 * description's own `description` already reflects (pinned or current). Omitted for a tool
+	 * with no typed parameters of its own (every other kind, and a `custom_https` definition with
+	 * none) — never an empty array standing in for "none declared". Bounded the same way a
+	 * definition's own `parameters` already is (`MAX_CUSTOM_TOOL_PARAMS`). */
+	parameters: z.array(CapabilityParameterSchema).min(1).max(MAX_CUSTOM_TOOL_PARAMS).optional(),
+});
+export type CapabilityDescription = z.infer<typeof CapabilityDescriptionSchema>;
+
+/** At most this many capabilities per turn; generous for a hub with a few dozen tools. */
+export const MAX_CAPABILITIES = 128;
+
+export const CapabilityDescriptionsSchema = z
+	.array(CapabilityDescriptionSchema)
+	.max(MAX_CAPABILITIES)
+	.refine(
+		(capabilities) => unique(capabilities.map((c) => c.name)),
+		"capability names must be unique",
+	);
+
+/**
+ * Version 1 is every turn and is unchanged in shape. Version 2 adds the Gateway's system status
+ * for agents that observe the system (ADR-023); a version 1 reader refuses version 2, so an older
+ * release fails such a run instead of silently dropping the status. Version 3 adds `capabilities`
+ * — bounded, structured descriptions of the agent's own effective tools — carried by every version
+ * 3 input regardless of `systemStatus`, which stays governed by observation alone, the same as
+ * version 2.
  */
 export const AgentTurnInputSchema = z
 	.strictObject({
-		schemaVersion: z.union([z.literal(1), z.literal(2)]),
+		schemaVersion: z.union([z.literal(1), z.literal(2), z.literal(3)]),
 		runId: UuidSchema,
 		agent: AgentIdentitySnapshotSchema,
 		organization: OrganizationSnapshotSchema,
@@ -430,16 +562,61 @@ export const AgentTurnInputSchema = z
 		/** JSON Schema of `AgentTurnModelOutput` the runtime must produce. */
 		outputSchema: JsonObjectSchema,
 		deadline: TimestampSchema,
-		/** Version 2 only: the Gateway's read-only snapshot of its own operation. */
+		/** Version 2 and 3 only, and only for an agent that observes the system: the Gateway's
+		 * read-only snapshot of its own operation. */
 		systemStatus: SystemStatusSchema.optional(),
+		/** Version 3 only, always present (possibly empty): bounded descriptions of the agent's own
+		 * effective tools, for the runtime prompt to describe them structurally. */
+		capabilities: CapabilityDescriptionsSchema.optional(),
+		/** Version 3 only: how many further capabilities `capabilities` itself had to leave out to
+		 * stay within `MAX_CAPABILITIES` (a wildcard resolving to more entries than that bound,
+		 * ADR-027) — omitted entirely when nothing was left out, never a reason to fail the turn the
+		 * way exceeding `MAX_CAPABILITIES` itself would. `toolPolicy.allow`/`requireHumanApproval`
+		 * stay complete regardless: only the structured, catalog-sourced description is bounded. */
+		capabilitiesOmitted: z.int().positive().optional(),
 	})
 	.check((ctx) => {
-		if ((ctx.value.schemaVersion === 2) !== (ctx.value.systemStatus !== undefined)) {
+		const { schemaVersion, systemStatus, capabilities, capabilitiesOmitted } = ctx.value;
+		if (
+			schemaVersion === 1 &&
+			(systemStatus !== undefined ||
+				capabilities !== undefined ||
+				capabilitiesOmitted !== undefined)
+		) {
 			ctx.issues.push({
 				code: "custom",
-				input: ctx.value.schemaVersion,
+				input: schemaVersion,
 				path: ["schemaVersion"],
-				message: "schemaVersion 2 carries systemStatus, and only version 2 does",
+				message: "schemaVersion 1 carries neither systemStatus nor capabilities",
+			});
+		}
+		if (
+			schemaVersion === 2 &&
+			(systemStatus === undefined ||
+				capabilities !== undefined ||
+				capabilitiesOmitted !== undefined)
+		) {
+			ctx.issues.push({
+				code: "custom",
+				input: schemaVersion,
+				path: ["schemaVersion"],
+				message: "schemaVersion 2 always carries systemStatus, and never capabilities",
+			});
+		}
+		if (capabilitiesOmitted !== undefined && capabilities === undefined) {
+			ctx.issues.push({
+				code: "custom",
+				input: capabilitiesOmitted,
+				path: ["capabilitiesOmitted"],
+				message: "capabilitiesOmitted requires capabilities",
+			});
+		}
+		if (schemaVersion === 3 && capabilities === undefined) {
+			ctx.issues.push({
+				code: "custom",
+				input: schemaVersion,
+				path: ["schemaVersion"],
+				message: "schemaVersion 3 always carries capabilities",
 			});
 		}
 	});

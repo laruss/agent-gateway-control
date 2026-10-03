@@ -208,6 +208,26 @@ describe("routing", () => {
 		).toBe("rate_limit");
 	});
 
+	it("enforces the rate limit for an agent literally named 'constructor', never exempting it through the prototype chain", () => {
+		// `NO_STATS.runsLastHour` (`{}`) has no *own* "constructor" key — a bare
+		// `stats.runsLastHour[agent.id]` would otherwise resolve, through the prototype chain, to
+		// `Object.prototype.constructor` (a function, not `undefined`), which `?? 0` cannot catch.
+		// Comparing a function `>=` a number coerces to `NaN >= n`, always `false` — never blocked,
+		// regardless of the real limit. A zero-run limit is the one bound where that difference is
+		// actually observable: the correct reading, `0 >= 0`, is `true` (blocked).
+		const targeted = postEvent({ rootId: null, targets: ["constructor"] });
+		expect(
+			routeEvent({
+				event: targeted,
+				agents: [agent("constructor")],
+				waits: [],
+				limits: { ...LIMITS, max_runs_per_agent_per_hour: 0 },
+				stats: NO_STATS,
+				now: NOW,
+			})[0]?.reason,
+		).toBe("rate_limit");
+	});
+
 	it("bounds a thread's wake-ups across cascades, for humans too", () => {
 		const human = postEvent({ rootId: null, targets: ["developer", "finance"] });
 		const routes = route(human, {

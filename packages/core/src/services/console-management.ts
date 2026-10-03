@@ -44,6 +44,7 @@ import {
 	loadActiveBundle,
 	ManagementConflictError,
 	previewChangeSetAgainst,
+	previewHash,
 } from "./management.ts";
 import { runtimeHealth } from "./runtime-health.ts";
 
@@ -210,9 +211,20 @@ export async function consoleShowAgent(
 				allowedChannels: agent.mattermost.allowed_channels,
 			},
 			runtime: agent.runtime,
-			rolePrompt: bundle.rolePrompts[agent.id] ?? "",
+			// Own-property lookup, never plain bracket access: an agent id like `constructor` has no
+			// own property in this plain-object dictionary but still resolves, through the prototype
+			// chain, to `Object.prototype.constructor` — truthy, and not a role prompt string — which
+			// `?? ""` alone would not catch.
+			rolePrompt:
+				(Object.hasOwn(bundle.rolePrompts, agent.id) ? bundle.rolePrompts[agent.id] : undefined) ??
+				"",
 			wakeRules: agent.wake_rules,
 			permissions: agent.permissions,
+			// Own-property check, never plain bracket access: an agent id like `constructor` has no
+			// own property in this plain-object dictionary but still resolves, through the prototype
+			// chain, to `Object.prototype.constructor` — truthy, and not an attachment list — which
+			// would otherwise misreport a legacy agent named `constructor` as hub-managed.
+			toolsHubManaged: Object.hasOwn(bundle.toolAttachments, agent.id),
 			memory: {
 				privateNamespace: agent.memory.private_namespace,
 				sharedNamespaces: agent.memory.shared_namespaces,
@@ -451,6 +463,44 @@ function changeSetProblems(base: ConfigDraftBundle, changeSet: ChangeSet): Reado
 	return [...opProblems, ...draftBundleProblems(draft)];
 }
 
+/**
+ * A hub-managed agent's `permissions` are a mirror of its compiled attachments (ADR-027), replaced
+ * on every commit regardless of what a direct edit sets — previewing (and committing) a patch that
+ * edits `tools_allow`/`tools_require_human_approval`/`tools_deny` for one would show a change the
+ * commit then silently overwrites back to the compiled result, a no-op the owner never asked for.
+ * Refused here, at the one place both `previewAgentPatch` and `commitAgentPatch` already resolve
+ * `bundle`, rather than left to surprise the owner after committing. Empty for a legacy agent (no
+ * attachments document at all), a patch that never touches `permissions`, or a `permissions` patch
+ * that only sets `observe_system` — compiled attachments never cover that field (`compiledAgentPermissions`
+ * sets it from the agent's own current value, untouched by the hub), so it is the one part of
+ * `permissions` a hub-managed agent still edits directly.
+ */
+function hubManagedPermissionsEditProblems(
+	bundle: ConfigDraftBundle,
+	agentId: string,
+	patch: AgentPatch,
+): Readonly<string[]> {
+	// Own-property check, never plain bracket access: an agent id like `constructor` has no own
+	// property here but still resolves, through the prototype chain, to
+	// `Object.prototype.constructor` — not `undefined` — which would otherwise treat a legacy agent
+	// named `constructor` as hub-managed and wrongly refuse a direct `permissions` edit for it.
+	if (patch.permissions === undefined || !Object.hasOwn(bundle.toolAttachments, agentId)) {
+		return [];
+	}
+	const { tools_allow, tools_require_human_approval, tools_deny } = patch.permissions;
+	if (
+		tools_allow === undefined &&
+		tools_require_human_approval === undefined &&
+		tools_deny === undefined
+	) {
+		return [];
+	}
+	return [
+		"this agent's tools are managed in the tools hub: edit its attachments there " +
+			"(gateway tools attach/detach/adopt), not its permission lists",
+	];
+}
+
 /** For an enabled-only patch (`AgentPatchPlan.enabledOnly`): the change set that actually applies
  * against `base` alone — a plain `set_agent_enabled`, or, when disabling and the agent's own
  * retained configuration no longer validates under `base`'s own rules, `remove_agent` instead
@@ -532,6 +582,21 @@ export async function previewAgentPatch(
 	if (baseRevisionId !== current.revisionId) {
 		return { kind: "conflict", currentRevisionId: current.revisionId };
 	}
+	const hubManagedProblems = hubManagedPermissionsEditProblems(current.bundle, agentId, patch);
+	if (hubManagedProblems.length > 0) {
+		return {
+			kind: "ok",
+			preview: {
+				baseRevisionId: current.revisionId,
+				baseHash: current.hash,
+				newHash: current.hash ?? previewHash(current.bundle),
+				noop: false,
+				diff: configDiff(current.bundle, current.bundle),
+				problems: hubManagedProblems,
+			},
+			impact: [],
+		};
+	}
 	const plan = planAgentPatch(current.agent, patch);
 	if (plan.enabledOnly && patch.enabled === false) {
 		const resolved = await resolveEnabledChangeSet(
@@ -612,6 +677,10 @@ export async function commitAgentPatch(
 	const agent = bundle.agents.find((candidate) => candidate.id === agentId);
 	if (agent === undefined) {
 		return { kind: "not-found" };
+	}
+	const hubManagedProblems = hubManagedPermissionsEditProblems(bundle, agentId, patch);
+	if (hubManagedProblems.length > 0) {
+		return { kind: "invalid", problems: hubManagedProblems };
 	}
 	const plan = planAgentPatch(agent, patch);
 	let changeSet: ChangeSet;

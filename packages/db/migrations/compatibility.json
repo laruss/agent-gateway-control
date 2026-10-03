@@ -29,7 +29,14 @@
     "0024_agent_lifecycle": "expand",
     "0025_agent_lifecycle_guards": "expand",
     "0026_outbox_cancelled_status": "expand",
-    "0027_lifecycle_retry_of": "expand"
+    "0027_lifecycle_retry_of": "expand",
+    "0028_tool_catalog": "expand",
+    "0029_tool_catalog_guards": "expand",
+    "0030_config_attachment_snapshots": "expand",
+    "0031_config_attachment_snapshots_guards": "expand",
+    "0032_agent_tool_attachments_managed": "expand",
+    "0033_custom_https_tools": "expand",
+    "0034_gateway_custom_tool_definition": "expand"
   },
   "releases": [
     {

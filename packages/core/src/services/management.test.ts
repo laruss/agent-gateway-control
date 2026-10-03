@@ -70,6 +70,7 @@ function bundleOf(agents: Readonly<AgentConfig[]>) {
 		agents: [...agents],
 		constitution: "Be helpful.",
 		rolePrompts: Object.fromEntries(agents.map((a) => [a.id, `Role prompt for ${a.id}.`])),
+		toolAttachments: {},
 	};
 }
 
@@ -78,6 +79,7 @@ const EMPTY: ConfigDraftBundle = {
 	agents: [],
 	constitution: "",
 	rolePrompts: {},
+	toolAttachments: {},
 };
 
 function apply(base: ConfigDraftBundle, ...ops: ChangeOperation[]) {
@@ -206,6 +208,396 @@ describe("applyChangeSet", () => {
 		expect(problems).toEqual(["set_agent_enabled: agent 'ghost' does not exist"]);
 	});
 
+	it("attach_tool adds a new attachment for an agent", () => {
+		const base = bundleOf([agent("alpha")]);
+		const { draft, problems } = apply(base, {
+			type: "attach_tool",
+			agentId: "alpha",
+			entryId: "gateway-mattermost-post",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+		});
+		expect(problems).toEqual([]);
+		expect(draft.toolAttachments.alpha).toEqual([
+			{ entryId: "gateway-mattermost-post", pinnedVersion: null, mode: "allow", settings: {} },
+		]);
+	});
+
+	it("attach_tool replaces an existing attachment of the same entry, rather than duplicating it", () => {
+		const base = bundleOf([agent("alpha")]);
+		const { draft } = apply(
+			base,
+			{
+				type: "attach_tool",
+				agentId: "alpha",
+				entryId: "gateway-mattermost-post",
+				pinnedVersion: null,
+				mode: "require_approval",
+				settings: {},
+			},
+			{
+				type: "attach_tool",
+				agentId: "alpha",
+				entryId: "gateway-mattermost-post",
+				pinnedVersion: 2,
+				mode: "allow",
+				settings: { note: "updated" },
+			},
+		);
+		expect(draft.toolAttachments.alpha).toEqual([
+			{
+				entryId: "gateway-mattermost-post",
+				pinnedVersion: 2,
+				mode: "allow",
+				settings: { note: "updated" },
+			},
+		]);
+	});
+
+	it("attach_tool for an agent that does not exist is a problem", () => {
+		const base = bundleOf([agent("alpha")]);
+		const { draft, problems } = apply(base, {
+			type: "attach_tool",
+			agentId: "ghost",
+			entryId: "gateway-mattermost-post",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+		});
+		expect(draft).toEqual(base);
+		expect(problems).toEqual(["attach_tool: agent 'ghost' does not exist"]);
+	});
+
+	it("detach_tool removes just the named entry's attachment", () => {
+		const base = bundleOf([agent("alpha")]);
+		const attached = apply(base, {
+			type: "attach_tool",
+			agentId: "alpha",
+			entryId: "gateway-mattermost-post",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+		}).draft;
+		const { draft, problems } = apply(attached, {
+			type: "detach_tool",
+			agentId: "alpha",
+			entryId: "gateway-mattermost-post",
+		});
+		expect(problems).toEqual([]);
+		expect(draft.toolAttachments.alpha).toEqual([]);
+	});
+
+	it("detach_tool of something never attached is an idempotent no-op", () => {
+		const base = bundleOf([agent("alpha")]);
+		const { draft, problems } = apply(base, {
+			type: "detach_tool",
+			agentId: "alpha",
+			entryId: "gateway-mattermost-post",
+		});
+		expect(problems).toEqual([]);
+		expect(draft).toEqual(base);
+	});
+
+	it("update_attachment patches only the fields given, leaving the rest", () => {
+		const base = bundleOf([agent("alpha")]);
+		const attached = apply(base, {
+			type: "attach_tool",
+			agentId: "alpha",
+			entryId: "gateway-mattermost-post",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: { a: 1 },
+		}).draft;
+		const { draft, problems } = apply(attached, {
+			type: "update_attachment",
+			agentId: "alpha",
+			entryId: "gateway-mattermost-post",
+			mode: "require_approval",
+		});
+		expect(problems).toEqual([]);
+		expect(draft.toolAttachments.alpha).toEqual([
+			{
+				entryId: "gateway-mattermost-post",
+				pinnedVersion: null,
+				mode: "require_approval",
+				settings: { a: 1 },
+			},
+		]);
+	});
+
+	it("update_attachment of an entry never attached is a problem", () => {
+		const base = bundleOf([agent("alpha")]);
+		const { draft, problems } = apply(base, {
+			type: "update_attachment",
+			agentId: "alpha",
+			entryId: "gateway-mattermost-post",
+			mode: "allow",
+		});
+		expect(draft).toEqual(base);
+		expect(problems).toEqual([
+			"update_attachment: agent 'alpha' has no attachment of 'gateway-mattermost-post'",
+		]);
+	});
+
+	// An agent id of `constructor` is a valid `AgentId` (lowercase letters only); `toolAttachments`
+	// is a plain-object dictionary, so a naive `draft.toolAttachments[op.agentId]` would otherwise
+	// resolve, through the prototype chain, to `Object.prototype.constructor` (a function) instead
+	// of `undefined` whenever this agent has no own entry yet. `Object.hasOwn` is the only safe way
+	// to ask "does this agent have an entry at all" first — once it has confirmed one does, reading
+	// it back (`draft.toolAttachments.constructor` below) is exactly as safe as any other key, since
+	// an own property always shadows the prototype regardless of dot or bracket notation.
+	describe("an agent literally named 'constructor'", () => {
+		it("attach_tool succeeds and records a real, own attachment entry", () => {
+			const base = bundleOf([agent("constructor")]);
+			const { draft, problems } = apply(base, {
+				type: "attach_tool",
+				agentId: "constructor",
+				entryId: "gateway-mattermost-post",
+				pinnedVersion: null,
+				mode: "allow",
+				settings: {},
+			});
+			expect(problems).toEqual([]);
+			expect(Object.hasOwn(draft.toolAttachments, "constructor")).toBe(true);
+			expect(draft.toolAttachments.constructor).toEqual([
+				{ entryId: "gateway-mattermost-post", pinnedVersion: null, mode: "allow", settings: {} },
+			]);
+		});
+
+		it("detach_tool of something never attached is an idempotent no-op, not a crash", () => {
+			const base = bundleOf([agent("constructor")]);
+			const { draft, problems } = apply(base, {
+				type: "detach_tool",
+				agentId: "constructor",
+				entryId: "gateway-mattermost-post",
+			});
+			expect(problems).toEqual([]);
+			expect(draft).toEqual(base);
+			expect(Object.hasOwn(draft.toolAttachments, "constructor")).toBe(false);
+		});
+
+		it("update_attachment of an entry never attached is a problem, not a crash", () => {
+			const base = bundleOf([agent("constructor")]);
+			const { draft, problems } = apply(base, {
+				type: "update_attachment",
+				agentId: "constructor",
+				entryId: "gateway-mattermost-post",
+				mode: "allow",
+			});
+			expect(draft).toEqual(base);
+			expect(problems).toEqual([
+				"update_attachment: agent 'constructor' has no attachment of 'gateway-mattermost-post'",
+			]);
+		});
+
+		it("attach then detach end-to-end leaves a real, empty own entry — never the inherited constructor function", () => {
+			const base = bundleOf([agent("constructor")]);
+			const attached = apply(base, {
+				type: "attach_tool",
+				agentId: "constructor",
+				entryId: "gateway-mattermost-post",
+				pinnedVersion: null,
+				mode: "allow",
+				settings: {},
+			}).draft;
+			const { draft, problems } = apply(attached, {
+				type: "detach_tool",
+				agentId: "constructor",
+				entryId: "gateway-mattermost-post",
+			});
+			expect(problems).toEqual([]);
+			expect(Object.hasOwn(draft.toolAttachments, "constructor")).toBe(true);
+			expect(draft.toolAttachments.constructor).toEqual([]);
+		});
+	});
+
+	it("clear_tool_attachments removes one entry's attachment from every agent that has it", () => {
+		const base = bundleOf([agent("alpha"), agent("beta")]);
+		const attached = apply(
+			base,
+			{
+				type: "attach_tool",
+				agentId: "alpha",
+				entryId: "gateway-mattermost-post",
+				pinnedVersion: null,
+				mode: "allow",
+				settings: {},
+			},
+			{
+				type: "attach_tool",
+				agentId: "alpha",
+				entryId: "gateway-memory-write",
+				pinnedVersion: null,
+				mode: "allow",
+				settings: {},
+			},
+			{
+				type: "attach_tool",
+				agentId: "beta",
+				entryId: "gateway-mattermost-post",
+				pinnedVersion: null,
+				mode: "allow",
+				settings: {},
+			},
+		).draft;
+		const { draft, problems } = apply(attached, {
+			type: "clear_tool_attachments",
+			entryId: "gateway-mattermost-post",
+		});
+		expect(problems).toEqual([]);
+		expect(draft.toolAttachments.alpha).toEqual([
+			{ entryId: "gateway-memory-write", pinnedVersion: null, mode: "allow", settings: {} },
+		]);
+		expect(draft.toolAttachments.beta).toEqual([]);
+	});
+
+	it("set_tool_attachments marks an existing agent hub-managed, even with an explicitly empty list", () => {
+		const base = bundleOf([agent("alpha")]);
+		const { draft, problems } = apply(base, {
+			type: "set_tool_attachments",
+			agentId: "alpha",
+			attachments: [],
+		});
+		expect(problems).toEqual([]);
+		expect(draft.toolAttachments.alpha).toEqual([]);
+	});
+
+	it("set_tool_attachments replaces the whole list in one operation", () => {
+		const attached = apply(bundleOf([agent("alpha")]), {
+			type: "attach_tool",
+			agentId: "alpha",
+			entryId: "gateway-mattermost-post",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+		}).draft;
+		const { draft, problems } = apply(attached, {
+			type: "set_tool_attachments",
+			agentId: "alpha",
+			attachments: [
+				{ entryId: "gateway-memory-write", pinnedVersion: null, mode: "allow", settings: {} },
+			],
+		});
+		expect(problems).toEqual([]);
+		expect(draft.toolAttachments.alpha).toEqual([
+			{ entryId: "gateway-memory-write", pinnedVersion: null, mode: "allow", settings: {} },
+		]);
+	});
+
+	it("set_tool_attachments for an agent that does not exist is a problem", () => {
+		const base = bundleOf([agent("alpha")]);
+		const { draft, problems } = apply(base, {
+			type: "set_tool_attachments",
+			agentId: "ghost",
+			attachments: [],
+		});
+		expect(draft).toEqual(base);
+		expect(problems).toEqual(["set_tool_attachments: agent 'ghost' does not exist"]);
+	});
+
+	it("remove_agent also drops the removed agent's own attachments", () => {
+		const base = bundleOf([agent("alpha")]);
+		const attached = apply(base, {
+			type: "attach_tool",
+			agentId: "alpha",
+			entryId: "gateway-mattermost-post",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+		}).draft;
+		const { draft } = apply(attached, { type: "remove_agent", agentId: "alpha" });
+		expect(draft.toolAttachments.alpha).toBeUndefined();
+	});
+
+	it("replace_bundle with no attachments document carries every existing attachment forward, filtered to the new agents (ADR-027)", () => {
+		const attached = apply(bundleOf([agent("alpha"), agent("beta")]), {
+			type: "attach_tool",
+			agentId: "alpha",
+			entryId: "gateway-mattermost-post",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+		}).draft;
+		const replacement = bundleOf([agent("alpha"), agent("gamma")]);
+		const { draft, problems } = apply(attached, { type: "replace_bundle", bundle: replacement });
+		expect(problems).toEqual([]);
+		// Carried forward: alpha keeps its attachment even though nothing in `replacement` ever
+		// mentioned one.
+		expect(draft.toolAttachments.alpha).toEqual([
+			{ entryId: "gateway-mattermost-post", pinnedVersion: null, mode: "allow", settings: {} },
+		]);
+		// `beta` left the configuration: its own attachments (it had none here, but the principle is
+		// the same) never survive a replace that drops it.
+		expect(draft.toolAttachments.beta).toBeUndefined();
+	});
+
+	it("replace_bundle with an explicit attachments document (even {}) replaces the whole document", () => {
+		const attached = apply(bundleOf([agent("alpha")]), {
+			type: "attach_tool",
+			agentId: "alpha",
+			entryId: "gateway-mattermost-post",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+		}).draft;
+		const replacement = bundleOf([agent("alpha")]);
+		const { draft, problems } = apply(attached, {
+			type: "replace_bundle",
+			bundle: replacement,
+			toolAttachments: {},
+		});
+		expect(problems).toEqual([]);
+		expect(draft.toolAttachments).toEqual({});
+	});
+
+	it("add_agent with no attachments document starts the agent legacy (no key of its own)", () => {
+		const { draft, problems } = apply(bundleOf([agent("alpha")]), {
+			type: "add_agent",
+			agent: agent("beta"),
+			rolePrompt: "Role prompt for beta.",
+		});
+		expect(problems).toEqual([]);
+		expect(Object.hasOwn(draft.toolAttachments, "beta")).toBe(false);
+	});
+
+	it("add_agent with an explicit, even empty, attachments list starts the agent hub-managed (restore's own carry-forward)", () => {
+		const { draft, problems } = apply(bundleOf([agent("alpha")]), {
+			type: "add_agent",
+			agent: agent("beta"),
+			rolePrompt: "Role prompt for beta.",
+			toolAttachments: [],
+		});
+		expect(problems).toEqual([]);
+		expect(draft.toolAttachments.beta).toEqual([]);
+	});
+
+	it("canonicalizes every agent's attachments by entryId, regardless of the order they were attached in", () => {
+		const { draft } = apply(
+			bundleOf([agent("alpha")]),
+			{
+				type: "attach_tool",
+				agentId: "alpha",
+				entryId: "native-web-search",
+				pinnedVersion: null,
+				mode: "allow",
+				settings: {},
+			},
+			{
+				type: "attach_tool",
+				agentId: "alpha",
+				entryId: "gateway-mattermost-post",
+				pinnedVersion: null,
+				mode: "allow",
+				settings: {},
+			},
+		);
+		expect(draft.toolAttachments.alpha?.map((a) => a.entryId)).toEqual([
+			"gateway-mattermost-post",
+			"native-web-search",
+		]);
+	});
+
 	it("applies an ordered list of operations in order, collecting every problem", () => {
 		const base = bundleOf([agent("alpha")]);
 		const { draft, problems } = apply(
@@ -243,6 +635,21 @@ describe("draftBundleProblems", () => {
 		const missingPrompt: ConfigDraftBundle = { ...base, rolePrompts: {} };
 		expect(draftBundleProblems(missingPrompt)).toEqual([
 			"agent finance: role prompt is missing or empty",
+		]);
+	});
+
+	it("reports a toolAttachments entry naming an agent not in the bundle", () => {
+		const base = bundleOf([agent("finance")]);
+		const orphaned: ConfigDraftBundle = {
+			...base,
+			toolAttachments: {
+				ghost: [
+					{ entryId: "gateway-mattermost-post", pinnedVersion: null, mode: "allow", settings: {} },
+				],
+			},
+		};
+		expect(draftBundleProblems(orphaned)).toEqual([
+			"toolAttachments: 'ghost' has attachments but is not a configured agent",
 		]);
 	});
 });
@@ -355,6 +762,140 @@ describe("configDiff", () => {
 			beforeSize: 0,
 			afterSize: "Be helpful.".length,
 		});
+	});
+
+	it("reports every attachment added, removed or changed, per agent per entry (ADR-027)", () => {
+		const before: ConfigDraftBundle = {
+			...bundleOf([agent("alpha")]),
+			toolAttachments: {
+				alpha: [
+					{
+						entryId: "gateway-mattermost-post",
+						pinnedVersion: null,
+						mode: "allow",
+						settings: {},
+					},
+					{ entryId: "native-web-search", pinnedVersion: null, mode: "allow", settings: {} },
+				],
+			},
+		};
+		const after: ConfigDraftBundle = {
+			...before,
+			toolAttachments: {
+				alpha: [
+					// Unchanged: left out of the diff entirely.
+					{
+						entryId: "gateway-mattermost-post",
+						pinnedVersion: null,
+						mode: "allow",
+						settings: {},
+					},
+					// native-web-search removed; native-web-fetch added; gateway-memory-write is new too,
+					// with a mode change relative to nothing (so "added", not "changed").
+					{
+						entryId: "native-web-fetch",
+						pinnedVersion: null,
+						mode: "require_approval",
+						settings: {},
+					},
+				],
+			},
+		};
+		expect(configDiff(before, after).toolAttachments).toEqual([
+			{ kind: "added", agentId: "alpha", entryId: "native-web-fetch" },
+			{ kind: "removed", agentId: "alpha", entryId: "native-web-search" },
+		]);
+	});
+
+	it("reports a changed attachment's own fields (mode, pinnedVersion, settings) by name", () => {
+		const before: ConfigDraftBundle = {
+			...bundleOf([agent("alpha")]),
+			toolAttachments: {
+				alpha: [
+					{
+						entryId: "gateway-mattermost-post",
+						pinnedVersion: null,
+						mode: "allow",
+						settings: { a: 1 },
+					},
+				],
+			},
+		};
+		const after: ConfigDraftBundle = {
+			...before,
+			toolAttachments: {
+				alpha: [
+					{
+						entryId: "gateway-mattermost-post",
+						pinnedVersion: 2,
+						mode: "require_approval",
+						settings: { a: 2 },
+					},
+				],
+			},
+		};
+		expect(configDiff(before, after).toolAttachments).toEqual([
+			{
+				kind: "changed",
+				agentId: "alpha",
+				entryId: "gateway-mattermost-post",
+				fields: ["mode", "pinnedVersion", "settings"],
+			},
+		]);
+	});
+
+	it("diffs an agent literally named 'constructor' without crashing, whichever side it is missing from", () => {
+		// `toolAttachments` is a plain-object dictionary keyed by agent id; a naive
+		// `before["constructor"]`/`after["constructor"]` would otherwise resolve, through the
+		// prototype chain, to `Object.prototype.constructor` (a function, not an array) the moment
+		// the id is absent from one side, and `.map()` on it would throw instead of reading "no
+		// attachments".
+		const before: ConfigDraftBundle = {
+			...bundleOf([agent("constructor")]),
+			toolAttachments: {
+				constructor: [
+					{
+						entryId: "gateway-mattermost-post",
+						pinnedVersion: null,
+						mode: "allow" as const,
+						settings: {},
+					},
+				],
+			},
+		};
+		// Present only in `after`: the "added to a side that previously had no own key" case.
+		const addedOnly: ConfigDraftBundle = { ...before, toolAttachments: {} };
+		expect(() => configDiff(addedOnly, before).toolAttachments).not.toThrow();
+		expect(configDiff(addedOnly, before).toolAttachments).toEqual([
+			{ kind: "added", agentId: "constructor", entryId: "gateway-mattermost-post" },
+		]);
+		// Present only in `before`: the reverse, "removed" case.
+		expect(() => configDiff(before, addedOnly).toolAttachments).not.toThrow();
+		expect(configDiff(before, addedOnly).toolAttachments).toEqual([
+			{ kind: "removed", agentId: "constructor", entryId: "gateway-mattermost-post" },
+		]);
+	});
+
+	it("diffs an agent literally named 'constructor's own role prompt as real text, never Object.prototype.constructor", () => {
+		// `bundleOf` gives every agent a role prompt of its own; dropping it from one side's
+		// `rolePrompts` (never an own key there at all) is what would otherwise fall through to the
+		// prototype — a bare `rolePrompts[id] ?? ""` cannot tell "no own key" from "a truthy
+		// non-string value" apart, and would hand `textChange` a function to measure instead of "".
+		const before: ConfigDraftBundle = { ...bundleOf([agent("constructor")]), rolePrompts: {} };
+		const after = bundleOf([agent("constructor")]);
+		const diff = configDiff(before, after);
+		expect(diff.agents).toEqual([
+			{
+				kind: "changed",
+				agentId: "constructor",
+				fieldPaths: [],
+				rolePrompt: {
+					changed: true,
+					beforeSize: 0,
+					afterSize: "Role prompt for constructor.".length,
+				},
+			},
+		]);
 	});
 });
 

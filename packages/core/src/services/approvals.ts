@@ -35,7 +35,9 @@ import {
 	resolveApproval,
 	type ToolActionRow,
 } from "./approval-store.ts";
+import { customGrantTimeIssues } from "./custom-tools.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
+import { loadEffectivePermissionsIn } from "./effective-permissions.ts";
 import {
 	audit,
 	isKillSwitchOn,
@@ -216,8 +218,11 @@ async function deny(uow: UnitOfWork, approval: ApprovalRow, reply: ApprovalReply
 }
 
 /**
- * What the policy says about executing the approval now, against the active configuration:
- * reasons it may not run, or none.
+ * What the policy says about executing the approval now, against the active configuration and the
+ * agent's effective permissions (ADR-027's single source of truth: compiled attachments for a
+ * hub-managed agent, its `permissions` lists unchanged for a legacy one) — never a stale snapshot
+ * from when the run was scheduled, since this runs whenever a human decides or a configuration
+ * change may have revoked the capability in the meantime. Reasons it may not run, or none.
  */
 async function executionIssues(uow: UnitOfWork, approval: ApprovalRow): Promise<string[]> {
 	const config = await loadActiveConfig(uow.tx.db);
@@ -228,18 +233,16 @@ async function executionIssues(uow: UnitOfWork, approval: ApprovalRow): Promise<
 	if (agent.state === "disabled") {
 		return [`@${agent.id} is disabled`];
 	}
-	const { permissions } = agent.config;
+	const financeAgentId = config.organization.organization.finance_agent_id;
+	const effective = await loadEffectivePermissionsIn(uow.tx, agent, financeAgentId);
 	const action = { actionType: approval.actionType, actionParams: approval.actionParams };
 	const issues = [
-		...approvedActionIssues(
-			{
-				allow: permissions.tools_allow,
-				requireHumanApproval: permissions.tools_require_human_approval,
-				deny: permissions.tools_deny,
-			},
-			{ agentId: agent.id, financeAgentId: config.organization.organization.finance_agent_id },
-			action,
-		),
+		...approvedActionIssues(effective.toolPolicy, { agentId: agent.id, financeAgentId }, action),
+		// A `custom_https` action only: refuses a grant once its pinned definition version no
+		// longer matches `agent`'s own currently selected one (the definition edited further, or
+		// the attachment itself re-pinned or unpinned, since the request was made), or once its
+		// parameters no longer pass that version's own typed rules. `[]` for any other action type.
+		...(await customGrantTimeIssues(uow.tx.db, agent.id, action)),
 	];
 	if (approvalActionHash(action) !== approval.immutableActionHash) {
 		issues.push("the stored action no longer matches its hash");
@@ -844,7 +847,13 @@ export async function withdrawOpenApprovals(
 
 /**
  * After a configuration change: queued actions the new policy no longer permits are cancelled
- * before they can begin. Runs in the config apply transaction, after the new agents are stored.
+ * before they can begin, and pending approvals (still awaiting a human's decision) the new policy
+ * no longer permits at all are withdrawn before anyone can grant them — ADR-027: a capability
+ * detached, or turned `disabled`, revokes a queued tool action or a pending approval for it, with
+ * an audit entry, rather than letting either run to completion on a permission the hub no longer
+ * shows. Runs in the config apply transaction, after the new agents are stored. `sweepApprovals`
+ * resolves and notifies the requesting agent of every approval this cancels, the same way it
+ * already does for one denied or expired.
  */
 export async function revokeQueuedActions(uow: UnitOfWork): Promise<number> {
 	const { db } = uow.tx;
@@ -853,7 +862,7 @@ export async function revokeQueuedActions(uow: UnitOfWork): Promise<number> {
 		.from(toolActions)
 		.innerJoin(approvalRequests, eq(approvalRequests.id, toolActions.approvalId))
 		.where(eq(toolActions.status, "queued"));
-	const revoked: string[] = [];
+	const revokedActions: string[] = [];
 	for (const row of queued) {
 		const issues = await executionIssues(uow, row.approval);
 		if (issues.length === 0) {
@@ -870,14 +879,40 @@ export async function revokeQueuedActions(uow: UnitOfWork): Promise<number> {
 				).slice(0, 500),
 			})
 			.where(and(eq(toolActions.id, row.actionId), eq(toolActions.status, "queued")));
-		revoked.push(row.actionId);
+		revokedActions.push(row.actionId);
 	}
-	if (revoked.length > 0) {
+	if (revokedActions.length > 0) {
 		await audit(uow, "system", "tool_actions.revoked", "gateway", "config", {
-			tool_action_ids: revoked.slice(0, 50),
+			tool_action_ids: revokedActions.slice(0, 50),
 		});
 	}
-	return revoked.length;
+
+	const pending = await db
+		.select()
+		.from(approvalRequests)
+		.where(eq(approvalRequests.status, "pending"));
+	const revokedApprovals: string[] = [];
+	for (const approval of pending) {
+		const issues = await executionIssues(uow, approval);
+		if (issues.length === 0) {
+			continue;
+		}
+		await lockAgent(db, approval.requestedByAgentId);
+		const [updated] = await db
+			.update(approvalRequests)
+			.set({ status: "cancelled" })
+			.where(and(eq(approvalRequests.id, approval.id), eq(approvalRequests.status, "pending")))
+			.returning({ id: approvalRequests.id });
+		if (updated !== undefined) {
+			revokedApprovals.push(updated.id);
+		}
+	}
+	if (revokedApprovals.length > 0) {
+		await audit(uow, "system", "approvals.revoked", "gateway", "config", {
+			approval_ids: revokedApprovals.slice(0, 50),
+		});
+	}
+	return revokedActions.length + revokedApprovals.length;
 }
 
 export type ManualOutcome = "succeeded" | "failed" | "cancelled";

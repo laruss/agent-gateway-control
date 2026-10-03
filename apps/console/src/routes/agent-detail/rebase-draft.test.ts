@@ -22,6 +22,7 @@ function detail(overrides: Partial<ConsoleAgentDetail> = {}): ConsoleAgentDetail
 		rolePrompt: "You are the director.",
 		wakeRules: [{ event_type: "mattermost.agent.mentioned", target_agent_id: "director" }],
 		permissions: { tools_allow: [], tools_require_human_approval: [], tools_deny: ["finance.*"] },
+		toolsHubManaged: false,
 		memory: { privateNamespace: "agents/director", sharedNamespaces: [] },
 		concurrency: { maxActiveRuns: 1, whileRunning: "enqueue-and-coalesce" },
 		...overrides,

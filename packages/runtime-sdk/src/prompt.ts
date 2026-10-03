@@ -1,5 +1,6 @@
 import {
 	type AgentTurnInput,
+	type CapabilityParameter,
 	type JsonValue,
 	type TrustLevel,
 	toolPatternCovers,
@@ -67,6 +68,60 @@ function builtInTools(
 	];
 }
 
+/** One `CapabilityParameter` as a compact, human-readable constraint, never a secret: bounds for a
+ * string/number, choices for an enum, nothing further for a boolean beyond its name and type. */
+function parameterSummary(param: CapabilityParameter): string {
+	switch (param.type) {
+		case "string":
+			return `${param.name} (string, ${param.minLength}-${param.maxLength} characters)`;
+		case "number": {
+			const bounds = [
+				param.minimum === undefined ? null : `min ${param.minimum}`,
+				param.maximum === undefined ? null : `max ${param.maximum}`,
+			].filter((bound): bound is string => bound !== null);
+			return `${param.name} (number${bounds.length === 0 ? "" : `, ${bounds.join(", ")}`})`;
+		}
+		case "boolean":
+			return `${param.name} (boolean)`;
+		case "enum":
+			// Each choice as its own JSON string literal, never a bare, comma-joined list: a choice
+			// that itself contains a comma (`"in progress, blocked"`) would otherwise render
+			// indistinguishably from two separate choices. `JSON.stringify` also escapes anything
+			// else that could blur a boundary (quotes, control characters), and the quotes around
+			// every choice make the boundary exact even when no choice happens to contain a comma.
+			return `${param.name} (one of: ${param.values.map((value) => JSON.stringify(value)).join(", ")})`;
+	}
+}
+
+/** One line per capability (version 3 only, ADR-023): the catalog's own short description beside
+ * its mode, a bounded, structured alternative to inferring what a bare tool name means. A
+ * parameterized capability's own non-secret parameter contract (`custom_https`, ADR-027) follows
+ * on its own, indented line — every declared parameter is required, so naming it here is the only
+ * way the model learns it must be supplied at all, not only its shape. `capabilitiesOmitted`,
+ * present only once `MAX_CAPABILITIES` left some out (`buildCapabilityDescriptions`, ADR-027), is
+ * noted as a trailing line: `toolPolicy.allow`/`requireHumanApproval` above already name every
+ * tool, described or not. */
+function capabilitiesList(
+	capabilities: Readonly<AgentTurnInput["capabilities"]>,
+	capabilitiesOmitted: AgentTurnInput["capabilitiesOmitted"],
+): string {
+	if (capabilities === undefined || capabilities.length === 0) {
+		return "(none)";
+	}
+	const lines = capabilities.map((c) => {
+		const line = `${c.name} (${c.mode === "allow" ? "allowed" : "needs approval"}): ${c.description}`;
+		return c.parameters === undefined
+			? line
+			: `${line}\n  required parameters: ${c.parameters.map(parameterSummary).join(", ")}`;
+	});
+	if (capabilitiesOmitted !== undefined) {
+		lines.push(
+			`(${capabilitiesOmitted} further capabilit${capabilitiesOmitted === 1 ? "y" : "ies"} not described here; see "Tools allowed"/"need human approval" above for the complete lists)`,
+		);
+	}
+	return list(lines);
+}
+
 /** JSON for a <data> block: `<` is escaped, so no content can close the block early. */
 function dataJson(value: JsonValue | object): string {
 	return JSON.stringify(value, null, 2).replace(/</g, "\\u003c");
@@ -120,6 +175,11 @@ export function renderTurnPrompt(
 			`Tools allowed: ${toolPolicy.allow.join(", ") || "(none)"}`,
 			`Tools that need human approval (request with nextState "needs_human"): ${toolPolicy.requireHumanApproval.join(", ") || "(none)"}`,
 			`Tools denied: ${toolPolicy.deny.join(", ") || "(none)"}`,
+			...(input.capabilities === undefined
+				? []
+				: [
+						`Your capabilities, described:\n${capabilitiesList(input.capabilities, input.capabilitiesOmitted)}`,
+					]),
 			`Built-in tools of your runtime, in your working directory (enforced by the runtime):\n${list(builtInTools(input, confinable))}`,
 			`Channels you may post to:\n${list(input.channels.map((c) => `#${c.name} (${c.channelId})`))}`,
 			memoryDenied

@@ -14,7 +14,9 @@ import type {
 	AgentConfig,
 	ChangeSetInput,
 	ConfigDiffAgent,
+	ConfigDiffAttachment,
 	OrganizationConfig,
+	ToolAttachmentsBundle,
 } from "@agent-gateway/contracts";
 import {
 	AdminError,
@@ -22,8 +24,10 @@ import {
 	type ChangePreview,
 	type CommitChangeResult,
 	type ControlPlaneDeps,
+	canonicalizeAttachments,
 	commitChange,
 	configSnapshotBundle,
+	dropAttachmentsToUnknownEntriesIn,
 	findConfigRevisionByIdempotencyKey,
 	inTransaction,
 	listConfigRevisions,
@@ -31,19 +35,27 @@ import {
 	prepareChange,
 } from "@agent-gateway/core";
 import { canonicalHash, sha256Hex } from "@agent-gateway/events";
-import { ConfigFileError, loadConfigDirectoryForImport } from "./config-files.ts";
+import {
+	ConfigFileError,
+	loadConfigDirectoryForImport,
+	TOOL_ATTACHMENTS_FILE,
+} from "./config-files.ts";
 
 const ORGANIZATION_FILE = "organization.yaml";
 const AGENTS_DIR = "agents";
 /** `manifest.json`'s own shape version, independent of `CONFIG_SNAPSHOT_FORMAT`. */
 const MANIFEST_FORMAT = 1;
 
-/** A bundle in plain, writable-array shape, as every `replace_bundle` change set needs it. */
+/** A bundle in plain, writable-array shape, as every `replace_bundle` change set needs it.
+ * `toolAttachments` omitted means no attachments document was resolved at all (a plain YAML
+ * directory with no `tool-attachments.json`): every agent's existing attachments carry forward
+ * unchanged rather than being cleared (ADR-027) — see `replaceBundleChangeSet`. */
 type ReplaceableBundle = Readonly<{
 	organization: OrganizationConfig;
 	agents: Readonly<AgentConfig[]>;
 	constitution: string;
 	rolePrompts: Readonly<Record<string, string>>;
+	toolAttachments?: ToolAttachmentsBundle;
 }>;
 
 /**
@@ -55,7 +67,15 @@ type ReplaceableBundle = Readonly<{
  * change set.
  */
 function replaceBundleChangeSet(bundle: ReplaceableBundle): ChangeSetInput {
-	return [{ type: "replace_bundle", bundle: configSnapshotBundle(bundle) }];
+	return [
+		{
+			type: "replace_bundle",
+			bundle: configSnapshotBundle(bundle),
+			...(bundle.toolAttachments === undefined
+				? {}
+				: { toolAttachments: canonicalizeAttachments(bundle.toolAttachments) }),
+		},
+	];
 }
 
 // ---------------------------------------------------------------------------
@@ -167,11 +187,24 @@ function setFileContent(files: Map<string, string>, path: string, content: strin
  * (`setFileContent`), happens here, before anything touches disk. Returns paths in a stable,
  * sorted order.
  */
+/** Deterministic JSON text for `tool-attachments.json`: agent ids and each agent's attachments
+ * sorted, so two exports of the same revision are byte-for-byte identical. */
+function toolAttachmentsText(toolAttachments: ToolAttachmentsBundle): string {
+	const ordered: Record<string, unknown> = {};
+	for (const agentId of Object.keys(toolAttachments).sort()) {
+		ordered[agentId] = [...(toolAttachments[agentId] ?? [])].sort((a, b) =>
+			a.entryId < b.entryId ? -1 : a.entryId > b.entryId ? 1 : 0,
+		);
+	}
+	return `${JSON.stringify(ordered, null, 2)}\n`;
+}
+
 function buildExportFiles(
 	organization: OrganizationConfig,
 	agents: Readonly<AgentConfig[]>,
 	constitution: string,
 	rolePrompts: Readonly<Record<string, string>>,
+	toolAttachments: ToolAttachmentsBundle,
 	revisionId: number,
 	hash: string,
 ): Readonly<[string, string][]> {
@@ -180,8 +213,15 @@ function buildExportFiles(
 	setFileContent(files, organization.organization.constitution_file, constitution);
 	for (const agent of [...agents].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
 		files.set(`${AGENTS_DIR}/${agent.id}.yaml`, yamlText(agent));
-		setFileContent(files, agent.prompts.role_file, rolePrompts[agent.id] ?? "");
+		// Own-property lookup, never plain bracket access: an agent id like `constructor` has no own
+		// property in `rolePrompts` when none was ever recorded for it, but still resolves, through
+		// the prototype chain, to `Object.prototype.constructor` — a function, not `undefined`, which
+		// `?? ""` would not catch and `setFileContent` would then write as this agent's role prompt.
+		const rolePrompt =
+			(Object.hasOwn(rolePrompts, agent.id) ? rolePrompts[agent.id] : undefined) ?? "";
+		setFileContent(files, agent.prompts.role_file, rolePrompt);
 	}
+	files.set(TOOL_ATTACHMENTS_FILE, toolAttachmentsText(toolAttachments));
 	const manifestFiles: Record<string, string> = {};
 	for (const [path, content] of files) {
 		manifestFiles[path] = sha256Hex(content);
@@ -262,6 +302,7 @@ export async function configExport(
 		bundle.agents,
 		bundle.constitution,
 		bundle.rolePrompts,
+		bundle.toolAttachments,
 		revisionId,
 		hash,
 	);
@@ -326,6 +367,18 @@ function formatDiffAgent(agent: ConfigDiffAgent): string {
 	return `  ~ ${agent.agentId}: ${parts.length > 0 ? parts.join("; ") : "(unchanged)"}`;
 }
 
+/** One line per added/removed/changed attachment (ADR-027): `agentId: entryId`, a changed one
+ * naming which of its own fields moved. */
+function formatDiffAttachment(attachment: ConfigDiffAttachment): string {
+	if (attachment.kind === "added") {
+		return `  + ${attachment.agentId}: ${attachment.entryId} (added)`;
+	}
+	if (attachment.kind === "removed") {
+		return `  - ${attachment.agentId}: ${attachment.entryId} (removed)`;
+	}
+	return `  ~ ${attachment.agentId}: ${attachment.entryId} (${attachment.fields.join(", ")})`;
+}
+
 /** The structural diff `config diff`/`config rollback` print by default (not `--json`). */
 export function formatConfigDiff(preview: ChangePreview): string {
 	const lines: string[] = [
@@ -343,6 +396,9 @@ export function formatConfigDiff(preview: ChangePreview): string {
 		lines.push(
 			`constitution: ${preview.diff.constitution.beforeSize} -> ${preview.diff.constitution.afterSize} chars`,
 		);
+	}
+	if (preview.diff.toolAttachments.length > 0) {
+		lines.push("attachments:", ...preview.diff.toolAttachments.map(formatDiffAttachment));
 	}
 	if (preview.problems.length > 0) {
 		lines.push("problems:", ...preview.problems.map((problem) => `  - ${problem}`));
@@ -399,7 +455,15 @@ export async function configImport(
 	print: (line: string) => void,
 ): Promise<CommitChangeResult> {
 	const input = loadConfigDirectoryForImport(options.dir, options.root);
-	const contentHash = canonicalHash(configSnapshotBundle(input));
+	// Includes the attachments document too (ADR-027): `configSnapshotBundle` alone no longer
+	// does — it is hashed and stored separately from the bundle now — so a key derived from it
+	// alone would collide for two imports whose `tool-attachments.json` differs but whose bundle
+	// does not, tripping `commitChangeIn`'s "idempotency key reused for a different change set"
+	// refusal instead of importing the new attachments.
+	const contentHash = canonicalHash({
+		bundle: configSnapshotBundle(input),
+		toolAttachments: canonicalizeAttachments(input.toolAttachments ?? {}),
+	});
 	let baseRevisionId: number | null;
 	let idempotencyKey: string;
 	if (options.expectedRevision !== null) {
@@ -489,6 +553,12 @@ export type ConfigRollbackOptions = Readonly<{
  * pointer reset. Prints the diff against the current active configuration before committing (the
  * CLI is non-interactive; `expectedRevision` already guards against committing over a change made
  * since the operator last looked). Refuses a target revision whose snapshot is unavailable.
+ *
+ * The target's own attachments carry forward, minus any naming a catalog entry deleted since
+ * (ADR-027): dropped and reported here, rather than failing the rollback outright or
+ * resurrecting a retired capability (a hard FK constraint no longer forces the choice either way —
+ * the entry's own row stays, retired — but reintroducing a deleted capability's attachment would
+ * still be the wrong outcome for a rollback to choose silently).
  */
 export async function configRollback(
 	deps: ControlPlaneDeps,
@@ -502,14 +572,24 @@ export async function configRollback(
 	if (organization === null || hash === null) {
 		throw new AdminError(`internal: revision ${options.revisionId} resolved to an empty bundle`);
 	}
+	const { toolAttachments, dropped } = await inTransaction(deps, ({ tx }) =>
+		dropAttachmentsToUnknownEntriesIn(tx.db, bundle.toolAttachments),
+	);
 	const changeSet = replaceBundleChangeSet({
 		organization,
 		agents: bundle.agents,
 		constitution: bundle.constitution,
 		rolePrompts: bundle.rolePrompts,
+		toolAttachments,
 	});
 	const preview = await prepareChange(deps, changeSet);
 	print(formatConfigDiff(preview));
+	if (dropped.length > 0) {
+		print(
+			`note: dropped ${dropped.length} attachment(s) to since-deleted catalog ` +
+				`entries: ${dropped.map((d) => `${d.agentId}:${d.entryId}`).join(", ")}`,
+		);
+	}
 	const result = await commitChange(deps, {
 		changeSet,
 		baseRevisionId: options.expectedRevision,

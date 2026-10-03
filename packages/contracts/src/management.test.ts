@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { z } from "zod";
+import { AgentConfigSchema } from "./agent-config.ts";
+import { AgentIdSchema } from "./common.ts";
 import {
 	ChangeOperationSchema,
 	ChangeSetSchema,
@@ -10,6 +13,7 @@ import {
 	MAX_CHANGE_SET_OPERATIONS,
 	RolePromptSchema,
 } from "./management.ts";
+import { OrganizationConfigSchema } from "./organization.ts";
 import { agent, issuePaths, organization } from "./test-fixtures.ts";
 
 function bundle() {
@@ -52,6 +56,7 @@ describe("ConfigRevisionSchema", () => {
 	const revision = {
 		id: 1,
 		snapshotHash: "a".repeat(64),
+		attachmentsSnapshotHash: null,
 		parentRevisionId: null,
 		generation: 1,
 		actor: "cli:owner",
@@ -64,6 +69,12 @@ describe("ConfigRevisionSchema", () => {
 
 	it("accepts a revision with no parent and no reason", () => {
 		expect(issuePaths(ConfigRevisionSchema, revision)).toEqual([]);
+	});
+
+	it("accepts a revision naming its own attachments snapshot (ADR-027)", () => {
+		expect(
+			issuePaths(ConfigRevisionSchema, { ...revision, attachmentsSnapshotHash: "b".repeat(64) }),
+		).toEqual([]);
 	});
 
 	it("accepts every known revision source", () => {
@@ -141,6 +152,43 @@ describe("ChangeOperationSchema", () => {
 			}),
 		).not.toEqual([]);
 	});
+
+	it("accepts replace_bundle with an explicit attachments document (ADR-027)", () => {
+		const bundle = {
+			organization: organization(),
+			agents: [agent("alpha")],
+			constitution: "Be helpful.",
+			rolePrompts: { alpha: "Role prompt." },
+		};
+		expect(
+			issuePaths(ChangeOperationSchema, {
+				type: "replace_bundle",
+				bundle,
+				toolAttachments: { alpha: [] },
+			}),
+		).toEqual([]);
+	});
+
+	it("accepts replace_bundle with no attachments document at all (carry-forward, ADR-027)", () => {
+		const bundle = {
+			organization: organization(),
+			agents: [agent("alpha")],
+			constitution: "Be helpful.",
+			rolePrompts: { alpha: "Role prompt." },
+		};
+		expect(issuePaths(ChangeOperationSchema, { type: "replace_bundle", bundle })).toEqual([]);
+	});
+
+	it("accepts add_agent with an explicit, even empty, attachments list (ADR-027)", () => {
+		expect(
+			issuePaths(ChangeOperationSchema, {
+				type: "add_agent",
+				agent: agent("beta"),
+				rolePrompt: "Role prompt.",
+				toolAttachments: [],
+			}),
+		).toEqual([]);
+	});
 });
 
 describe("ChangeSetSchema", () => {
@@ -175,6 +223,16 @@ describe("ConfigDiffSchema", () => {
 			],
 			organizationFieldPaths: ["mattermost.channels"],
 			constitution: { changed: false, beforeSize: 11, afterSize: 11 },
+			toolAttachments: [
+				{ kind: "added", agentId: "gamma", entryId: "native-repository-read" },
+				{ kind: "removed", agentId: "gamma", entryId: "gateway-memory-write" },
+				{
+					kind: "changed",
+					agentId: "gamma",
+					entryId: "executor-finance-payment-create",
+					fields: ["mode", "settings"],
+				},
+			],
 		};
 		expect(issuePaths(ConfigDiffSchema, diff)).toEqual([]);
 	});
@@ -185,7 +243,49 @@ describe("ConfigDiffSchema", () => {
 				agents: [],
 				organizationFieldPaths: [],
 				constitution: { changed: false, beforeSize: 11, afterSize: 11 },
+				toolAttachments: [],
 			}),
 		).toEqual([]);
+	});
+
+	it("rejects a changed attachment with no fields named", () => {
+		expect(
+			issuePaths(ConfigDiffSchema, {
+				agents: [],
+				organizationFieldPaths: [],
+				constitution: { changed: false, beforeSize: 11, afterSize: 11 },
+				toolAttachments: [{ kind: "changed", agentId: "gamma", entryId: "x", fields: [] }],
+			}),
+		).not.toEqual([]);
+	});
+});
+
+describe("ConfigSnapshotBundleSchema stays the shape release 0.6.0 reads (ADR-027)", () => {
+	/**
+	 * `v0.6.0`'s own `ConfigSnapshotBundleSchema` (`git show v0.6.0:packages/contracts/src/management.ts`),
+	 * pinned here rather than fetched: a `strictObject` over the same four fields, built from the
+	 * same `OrganizationConfigSchema`/`AgentConfigSchema`/`AgentIdSchema` this file still imports
+	 * (neither has gained a new *required* field since, so reusing them here still exercises the
+	 * one thing this test actually guards — that nothing this release adds to the *outer* bundle
+	 * shape, like a `toolAttachments` key, breaks a 0.6.0 `strictObject`'s "no unknown keys" rule).
+	 */
+	const Pinned060ConfigSnapshotBundleSchema = z.strictObject({
+		organization: OrganizationConfigSchema,
+		agents: z.array(AgentConfigSchema),
+		constitution: z.string().min(1),
+		rolePrompts: z.record(AgentIdSchema, z.string().min(1)),
+	});
+
+	it("parses a bundle this release's ConfigSnapshotBundleSchema produces", () => {
+		const value = bundle();
+		// A round-trip through JSON, the same lossy boundary a `jsonb` column actually stores
+		// through, so this exercises exactly what `config_snapshots.bundle` would hold.
+		const stored = JSON.parse(JSON.stringify(ConfigSnapshotBundleSchema.parse(value)));
+		expect(issuePaths(Pinned060ConfigSnapshotBundleSchema, stored)).toEqual([]);
+	});
+
+	it("rejects a bundle carrying toolAttachments directly: exactly what this schema must never do", () => {
+		const withAttachments = { ...bundle(), toolAttachments: { alpha: [] } };
+		expect(issuePaths(Pinned060ConfigSnapshotBundleSchema, withAttachments)).toEqual([""]);
 	});
 });

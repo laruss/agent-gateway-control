@@ -48,6 +48,7 @@ function detailFixture(): ConsoleAgentDetailResponse {
 				tools_require_human_approval: [],
 				tools_deny: ["finance.*"],
 			},
+			toolsHubManaged: false,
 			memory: { privateNamespace: "agents/director", sharedNamespaces: [] },
 			concurrency: { maxActiveRuns: 1, whileRunning: "enqueue-and-coalesce" },
 		},
@@ -150,6 +151,7 @@ function stubFetch(commitOutcome: CommitOutcome): {
 						],
 						organizationFieldPaths: [],
 						constitution: { changed: false, beforeSize: 0, afterSize: 0 },
+						toolAttachments: [],
 					},
 				});
 			}
@@ -537,6 +539,7 @@ describe("AgentDetailPage", () => {
 							],
 							organizationFieldPaths: [],
 							constitution: { changed: false, beforeSize: 0, afterSize: 0 },
+							toolAttachments: [],
 						},
 					});
 				}

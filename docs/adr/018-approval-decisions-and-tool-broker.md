@@ -96,8 +96,9 @@ The agent waits on one Gateway-created wait for `approval.resolved`, correlation
 ### Executing
 
 - **`tool-runner` is a separate process.** It serves configured namespaces, the first segment
-  of an action type (`finance`, `mail`, `deploy`, `publish`, `issue`). Each namespace has its
-  own queues:
+  of an action type (`finance`, `mail`, `deploy`, `publish`, `issue`, `custom`, `utility` — the
+  last two added for owner-defined HTTPS tools and packaged utilities, ADR-027). Each namespace
+  has its own queues:
   - `tool.execute.<ns>`;
   - `tool.report.<ns>`;
   - `dlq.tool.execute.<ns>`.
@@ -138,6 +139,14 @@ The agent waits on one Gateway-created wait for `approval.resolved`, correlation
   `tool-action:<approval_id>:<hash>`, and must be idempotent by that key at the provider. An
   executor either returns a receipt or a known failure; an executor that throws leaves the
   outcome `unknown`.
+  - The `custom` namespace is the one exception to "static": an owner-created `custom_https`
+    entry's action type (`custom.<entry-id>`) is unbounded and unknown at startup, so a runner
+    serving `custom` also carries a *dynamic* executor, tried only once the static registry has
+    no exact match — it resolves the specific entry (and its exact approved definition version,
+    read through `gateway_custom_tool_definition`, the one additional narrow function this
+    namespace needs) at job time instead. `utility` stays fully static: its one action type this
+    release ships, `utility.text-transform`, is fixed, image-shipped code, known at startup like
+    any other executor (ADR-027).
   - The MVP ships no real integration, only test executors. A runner without an executor for
     the action fails it as known once `begin` vouched for the job, before anything is sent.
 - **Reports** are bound to the report queue's namespace, the action and the attempt. The

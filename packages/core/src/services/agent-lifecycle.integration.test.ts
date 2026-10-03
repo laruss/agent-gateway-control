@@ -24,6 +24,7 @@ import {
 	StaleLifecycleOperationError,
 } from "./agent-lifecycle.ts";
 import type { ControlPlaneDeps } from "./deps.ts";
+import { loadEffectivePermissionsIn } from "./effective-permissions.ts";
 import {
 	activeConfigRevisionId,
 	commitChange,
@@ -33,6 +34,8 @@ import {
 import { listMemory } from "./memory.ts";
 import { handleRunReport } from "./runs.ts";
 import { recordWorkerStatus } from "./runtime-health.ts";
+import { loadAgents } from "./store.ts";
+import { attachTool, deleteCatalogEntry, ensureToolCatalogSeeded } from "./tool-catalog.ts";
 
 function organization(): OrganizationConfig {
 	return OrganizationConfigSchema.parse({
@@ -606,6 +609,227 @@ describe("agent lifecycle service (ADR-026)", () => {
 		expect(await activeConfigRevisionId(deps)).toBe(restored.revisionId);
 	});
 
+	it("restore carries the agent's last hub-managed attachments forward, including an explicitly empty list (ADR-027)", async () => {
+		await ensureToolCatalogSeeded(deps, "test");
+		const created = await requestAgentCreate(deps, createInput("mu"));
+		await markProvisioning(deps, created.operationId, "test");
+		await completeOperation(deps, created.operationId, "test");
+		await attachTool(deps, {
+			agentId: "mu",
+			entryId: "gateway-mattermost-post",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+		const retired = await requestAgentRetire(deps, { agentId: "mu", actor: "test", source: "cli" });
+		await markProvisioning(deps, retired.operationId, "test");
+		await completeOperation(deps, retired.operationId, "test");
+
+		const restored = await requestAgentRestore(deps, {
+			agentId: "mu",
+			actor: "test",
+			source: "cli",
+		});
+		expect(restored.droppedAttachments).toEqual([]);
+		const { bundle } = await inTransaction(deps, ({ tx }) =>
+			loadActiveBundle(tx.db, restored.revisionId),
+		);
+		// `mu` was still legacy (no attachments document) the first time anything attached to it:
+		// `attachTool` converts its own `tools_deny: ["finance.*"]` (every non-finance agent's own
+		// required baseline, `createInput`) into the same catalog entries `gateway tools adopt`
+		// would, in the same revision, alongside the attachment actually requested — never just the
+		// one attachment on its own, which would otherwise make it hub-managed while silently
+		// dropping everything its legacy permissions covered (ADR-027).
+		expect(bundle.toolAttachments.mu).toEqual([
+			{
+				entryId: "executor-finance-payment-create",
+				pinnedVersion: null,
+				mode: "disabled",
+				settings: {},
+			},
+			{
+				entryId: "executor-finance-subscription-create",
+				pinnedVersion: null,
+				mode: "disabled",
+				settings: {},
+			},
+			{ entryId: "gateway-mattermost-post", pinnedVersion: null, mode: "allow", settings: {} },
+		]);
+
+		// A second agent, explicitly cleared (hub-managed but empty) before it retires, is restored
+		// the same way: still hub-managed (a key of its own), just with nothing in it — never
+		// reverted to legacy (converted from `permissions`) on restore. Built with
+		// `set_tool_attachments` directly (`gateway tools adopt`'s own, explicit-empty case), not
+		// `attachTool` then `detach_tool`: with a legacy conversion now carried forward on first
+		// attach, detaching the one tool actually requested no longer leaves a truly empty list
+		// behind on its own when the agent's own legacy permissions resolve to anything at all.
+		const createdNu = await requestAgentCreate(deps, createInput("nu"));
+		await markProvisioning(deps, createdNu.operationId, "test");
+		await completeOperation(deps, createdNu.operationId, "test");
+		const nuRevisionId = await activeConfigRevisionId(deps);
+		await commitChange(deps, {
+			changeSet: [{ type: "set_tool_attachments", agentId: "nu", attachments: [] }],
+			baseRevisionId: nuRevisionId,
+			actor: "test",
+			source: "cli_apply",
+		});
+		const retiredNu = await requestAgentRetire(deps, {
+			agentId: "nu",
+			actor: "test",
+			source: "cli",
+		});
+		await markProvisioning(deps, retiredNu.operationId, "test");
+		await completeOperation(deps, retiredNu.operationId, "test");
+		const restoredNu = await requestAgentRestore(deps, {
+			agentId: "nu",
+			actor: "test",
+			source: "cli",
+		});
+		const { bundle: bundleNu } = await inTransaction(deps, ({ tx }) =>
+			loadActiveBundle(tx.db, restoredNu.revisionId),
+		);
+		expect(bundleNu.toolAttachments.nu).toEqual([]);
+	});
+
+	it("restore drops an attachment to a catalog entry deleted since retirement, reporting it rather than failing or resurrecting it (ADR-027)", async () => {
+		await ensureToolCatalogSeeded(deps, "test");
+		const created = await requestAgentCreate(deps, createInput("xi"));
+		await markProvisioning(deps, created.operationId, "test");
+		await completeOperation(deps, created.operationId, "test");
+		await attachTool(deps, {
+			agentId: "xi",
+			entryId: "gateway-memory-write",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+		const retired = await requestAgentRetire(deps, { agentId: "xi", actor: "test", source: "cli" });
+		await markProvisioning(deps, retired.operationId, "test");
+		await completeOperation(deps, retired.operationId, "test");
+		await deleteCatalogEntry(deps, "gateway-memory-write", "test");
+
+		const restored = await requestAgentRestore(deps, {
+			agentId: "xi",
+			actor: "test",
+			source: "cli",
+		});
+		expect(restored.droppedAttachments).toEqual([{ entryId: "gateway-memory-write" }]);
+		const { bundle } = await inTransaction(deps, ({ tx }) =>
+			loadActiveBundle(tx.db, restored.revisionId),
+		);
+		// `xi` was still legacy when `attachTool` above first ran: its own `tools_deny:
+		// ["finance.*"]` (`createInput`'s own default) converted into these two disabled
+		// attachments alongside `gateway-memory-write` (ADR-027) — neither dropped nor deleted, so
+		// both remain even though the one attachment this test is actually about is gone.
+		expect(bundle.toolAttachments.xi).toEqual([
+			{
+				entryId: "executor-finance-payment-create",
+				pinnedVersion: null,
+				mode: "disabled",
+				settings: {},
+			},
+			{
+				entryId: "executor-finance-subscription-create",
+				pinnedVersion: null,
+				mode: "disabled",
+				settings: {},
+			},
+		]);
+	});
+
+	it("restoring a retired agent never widens permissions through a native implication whose own entry was deleted while retired (ADR-027)", async () => {
+		// `omicron` attaches `tests.run` (allow) and explicitly suppresses the native dependency it
+		// would otherwise imply (`workspace.write`, disabled) — exactly the shape
+		// `deleteCatalogEntry refuses when clearing an attachment would widen an agent's effective
+		// permissions` (`tool-catalog.integration.test.ts`) already refuses for a *live* agent.
+		// Retiring removes `omicron` from the active configuration first, so deleting
+		// `native-workspace-write` while it is retired is no longer refused the same way (nobody in
+		// the active configuration holds or implies it any more) — the bug this guards against: the
+		// entry comes back deleted, the disabled attachment suppressing the implication is dropped on
+		// restore (never resurrecting a retired capability), and nothing must silently let
+		// `workspace.write` through via `tests.run`'s own implication once nothing explicit opposes
+		// it any more.
+		await ensureToolCatalogSeeded(deps, "test");
+		const created = await requestAgentCreate(deps, createInput("omicron"));
+		await markProvisioning(deps, created.operationId, "test");
+		await completeOperation(deps, created.operationId, "test");
+		await attachTool(deps, {
+			agentId: "omicron",
+			entryId: "native-tests-run",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+		await attachTool(deps, {
+			agentId: "omicron",
+			entryId: "native-workspace-write",
+			pinnedVersion: null,
+			mode: "disabled",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+		const retired = await requestAgentRetire(deps, {
+			agentId: "omicron",
+			actor: "test",
+			source: "cli",
+		});
+		await markProvisioning(deps, retired.operationId, "test");
+		await completeOperation(deps, retired.operationId, "test");
+		await deleteCatalogEntry(deps, "native-workspace-write", "test");
+
+		const restored = await requestAgentRestore(deps, {
+			agentId: "omicron",
+			actor: "test",
+			source: "cli",
+		});
+		expect(restored.droppedAttachments).toEqual([{ entryId: "native-workspace-write" }]);
+		const { bundle } = await inTransaction(deps, ({ tx }) =>
+			loadActiveBundle(tx.db, restored.revisionId),
+		);
+		// The disabled `workspace.write` suppression is gone (dropped, its own entry deleted), but
+		// `tests.run`'s own allow attachment carried forward unchanged, alongside the two disabled
+		// finance attachments `omicron`'s own `tools_deny: ["finance.*"]` (`createInput`'s own
+		// default) converted on its very first, still-legacy attach (ADR-027) — neither dropped nor
+		// deleted, so both remain too.
+		expect(bundle.toolAttachments.omicron).toEqual([
+			{
+				entryId: "executor-finance-payment-create",
+				pinnedVersion: null,
+				mode: "disabled",
+				settings: {},
+			},
+			{
+				entryId: "executor-finance-subscription-create",
+				pinnedVersion: null,
+				mode: "disabled",
+				settings: {},
+			},
+			{ entryId: "native-tests-run", pinnedVersion: null, mode: "allow", settings: {} },
+		]);
+		const record = (await inTransaction(deps, ({ tx }) => loadAgents(tx.db))).find(
+			(a) => a.id === "omicron",
+		);
+		if (record === undefined) {
+			throw new Error("expected 'omicron' to be restored");
+		}
+		const effective = await inTransaction(deps, (uow) =>
+			loadEffectivePermissionsIn(uow.tx, record, "finance"),
+		);
+		// Never widened: `workspace.write` stays withheld, because its own catalog entry no longer
+		// exists — reported as a missing prerequisite of `tests.run`, never silently granted.
+		expect(effective.toolPolicy.allow).toContain("tests.run");
+		expect(effective.toolPolicy.allow).toContain("repository.read");
+		expect(effective.toolPolicy.allow).not.toContain("workspace.write");
+		expect(effective.missingPrerequisites["tests.run"]).toEqual(["workspace.write"]);
+	});
+
 	it("restore migrates an adopted (bootstrap-managed) agent's token reference to the lifecycle provisioner's own path", async () => {
 		// `finance` (from `reset()`) is bootstrap-managed: `agent("finance")` gives it the operator's
 		// own `/run/secrets/mm_finance_token`, never touched by `requestAgentCreate`. Adopted, then
@@ -813,6 +1037,65 @@ describe("agent lifecycle service (ADR-026)", () => {
 			)
 		).rows;
 		expect(org.finance_agent_id).toBe("finance");
+	});
+
+	it("restore normalizes a hub-managed former finance agent's attachments too, unless makeFinanceAgent reclaims the role", async () => {
+		await reset([agent("accountant")]);
+		await ensureToolCatalogSeeded(deps, "test");
+		await ensureAgentLifecycleAdoption(deps, "test");
+
+		// "finance" becomes hub-managed while it still is the organization's finance agent: one
+		// finance entry explicitly `require_approval`, converting its own `tools_deny: ["finance.*"]`
+		// (the default `agent()` shape) into a `disabled` attachment for the other.
+		await attachTool(deps, {
+			agentId: "finance",
+			entryId: "executor-finance-payment-create",
+			pinnedVersion: null,
+			mode: "require_approval",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+
+		const retired = await requestAgentRetire(deps, {
+			agentId: "finance",
+			actor: "test",
+			source: "cli",
+			reassignFinanceTo: "accountant",
+		});
+		await markProvisioning(deps, retired.operationId, "test");
+		await completeOperation(deps, retired.operationId, "test");
+
+		// Restoring without `makeFinanceAgent`: "accountant" is the active finance agent now, so
+		// this must not throw even though "finance"'s carried-forward attachments still name finance
+		// entries.
+		const restored = await requestAgentRestore(deps, {
+			agentId: "finance",
+			actor: "test",
+			source: "cli",
+		});
+		expect(await activeConfigRevisionId(deps)).toBe(restored.revisionId);
+
+		const { bundle } = await inTransaction(deps, ({ tx }) =>
+			loadActiveBundle(tx.db, restored.revisionId),
+		);
+		// No finance attachment may compile into anything for an agent that is no longer the
+		// finance agent: every finance entry carried forward is `disabled`, never `allow` or
+		// `require_approval`, matching what `normalizeNonFinancePermissions` already does for a
+		// legacy agent's permission patterns.
+		for (const attachment of bundle.toolAttachments.finance ?? []) {
+			if (attachment.entryId.startsWith("executor-finance-")) {
+				expect(attachment.mode).toBe("disabled");
+			}
+		}
+		const [{ config: normalized }] = (
+			await pool.query("select config from agents where id = 'finance'")
+		).rows;
+		expect(normalized.permissions.tools_allow).not.toContain("finance.payment.create");
+		expect(normalized.permissions.tools_require_human_approval).not.toContain(
+			"finance.payment.create",
+		);
+		expect(normalized.permissions.tools_deny).toContain("finance.*");
 	});
 
 	it("refuses to complete an operation a later request already superseded", async () => {

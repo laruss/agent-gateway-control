@@ -25,6 +25,7 @@ export const MOCK_SCENARIOS = [
 	"permanent",
 	"artifact",
 	"approval",
+	"approval-huge",
 	"fail",
 ] as const;
 export type MockScenario = (typeof MOCK_SCENARIOS)[number];
@@ -251,6 +252,24 @@ export function scenarioOutput(
 							{ name: "recurring", value: "false" },
 						],
 						actionSummary: "Mock payment for a test scenario.",
+					},
+				},
+			};
+		case "approval-huge":
+			return {
+				...base(input, "Asked for an oversized approval"),
+				publicMessages: [],
+				nextState: {
+					kind: "needs_human",
+					approvalRequest: {
+						actionType: target ?? "finance.payment.create",
+						// A percent-encoded CJK path value (each character three UTF-8 bytes, nine
+						// characters once percent-encoded) pushes a custom tool's own resolved request
+						// preview well past its 4000-character bound on its own (ADR-027) — a draft a
+						// real custom tool definition exposing a single long string parameter named
+						// `id` can turn into exactly this request.
+						actionParams: [{ name: "id", value: "中".repeat(500) }],
+						actionSummary: "Looks up an item by its (very long) id.",
 					},
 				},
 			};

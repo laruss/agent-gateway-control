@@ -161,6 +161,14 @@ export function wakePriority(agent: RoutingAgent, event: GatewayEvent): number |
 	return subscribes(agent, event) ? PRIORITY.subscription : null;
 }
 
+/** `record[id]`, own-property only, `0` otherwise — never falling through to `Object.prototype`
+ * for an id like `constructor` that has no own entry (no runs or messages recorded for it yet),
+ * which a bare `record[id] ?? 0` would resolve to a function, not `undefined`, silently exempting
+ * that agent from whichever limit `record` counts toward. */
+function ownCount(record: Readonly<Record<AgentId, number>>, id: AgentId): number {
+	return Object.hasOwn(record, id) ? (record[id] ?? 0) : 0;
+}
+
 /**
  * Deterministic routing of one event: exact wait matches first, then structured targets, then
  * untargeted subscriptions; everything else is stored only. Every candidate passes the loop
@@ -235,7 +243,7 @@ export function routeEvent(input: RoutingInput): Readonly<Route[]> {
 			routes.push(route("blocked", "hop_limit"));
 		} else if (cascadeWakes >= limits.max_turns_per_cascade) {
 			routes.push(route("blocked", "cascade_limit"));
-		} else if ((stats.runsLastHour[agent.id] ?? 0) >= limits.max_runs_per_agent_per_hour) {
+		} else if (ownCount(stats.runsLastHour, agent.id) >= limits.max_runs_per_agent_per_hour) {
 			routes.push(route("blocked", "rate_limit"));
 		} else if (threadWakes >= MAX_THREAD_WAKES_PER_WINDOW) {
 			routes.push(route("blocked", "thread_rate_limit"));
@@ -243,7 +251,7 @@ export function routeEvent(input: RoutingInput): Readonly<Route[]> {
 			routes.push(route("blocked", "duplicate_payload"));
 		} else if (
 			sender !== null &&
-			(stats.pairwiseMessages[agent.id] ?? 0) >= MAX_PAIRWISE_MESSAGES
+			ownCount(stats.pairwiseMessages, agent.id) >= MAX_PAIRWISE_MESSAGES
 		) {
 			routes.push(route("blocked", "pairwise_limit"));
 		} else {

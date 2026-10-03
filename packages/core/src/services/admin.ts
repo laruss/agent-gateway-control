@@ -7,7 +7,9 @@ import {
 	type AgentLifecycleOperationState,
 	type AgentLifecycleSource,
 	BOT_SECRET_FILE_PREFIX,
+	CONFIG_ATTACHMENTS_SNAPSHOT_FORMAT,
 	CONFIG_SNAPSHOT_FORMAT,
+	ConfigAttachmentsSnapshotSchema,
 	type ConfigRevisionSource,
 	type ConfigSnapshotBundle,
 	type MattermostId,
@@ -17,6 +19,8 @@ import {
 	QUEUES,
 	RolePromptSchema,
 	type RuntimeAdapterId,
+	type ToolAttachment,
+	type ToolAttachmentsBundle,
 	validateConfigBundle,
 } from "@agent-gateway/contracts";
 import {
@@ -27,6 +31,8 @@ import {
 	agentRuns,
 	agents,
 	approvalRequests,
+	catalogAttachments,
+	configAttachmentSnapshots,
 	configRevisionAcks,
 	configRevisions,
 	configSnapshots,
@@ -45,10 +51,27 @@ import {
 	withTransaction,
 } from "@agent-gateway/db";
 import { canonicalHash } from "@agent-gateway/events";
-import { and, asc, desc, eq, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
+import {
+	and,
+	asc,
+	desc,
+	eq,
+	inArray,
+	isNotNull,
+	isNull,
+	ne,
+	notInArray,
+	or,
+	sql,
+} from "drizzle-orm";
 import { grantedChannels } from "../channel-access.ts";
 import { nextAgentState, requireTransition } from "../state-machine.ts";
 import { revokeQueuedActions, sweepApprovals, withdrawOpenApprovals } from "./approvals.ts";
+import {
+	attachmentCatalogProblems,
+	duplicateAttachmentIssues,
+	mirrorCompiledAttachmentPermissions,
+} from "./attachment-validation.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
 import {
 	rejectLifecycleOwnedRemovals,
@@ -91,12 +114,22 @@ export class AdminError extends Error {
 // Configuration
 // ---------------------------------------------------------------------------
 
-/** A configuration bundle as read from disk, with prompt files already resolved to text. */
+/**
+ * A configuration bundle as read from disk, with prompt files already resolved to text.
+ * `toolAttachments` is never part of the stored `ConfigSnapshotBundle` itself (ADR-027:
+ * attachments are a separate, content-addressed document — see `config_attachment_snapshots`) —
+ * here it is only the *input-side* signal `applyConfig` resolves before writing: omitted, no
+ * attachments document was supplied at all (a plain YAML directory with no
+ * `tool-attachments.json`), and every agent's existing attachments carry forward unchanged rather
+ * than being silently cleared; given (even `{}`), it replaces the stored document in full. See
+ * `resolveApplyToolAttachments`.
+ */
 export type ConfigApplyInput = Readonly<{
 	organization: OrganizationConfig;
 	agents: Readonly<AgentConfig[]>;
 	constitution: string;
 	rolePrompts: Readonly<Record<string, string>>;
+	toolAttachments?: ToolAttachmentsBundle;
 }>;
 
 export type ConfigApplyResult = Readonly<{
@@ -130,7 +163,13 @@ export function configBundleProblems(input: ConfigApplyInput): Readonly<string[]
 		if (agent.concurrency.max_active_runs !== 1) {
 			problems.push(`agent ${agent.id}: max_active_runs other than 1 is not supported yet`);
 		}
-		if (!(agent.id in input.rolePrompts) || input.rolePrompts[agent.id]?.trim() === "") {
+		// Own-property lookup, never `in` (which also walks the prototype chain: `"constructor" in
+		// {}` is `true`) or a bare bracket read: an agent id like `constructor` has no own property
+		// here when no caller actually supplied one, but `in`/a bracket read would otherwise resolve
+		// it, through the prototype chain, to `Object.prototype.constructor` — a function, not a role
+		// prompt string and not `undefined` either — wrongly treated as "present" or fed to
+		// `RolePromptSchema` as a confusing non-string failure instead of "missing or empty".
+		if (!Object.hasOwn(input.rolePrompts, agent.id) || input.rolePrompts[agent.id]?.trim() === "") {
 			problems.push(`agent ${agent.id}: role prompt is missing or empty`);
 			continue;
 		}
@@ -285,6 +324,71 @@ export function configSnapshotBundle(input: ConfigApplyInput): ConfigSnapshotBun
 	};
 }
 
+/** `canonicalizeAttachments` (`management.ts`'s own, tested copy), duplicated here for the same
+ * reason as the rest of this file's "shared with the managed-configuration service" section below
+ * (an import cycle: `management.ts` already imports `writeConfigRevisionIn` from this file). Every
+ * agent's attachment list sorted by `entryId`, so a round-trip export/import or an unrelated apply
+ * never manufactures a new revision purely from attachment order (ADR-027). */
+function canonicalizeAttachmentsIn(bundle: ToolAttachmentsBundle): ToolAttachmentsBundle {
+	const result: Record<string, ToolAttachment[]> = {};
+	for (const [agentId, attachments] of Object.entries(bundle)) {
+		result[agentId] = [...attachments].sort((a, b) =>
+			a.entryId < b.entryId ? -1 : a.entryId > b.entryId ? 1 : 0,
+		);
+	}
+	return result;
+}
+
+/** The attachments document behind `revisionId` (`{}`: no revision, or no document recorded for
+ * it), read the same trusted-column way `loadOrganizationIn` reads `agents.config` — never through
+ * the validated, cached `management.ts` reader (same import-cycle reason as above). */
+async function loadToolAttachmentsIn(
+	db: Db,
+	revisionId: number | null,
+): Promise<ToolAttachmentsBundle> {
+	if (revisionId === null) {
+		return {};
+	}
+	const [revision] = await db
+		.select({ attachmentsSnapshotHash: configRevisions.attachmentsSnapshotHash })
+		.from(configRevisions)
+		.where(eq(configRevisions.id, revisionId));
+	if (revision === undefined || revision.attachmentsSnapshotHash === null) {
+		return {};
+	}
+	const [snapshot] = await db
+		.select({ bundle: configAttachmentSnapshots.bundle })
+		.from(configAttachmentSnapshots)
+		.where(eq(configAttachmentSnapshots.hash, revision.attachmentsSnapshotHash));
+	if (snapshot === undefined) {
+		return {};
+	}
+	const parsed = ConfigAttachmentsSnapshotSchema.safeParse(snapshot.bundle);
+	return parsed.success ? parsed.data : {};
+}
+
+/**
+ * The attachments document `applyConfig` stores for this apply (ADR-027):
+ * `input.toolAttachments` explicitly, when given (an operator-supplied `tool-attachments.json`,
+ * even `{}`); otherwise every agent's attachments carried forward unchanged from whichever
+ * revision was active immediately before this apply — a plain YAML directory that never resolved
+ * one must not silently clear a hub-managed agent's attachments. Either way, filtered down to the
+ * agents this apply still configures (an agent it drops cannot keep attachments no configured
+ * agent may hold) and canonicalized.
+ */
+async function resolveApplyToolAttachments(
+	db: Db,
+	parentRevisionId: number | null,
+	input: ConfigApplyInput,
+): Promise<ToolAttachmentsBundle> {
+	const configuredAgentIds = new Set(input.agents.map((agent) => agent.id));
+	const source = input.toolAttachments ?? (await loadToolAttachmentsIn(db, parentRevisionId));
+	const filtered = Object.fromEntries(
+		Object.entries(source).filter(([agentId]) => configuredAgentIds.has(agentId)),
+	);
+	return canonicalizeAttachmentsIn(filtered);
+}
+
 /** The configuration row's history fields, as `gateway_controls` held them before this change. */
 type ActiveControlsRow = Readonly<{
 	version: string | null;
@@ -351,6 +455,13 @@ async function recordedEnabledAgreesWithLive(
  * its own recomputed hash — which can differ from `config_versions.version` of the same row, since
  * nothing here reconstructs a role prompt or an ordering the original apply alone knew — never
  * under a hash it does not actually reproduce.
+ *
+ * The stale revision's own attachments document (ADR-027), if it had one, carries forward into the
+ * backfill revision unchanged, filtered to the agents the backfilled bundle still configures (the
+ * same rule `resolveApplyToolAttachments` applies for a plain YAML `config apply`) — never silently
+ * dropped to `{}` just because this particular write path never otherwise touches attachments: a
+ * backfill triggered only by `agents.enabled` drifting (an older release's own direct toggle, no
+ * attachment ever touched) must not demote every hub-managed agent to legacy on its own.
  */
 export async function ensureConfigHistoryIn(
 	uow: UnitOfWork,
@@ -400,6 +511,25 @@ export async function ensureConfigHistoryIn(
 		constitution: versionRow.constitution,
 		rolePrompts: Object.fromEntries(agentRows.map((agent) => [agent.config.id, agent.rolePrompt])),
 	};
+	// The stale revision's own attachments document (if any) carries forward, filtered to the
+	// agents this backfill bundle still configures — the same rule `resolveApplyToolAttachments`
+	// already applies for a plain YAML `config apply`. Never reconstructed from nothing: a database
+	// upgraded from a release before ADR-027 ever recorded one has none to carry forward, and this
+	// backfill honestly carries none either (`attachmentsSnapshotHash` stays null below). Without
+	// this, a backfill triggered only by `agents.enabled` drifting (an older release's own direct
+	// toggle, no attachment ever touched) would otherwise demote every hub-managed agent to legacy —
+	// `attachments_snapshot_hash` null means exactly that (ADR-027's own rollback-recovery rule),
+	// which is only actually true for a release that predates attachments altogether.
+	const configuredAgentIds = new Set(bundle.agents.map((agent) => agent.id));
+	const toolAttachments = canonicalizeAttachmentsIn(
+		Object.fromEntries(
+			Object.entries(await loadToolAttachmentsIn(db, row.revision)).filter(([agentId]) =>
+				configuredAgentIds.has(agentId),
+			),
+		),
+	);
+	const hasToolAttachments = Object.keys(toolAttachments).length > 0;
+	const attachmentsSnapshotHash = hasToolAttachments ? canonicalHash(toolAttachments) : null;
 	const hash = canonicalHash(bundle);
 	await db
 		.insert(configSnapshots)
@@ -411,10 +541,22 @@ export async function ensureConfigHistoryIn(
 			createdAt: uow.now,
 		})
 		.onConflictDoNothing();
+	if (attachmentsSnapshotHash !== null) {
+		await db
+			.insert(configAttachmentSnapshots)
+			.values({
+				hash: attachmentsSnapshotHash,
+				bundle: toolAttachments,
+				format: CONFIG_ATTACHMENTS_SNAPSHOT_FORMAT,
+				createdAt: uow.now,
+			})
+			.onConflictDoNothing();
+	}
 	const [revision] = await db
 		.insert(configRevisions)
 		.values({
 			snapshotHash: hash,
+			attachmentsSnapshotHash,
 			// The stale revision (if any) becomes this one's parent, same as a fresh backfill's
 			// null parent when none was ever recorded.
 			parentRevisionId: row.revision,
@@ -478,6 +620,102 @@ export async function ensureConfigHistory(deps: ControlPlaneDeps, actor: string)
 				.set({ activeConfigRevision: revisionId, updatedAt: uow.now })
 				.where(eq(gatewayControls.id, 1));
 		}
+	});
+}
+
+/**
+ * The live projections `loadEffectivePermissionsIn` trusts without re-reading the active
+ * revision's own attachments document every time (`catalog_attachments`,
+ * `agents.tool_attachments_managed`), reconciled back to agree with it — never assumed to already
+ * agree, the way every other reader of them does (ADR-027's "the active revision is the source of
+ * truth" rule). They normally do agree, since `writeConfigRevisionIn` reconciles both in the same
+ * transaction as every revision it writes; the one way they stop agreeing is a release before
+ * ADR-027 writing a revision through its own, older `applyConfig` during a rollback interval — it
+ * has no `toolAttachments` document to call `writeConfigRevisionIn` with at all (the parameter did
+ * not exist for it) and knows nothing of either projection, so its revision lands with
+ * `attachments_snapshot_hash` null while the projections are left exactly as a hub-managed agent's
+ * last *pre-rollback* commit set them. Re-upgrading past this point would otherwise trust those
+ * stale projections and resurrect (or keep denying) whatever access the older release's own
+ * `permissions` edit actually changed, since nothing before this ever re-read the active revision's
+ * attachments document again to check. A revision with a null `attachments_snapshot_hash` carries no
+ * attachments document at all — only this release's own writer ever records one — so every agent it
+ * names is legacy: this reconciles both projections to the empty document (`{}`). This is *not* the
+ * same case as a plain YAML apply with no `tool-attachments.json` (a common point of confusion):
+ * that apply still carries every agent's existing attachments forward unchanged, filtered to the
+ * agents it still configures (`resolveApplyToolAttachments`), and so still ends up with a real,
+ * non-null `attachments_snapshot_hash` whenever there was anything to carry forward — `{}` here is
+ * reached only for a revision with no attachments document at all, the pre-ADR-027-writer case
+ * above. A revision with a non-null hash was necessarily written by this release's
+ * own writer, which already reconciled both projections to match it in the same transaction; this
+ * still re-reads and reconciles against it rather than trusting that, so a database nudged out of
+ * sync by anything else (a restored backup, a hand edit) is corrected the same way.
+ *
+ * A no-op, and cheap, in the overwhelmingly common case where the live projections already agree
+ * with the active revision's document (compared by canonical hash, the same comparison
+ * `attachments_snapshot_hash` itself is defined by) — safe to call at every controller/CLI startup,
+ * next to `ensureConfigHistory`, whether or not reconciling is actually needed.
+ */
+export async function ensureToolAttachmentsReconciled(
+	deps: ControlPlaneDeps,
+	actor: string,
+): Promise<void> {
+	await inTransaction(deps, async (uow) => {
+		const { db } = uow.tx;
+		const [controls] = await db
+			.select({ revision: gatewayControls.activeConfigRevision })
+			.from(gatewayControls)
+			.where(eq(gatewayControls.id, 1))
+			.for("update");
+		if (controls === undefined || controls.revision === null) {
+			return;
+		}
+		const desired = canonicalizeAttachmentsIn(await loadToolAttachmentsIn(db, controls.revision));
+		const managedAgentIds = await db
+			.select({ id: agents.id })
+			.from(agents)
+			.where(eq(agents.toolAttachmentsManaged, true));
+		const attachmentRows = await db
+			.select({
+				agentId: catalogAttachments.agentId,
+				entryId: catalogAttachments.entryId,
+				pinnedVersion: catalogAttachments.pinnedVersion,
+				mode: catalogAttachments.mode,
+				settings: catalogAttachments.settings,
+			})
+			.from(catalogAttachments);
+		const liveByAgent = new Map<string, ToolAttachment[]>(
+			managedAgentIds.map((row) => [row.id, []]),
+		);
+		for (const row of attachmentRows) {
+			const list = liveByAgent.get(row.agentId);
+			if (list !== undefined) {
+				list.push({
+					entryId: row.entryId,
+					pinnedVersion: row.pinnedVersion,
+					mode: row.mode,
+					settings: row.settings,
+				});
+			}
+		}
+		const live = canonicalizeAttachmentsIn(Object.fromEntries(liveByAgent));
+		if (canonicalHash(live) === canonicalHash(desired)) {
+			return;
+		}
+		await reconcileCatalogAttachmentsIn(uow, desired);
+		uow.deps.log.warn(
+			"tool attachment projections disagreed with the active configuration revision's own " +
+				"attachments document; reconciled to match it (likely a release before ADR-027 changed " +
+				"configuration during a rollback interval) — review with 'gateway tools list'/'gateway " +
+				"agents show <agent>'",
+			{ revision_id: controls.revision },
+		);
+		await audit(
+			uow,
+			actor,
+			"config.tool_attachments_reconciled",
+			"config",
+			String(controls.revision),
+		);
 	});
 }
 
@@ -561,9 +799,19 @@ export async function ackConfigRevision(
 
 /** Everything {@link writeConfigRevisionIn} needs to write one configuration change. */
 export type WriteConfigRevisionInput = Readonly<{
+	/** The resolved agent definitions this change applies, *before* the bundle-mirror invariant
+	 * below runs — a hub-managed agent's own `permissions` field here may already be stale (a plain
+	 * YAML `config apply` carries whatever the directory says) or may already agree with
+	 * `toolAttachments` (every other write path already mirrors before calling this). Either way,
+	 * `writeConfigRevisionIn` recomputes the bundle and its hash from the *mirrored* agents, never
+	 * from this value directly, so what is actually hashed and stored always agrees with
+	 * `toolAttachments`. */
 	input: ConfigApplyInput;
-	bundle: ConfigSnapshotBundle;
-	version: string;
+	/** This revision's own, final, already-canonicalized attachments document (ADR-027) —
+	 * stored as its own content-addressed snapshot, separate from the bundle; `{}` when no agent has
+	 * ever been touched through the tool-catalog hub. Resolved by the caller
+	 * (`commitChangeIn`/`applyConfig`'s own `resolveApplyToolAttachments`). */
+	toolAttachments: ToolAttachmentsBundle;
 	generation: number;
 	parentRevisionId: number | null;
 	actor: string;
@@ -581,15 +829,22 @@ export type WriteConfigRevisionInput = Readonly<{
  * `gateway_controls` lock; this function only writes. Agents that left the configuration are
  * disabled, never deleted: their history stays referenced. An agent with a run in progress cannot
  * be disabled; pause it first.
+ *
+ * ADR-027's bundle-mirror invariant is enforced here, not left to each caller to remember: every
+ * hub-managed agent's `permissions` field is (re)compiled from `toolAttachments` before the bundle
+ * is hashed or stored, so the stored bundle (and so `gateway config export`/`gateway agents show`)
+ * can never disagree with enforcement, whichever path committed the change — a plain YAML `config
+ * apply` included. Idempotent against a caller that already mirrored (`commitChangeIn` mirrors
+ * earlier too, for its own no-op check and diff): compiling an already-compiled result reproduces
+ * it exactly, so this never undoes or duplicates that work, only repeats a cheap catalog read.
  */
 export async function writeConfigRevisionIn(
 	uow: UnitOfWork,
 	write: WriteConfigRevisionInput,
 ): Promise<ConfigApplyResult> {
 	const {
-		input,
-		bundle,
-		version,
+		input: rawInput,
+		toolAttachments,
 		generation,
 		parentRevisionId,
 		actor,
@@ -599,6 +854,37 @@ export async function writeConfigRevisionIn(
 		changeHash,
 	} = write;
 	const { db } = uow.tx;
+	// Every caller already runs `attachmentCatalogProblems` (which itself includes this) against
+	// the same `toolAttachments` before ever reaching this shared writer; checked again here,
+	// against whatever caller this ever grows, so a bundle with two attachments of the same entry
+	// can never be written at all — never committed and only discovered later, when
+	// `loadActiveBundle` next parses the overlapping permission lists it compiles into.
+	const duplicateProblems = duplicateAttachmentIssues(toolAttachments);
+	if (duplicateProblems.length > 0) {
+		throw new AdminError(`configuration is invalid:\n- ${duplicateProblems.join("\n- ")}`);
+	}
+	const mirroredAgents = await mirrorCompiledAttachmentPermissions(
+		db,
+		rawInput.organization.organization.finance_agent_id,
+		rawInput.agents,
+		toolAttachments,
+	);
+	// The bundle-mirror invariant's own result, validated before it is ever hashed or written:
+	// `AgentConfigSchema` itself refuses an agent whose compiled permission lists overlap
+	// (`toolPatternOverlaps`) — catching that here, against the exact agents about to be stored,
+	// is what keeps a bad compile result from ever reaching `config_snapshots` at all, rather than
+	// surfacing only the next time something parses the snapshot back (`loadActiveBundle`).
+	for (const agent of mirroredAgents) {
+		const parsed = AgentConfigSchema.safeParse(agent);
+		if (!parsed.success) {
+			throw new AdminError(
+				`internal: agent '${agent.id}'s compiled attachments produced an invalid configuration:\n- ${parsed.error.issues.map((issue) => issue.message).join("\n- ")}`,
+			);
+		}
+	}
+	const input: ConfigApplyInput = { ...rawInput, agents: mirroredAgents };
+	const bundle = configSnapshotBundle(input);
+	const version = canonicalHash(bundle);
 	const previous = await loadActiveConfig(db);
 	if (
 		previous !== null &&
@@ -669,10 +955,28 @@ export async function writeConfigRevisionIn(
 			createdAt: uow.now,
 		})
 		.onConflictDoNothing();
+	// This revision's own attachments document (ADR-027), stored apart from `config_snapshots`
+	// so that table stays exactly the shape a release before this column existed already reads:
+	// `{}` (no agent ever touched through the hub) gets no row at all and a null column, the same
+	// way `attachments_snapshot_hash` stays null for a revision recorded before this column existed.
+	const hasToolAttachments = Object.keys(toolAttachments).length > 0;
+	const attachmentsSnapshotHash = hasToolAttachments ? canonicalHash(toolAttachments) : null;
+	if (attachmentsSnapshotHash !== null) {
+		await db
+			.insert(configAttachmentSnapshots)
+			.values({
+				hash: attachmentsSnapshotHash,
+				bundle: toolAttachments,
+				format: CONFIG_ATTACHMENTS_SNAPSHOT_FORMAT,
+				createdAt: uow.now,
+			})
+			.onConflictDoNothing();
+	}
 	const [revision] = await db
 		.insert(configRevisions)
 		.values({
 			snapshotHash: version,
+			attachmentsSnapshotHash,
 			parentRevisionId,
 			generation,
 			actor,
@@ -733,7 +1037,12 @@ export async function writeConfigRevisionIn(
 			configVersion: version,
 			maxActiveRuns: agent.concurrency.max_active_runs,
 			config: agent,
-			rolePrompt: input.rolePrompts[agent.id] ?? "",
+			// Own-property lookup: see `configBundleProblems`'s own comment above — an agent id like
+			// `constructor` with no role prompt of its own would otherwise resolve, through the
+			// prototype chain, to `Object.prototype.constructor` instead of `undefined`.
+			rolePrompt:
+				(Object.hasOwn(input.rolePrompts, agent.id) ? input.rolePrompts[agent.id] : undefined) ??
+				"",
 			updatedAt: uow.now,
 		};
 		const existing = await lockAgent(db, agent.id);
@@ -776,6 +1085,7 @@ export async function writeConfigRevisionIn(
 			disabled.push(id);
 		}
 	}
+	await reconcileCatalogAttachmentsIn(uow, toolAttachments);
 	// Approved actions that have not begun are checked against the new policy.
 	await revokeQueuedActions(uow);
 	// Cards live in the approvals channel, and only replies there decide: when it moves (or the
@@ -801,6 +1111,78 @@ export async function writeConfigRevisionIn(
 		source,
 	});
 	return { version, revisionId: revision.id, created, updated, disabled };
+}
+
+/**
+ * Reconciles `catalog_attachments` — the current-state projection of
+ * `ConfigSnapshotBundle.toolAttachments` (ADR-027), the same way the loop above reconciles `agents`
+ * against `ConfigSnapshotBundle.agents` — to match `desired` exactly: a row for a binding no
+ * longer in `desired` is removed, and one still there is inserted or updated. Also reconciles
+ * `agents.tool_attachments_managed` to whether `desired` has a key for each agent at all (even an
+ * explicitly empty list counts): the live, cheap "hub-managed" signal `catalog_attachments` rows
+ * alone cannot give, since an empty list and "never touched" both have zero rows there. Runs on
+ * every configuration write (`replace_bundle`, `attach_tool`, `detach_tool`, `update_attachment`,
+ * `clear_tool_attachments` alike), so neither projection ever drifts from the bundle that is the
+ * actual source of truth.
+ */
+async function reconcileCatalogAttachmentsIn(
+	uow: UnitOfWork,
+	desired: ToolAttachmentsBundle,
+): Promise<void> {
+	const { db } = uow.tx;
+	const desiredRows = Object.entries(desired).flatMap(([agentId, attachments]) =>
+		attachments.map((attachment) => ({ agentId, ...attachment })),
+	);
+	const existing = await db
+		.select({ agentId: catalogAttachments.agentId, entryId: catalogAttachments.entryId })
+		.from(catalogAttachments);
+	const desiredKeys = new Set(desiredRows.map((row) => `${row.agentId}\u0000${row.entryId}`));
+	const stale = existing.filter((row) => !desiredKeys.has(`${row.agentId}\u0000${row.entryId}`));
+	for (const row of stale) {
+		await db
+			.delete(catalogAttachments)
+			.where(
+				and(
+					eq(catalogAttachments.agentId, row.agentId),
+					eq(catalogAttachments.entryId, row.entryId),
+				),
+			);
+	}
+	for (const row of desiredRows) {
+		await db
+			.insert(catalogAttachments)
+			.values({
+				agentId: row.agentId,
+				entryId: row.entryId,
+				pinnedVersion: row.pinnedVersion,
+				mode: row.mode,
+				settings: row.settings,
+				createdAt: uow.now,
+				updatedAt: uow.now,
+			})
+			.onConflictDoUpdate({
+				target: [catalogAttachments.agentId, catalogAttachments.entryId],
+				set: {
+					pinnedVersion: row.pinnedVersion,
+					mode: row.mode,
+					settings: row.settings,
+					updatedAt: uow.now,
+				},
+			});
+	}
+	const hubManagedIds = Object.keys(desired);
+	if (hubManagedIds.length === 0) {
+		await db.update(agents).set({ toolAttachmentsManaged: false });
+	} else {
+		await db
+			.update(agents)
+			.set({ toolAttachmentsManaged: true })
+			.where(inArray(agents.id, hubManagedIds));
+		await db
+			.update(agents)
+			.set({ toolAttachmentsManaged: false })
+			.where(notInArray(agents.id, hubManagedIds));
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1022,8 +1404,6 @@ export async function applyConfig(
 	if (problems.length > 0) {
 		throw new AdminError(`configuration is invalid:\n- ${problems.join("\n- ")}`);
 	}
-	const bundle = configSnapshotBundle(input);
-	const version = canonicalHash(bundle);
 	return inTransaction(deps, async (uow) => {
 		const { db } = uow.tx;
 		// The configuration row first, for update: applies are serialized, and the generation and
@@ -1120,10 +1500,16 @@ export async function applyConfig(
 				].sort()
 			: channelsChangedAgentIdsIn(priorAgents, input.agents);
 		const lockedLifecycle = await lockLifecycleRowsIn(db, channelsChangedIds);
+		const toolAttachments = await resolveApplyToolAttachments(db, parentRevisionId, input);
+		// The same catalog constraints every managed write checks (ADR-027): a directory exported before
+		// an entry was deleted must not bring its attachment back through a plain `config apply`.
+		const attachmentProblems = await attachmentCatalogProblems(db, toolAttachments);
+		if (attachmentProblems.length > 0) {
+			throw new AdminError(`configuration is invalid:\n- ${attachmentProblems.join("\n- ")}`);
+		}
 		const result = await writeConfigRevisionIn(uow, {
 			input,
-			bundle,
-			version,
+			toolAttachments,
 			generation,
 			parentRevisionId,
 			actor,

@@ -30,6 +30,12 @@ $GATEWAY_HOME/secrets/
     gmail_refresh_token       written by `gateway gmail authorize`
   tool-runner/
     database_url              a role limited with `gateway db grant-tool-runner`
+  custom-tools/               a custom HTTPS tool's own named secrets (ADR-027), mounted
+                              read-only at /run/custom-tool-secrets for the tool runner — a
+                              third mount, distinct from the above: written only by
+                              `gateway tools secret set <alias>`, never by bootstrap or the
+                              controller
+    <alias>                    one file per secret alias a definition names, e.g. ticket_api_key
 ```
 
 `bin/init-home.sh` creates the directories, the database password and the controller's

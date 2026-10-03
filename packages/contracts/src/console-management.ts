@@ -130,6 +130,12 @@ export const ConsoleAgentDetailSchema = z.strictObject({
 	rolePrompt: z.string().max(50_000),
 	wakeRules: z.array(WakeRuleSchema).max(32),
 	permissions: AgentPermissionsSchema,
+	/** `true`: the active revision's attachments document has an entry for this agent, even an
+	 * explicitly empty one (ADR-027) — its `permissions` above is a mirror of its compiled
+	 * attachments, kept in sync on every attachment write, and is never independently editable here
+	 * (the editor shows it read-only; a patch that tries anyway is refused). `false`: a legacy
+	 * agent, whose `permissions` are exactly what a patch sets, unchanged. */
+	toolsHubManaged: z.boolean(),
 	memory: ConsoleAgentMemorySchema,
 	concurrency: ConsoleAgentConcurrencySchema,
 });

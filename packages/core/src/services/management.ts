@@ -10,20 +10,29 @@ import {
 	type ChangeSet,
 	type ChangeSetInput,
 	ChangeSetSchema,
+	ConfigAttachmentsSnapshotSchema,
 	type ConfigDiff,
 	type ConfigDiffAgent,
+	type ConfigDiffAttachment,
 	ConfigRevisionReasonSchema,
 	type ConfigRevisionSource,
 	ConfigRevisionSourceSchema,
 	ConfigSnapshotBundleSchema,
 	IdempotencyKeySchema,
+	type JsonValue,
+	MAX_ATTACHMENTS_PER_AGENT,
 	type OrganizationConfig,
+	Sha256HexSchema,
 	type TextChange,
+	type ToolAttachment,
+	type ToolAttachmentsBundle,
 } from "@agent-gateway/contracts";
 import {
 	agentLifecycle,
 	agentLifecycleOperations,
 	agents,
+	catalogEntries,
+	configAttachmentSnapshots,
 	configRevisions,
 	configSnapshots,
 	gatewayControls,
@@ -40,6 +49,13 @@ import {
 	inTransaction,
 	writeConfigRevisionIn,
 } from "./admin.ts";
+import {
+	type AttachmentWidening,
+	acceptWideningHash,
+	attachmentCatalogProblems,
+	changeSetWidenings,
+	mirrorCompiledAttachmentPermissions,
+} from "./attachment-validation.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
 import {
 	rejectLifecycleOwnedRemovals,
@@ -49,6 +65,8 @@ import {
 import { audit, lifecycleOwnedAgentIds } from "./store.ts";
 
 type Db = UnitOfWork["tx"]["db"];
+
+export { attachmentCatalogProblems };
 
 // ---------------------------------------------------------------------------
 // Draft bundles: a configuration bundle being built up by a change set, which (unlike
@@ -61,6 +79,10 @@ export type ConfigDraftBundle = Readonly<{
 	agents: Readonly<AgentConfig[]>;
 	constitution: string;
 	rolePrompts: Readonly<Record<string, string>>;
+	/** Every agent's catalog attachments, keyed by agent id (ADR-027); an agent absent from this
+	 * map has never been touched through the tool-catalog service — `loadAllAgentToolAttachments`
+	 * (`tool-catalog.ts`) falls back to converting its `permissions` lists instead. */
+	toolAttachments: ToolAttachmentsBundle;
 }>;
 
 const EMPTY_DRAFT_BUNDLE: ConfigDraftBundle = {
@@ -68,6 +90,7 @@ const EMPTY_DRAFT_BUNDLE: ConfigDraftBundle = {
 	agents: [],
 	constitution: "",
 	rolePrompts: {},
+	toolAttachments: {},
 };
 
 /** The same order `configSnapshotBundle` sorts agents in, so a hash never depends on array order. */
@@ -76,10 +99,14 @@ function byAgentId(a: AgentConfig, b: AgentConfig): number {
 }
 
 /**
- * The canonical hash of a draft bundle, whether or not it is valid (an organization-less draft
- * hashes too, so `prepareChange` stays deterministic even for a change set that does not
- * validate). A valid draft's hash is identical to `canonicalHash(configSnapshotBundle(...))` of
- * the same content: the same field order and the same agent sort.
+ * The canonical hash of a draft bundle's configuration content alone, whether or not it is valid
+ * (an organization-less draft hashes too, so `prepareChange` stays deterministic even for a
+ * change set that does not validate). A valid draft's hash is identical to
+ * `canonicalHash(configSnapshotBundle(...))` of the same content: the same field order and the
+ * same agent sort. Deliberately excludes `toolAttachments`, which ADR-027 hashes and stores as its
+ * own, separate attachments snapshot — see `canonicalizeAttachments` and
+ * `commitChangeIn`'s own noop check, which compares that content directly rather than through a
+ * combined hash.
  */
 export function previewHash(draft: ConfigDraftBundle): string {
 	return canonicalHash({
@@ -88,6 +115,25 @@ export function previewHash(draft: ConfigDraftBundle): string {
 		constitution: draft.constitution,
 		rolePrompts: { ...draft.rolePrompts },
 	});
+}
+
+/**
+ * `toolAttachments`, with every agent's own attachment list sorted by `entryId` (ADR-027):
+ * applied once, right after a change set is applied (`applyChangeSet`), so every reader downstream
+ * — the diff, the noop comparison, the attachments snapshot actually hashed and stored — sees the
+ * same, order-independent content regardless of the order attachments happened to be attached in.
+ * Without this, an unrelated export/import round-trip (which writes `tool-attachments.json` with
+ * each agent's attachments already sorted) would hash to different content than what was actually
+ * stored, manufacturing a spurious new revision for a no-op import.
+ */
+export function canonicalizeAttachments(bundle: ToolAttachmentsBundle): ToolAttachmentsBundle {
+	const result: Record<string, ToolAttachment[]> = {};
+	for (const [agentId, attachments] of Object.entries(bundle)) {
+		result[agentId] = [...attachments].sort((a, b) =>
+			a.entryId < b.entryId ? -1 : a.entryId > b.entryId ? 1 : 0,
+		);
+	}
+	return result;
 }
 
 /**
@@ -142,20 +188,28 @@ type LoadedBundle = Readonly<{ bundle: ConfigDraftBundle; hash: string | null }>
  * The bundle behind `revisionId` (null: no revision has ever been recorded, the empty bundle a
  * fresh database starts from), read at the validated boundary: a stored snapshot that does not
  * parse as `ConfigSnapshotBundleSchema` fails clearly here rather than corrupting a change set
- * applied on top of it.
+ * applied on top of it. `toolAttachments` is read from this same revision's own, separate
+ * attachments snapshot (ADR-027) — `{}` when it names none (a revision recorded before that
+ * column existed, or one whose configuration has no agent ever touched through the hub) — and
+ * merged in, so every caller still gets one `ConfigDraftBundle` with both halves of this
+ * revision's actual content, exactly as before the two were split into separate tables.
  */
 export async function loadActiveBundle(db: Db, revisionId: number | null): Promise<LoadedBundle> {
 	if (revisionId === null) {
 		return { bundle: EMPTY_DRAFT_BUNDLE, hash: null };
 	}
 	const [revision] = await db
-		.select({ snapshotHash: configRevisions.snapshotHash })
+		.select({
+			snapshotHash: configRevisions.snapshotHash,
+			attachmentsSnapshotHash: configRevisions.attachmentsSnapshotHash,
+		})
 		.from(configRevisions)
 		.where(eq(configRevisions.id, revisionId));
 	if (revision === undefined) {
 		throw new AdminError(`config revision ${revisionId} does not exist`);
 	}
-	const cached = cachedSnapshot(revision.snapshotHash);
+	const cacheKey = `${revision.snapshotHash}\u0000${revision.attachmentsSnapshotHash ?? ""}`;
+	const cached = cachedSnapshot(cacheKey);
 	if (cached !== undefined) {
 		return { bundle: cached, hash: revision.snapshotHash };
 	}
@@ -176,8 +230,29 @@ export async function loadActiveBundle(db: Db, revisionId: number | null): Promi
 				.join("; ")}`,
 		);
 	}
-	const bundle = deepFreeze(parsed.data);
-	cacheSnapshot(revision.snapshotHash, bundle);
+	let toolAttachments: ToolAttachmentsBundle = {};
+	if (revision.attachmentsSnapshotHash !== null) {
+		const [attachmentsSnapshot] = await db
+			.select({ bundle: configAttachmentSnapshots.bundle })
+			.from(configAttachmentSnapshots)
+			.where(eq(configAttachmentSnapshots.hash, revision.attachmentsSnapshotHash));
+		if (attachmentsSnapshot === undefined) {
+			throw new AdminError(
+				`attachments snapshot '${revision.attachmentsSnapshotHash}' referenced by revision ${revisionId} does not exist`,
+			);
+		}
+		const parsedAttachments = ConfigAttachmentsSnapshotSchema.safeParse(attachmentsSnapshot.bundle);
+		if (!parsedAttachments.success) {
+			throw new AdminError(
+				`attachments snapshot '${revision.attachmentsSnapshotHash}' is malformed: ${parsedAttachments.error.issues
+					.map((issue) => `${issue.path.join(".")}: ${issue.message}`)
+					.join("; ")}`,
+			);
+		}
+		toolAttachments = parsedAttachments.data;
+	}
+	const bundle = deepFreeze({ ...parsed.data, toolAttachments });
+	cacheSnapshot(cacheKey, bundle);
 	return { bundle, hash: revision.snapshotHash };
 }
 
@@ -238,16 +313,33 @@ export type OperationResult = Readonly<{ draft: ConfigDraftBundle; problems: Rea
  */
 function applyOperation(draft: ConfigDraftBundle, op: ChangeOperation): OperationResult {
 	switch (op.type) {
-		case "replace_bundle":
+		case "replace_bundle": {
+			// `op.toolAttachments` omitted: no attachments document was supplied (a plain YAML
+			// directory, any caller that never resolved one) — every agent's existing attachments
+			// carry forward unchanged, filtered down to the agents this replace still configures
+			// (ADR-027: whole-bundle-replace semantics apply to the bundle, never silently to
+			// attachments, which change only when a document is actually given). Present (even `{}`):
+			// this *is* the new document, replacing whatever was there before in full.
+			const configuredAgentIds = new Set(op.bundle.agents.map((agent) => agent.id));
+			const toolAttachments =
+				op.toolAttachments === undefined
+					? Object.fromEntries(
+							Object.entries(draft.toolAttachments).filter(([agentId]) =>
+								configuredAgentIds.has(agentId),
+							),
+						)
+					: op.toolAttachments;
 			return {
 				draft: {
 					organization: op.bundle.organization,
 					agents: op.bundle.agents,
 					constitution: op.bundle.constitution,
 					rolePrompts: op.bundle.rolePrompts,
+					toolAttachments,
 				},
 				problems: [],
 			};
+		}
 		case "set_constitution":
 			return { draft: { ...draft, constitution: op.constitution }, problems: [] };
 		case "update_agent": {
@@ -263,11 +355,20 @@ function applyOperation(draft: ConfigDraftBundle, op: ChangeOperation): Operatio
 			if (draft.agents.some((agent) => agent.id === op.agent.id)) {
 				return { draft, problems: [`add_agent: agent '${op.agent.id}' already exists`] };
 			}
+			// `op.toolAttachments` omitted: the agent starts legacy, with no attachments key of its
+			// own — a brand-new agent's long-standing behavior (`requestAgentCreate`). Present (even
+			// `[]`): it starts hub-managed with exactly this list — `requestAgentRestore`'s own
+			// carried-forward last attachments (ADR-027).
+			const toolAttachments =
+				op.toolAttachments === undefined
+					? draft.toolAttachments
+					: { ...draft.toolAttachments, [op.agent.id]: op.toolAttachments };
 			return {
 				draft: {
 					...draft,
 					agents: [...draft.agents, op.agent],
 					rolePrompts: { ...draft.rolePrompts, [op.agent.id]: op.rolePrompt },
+					toolAttachments,
 				},
 				problems: [],
 			};
@@ -278,11 +379,14 @@ function applyOperation(draft: ConfigDraftBundle, op: ChangeOperation): Operatio
 			}
 			const rolePrompts = { ...draft.rolePrompts };
 			delete rolePrompts[op.agentId];
+			const toolAttachments = { ...draft.toolAttachments };
+			delete toolAttachments[op.agentId];
 			return {
 				draft: {
 					...draft,
 					agents: draft.agents.filter((agent) => agent.id !== op.agentId),
 					rolePrompts,
+					toolAttachments,
 				},
 				problems: [],
 			};
@@ -321,6 +425,107 @@ function applyOperation(draft: ConfigDraftBundle, op: ChangeOperation): Operatio
 				problems: [],
 			};
 		}
+		case "attach_tool": {
+			if (!draft.agents.some((agent) => agent.id === op.agentId)) {
+				return { draft, problems: [`attach_tool: agent '${op.agentId}' does not exist`] };
+			}
+			// Own-property lookup, never plain bracket access: an agent id like `constructor` has no
+			// own property in this plain-object dictionary but still resolves, through the prototype
+			// chain, to `Object.prototype.constructor` — a function, not `undefined` — which `??`
+			// would not replace, and which has no `.filter` below.
+			const existing = Object.hasOwn(draft.toolAttachments, op.agentId)
+				? (draft.toolAttachments[op.agentId] ?? [])
+				: [];
+			const attachment: ToolAttachment = {
+				entryId: op.entryId,
+				pinnedVersion: op.pinnedVersion,
+				mode: op.mode,
+				settings: op.settings,
+			};
+			return {
+				draft: {
+					...draft,
+					toolAttachments: {
+						...draft.toolAttachments,
+						[op.agentId]: [...existing.filter((a) => a.entryId !== op.entryId), attachment],
+					},
+				},
+				problems: [],
+			};
+		}
+		case "detach_tool": {
+			// Own-property lookup: see `attach_tool` above — an agent id like `constructor` would
+			// otherwise resolve to `Object.prototype.constructor` instead of `undefined`.
+			const existing = Object.hasOwn(draft.toolAttachments, op.agentId)
+				? draft.toolAttachments[op.agentId]
+				: undefined;
+			if (existing === undefined || !existing.some((a) => a.entryId === op.entryId)) {
+				// Idempotent: detaching something never (or no longer) attached changes nothing.
+				return { draft, problems: [] };
+			}
+			return {
+				draft: {
+					...draft,
+					toolAttachments: {
+						...draft.toolAttachments,
+						[op.agentId]: existing.filter((a) => a.entryId !== op.entryId),
+					},
+				},
+				problems: [],
+			};
+		}
+		case "update_attachment": {
+			// Own-property lookup: see `attach_tool` above — an agent id like `constructor` would
+			// otherwise resolve to `Object.prototype.constructor` instead of `undefined`, and that
+			// function has no `.find` either.
+			const existing = Object.hasOwn(draft.toolAttachments, op.agentId)
+				? draft.toolAttachments[op.agentId]
+				: undefined;
+			const current = existing?.find((a) => a.entryId === op.entryId);
+			if (existing === undefined || current === undefined) {
+				return {
+					draft,
+					problems: [
+						`update_attachment: agent '${op.agentId}' has no attachment of '${op.entryId}'`,
+					],
+				};
+			}
+			const updated: ToolAttachment = {
+				entryId: op.entryId,
+				pinnedVersion: op.pinnedVersion === undefined ? current.pinnedVersion : op.pinnedVersion,
+				mode: op.mode ?? current.mode,
+				settings: op.settings ?? current.settings,
+			};
+			return {
+				draft: {
+					...draft,
+					toolAttachments: {
+						...draft.toolAttachments,
+						[op.agentId]: existing.map((a) => (a.entryId === op.entryId ? updated : a)),
+					},
+				},
+				problems: [],
+			};
+		}
+		case "clear_tool_attachments": {
+			const toolAttachments: Record<string, ToolAttachment[]> = {};
+			for (const [agentId, attachments] of Object.entries(draft.toolAttachments)) {
+				toolAttachments[agentId] = attachments.filter((a) => a.entryId !== op.entryId);
+			}
+			return { draft: { ...draft, toolAttachments }, problems: [] };
+		}
+		case "set_tool_attachments": {
+			if (!draft.agents.some((agent) => agent.id === op.agentId)) {
+				return { draft, problems: [`set_tool_attachments: agent '${op.agentId}' does not exist`] };
+			}
+			return {
+				draft: {
+					...draft,
+					toolAttachments: { ...draft.toolAttachments, [op.agentId]: [...op.attachments] },
+				},
+				problems: [],
+			};
+		}
 	}
 }
 
@@ -337,7 +542,13 @@ export function applyChangeSet(base: ConfigDraftBundle, changeSet: ChangeSet): O
 		draft = result.draft;
 		problems.push(...result.problems);
 	}
-	return { draft, problems };
+	// Canonicalized once, here, so every reader of the result — the diff, the noop comparison, the
+	// attachments snapshot actually hashed and stored — agrees regardless of the order individual
+	// operations happened to attach things in (ADR-027; see `canonicalizeAttachments`).
+	return {
+		draft: { ...draft, toolAttachments: canonicalizeAttachments(draft.toolAttachments) },
+		problems,
+	};
 }
 
 /** Whole-bundle validation of a draft, the same `configBundleProblems` `applyConfig` uses. */
@@ -345,7 +556,7 @@ export function draftBundleProblems(draft: ConfigDraftBundle): string[] {
 	if (draft.organization === null) {
 		return ["organization: configuration is missing; the first change must replace_bundle"];
 	}
-	return [
+	const problems = [
 		...configBundleProblems({
 			organization: draft.organization,
 			agents: draft.agents,
@@ -353,6 +564,107 @@ export function draftBundleProblems(draft: ConfigDraftBundle): string[] {
 			rolePrompts: draft.rolePrompts,
 		}),
 	];
+	const configuredAgentIds = new Set(draft.agents.map((agent) => agent.id));
+	for (const [agentId, attachments] of Object.entries(draft.toolAttachments)) {
+		if (!configuredAgentIds.has(agentId)) {
+			problems.push(`toolAttachments: '${agentId}' has attachments but is not a configured agent`);
+		}
+		if (attachments.length > MAX_ATTACHMENTS_PER_AGENT) {
+			problems.push(
+				`toolAttachments: agent '${agentId}' has ${attachments.length} attachments, over the ${MAX_ATTACHMENTS_PER_AGENT} limit`,
+			);
+		}
+	}
+	return problems;
+}
+
+// ---------------------------------------------------------------------------
+// Catalog constraints (ADR-027): checked against the database, so pure `draftBundleProblems`
+// cannot cover it. Called from every write path that commits a bundle (`prepareChange`,
+// `commitChangeIn`), closing the gap `attachTool`/`updateAttachment`'s own, earlier
+// `checkAttachable` left open for `config import`'s `replace_bundle` and a direct `commitChange` —
+// deliberately not from `previewChangeSetAgainst`, whose own doc comment requires it stay a pure
+// function of (base, patch) for an idempotent retry to replay safely; the console's own change
+// sets never touch `toolAttachments` in the first place, so nothing is lost by excluding it there.
+// ---------------------------------------------------------------------------
+
+/**
+ * The bundle-mirror invariant (ADR-027): every hub-managed agent's `permissions` field is replaced
+ * with its own compiled attachments, in the same draft and so the same revision an attachment
+ * write ever produces — never a separate, later write. This is what keeps an older release (one
+ * before the compiler existed, enforcing only `permissions`) safe to roll back to: it reads the
+ * same effective permissions a compiler-aware release would have enforced, because the bundle
+ * itself already carries them, not only the separate attachments document an older release does
+ * not know how to read. A legacy agent (no `toolAttachments` entry at all) is returned unchanged —
+ * its `permissions` stay exactly what it was given, the single source of truth it already is. Run
+ * only once an organization exists (nothing compiles before a finance agent is known) and skipped
+ * entirely when no agent has ever been touched through the hub, so a plain YAML `config apply`
+ * that never mentions attachments costs this function nothing beyond the one check.
+ */
+export async function mirrorCompiledAttachmentPermissionsIn(
+	db: Db,
+	draft: ConfigDraftBundle,
+): Promise<ConfigDraftBundle> {
+	if (draft.organization === null || Object.keys(draft.toolAttachments).length === 0) {
+		return draft;
+	}
+	const agents = await mirrorCompiledAttachmentPermissions(
+		db,
+		draft.organization.organization.finance_agent_id,
+		draft.agents,
+		draft.toolAttachments,
+	);
+	return { ...draft, agents };
+}
+
+// ---------------------------------------------------------------------------
+// Dropping attachments to a retired catalog entry: `config rollback` and `requestAgentRestore`
+// reintroduce historical content they themselves resolved, not something an operator hand-typed,
+// so (unlike `attachmentCatalogProblems` above) a reference to a since-deleted entry is dropped
+// and reported rather than refused outright — never silently, and never resurrecting the
+// capability (ADR-027).
+// ---------------------------------------------------------------------------
+
+export type DroppedAttachment = Readonly<{ agentId: AgentId; entryId: string }>;
+
+/** `toolAttachments`, with every attachment naming an entry outside `knownEntryIds` removed; the
+ * ones removed, for the caller to report. Pure — `dropAttachmentsToUnknownEntriesIn` resolves
+ * `knownEntryIds` from the database. */
+export function dropAttachmentsToUnknownEntries(
+	toolAttachments: ToolAttachmentsBundle,
+	knownEntryIds: ReadonlySet<string>,
+): Readonly<{ toolAttachments: ToolAttachmentsBundle; dropped: Readonly<DroppedAttachment[]> }> {
+	const dropped: DroppedAttachment[] = [];
+	const result: Record<string, ToolAttachment[]> = {};
+	for (const [agentId, attachments] of Object.entries(toolAttachments)) {
+		result[agentId] = attachments.filter((attachment) => {
+			if (knownEntryIds.has(attachment.entryId)) {
+				return true;
+			}
+			dropped.push({ agentId, entryId: attachment.entryId });
+			return false;
+		});
+	}
+	return { toolAttachments: result, dropped };
+}
+
+/** Every catalog entry that still exists and is not deleted — attachable, right now. */
+export async function loadAttachableEntryIds(db: Db): Promise<ReadonlySet<string>> {
+	const rows = await db
+		.select({ id: catalogEntries.id, deletedAt: catalogEntries.deletedAt })
+		.from(catalogEntries);
+	return new Set(rows.filter((row) => row.deletedAt === null).map((row) => row.id));
+}
+
+/** {@link dropAttachmentsToUnknownEntries}, resolving `knownEntryIds` from the database itself. */
+export async function dropAttachmentsToUnknownEntriesIn(
+	db: Db,
+	toolAttachments: ToolAttachmentsBundle,
+): Promise<
+	Readonly<{ toolAttachments: ToolAttachmentsBundle; dropped: Readonly<DroppedAttachment[]> }>
+> {
+	const known = await loadAttachableEntryIds(db);
+	return dropAttachmentsToUnknownEntries(toolAttachments, known);
 }
 
 // ---------------------------------------------------------------------------
@@ -420,9 +732,64 @@ function textChange(before: string, after: string): TextChange {
 }
 
 /**
+ * Every agent's own catalog-entry attachment added, removed or changed between `before` and
+ * `after`, sorted by `agentId` then `entryId` (ADR-027): `config diff`/`config rollback` now
+ * show exactly what changed, not merely which agents' attachments differ.
+ */
+function attachmentsDiff(
+	before: ToolAttachmentsBundle,
+	after: ToolAttachmentsBundle,
+): ConfigDiffAttachment[] {
+	const agentIds = [...new Set([...Object.keys(before), ...Object.keys(after)])].sort();
+	const result: ConfigDiffAttachment[] = [];
+	for (const agentId of agentIds) {
+		// Own-property lookup, never bare bracket access: `before`/`after` are plain-object
+		// dictionaries keyed by agent id, and an agent id like `constructor` has no own property in
+		// one of them (added or removed entirely) but still resolves, through the prototype chain, to
+		// `Object.prototype.constructor` — a function, not `undefined` and not an array — which would
+		// otherwise crash the `.map()` below instead of being read as "no attachments".
+		const beforeAttachments = Object.hasOwn(before, agentId) ? before[agentId] : undefined;
+		const afterAttachments = Object.hasOwn(after, agentId) ? after[agentId] : undefined;
+		const beforeByEntry = new Map((beforeAttachments ?? []).map((a) => [a.entryId, a]));
+		const afterByEntry = new Map((afterAttachments ?? []).map((a) => [a.entryId, a]));
+		const entryIds = [...new Set([...beforeByEntry.keys(), ...afterByEntry.keys()])].sort();
+		for (const entryId of entryIds) {
+			const beforeAttachment = beforeByEntry.get(entryId);
+			const afterAttachment = afterByEntry.get(entryId);
+			if (beforeAttachment === undefined && afterAttachment !== undefined) {
+				result.push({ kind: "added", agentId, entryId });
+				continue;
+			}
+			if (beforeAttachment !== undefined && afterAttachment === undefined) {
+				result.push({ kind: "removed", agentId, entryId });
+				continue;
+			}
+			if (beforeAttachment === undefined || afterAttachment === undefined) {
+				continue;
+			}
+			const fields: Array<"mode" | "pinnedVersion" | "settings"> = [];
+			if (beforeAttachment.mode !== afterAttachment.mode) {
+				fields.push("mode");
+			}
+			if (beforeAttachment.pinnedVersion !== afterAttachment.pinnedVersion) {
+				fields.push("pinnedVersion");
+			}
+			if (!deepEqual(beforeAttachment.settings, afterAttachment.settings)) {
+				fields.push("settings");
+			}
+			if (fields.length > 0) {
+				result.push({ kind: "changed", agentId, entryId, fields });
+			}
+		}
+	}
+	return result;
+}
+
+/**
  * A deterministic structural diff between two draft bundles: every agent added, removed or
  * changed (an unchanged agent — same fields, same role prompt — is left out entirely), the
- * organization's changed field paths, and the constitution's change. An agent's own fields are
+ * organization's changed field paths, the constitution's change, and every agent's own
+ * catalog-entry attachment added, removed or changed (ADR-027). An agent's own fields are
  * compared one level deep (`fieldPaths` names top-level `AgentConfig` keys, e.g. `"runtime"`);
  * the organization is compared all the way down, since its fields are the operator-facing detail
  * a console or reviewing agent needs.
@@ -444,7 +811,16 @@ export function configDiff(before: ConfigDraftBundle, after: ConfigDraftBundle):
 			continue;
 		}
 		const fieldPaths = structuralFieldPaths(beforeAgent, afterAgent, 1);
-		const rolePrompt = textChange(before.rolePrompts[id] ?? "", after.rolePrompts[id] ?? "");
+		// Own-property lookup, never plain bracket access: an agent id like `constructor` has no own
+		// property in `rolePrompts` on a side that never recorded one for it, but still resolves,
+		// through the prototype chain, to `Object.prototype.constructor` — a function, not a role
+		// prompt string, which `?? ""` would not catch (the function is not nullish) and which
+		// `textChange` would then measure as if it were real prompt text.
+		const beforeRolePrompt =
+			(Object.hasOwn(before.rolePrompts, id) ? before.rolePrompts[id] : undefined) ?? "";
+		const afterRolePrompt =
+			(Object.hasOwn(after.rolePrompts, id) ? after.rolePrompts[id] : undefined) ?? "";
+		const rolePrompt = textChange(beforeRolePrompt, afterRolePrompt);
 		if (fieldPaths.length === 0 && !rolePrompt.changed) {
 			continue;
 		}
@@ -458,6 +834,7 @@ export function configDiff(before: ConfigDraftBundle, after: ConfigDraftBundle):
 			Number.POSITIVE_INFINITY,
 		),
 		constitution: textChange(before.constitution, after.constitution),
+		toolAttachments: attachmentsDiff(before.toolAttachments, after.toolAttachments),
 	};
 }
 
@@ -558,13 +935,16 @@ export async function prepareChange(
 				),
 			};
 		}
-		const { draft, problems: opProblems } = applyChangeSet(base, shape.data);
-		const problems = [...opProblems, ...draftBundleProblems(draft)];
+		const applied = applyChangeSet(base, shape.data);
+		const draft = await mirrorCompiledAttachmentPermissionsIn(db, applied.draft);
+		const attachmentProblems = await attachmentCatalogProblems(db, draft.toolAttachments);
+		const problems = [...applied.problems, ...draftBundleProblems(draft), ...attachmentProblems];
 		const newHash = previewHash(draft);
 		const noop =
 			problems.length === 0 &&
 			baseHash !== null &&
 			baseHash === newHash &&
+			deepEqual(canonicalizeAttachments(base.toolAttachments), draft.toolAttachments) &&
 			!(await liveEnabledDiverges(db, enabledById(draft.agents)));
 		return {
 			baseRevisionId,
@@ -619,6 +999,7 @@ export async function previewChangeSetAgainst(
 		problems.length === 0 &&
 		baseHash !== null &&
 		baseHash === newHash &&
+		deepEqual(canonicalizeAttachments(base.toolAttachments), draft.toolAttachments) &&
 		!(await inTransaction(deps, ({ tx }) => liveEnabledDiverges(tx.db, enabledById(draft.agents))));
 	return { baseRevisionId, baseHash, newHash, noop, diff: configDiff(base, draft), problems };
 }
@@ -635,6 +1016,41 @@ export class ManagementConflictError extends Error {
 	}
 }
 
+/**
+ * Thrown by `commitChangeIn` (ADR-027) when a `detach_tool`/`clear_tool_attachments`/
+ * `set_tool_attachments` operation in the change set being committed would widen one or more
+ * agents' effective permissions — `widenings` names every agent and tool affected
+ * (`changeSetWidenings`, `attachment-validation.ts`), computed fresh under this same commit's own
+ * lock, against the exact revision it is about to replace, never a caller's own earlier,
+ * separately-read preview. `acceptWidening` is the canonical hash of this exact `widenings` list
+ * (`acceptWideningHash`): a caller that has already seen it (the console's own 422 response) echoes
+ * it back as `CommitChangeInput.acceptWidening` to proceed anyway — refused the moment a concurrent
+ * change makes this same computation, run again, produce a different list, since a stale or forged
+ * hash can never match what the server just computed itself. `deleteCatalogEntry` gives a caller no
+ * way to supply this at all: a catalog-wide delete affecting agents the owner may not have reviewed
+ * individually has no confirm step of its own, unlike a single attachment `detachTool` lets the
+ * owner deliberately turn off.
+ */
+export class WidensPermissionsError extends Error {
+	constructor(
+		readonly widenings: Readonly<AttachmentWidening[]>,
+		readonly acceptWidening: string,
+	) {
+		super(
+			"would widen effective permissions for: " +
+				widenings
+					.map(
+						(widening) =>
+							`${widening.agentId} (${widening.tools
+								.map((tool) => `${tool.tool}: ${tool.from} -> ${tool.to}`)
+								.join(", ")})`,
+					)
+					.join("; "),
+		);
+		this.name = "WidensPermissionsError";
+	}
+}
+
 /** What the commit transaction settled on; a conflict is thrown only once it has committed. */
 export type CommitOutcome =
 	| Readonly<{ kind: "committed"; result: CommitChangeResult }>
@@ -646,10 +1062,28 @@ export type CommitChangeInput = Readonly<{
 	baseRevisionId: number | null;
 	/** A repeated commit with the same key returns the first commit's result; see `commitChange`. */
 	idempotencyKey?: string;
+	/**
+	 * What a retry under `idempotencyKey` must match, in place of the change set itself: for a
+	 * request whose change set depends on the state it was made against (an attachment that also
+	 * converts a legacy agent's permissions), the caller's own request, which a retry reproduces
+	 * exactly while the change set it led to may not.
+	 */
+	requestIdentity?: JsonValue;
 	actor: string;
 	source: ConfigRevisionSource;
 	reason?: string;
+	/** `WidensPermissionsError.acceptWidening`, from a widening this exact caller already saw
+	 * (ADR-027): the owner's explicit acknowledgement that a removal's own widening is intended.
+	 * Checked after the idempotent-replay lookup above (a committed key replays without
+	 * re-evaluating this at all) and against the widenings this commit computes right now, under its
+	 * own lock — never the ones an earlier, separate read might have shown. */
+	acceptWidening?: string;
 }>;
+
+/** The hash a retry under the same idempotency key is compared against (`requestIdentity`). */
+function replayHash(input: CommitChangeInput, changeSet: ChangeSet): string {
+	return canonicalHash(input.requestIdentity ?? changeSet);
+}
 
 export type CommitChangeResult = Readonly<{
 	revisionId: number;
@@ -698,6 +1132,12 @@ function checkCommitChangeInput(
 		const key = IdempotencyKeySchema.safeParse(input.idempotencyKey);
 		if (!key.success) {
 			problems.push(...key.error.issues.map((issue) => `idempotencyKey: ${issue.message}`));
+		}
+	}
+	if (input.acceptWidening !== undefined) {
+		const hash = Sha256HexSchema.safeParse(input.acceptWidening);
+		if (!hash.success) {
+			problems.push(...hash.error.issues.map((issue) => `acceptWidening: ${issue.message}`));
 		}
 	}
 	return { problems, changeSet: changeSet.success ? changeSet.data : null };
@@ -972,8 +1412,7 @@ export async function commitChangeIn(
 			.from(configRevisions)
 			.where(eq(configRevisions.idempotencyKey, input.idempotencyKey));
 		if (existing !== undefined) {
-			const changeHash = canonicalHash(changeSet);
-			if (existing.changeHash !== changeHash) {
+			if (existing.changeHash !== replayHash(input, changeSet)) {
 				throw new AdminError(
 					`idempotency key '${input.idempotencyKey}' was already used with a different change set`,
 				);
@@ -1014,13 +1453,38 @@ export async function commitChangeIn(
 	}
 
 	const { bundle: base, hash: baseHash } = await loadActiveBundle(db, currentRevisionId);
-	const { draft, problems: opProblems } = applyChangeSet(base, changeSet);
-	const problems = [...opProblems, ...draftBundleProblems(draft)];
+	const applied = applyChangeSet(base, changeSet);
+	const draft = await mirrorCompiledAttachmentPermissionsIn(db, applied.draft);
+	const attachmentProblems = await attachmentCatalogProblems(db, draft.toolAttachments);
+	const problems = [...applied.problems, ...draftBundleProblems(draft), ...attachmentProblems];
 	if (problems.length > 0) {
 		throw new AdminError(`configuration is invalid:\n- ${problems.join("\n- ")}`);
 	}
 	if (draft.organization === null) {
 		throw new AdminError("internal: a validated configuration always has an organization");
+	}
+	// "A removal never widens effective permissions" (ADR-027), enforced here, under this same
+	// commit's lock and against the exact revision it is about to replace — never a separate,
+	// earlier read `detachTool`/`deleteCatalogEntry` used to take outside any transaction, racing a
+	// concurrent change between that read and this commit. Every other change-set operation
+	// (`attach_tool`, `update_attachment`, a plain `replace_bundle`) grants or restricts something
+	// the owner explicitly asked for and is never checked here — `changeSetWidenings` only ever
+	// looks at `detach_tool`/`clear_tool_attachments`/`set_tool_attachments`.
+	const widenings = await changeSetWidenings(
+		db,
+		changeSet,
+		{
+			agents: base.agents,
+			toolAttachments: base.toolAttachments,
+			financeAgentId: (base.organization?.organization.finance_agent_id ?? "") as AgentId,
+		},
+		{ toolAttachments: draft.toolAttachments },
+	);
+	if (widenings.length > 0) {
+		const acceptWidening = acceptWideningHash(widenings);
+		if (input.acceptWidening !== acceptWidening) {
+			throw new WidensPermissionsError(widenings, acceptWidening);
+		}
 	}
 	const botSecretProblems = await rejectUnownedBotSecretPaths(
 		db,
@@ -1069,6 +1533,7 @@ export async function commitChangeIn(
 	if (
 		currentRevisionId !== null &&
 		baseHash === version &&
+		deepEqual(canonicalizeAttachments(base.toolAttachments), draft.toolAttachments) &&
 		!(await liveEnabledDiverges(db, enabledById(draft.agents)))
 	) {
 		return {
@@ -1101,15 +1566,14 @@ export async function commitChangeIn(
 
 	const result = await writeConfigRevisionIn(uow, {
 		input: resolvedInput,
-		bundle,
-		version,
+		toolAttachments: draft.toolAttachments,
 		generation,
 		parentRevisionId: currentRevisionId,
 		actor: input.actor,
 		source: input.source,
 		reason: input.reason ?? null,
 		idempotencyKey: input.idempotencyKey ?? null,
-		changeHash: input.idempotencyKey === undefined ? null : canonicalHash(changeSet),
+		changeHash: input.idempotencyKey === undefined ? null : replayHash(input, changeSet),
 	});
 	await queueMembershipReprovisioning(
 		uow,

@@ -149,7 +149,7 @@ describe("scheduling, retry and redrive carry the system status (ADR-023)", () =
 		);
 	};
 
-	it("schedules an ordinary agent's turn as version 1, with no systemStatus and no status query", async () => {
+	it("schedules an ordinary agent's turn as version 3, with no systemStatus and no status query", async () => {
 		const spy = querySpy(gateway.pool);
 		const event = humanPost("@finance status please", ["finance"]);
 		await ingestEvent({ ...gateway.deps(), pool: spy.pool }, event);
@@ -161,11 +161,11 @@ describe("scheduling, retry and redrive carry the system status (ADR-023)", () =
 		await idle("finance");
 		const run = await latestRun("finance");
 		const snapshot = await snapshotOf(run.id);
-		expect(snapshot.input.schemaVersion).toBe(1);
+		expect(snapshot.input.schemaVersion).toBe(3);
 		expect(snapshot.input.systemStatus).toBeUndefined();
 	});
 
-	it("schedules an observing agent's turn as version 2, carrying a fresh systemStatus", async () => {
+	it("schedules an observing agent's turn as version 3, carrying a fresh systemStatus", async () => {
 		await setObserveSystem("director", true);
 		const spy = querySpy(gateway.pool);
 		const event = humanPost("@director status please", ["director"]);
@@ -177,7 +177,7 @@ describe("scheduling, retry and redrive carry the system status (ADR-023)", () =
 		await idle("director");
 		const run = await latestRun("director");
 		const snapshot = await snapshotOf(run.id);
-		expect(snapshot.input.schemaVersion).toBe(2);
+		expect(snapshot.input.schemaVersion).toBe(3);
 		expect(snapshot.input.systemStatus).toMatchObject({ killSwitch: false });
 		expect(snapshot.input.systemStatus?.agents.some((a) => a.agentId === "director")).toBe(true);
 	});
@@ -197,7 +197,7 @@ describe("scheduling, retry and redrive carry the system status (ADR-023)", () =
 			const jobInput = RunJobSchema.parse(job?.data).input;
 			const snapshot = await snapshotOf(run.id);
 			expect(jobInput).toEqual(snapshot.input);
-			expect(jobInput.schemaVersion).toBe(2);
+			expect(jobInput.schemaVersion).toBe(3);
 		} finally {
 			await gateway.startWorker();
 			await idle("director");
@@ -214,7 +214,7 @@ describe("scheduling, retry and redrive carry the system status (ADR-023)", () =
 				throw new Error("no run was scheduled");
 			}
 			const before = await snapshotOf(run.id);
-			expect(before.input.schemaVersion).toBe(2);
+			expect(before.input.schemaVersion).toBe(3);
 
 			const usage: RuntimeUsage = {
 				inputTokens: 321,
@@ -409,14 +409,14 @@ describe("scheduling, retry and redrive carry the system status (ADR-023)", () =
 			throw new Error("no run was scheduled");
 		}
 		const original = await snapshotOf(originalRun.id);
-		expect(original.input.schemaVersion).toBe(2);
+		expect(original.input.schemaVersion).toBe(3);
 
 		const redriven = await redriveRun(gateway.deps(), originalRun.id, "test");
 		if (!("runId" in redriven)) {
 			throw new Error(`redrive did not start a run: ${redriven.skipped}`);
 		}
 		const fresh = await snapshotOf(redriven.runId);
-		expect(fresh.input.schemaVersion).toBe(2);
+		expect(fresh.input.schemaVersion).toBe(3);
 		expect(fresh.input.systemStatus?.asOf).not.toBe(original.input.systemStatus?.asOf);
 		expect(Date.parse(fresh.input.systemStatus?.asOf ?? "")).toBeGreaterThan(
 			Date.parse(original.input.systemStatus?.asOf ?? ""),
@@ -428,18 +428,18 @@ describe("scheduling, retry and redrive carry the system status (ADR-023)", () =
 		directorPermanentFailureRunId = redriven.runId;
 	});
 
-	it("a permission turned off before redrive is respected: the redriven turn is version 1", async () => {
+	it("a permission turned off before redrive is respected: the redriven turn carries no systemStatus", async () => {
 		await setObserveSystem("director", false);
 		const redriven = await redriveRun(gateway.deps(), directorPermanentFailureRunId, "test");
 		if (!("runId" in redriven)) {
 			throw new Error(`redrive did not start a run: ${redriven.skipped}`);
 		}
 		const fresh = await snapshotOf(redriven.runId);
-		expect(fresh.input.schemaVersion).toBe(1);
+		expect(fresh.input.schemaVersion).toBe(3);
 		expect(fresh.input.systemStatus).toBeUndefined();
 	});
 
-	it("a permission turned on before redrive is respected: the redriven turn is version 2", async () => {
+	it("a permission turned on before redrive is respected: the redriven turn carries a systemStatus", async () => {
 		const event = humanPost("@finance [mock:permanent]", ["finance"]);
 		await ingestEvent(gateway.deps(), event);
 		await failed("finance");
@@ -448,7 +448,7 @@ describe("scheduling, retry and redrive carry the system status (ADR-023)", () =
 			throw new Error("no run was scheduled");
 		}
 		const original = await snapshotOf(originalRun.id);
-		expect(original.input.schemaVersion).toBe(1);
+		expect(original.input.schemaVersion).toBe(3);
 
 		await setObserveSystem("finance", true);
 		const redriven = await redriveRun(gateway.deps(), originalRun.id, "test");
@@ -456,7 +456,7 @@ describe("scheduling, retry and redrive carry the system status (ADR-023)", () =
 			throw new Error(`redrive did not start a run: ${redriven.skipped}`);
 		}
 		const fresh = await snapshotOf(redriven.runId);
-		expect(fresh.input.schemaVersion).toBe(2);
+		expect(fresh.input.schemaVersion).toBe(3);
 		expect(fresh.input.systemStatus).toBeDefined();
 		await setObserveSystem("finance", false);
 	});
@@ -493,7 +493,7 @@ describe("scheduling, retry and redrive carry the system status (ADR-023)", () =
 			throw new Error("no run was scheduled");
 		}
 		const original = await snapshotOf(originalRun.id);
-		expect(original.input.schemaVersion).toBe(2);
+		expect(original.input.schemaVersion).toBe(3);
 
 		const later = { ...gateway.deps(), clock: () => new Date(Date.now() + 2 * 3600_000) };
 		expect(await handleWaitTimeout(later, { waitId: wait.id })).toBe("timed_out");
@@ -502,7 +502,7 @@ describe("scheduling, retry and redrive carry the system status (ADR-023)", () =
 		const resumedRun = await latestRun("mail-follower");
 		expect(resumedRun.id).not.toBe(originalRun.id);
 		const resumed = await snapshotOf(resumedRun.id);
-		expect(resumed.input.schemaVersion).toBe(2);
+		expect(resumed.input.schemaVersion).toBe(3);
 		expect(resumed.input.systemStatus?.asOf).not.toBe(original.input.systemStatus?.asOf);
 		expect(Date.parse(resumed.input.systemStatus?.asOf ?? "")).toBeGreaterThan(
 			Date.parse(original.input.systemStatus?.asOf ?? ""),

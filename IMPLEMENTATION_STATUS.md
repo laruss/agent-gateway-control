@@ -2198,3 +2198,194 @@ Not yet released; see the Changelog's `[Unreleased]` section.
   credential unlock failed is discarded) — fixed.
 
 Released as 0.6.0 (migrations `0024_agent_lifecycle` to `0027_lifecycle_retry_of`, all expand; head `0027_lifecycle_retry_of`, pg-boss schema 42).
+
+## Phase 15 - Tool catalog: entries, versions and attachments
+
+Status: **done** (the catalog data model, the compiler, enforcement, custom HTTPS tools, packaged
+utilities and the console's own Instruments & Utils hub and agent capability editor; review closed
+after round 5, the round limit, with its findings and those of the final reviews of the fix commits
+fixed and covered by tests)
+
+| Item | State | Evidence |
+|------|-------|----------|
+| Catalog entry/version/attachment contracts: `kind` (`native`/`gateway`/`executor`/`custom_https`/`utility`), immutable `implementationKey`, bounded `configSchema`/`settings`, `riskFloor`, `supportedAdapters`, `ToolAttachment` (`entryId`/`pinnedVersion`/`mode`/`settings`), `riskFloorAllows` | done | `packages/contracts/src/tool-catalog.ts` |
+| Attachments are their own content-addressed document (`ConfigAttachmentsSnapshotSchema`), named by a revision alongside its bundle (`attachmentsSnapshotHash`), never a `ConfigSnapshotBundle` field — an older release's own `strictObject` schema still parses every snapshot this release writes. `replace_bundle`/`add_agent` carry an optional sibling `toolAttachments` (omitted: carry forward unchanged; given, even `{}`/`[]`: replaces in full). A richer `ConfigDiff.toolAttachments` (added/removed/changed, per agent per entry, naming which fields changed) | done | `packages/contracts/src/management.ts` |
+| Schema: `catalog_entries` (`deleted_at`/`deleted_by`: deleting marks, never removes, the row), `catalog_entry_versions` (append-only — migration `0029` guards it), `catalog_attachments` (the active revision's current-state projection), `catalog_entry_tombstones`, `config_attachment_snapshots` (append-only — migration `0031` guards it) | done | `packages/db/src/schema.ts`, migrations `0028_tool_catalog`/`0029_tool_catalog_guards`/`0030_config_attachment_snapshots`/`0031_config_attachment_snapshots_guards` |
+| `ensureToolCatalogSeeded`: idempotent, seeds every built-in this release ships, never re-adds a tombstoned one; run at controller startup and every CLI session | done | `packages/core/src/services/tool-catalog.ts`, `apps/controller/src/controller.ts`, `apps/cli/src/commands.ts` |
+| `legacyAttachmentsFromPermissions` (pure) and `loadAllAgentToolAttachments`/`loadAgentToolAttachments`: a hub-managed agent's recorded attachments, or a legacy agent's `permissions` converted on the fly against entries known right now (deleted entries excluded), with unresolved patterns kept visible | done | `packages/core/src/services/tool-catalog.ts` |
+| `listCatalogEntries`/`getCatalogEntry` (deleted entries excluded; availability computed from a caller-supplied context, never stored), `listCatalogEntryVersions` (unfiltered — history stays readable), `editCatalogEntry` (every supplied field validated against its own contract schema before insert; a built-in's `configSchema`/`riskFloor`/`supportedAdapters` refused), `deleteCatalogEntry` (every attachment cleared atomically, the entry's own row marked deleted — never removed, so a historical rollback that once attached it never FK-fails — a tombstone for a built-in; `gateway_controls` locked before `catalog_entries`, matching every other writer's lock order), `attachTool`/`detachTool`/`updateAttachment` (through `commitChange`, a risk-floor check before attaching `allow`) | done | `packages/core/src/services/tool-catalog.ts` |
+| `attachmentCatalogProblems`: every attachment any write path commits (not only `attachTool`'s own `checkAttachable`) is checked — entry exists and is not deleted, pinned version exists, mode respects risk floor — at the shared `prepareChange`/`commitChangeIn` boundary | done | `packages/core/src/services/management.ts` |
+| `canonicalizeAttachments`: every agent's attachment list sorted by `entryId` once, right after a change set applies, before anything hashes or stores it — an untouched export/import round-trips to a no-op regardless of attach order | done | `packages/core/src/services/management.ts` |
+| `writeConfigRevisionIn` resolves and stores this revision's own attachments snapshot (carried forward or replaced — never derived from `bundle`) and reconciles `catalog_attachments` to it on every write, the same way it reconciles `agents`; `applyConfig`'s own `resolveApplyToolAttachments` carries attachments forward when no document was supplied | done | `packages/core/src/services/admin.ts` |
+| `dropAttachmentsToUnknownEntriesIn`: `config rollback` and `requestAgentRestore` each drop an attachment naming a catalog entry deleted since, reporting it (the rollback's own printed note; `RequestAgentRestoreResult.droppedAttachments`), rather than failing or resurrecting the capability | done | `packages/core/src/services/management.ts`, `apps/cli/src/config-commands.ts`, `packages/core/src/services/agent-lifecycle.ts` |
+| `gateway config export`/`import` round-trip `tool-attachments.json`, optional (an export from before this phase, or a hand-written directory, has none and carries existing attachments forward rather than clearing them); `config rollback` carries the target revision's own attachments forward, minus any dropped; `formatConfigDiff` renders every attachment change | done | `apps/cli/src/config-files.ts`, `apps/cli/src/config-commands.ts` |
+| `compileAttachments` (pure): disjoint `allow`/`requireApproval`/`deny`, native dependency propagation (`NATIVE_TOOL_DEPENDENCIES`) with `impliedBy`, an adapter-specific prerequisite table (`ADAPTER_NATIVE_PREREQUISITES`) surfaced as `missingPrerequisites` without changing what is granted, `memory.write` always explicit in `allow` or `deny`, finance capabilities compiled in only for the finance agent; `modeSupportedByKind` (native/gateway: `allow`/`disabled`; executor: `require_approval`/`disabled`) checked at the same shared write boundary as the risk floor | done | `packages/policy/src/compile.ts` |
+| `loadEffectivePermissionsIn`: the single source of truth — compiled attachments for a hub-managed agent (`agents.tool_attachments_managed`, migration `0032`, reconciled alongside `catalog_attachments`), a legacy agent's `permissions` lists unchanged otherwise; read by the turn scheduler (stored in the run's own `toolPolicy` snapshot), the approval grant/revoke path (read live), and capability descriptions for turn input version 3 | done | `packages/core/src/services/effective-permissions.ts` |
+| `mirrorCompiledAttachmentPermissionsIn`: every hub-managed agent's `permissions` replaced with its compiled attachments in the same draft `prepareChange`/`commitChangeIn` hash and validate — the bundle-mirror invariant that keeps a binary rollback to 0.6.0 enforcing the same effective permissions | done | `packages/core/src/services/management.ts` |
+| `adoptAgentToolAttachments` / `gateway tools adopt <agent>\|--all [--dry-run]`: explicit, never-implicit migration of a legacy agent's `permissions` into real attachments, one committed revision per agent, reporting unresolved patterns, before/after effective permissions and any mode a resolved pattern's entry `kind` cannot support | done | `packages/core/src/services/tool-catalog.ts`, `apps/cli/src/commands.ts` |
+| `revokeQueuedActions` also withdraws a still-pending approval (not only an already-granted, queued tool action) once the live, recompiled policy no longer permits it, with an audit entry | done | `packages/core/src/services/approvals.ts` |
+| `AgentTurnInput.schemaVersion` 3 (ADR-023): bounded capability descriptions (`name`/`description`/`mode`), decoupled from `systemStatus`'s own presence rule; versions 1/2 still accepted for an already-queued job; the rendered prompt describes capabilities structurally when present | done | `packages/contracts/src/turn.ts`, `packages/core/src/turn-context.ts`, `packages/runtime-sdk/src/prompt.ts` |
+| `custom_https` definitions (`CustomHttpsDefinitionSchema`, `customHttpsDefinitionProblems`): fixed host/path template/method, typed parameters mapped into one encoded path/query/header/body slot each, named secret slots, a required idempotency header for any write; `createCustomHttpsTool`/`editCatalogEntry` (publishes a new immutable version); `MODES_BY_KIND` gives `custom_https`/`utility` only `require_approval`/`disabled` | done | `packages/contracts/src/custom-tool.ts`, `packages/core/src/services/tool-catalog.ts`, `packages/policy/src/compile.ts` |
+| A request naming a `custom_https` action is pinned to the entry's current definition version (`prepareCustomApprovalDraft`) before the card is ever shown or hashed; grant time re-checks the pin and the parameters against the entry's *current* definition (`customGrantTimeIssues`/`customDefinitionVersionIssues`), refusing a grant once the definition moved on | done | `packages/core/src/services/custom-tools.ts`, `packages/core/src/services/runs.ts`, `packages/core/src/services/approvals.ts` |
+| Egress guard: resolves a hostname once (injectable `DnsResolver`) and connects to exactly that address, never re-resolving (defeats DNS rebinding); classifies every literal/resolved address (dotted/decimal/octal/hex IPv4, compressed/mapped IPv6) and refuses private/loopback/link-local (incl. the cloud metadata address)/CGNAT/multicast/reserved/documentation/unique-local/mapped; redirects never followed; a response over its size limit aborted mid-stream, `GET` → `failed`, a write → `unknown` (the request may already have been sent) | done | `packages/policy/src/ip-guard.ts`, `packages/tool-broker/src/egress.ts` |
+| `executeCustomHttpsAction`: resolves the model's parameters and the definition's named secrets into the concrete request (percent-encoded path, never free interpolation), fills the idempotency header from the action's own stored key, scrubs every secret value from the receipt/error even if the destination echoes it back | done | `packages/tool-broker/src/custom-https-executor.ts` |
+| A new `custom` broker namespace routes every `custom_https` entry's action type through one shared queue; a tool runner serving it dispatches dynamically (`DynamicExecutor`, tried once the static registry has no exact match) to the exact approved definition version, read through `gateway_custom_tool_definition` — a narrow, read-only `SECURITY DEFINER` function symmetrical with `gateway_begin_tool_action`, granted only to a role that can settle `custom`'s own execute jobs | done | `packages/tool-broker/src/tool-job.ts`, `apps/tool-runner/src/runner.ts`, migration `0034_gateway_custom_tool_definition` |
+| Packaged utilities: a new `utility` kind, fully static (like `executor`) — `utility.text-transform` (trim/case/reverse/slugify, bounded input/output) ships to prove the path; availability reflects whether a running tool runner actually registers it | done | `packages/contracts/src/custom-tool.ts`, `packages/tool-broker/src/utility.ts`, `apps/tool-runner/src/main.ts` |
+| `gateway tools secret set <alias>` (hidden entry, confirmed, written verbatim to a dedicated custom-tool secrets mount — never hashed, never the model, the database, logs, an approval or an error) and `gateway tools custom create\|edit <entry-id>` (a JSON definition file) | done | `apps/cli/src/custom-tool-commands.ts`, `apps/cli/src/commands.ts` |
+| Release configuration: a third secrets mount (`$GATEWAY_HOME/secrets/custom-tools`, `/run/custom-tool-secrets` read-only in the tool runner), `init-home.sh` creates it (0700, owner 10001), the CLI's own `/secrets` mount already covers writing to it, backed up the same way every other secret under `$GATEWAY_HOME` already is (no special-casing needed) | done | `deploy/release/compose.yaml`, `deploy/release/bin/init-home.sh` |
+| Console read models and change-set translation for the hub: `consoleListToolCatalog`/`consoleGetToolCatalogEntry` (availability from `runtimeHealth`, attached-agent count/list), `consoleCreateCustomTool`/`consoleEditCatalogEntry`/`consoleDeleteCatalogEntry`, `consoleAgentTools` (requested vs compiled effective, `missingPrerequisites` added to `EffectiveAgentPermissions`), `consoleAttachTool`/`consoleDetachTool`/`consoleUpdateAttachment`, `consoleAdoptPreview`/`consoleAdoptCommit` (`adoptAgentToolAttachments` gained an optional `source`/`idempotencyKey` so a console-driven adoption carries `source: "console"` and an idempotency key like every other console mutation, CLI callers unchanged) | done | `packages/core/src/services/console-tools.ts`, `packages/core/src/services/effective-permissions.ts`, `packages/core/src/services/tool-catalog.ts` |
+| Controller routes: `GET/POST /api/tools*`, `GET/POST /api/agents/:id/tools*` — session/CSRF/exact-Origin exactly like the Agents hub's own routes (ADR-025); a secret alias's "is it set" status is resolved here, not in `core`, from a read-only mount the controller now also has (`CUSTOM_TOOL_SECRETS_DIR`/`customToolSecretsDir`, release config and `ConsoleServerOptions` both extended) — `core` stays filesystem-free | done | `apps/controller/src/console-tools.ts`, `apps/controller/src/console-server.ts`, `apps/controller/src/main.ts`, `deploy/release/compose.yaml` |
+| Contracts for the new surface: `ConsoleToolCatalogListResponse`/`ConsoleToolCatalogEntryDetailResponse`, create/edit/delete request-response pairs, `ConsoleAgentToolsResponse` (requested/unresolved/effective/capabilities/missingPrerequisites/memoryWriteAllowed), attach/detach/update and adopt preview/commit DTOs | done | `packages/contracts/src/console-tools.ts` |
+| Console pages: **Instruments & utils** hub (searchable, grouped by kind, availability badges, create/edit/delete with review step and impact confirmation, attach-to-agent) and the Agents hub's own **Tools** tab (requested vs effective, implied capabilities, missing adapter prerequisites, attach/detach/mode-change acting immediately, "Adopt into the tools hub" with a dry-run preview) | done | `apps/console/src/routes/tools-hub-page.tsx`, `apps/console/src/routes/tool-detail-page.tsx`, `apps/console/src/routes/tools-hub/`, `apps/console/src/routes/agent-detail/tools-tab.tsx`, `apps/console/src/routes/agent-detail/{attach-entry-dialog,adopt-dialog}.tsx` |
+
+Not yet done: executor/utility/`custom_https` availability still has no live signal from a running
+tool runner (`registeredExecutorActionTypes`/`registeredNamespaces` are supplied by the caller,
+always empty in production today, unchanged by this step) — the hub's own availability badge
+inherits this gap honestly rather than papering over it.
+
+Acceptance:
+
+- [x] Unit: legacy conversion (exact match, wildcard expansion only against known entries,
+  unresolved patterns kept, `tools_deny` to `disabled`, finance rules honoured), a built-in's
+  immutable fields refused on edit, `editCatalogEntryInputProblems`'s own bounds, availability
+  computation (an unregistered executor action is unavailable; a native capability needs an
+  installed adapter; a gateway capability is always available; `custom_https` never is),
+  `replace_bundle`/`add_agent`'s attachments carry-forward-or-replace semantics, canonicalization
+  by `entryId`, a richer `configDiff` attachments list, a snapshot this release writes still parses
+  with 0.6.0's own pinned `ConfigSnapshotBundleSchema`.
+- [x] Integration: seeding is idempotent; a tombstoned built-in never returns across reseeding
+  while the rest still do; editing publishes a new, immutable version with readable history (the
+  guard trigger refuses a direct UPDATE/DELETE of a version row); deleting an entry removes every
+  agent's attachment of it in the same transaction as its tombstone, without deadlocking a
+  concurrent attach (lock order); a direct `commitChange`/`config import` is refused for an
+  attachment naming a nonexistent or deleted entry, not only through `attachTool`'s own check;
+  rolling back to a revision that attached a since-deleted entry drops it rather than FK-failing or
+  resurrecting it; attach/detach/update each commit a revision carrying their given source and are
+  covered by rollback; an attachment round-trips through `config export`/`import` losslessly at the
+  same hash, including when attached in a different order than export's own sort; a directory from
+  before this phase still imports, carrying existing attachments forward; retiring then restoring
+  an agent carries its last hub-managed attachments forward (including an explicitly empty list),
+  minus any naming a catalog entry deleted since.
+- [x] Unit (the compiler, `packages/policy/src/compile.test.ts`): disjoint lists from each
+  attachment's own mode; an unknown/deleted entry id grants nothing; `tests.run` implies
+  `repository.read`/`workspace.write` with `impliedBy` recorded, an explicit deny of the implied
+  tool wins; a Codex-only prerequisite is surfaced (`missingPrerequisites`) without being granted or
+  removed, another adapter has none; `memory.write` is always explicit in `allow` or `deny`; a
+  finance attachment held by a non-finance agent grants nothing, the finance agent's own compiles
+  normally; the bundle-mirror mapping adds `finance.*` to `tools_deny` only for a non-finance agent,
+  never alongside an individual finance pattern; `modeSupportedByKind` per kind.
+- [x] Integration (`packages/core/src/services/effective-permissions.integration.test.ts`): every
+  catalog toggle against `loadEffectivePermissionsIn` for each built-in kind — attach `allow` →
+  permitted, `disabled` → denied, a broker action needs `require_approval` and refuses `allow`;
+  native dependency propagation verified in both the compiled result and the mirrored bundle
+  `permissions` (the bundle-mirror invariant, directly, against the stored `agents.config` row); an
+  adapter-specific prerequisite surfaces without changing what is granted; detaching (or never
+  attaching) `memory.write` removes memory authority; a finance attachment on a non-finance agent
+  grants nothing; a legacy agent's effective permissions are unchanged; `gateway tools adopt`
+  dry-run and commit (identical before/after when every pattern resolves, a no-op the second time,
+  `--all`), and the explicit memory-write narrowing a dry-run surfaces for an agent that never
+  denied it.
+- [x] Integration, end to end (`apps/controller/src/tool-catalog-enforcement.integration.test.ts`):
+  a broker action attached `require_approval` creates a real pending approval through the mock
+  runtime; detaching it cancels the still-pending approval with an audit entry
+  (`approvals.revoked`), and the agent's own wait resumes normally; an agent with `memory.write`
+  never attached has its memory proposal rejected by the turn's own authority, end to end (no
+  memory item is ever accepted for that run).
+- [x] Integration (`apps/controller/src/operator-turns.integration.test.ts`, updated): every
+  scheduled turn is version 3 regardless of `observe_system`; `systemStatus` presence still follows
+  observation alone; old queued jobs are not re-exercised here (versions 1/2 remain
+  schema-acceptable, unit-tested in `packages/contracts/src/contracts.test.ts`).
+- [x] Unit (`packages/policy/src/ip-guard.test.ts`): every literal address form (dotted, decimal,
+  octal, hex IPv4; compressed, mapped, unique-local, link-local IPv6) classified correctly;
+  ordinary public addresses allowed; a real hostname is never treated as a literal.
+- [x] Unit (`packages/tool-broker/src/egress.test.ts`): a literal or resolved private/loopback/
+  link-local/CGNAT/multicast address refused before any connection; a resolver called exactly
+  once (DNS-rebinding defeated by construction, not by re-checking a second answer); against a
+  real local HTTPS test server with a throwaway CA — the definition's own SNI/Host reach the
+  destination, not the resolved address; an unexpected content type and an oversized `GET`
+  response are clean `failed` outcomes; an oversized write response and a post-send timeout both
+  throw (recorded as `unknown` by the caller); the idempotency header reaches the destination.
+- [x] Unit (`packages/tool-broker/src/custom-https-executor.test.ts`): resolves by (entry id,
+  version), fills a secret header and never leaks it (even echoed back by the destination);
+  refuses a mismatched entry id (cross-namespace/cross-entry denial) and a pinned version with no
+  matching definition; a path-traversal attempt (`../../etc/passwd`) is percent-encoded into
+  exactly one segment, never escaping it, and a secret reaches a query parameter, never the path.
+- [x] Unit (`packages/policy/src/custom-tool.test.ts`): typed parameter validation per type (string
+  bounds, number range, boolean, enum) and per slot (a path value that is `.`/`..`/contains a
+  separator is refused); `resolveCustomHttpRequest` resolves every value into its declared slot,
+  secret-filled slots carrying only their wire name; `customDefinitionVersionIssues` refuses a
+  pinned version that no longer matches the current one.
+- [x] Integration (`apps/tool-runner/src/custom-tools.integration.test.ts`): a `custom_https` entry
+  created and attached through the real database, requested and approved through the real decision
+  path, resolves its exact approved definition through `gateway_custom_tool_definition` in a real
+  running tool runner — and the egress guard refuses its (necessarily loopback, for a test with no
+  external network) destination, never touching it; a runner serving a different namespace can
+  neither begin the action nor read the definition at all (cross-namespace denial, enforced by the
+  database, not only by the application).
+- [x] Controller integration (`apps/controller/src/console-tools.integration.test.ts`): every
+  `/api/tools*`/`/api/agents/:id/tools*` route — catalog list/detail, create/edit/delete (a write
+  without an idempotency header refused at create, a built-in's edit beyond name/description
+  refused, delete reports and then 404s), secret-alias status (`set` toggles from `false` to `true`
+  once the file exists, the response body never contains the value itself), a legacy agent's
+  requested-vs-effective read with unresolved patterns, attach (legacy conversion carried forward
+  in the same revision), idempotent replay, detach (no-op vs real), update, adopt (dry-run preview,
+  commit, `alreadyHubManaged` the second time); 401 without a session, 403 missing CSRF or a
+  foreign Origin.
+- [x] Integration (`packages/core/src/services/effective-permissions.integration.test.ts`,
+  extended): `missingPrerequisites` now part of `EffectiveAgentPermissions`, empty under the mock
+  adapter and `{ "repository.read": ["tests.run"] }` under Codex for the same attachment —
+  populated straight from `compileAttachments`, already unit-tested on its own in
+  `packages/policy/src/compile.test.ts`.
+- [x] Console unit (Vitest + Testing Library): the hub's own list groups by kind and filters by
+  search text, shows an error banner on a failed load, opens the create dialog; an entry's detail
+  page shows version history and attached agents, a built-in's edit dialog offers only name/
+  description while a `custom_https` entry's own exposes the full definition, a secret alias's
+  status and the exact CLI command for one still unset, "Attach to agent"; the delete dialog names
+  every agent that would lose the entry and reports a 409 inline; the agent Tools tab previews a
+  legacy agent's conversion read-only with "Adopt into the tools hub" offered, shows effective
+  access/implied capabilities/a missing runtime prerequisite/memory-write authority, detaches
+  directly, and opens "Attach a tool" excluding already-requested entries; `customHttpsDefinitionProblems`
+  reused directly (not reimplemented) for the create/edit form's own client-side validation.
+- [x] End to end (`apps/tool-runner/src/console-custom-tools.e2e.test.ts`): a custom HTTPS tool
+  created and attached entirely through the console's own HTTP routes (not core functions called
+  directly), a real mock-runtime turn requests it, a real approval is granted, a real tool runner
+  attempts it (the egress guard correctly refuses the necessarily-loopback destination, the same
+  security-correct outcome `custom-tools.integration.test.ts` already establishes — never weakened
+  to force a success); detaching it through the console and requesting it again is refused outright
+  by the turn's own authority before any approval is ever created (`status: "failed"`,
+  `error_code: "invalid_output"`, the same non-retryable rejection a denied memory write already
+  proves end to end in `tool-catalog-enforcement.integration.test.ts`).
+
+### Phase 15 review log
+
+- Per-change reviews (Codex) while building the catalog model, the compiler and enforcement,
+  custom HTTPS tools and the console hub — each fixed before the next change started.
+- Round 1 (Codex + Opus subagent): 2 P1 + 7 P2. Fixed: revisions written by the previous release
+  after a binary rollback, wildcard patterns in legacy effective lists, adoption bound to the
+  previewed revision, a missing secret file treated as a known failure, `tools adopt --all`
+  skipping retired agents, wildcard adoption bounds, idempotent replay before validation, console
+  form input and error handling.
+- Round 2: 1 P1 + 5 P2 + P3s. Fixed: restoring a former finance agent, deleting an entry also
+  revoking it from legacy agents, a 3xx never a success, bounded capability descriptions, receipt
+  safety of utility results, adoption bound to the catalog, console form keys and accessibility,
+  delete provenance and impact inside its own transaction, conflict-checked custom tool edits.
+- Round 3: 2 P1 + 4 P2 + 4 P3. Fixed: deleting or detaching an entry can no longer widen access
+  through an implied capability, approvals and execution use the agent's pinned definition
+  version, an implicit legacy conversion refuses unresolved patterns, prototype-safe lookups for
+  agent ids such as `constructor`, console modes filtered by kind, an authoritative secret-free
+  request preview on custom tool approval cards.
+- Round 4: 1 P1 + 5 P2. Fixed: the "a removal never widens permissions" check moved into the
+  commit itself and bound to the exact widening the owner accepted, implicit holders block a
+  delete, duplicate parameter names refused, own-property lookups everywhere (including the
+  hourly run limit). An approval card always carries the full request preview; a request whose
+  preview cannot be shown in full is refused when it is made.
+- Round 5: Codex 2 P1 + 3 P2, Opus 3 P2 + 3 P3. Fixed: a custom write answered with a server error
+  is an unknown outcome, agents see each custom tool's parameter contract, a deleted entry is
+  never granted implicitly (attach, restore, rollback), the preview encodes query values as sent,
+  adoption previews check permission list bounds, an invalid approval card fails the run cleanly,
+  surrogate-safe summary shrinking, an unresolvable custom action refused.
+- Final review of the fix commit: 1 P1 + 2 P2 (a deleted implied tool explicitly denied so the
+  runtime cannot infer it, a byte budget for capability descriptions, unambiguous enum choices in
+  the prompt) — fixed; the review of that fix found nothing further.
+
+Not yet released; see the Changelog's `[Unreleased]` section.
