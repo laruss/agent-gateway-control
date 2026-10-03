@@ -5,6 +5,7 @@ import {
 	compileAttachments,
 	compiledAgentPermissions,
 	compiledToolPolicyLists,
+	describeWidenedTools,
 	modeSupportedByKind,
 	widenedTools,
 } from "./compile.ts";
@@ -385,5 +386,47 @@ describe("widenedTools", () => {
 		});
 		expect(after.allow).toContain("workspace.write");
 		expect(widenedTools(before, after)).toEqual(["workspace.write"]);
+	});
+});
+
+describe("describeWidenedTools", () => {
+	it("names both levels a widened tool actually moved between, the canonical content a caller hashes", () => {
+		const before = compileAttachments({
+			...BASE,
+			attachments: [attachment("native-web-search", "disabled")],
+			catalog: CATALOG,
+		});
+		const after = compileAttachments({
+			...BASE,
+			attachments: [attachment("native-web-search", "allow")],
+			catalog: CATALOG,
+		});
+		expect(describeWidenedTools(before, after)).toEqual([
+			{ tool: "web.search", from: "deny", to: "allow" },
+		]);
+	});
+
+	it("sorts by tool name, and widenedTools is exactly its own tool names in the same order", () => {
+		const before = compileAttachments({
+			...BASE,
+			attachments: [
+				attachment("native-web-search", "disabled"),
+				attachment("native-tests-run", "require_approval"),
+				attachment("native-repository-read", "disabled"),
+				attachment("native-workspace-write", "disabled"),
+			],
+			catalog: CATALOG,
+		});
+		const after = compileAttachments({
+			...BASE,
+			attachments: [
+				attachment("native-web-search", "allow"),
+				attachment("native-tests-run", "allow"),
+			],
+			catalog: CATALOG,
+		});
+		const described = describeWidenedTools(before, after);
+		expect(described.map((w) => w.tool)).toEqual(widenedTools(before, after));
+		expect(described).toEqual([...described].sort((a, b) => (a.tool < b.tool ? -1 : 1)));
 	});
 });

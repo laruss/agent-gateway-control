@@ -77,7 +77,12 @@ describe("DeleteEntryDialog", () => {
 				jsonResponse(
 					{
 						error: "deleting this entry would widen one or more agents' effective permissions",
-						widenings: [{ agentId: "alpha", tools: ["workspace.write"] }],
+						widenings: [
+							{
+								agentId: "alpha",
+								tools: [{ tool: "workspace.write", from: "deny", to: "allow" }],
+							},
+						],
 					},
 					422,
 				),
@@ -96,7 +101,7 @@ describe("DeleteEntryDialog", () => {
 		);
 		await user.click(screen.getByRole("button", { name: /^delete$/i }));
 		expect(await screen.findByText(/would widen effective permissions/i)).toBeInTheDocument();
-		expect(screen.getByText(/alpha \(workspace\.write\)/)).toBeInTheDocument();
+		expect(screen.getByText(/alpha \(workspace\.write: deny -> allow\)/)).toBeInTheDocument();
 		expect(onDeleted).not.toHaveBeenCalled();
 	});
 

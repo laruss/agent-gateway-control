@@ -163,7 +163,13 @@ export function configBundleProblems(input: ConfigApplyInput): Readonly<string[]
 		if (agent.concurrency.max_active_runs !== 1) {
 			problems.push(`agent ${agent.id}: max_active_runs other than 1 is not supported yet`);
 		}
-		if (!(agent.id in input.rolePrompts) || input.rolePrompts[agent.id]?.trim() === "") {
+		// Own-property lookup, never `in` (which also walks the prototype chain: `"constructor" in
+		// {}` is `true`) or a bare bracket read: an agent id like `constructor` has no own property
+		// here when no caller actually supplied one, but `in`/a bracket read would otherwise resolve
+		// it, through the prototype chain, to `Object.prototype.constructor` — a function, not a role
+		// prompt string and not `undefined` either — wrongly treated as "present" or fed to
+		// `RolePromptSchema` as a confusing non-string failure instead of "missing or empty".
+		if (!Object.hasOwn(input.rolePrompts, agent.id) || input.rolePrompts[agent.id]?.trim() === "") {
 			problems.push(`agent ${agent.id}: role prompt is missing or empty`);
 			continue;
 		}
@@ -1031,7 +1037,12 @@ export async function writeConfigRevisionIn(
 			configVersion: version,
 			maxActiveRuns: agent.concurrency.max_active_runs,
 			config: agent,
-			rolePrompt: input.rolePrompts[agent.id] ?? "",
+			// Own-property lookup: see `configBundleProblems`'s own comment above — an agent id like
+			// `constructor` with no role prompt of its own would otherwise resolve, through the
+			// prototype chain, to `Object.prototype.constructor` instead of `undefined`.
+			rolePrompt:
+				(Object.hasOwn(input.rolePrompts, agent.id) ? input.rolePrompts[agent.id] : undefined) ??
+				"",
 			updatedAt: uow.now,
 		};
 		const existing = await lockAgent(db, agent.id);

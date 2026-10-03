@@ -73,14 +73,24 @@ longer shows.
 **Detaching (or deleting an entry entirely) never widens what an agent may actually do.** An
 attached `disabled`/`require_approval` can be the only thing suppressing a native dependency's
 implication (`tests.run` implying `workspace.write`): removing it would otherwise let that
-implication through the moment nothing explicit governs the implied tool any more. Both the Tools
-tab's own "Detach" and the hub's own entry-delete each compute every affected agent's effective
-permissions before and after the removal, and refuse — nothing committed, the console shows which
-tool would widen, for which agent — the moment any agent would gain anything. Detaching one
-attachment for one agent can be confirmed anyway (the Tools tab's own "Detach anyway", once it has
-shown the warning) since it is a normal, deliberate edit; deleting a catalog entry has no such
-override — an owner who means to widen several agents at once detaches or reconfigures each one
-individually first, under full review, rather than through one blanket confirm.
+implication through the moment nothing explicit governs the implied tool any more. This is enforced
+once, at the shared configuration-commit boundary itself — under its own lock, against the exact
+revision actually being committed, never a separate, earlier read a concurrent change could race —
+for every `detach_tool`/`clear_tool_attachments` (the hub's own entry-delete) and any
+`set_tool_attachments` that replaces an already hub-managed agent's list; the commit refuses
+(nothing written) the moment any agent would gain anything, naming every affected agent and tool.
+Detaching one attachment for one agent can be confirmed anyway (the Tools tab's own "Detach anyway",
+once it has shown the warning) by resubmitting the exact hash of the widening the console just
+displayed — never a bare "yes, I confirm" flag, so a confirm can never be replayed against a
+different, newer widening than the one actually shown; a stale or forged hash, or one computed from
+an earlier, now-superseded state, is refused the same way. Deleting a catalog entry has no such
+override at all — an owner who means to widen several agents at once detaches or reconfigures each
+one individually first, under full review, rather than through one blanket confirm. Deleting an
+entry is also refused while any agent effectively holds its capability only *implicitly*, through
+another attached tool's own dependency (`tests.run` implying `workspace.write`, with no attachment of
+`workspace.write`'s own entry at all) — otherwise the hub would show the capability retired
+everywhere while the compiler keeps granting it, unaffected; the owner reconfigures that agent's
+attachments first.
 
 An attachment's `mode` is bounded by its catalog entry's own `kind`, not only its risk floor:
 
@@ -235,6 +245,9 @@ A few rules the definition can never work around:
 - No two parameters (or a parameter and a secret) ever target the same slot — header names compare
   case-insensitively, since two differently-cased spellings are the same HTTP header — and none of
   them may target the idempotency header either.
+- No two parameters ever share the same `name`, even across different slots — a request resolves a
+  value by `name` alone, so two differently-slotted parameters named alike would silently resolve to
+  the model's one value in both places instead of two independent ones.
 - A secret may never sit in the `path` (it would be visible, and the approval card shows the
   resolved path).
 - A write (anything but `GET`) must declare `idempotency`; a `GET` must not — a write without a
@@ -311,7 +324,15 @@ redefine.
 The approval card itself shows an authoritative, secret-free **request preview** — method, the
 resolved path, query/header/body field names, a secret-filled slot named but never its value — in
 its own block, separate from the model's own free-text summary: the summary is the agent's prose,
-the preview is exactly what will run.
+the preview is exactly what will run, and it is never cut to make room for anything else. A
+resolved value long enough to push the preview past its own stored bound (a percent-encoded path
+segment with non-ASCII content, say) refuses the whole request outright — "the request is too
+large to show in full for approval; use shorter values" — rather than showing the owner a cut
+preview; the same is true of the finished card against Mattermost's own post limit as a whole: if
+room is needed, only the model's own summary is shortened (never the preview, never the
+parameters, which are bounded, and refused rather than trimmed, before the request is ever
+created), and if the card still does not fit even with the summary dropped entirely, the request is
+refused the same way, before an approval ever exists.
 
 ### What config rollback covers
 

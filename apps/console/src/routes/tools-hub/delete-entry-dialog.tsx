@@ -9,7 +9,7 @@ import {
 	DialogHeader,
 	DialogTitle,
 } from "@/components/ui/dialog";
-import { ApiError, deleteCatalogEntry } from "@/lib/api-client";
+import { ApiError, deleteCatalogEntry, formatWidenedTools } from "@/lib/api-client";
 
 export type DeleteEntryDialogProps = Readonly<{
 	open: boolean;
@@ -64,7 +64,7 @@ export function DeleteEntryDialog({
 			if (result.kind === "would_widen") {
 				setError(
 					`Deleting this entry would widen effective permissions for ${result.widenings
-						.map((widening) => `${widening.agentId} (${widening.tools.join(", ")})`)
+						.map((widening) => `${widening.agentId} (${formatWidenedTools(widening.tools)})`)
 						.join("; ")} — detach or reconfigure those attachments first.`,
 				);
 				return;

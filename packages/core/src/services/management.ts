@@ -22,6 +22,7 @@ import {
 	type JsonValue,
 	MAX_ATTACHMENTS_PER_AGENT,
 	type OrganizationConfig,
+	Sha256HexSchema,
 	type TextChange,
 	type ToolAttachment,
 	type ToolAttachmentsBundle,
@@ -49,7 +50,10 @@ import {
 	writeConfigRevisionIn,
 } from "./admin.ts";
 import {
+	type AttachmentWidening,
+	acceptWideningHash,
 	attachmentCatalogProblems,
+	changeSetWidenings,
 	mirrorCompiledAttachmentPermissions,
 } from "./attachment-validation.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
@@ -739,8 +743,15 @@ function attachmentsDiff(
 	const agentIds = [...new Set([...Object.keys(before), ...Object.keys(after)])].sort();
 	const result: ConfigDiffAttachment[] = [];
 	for (const agentId of agentIds) {
-		const beforeByEntry = new Map((before[agentId] ?? []).map((a) => [a.entryId, a]));
-		const afterByEntry = new Map((after[agentId] ?? []).map((a) => [a.entryId, a]));
+		// Own-property lookup, never bare bracket access: `before`/`after` are plain-object
+		// dictionaries keyed by agent id, and an agent id like `constructor` has no own property in
+		// one of them (added or removed entirely) but still resolves, through the prototype chain, to
+		// `Object.prototype.constructor` — a function, not `undefined` and not an array — which would
+		// otherwise crash the `.map()` below instead of being read as "no attachments".
+		const beforeAttachments = Object.hasOwn(before, agentId) ? before[agentId] : undefined;
+		const afterAttachments = Object.hasOwn(after, agentId) ? after[agentId] : undefined;
+		const beforeByEntry = new Map((beforeAttachments ?? []).map((a) => [a.entryId, a]));
+		const afterByEntry = new Map((afterAttachments ?? []).map((a) => [a.entryId, a]));
 		const entryIds = [...new Set([...beforeByEntry.keys(), ...afterByEntry.keys()])].sort();
 		for (const entryId of entryIds) {
 			const beforeAttachment = beforeByEntry.get(entryId);
@@ -800,7 +811,16 @@ export function configDiff(before: ConfigDraftBundle, after: ConfigDraftBundle):
 			continue;
 		}
 		const fieldPaths = structuralFieldPaths(beforeAgent, afterAgent, 1);
-		const rolePrompt = textChange(before.rolePrompts[id] ?? "", after.rolePrompts[id] ?? "");
+		// Own-property lookup, never plain bracket access: an agent id like `constructor` has no own
+		// property in `rolePrompts` on a side that never recorded one for it, but still resolves,
+		// through the prototype chain, to `Object.prototype.constructor` — a function, not a role
+		// prompt string, which `?? ""` would not catch (the function is not nullish) and which
+		// `textChange` would then measure as if it were real prompt text.
+		const beforeRolePrompt =
+			(Object.hasOwn(before.rolePrompts, id) ? before.rolePrompts[id] : undefined) ?? "";
+		const afterRolePrompt =
+			(Object.hasOwn(after.rolePrompts, id) ? after.rolePrompts[id] : undefined) ?? "";
+		const rolePrompt = textChange(beforeRolePrompt, afterRolePrompt);
 		if (fieldPaths.length === 0 && !rolePrompt.changed) {
 			continue;
 		}
@@ -996,6 +1016,41 @@ export class ManagementConflictError extends Error {
 	}
 }
 
+/**
+ * Thrown by `commitChangeIn` (ADR-027) when a `detach_tool`/`clear_tool_attachments`/
+ * `set_tool_attachments` operation in the change set being committed would widen one or more
+ * agents' effective permissions — `widenings` names every agent and tool affected
+ * (`changeSetWidenings`, `attachment-validation.ts`), computed fresh under this same commit's own
+ * lock, against the exact revision it is about to replace, never a caller's own earlier,
+ * separately-read preview. `acceptWidening` is the canonical hash of this exact `widenings` list
+ * (`acceptWideningHash`): a caller that has already seen it (the console's own 422 response) echoes
+ * it back as `CommitChangeInput.acceptWidening` to proceed anyway — refused the moment a concurrent
+ * change makes this same computation, run again, produce a different list, since a stale or forged
+ * hash can never match what the server just computed itself. `deleteCatalogEntry` gives a caller no
+ * way to supply this at all: a catalog-wide delete affecting agents the owner may not have reviewed
+ * individually has no confirm step of its own, unlike a single attachment `detachTool` lets the
+ * owner deliberately turn off.
+ */
+export class WidensPermissionsError extends Error {
+	constructor(
+		readonly widenings: Readonly<AttachmentWidening[]>,
+		readonly acceptWidening: string,
+	) {
+		super(
+			"would widen effective permissions for: " +
+				widenings
+					.map(
+						(widening) =>
+							`${widening.agentId} (${widening.tools
+								.map((tool) => `${tool.tool}: ${tool.from} -> ${tool.to}`)
+								.join(", ")})`,
+					)
+					.join("; "),
+		);
+		this.name = "WidensPermissionsError";
+	}
+}
+
 /** What the commit transaction settled on; a conflict is thrown only once it has committed. */
 export type CommitOutcome =
 	| Readonly<{ kind: "committed"; result: CommitChangeResult }>
@@ -1017,6 +1072,12 @@ export type CommitChangeInput = Readonly<{
 	actor: string;
 	source: ConfigRevisionSource;
 	reason?: string;
+	/** `WidensPermissionsError.acceptWidening`, from a widening this exact caller already saw
+	 * (ADR-027): the owner's explicit acknowledgement that a removal's own widening is intended.
+	 * Checked after the idempotent-replay lookup above (a committed key replays without
+	 * re-evaluating this at all) and against the widenings this commit computes right now, under its
+	 * own lock — never the ones an earlier, separate read might have shown. */
+	acceptWidening?: string;
 }>;
 
 /** The hash a retry under the same idempotency key is compared against (`requestIdentity`). */
@@ -1071,6 +1132,12 @@ function checkCommitChangeInput(
 		const key = IdempotencyKeySchema.safeParse(input.idempotencyKey);
 		if (!key.success) {
 			problems.push(...key.error.issues.map((issue) => `idempotencyKey: ${issue.message}`));
+		}
+	}
+	if (input.acceptWidening !== undefined) {
+		const hash = Sha256HexSchema.safeParse(input.acceptWidening);
+		if (!hash.success) {
+			problems.push(...hash.error.issues.map((issue) => `acceptWidening: ${issue.message}`));
 		}
 	}
 	return { problems, changeSet: changeSet.success ? changeSet.data : null };
@@ -1395,6 +1462,29 @@ export async function commitChangeIn(
 	}
 	if (draft.organization === null) {
 		throw new AdminError("internal: a validated configuration always has an organization");
+	}
+	// "A removal never widens effective permissions" (ADR-027), enforced here, under this same
+	// commit's lock and against the exact revision it is about to replace — never a separate,
+	// earlier read `detachTool`/`deleteCatalogEntry` used to take outside any transaction, racing a
+	// concurrent change between that read and this commit. Every other change-set operation
+	// (`attach_tool`, `update_attachment`, a plain `replace_bundle`) grants or restricts something
+	// the owner explicitly asked for and is never checked here — `changeSetWidenings` only ever
+	// looks at `detach_tool`/`clear_tool_attachments`/`set_tool_attachments`.
+	const widenings = await changeSetWidenings(
+		db,
+		changeSet,
+		{
+			agents: base.agents,
+			toolAttachments: base.toolAttachments,
+			financeAgentId: (base.organization?.organization.finance_agent_id ?? "") as AgentId,
+		},
+		{ toolAttachments: draft.toolAttachments },
+	);
+	if (widenings.length > 0) {
+		const acceptWidening = acceptWideningHash(widenings);
+		if (input.acceptWidening !== acceptWidening) {
+			throw new WidensPermissionsError(widenings, acceptWidening);
+		}
 	}
 	const botSecretProblems = await rejectUnownedBotSecretPaths(
 		db,

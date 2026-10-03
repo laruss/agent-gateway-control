@@ -255,6 +255,21 @@ export function customHttpsDefinitionProblems(
 			);
 		}
 	}
+	// Every parameter's own `name` (what the model fills in) must be unique across the whole
+	// definition, even across different slots: `resolveCustomHttpRequest` looks a value up by
+	// `param.name` alone (`given.get(param.name)`), so two parameters sharing a name — a path
+	// parameter and a header parameter both called `id`, say — would silently resolve to the exact
+	// same model-supplied value in both places, never the two independent values a definition author
+	// naming them the same by mistake most likely intended.
+	const paramNameCounts = new Map<string, number>();
+	for (const param of definition.parameters) {
+		paramNameCounts.set(param.name, (paramNameCounts.get(param.name) ?? 0) + 1);
+	}
+	for (const [name, count] of paramNameCounts) {
+		if (count > 1) {
+			problems.push(`parameter '${name}' is declared more than once`);
+		}
+	}
 	// Every (slot, slotName) pair must be unique across parameters, secret slots and the
 	// idempotency header: two sources writing the same header or body field would make the actual
 	// request ambiguous, and a parameter or secret quietly aliasing the idempotency header could

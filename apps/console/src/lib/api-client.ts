@@ -321,16 +321,39 @@ const InvalidBodySchema = z.strictObject({
 	problems: z.array(z.string()),
 });
 
+/** One tool whose effective access level would increase, naming both levels (ADR-027). */
+const PermissionWideningSchema = z.object({
+	tool: z.string(),
+	from: z.enum(["deny", "require_approval", "allow"]),
+	to: z.enum(["deny", "require_approval", "allow"]),
+});
+export type PermissionWidening = z.infer<typeof PermissionWideningSchema>;
+
 /** One agent, and the tools its effective permissions would gain — `detachTool`/`deleteCatalogEntry`'s
  * own `would_widen` (422) outcome (ADR-027: removing an attachment must never widen access). A
  * `problems`-less shape of its own, since `InvalidBodySchema` above is a `strictObject` and refuses
  * an unknown `widenings` key just as it would refuse a missing `problems` one. */
-const WideningSchema = z.object({ agentId: z.string(), tools: z.array(z.string()) });
+const WideningSchema = z.object({ agentId: z.string(), tools: z.array(PermissionWideningSchema) });
 const WidenBodySchema = z.strictObject({
 	error: z.string(),
 	widenings: z.array(WideningSchema),
 });
 export type Widening = z.infer<typeof WideningSchema>;
+
+/** `WidenBodySchema`, plus the hash a detach's own confirm resubmits as `acceptWidening` to proceed
+ * anyway (ADR-027) — `deleteCatalogEntry` has no such override, so only `detachTool`'s own `422`
+ * carries this field. */
+const DetachWidenBodySchema = z.strictObject({
+	error: z.string(),
+	widenings: z.array(WideningSchema),
+	acceptWidening: z.string(),
+});
+
+/** `${tool}: ${from} -> ${to}` for every widening a `would_widen` (422) names, for an agent — the
+ * one formatting both the delete and detach confirm flows show. */
+export function formatWidenedTools(tools: Readonly<PermissionWidening[]>): string {
+	return tools.map((widening) => `${widening.tool}: ${widening.from} -> ${widening.to}`).join(", ");
+}
 
 /** `POST /api/agents/:id/preview`'s own documented outcomes (ADR-025): `conflict` (409) means
  * `baseRevisionId` is not the revision actually active right now — the editor's own loaded view,
@@ -734,7 +757,7 @@ export async function attachTool(
 export type DetachToolOutcome =
 	| Readonly<{ kind: "ok"; response: ConsoleDetachToolResponse }>
 	| Readonly<{ kind: "conflict"; currentRevisionId: number | null }>
-	| Readonly<{ kind: "would_widen"; widenings: Readonly<Widening[]> }>
+	| Readonly<{ kind: "would_widen"; widenings: Readonly<Widening[]>; acceptWidening: string }>
 	| Readonly<{ kind: "invalid"; problems: Readonly<string[]> }>;
 
 export async function detachTool(
@@ -752,9 +775,13 @@ export async function detachTool(
 	}
 	if (response.status === 422) {
 		const parsedBody = await response.json();
-		const widen = WidenBodySchema.safeParse(parsedBody);
+		const widen = DetachWidenBodySchema.safeParse(parsedBody);
 		if (widen.success) {
-			return { kind: "would_widen", widenings: widen.data.widenings };
+			return {
+				kind: "would_widen",
+				widenings: widen.data.widenings,
+				acceptWidening: widen.data.acceptWidening,
+			};
 		}
 		return { kind: "invalid", problems: InvalidBodySchema.parse(parsedBody).problems };
 	}

@@ -280,21 +280,49 @@ existed re-enabling a row after it had already left the active configuration) �
 `tools_deny` already covers the key, since denying a tool is not "holding" it
 (`packages/policy/src/tools.ts`'s own enforcement checks `deny` before `allow`/`requireApproval`).
 
-**Never widens any affected agent's effective permissions, either.** Clearing a `disabled` or
+**Never widens any affected agent's effective permissions, either — enforced once, at the shared
+commit boundary, never a caller's own separate, earlier read.** Clearing a `disabled` or
 `require_approval` attachment of the deleted entry can be the one thing standing between an agent
 and a native dependency's implication it would otherwise suppress (`tests.run` implying
-`workspace.write`, `NATIVE_TOOL_DEPENDENCIES`): `deleteCatalogEntry` computes every affected agent's
-compiled attachments before and after the clear (`widenedByRemovingAttachment`,
-`attachment-validation.ts`, built on `compileAttachments` and `widenedTools`,
-`@agent-gateway/policy`) and refuses the whole delete — nothing committed, `WidensPermissionsError`
-naming every agent and the tool it would gain — the moment any agent would gain anything; the owner
-detaches or reconfigures that agent's attachments first. `detachTool` applies the identical check
-for the one agent it is called on, with an escape hatch `deleteCatalogEntry` deliberately has none
-of: `DetachToolInput.confirmWidening`, an explicit acknowledgement that the owner actually intends
-the widening (the console's own confirm step, once it has shown which tool would widen) — a single
-attachment the owner is deliberately turning off is a normal, everyday edit a confirm can clear,
-where a catalog-wide delete affecting agents the owner may not even have reviewed individually is
-not.
+`workspace.write`, `NATIVE_TOOL_DEPENDENCIES`). `commitChangeIn` (`management.ts`) itself computes
+every affected agent's compiled attachments before and after the change, under its own lock and
+against the exact revision it is about to replace, for every change set containing a `detach_tool`,
+a `clear_tool_attachments` (`deleteCatalogEntry`'s own operation) or a `set_tool_attachments` that
+*replaces* an already hub-managed agent's list (never the first conversion that establishes one,
+which is "identical in effect" by construction — adoption's own invariant) — `changeSetWidenings`,
+`attachment-validation.ts`, built on `compileAttachments` and `describeWidenedTools`,
+`@agent-gateway/policy`. It refuses the whole commit — nothing written, `WidensPermissionsError`
+naming every agent and tool affected, both the level it moves from and to — unless the caller's own
+`CommitChangeInput.acceptWidening` names the exact canonical hash (`acceptWideningHash`) this same
+computation, run again right now, actually produces: a stale hash (a concurrent change landed since
+whatever showed it) or a forged one can never match. `detachTool` threads this straight through as
+its own `DetachToolInput.acceptWidening` — an explicit acknowledgement that the owner actually
+intends the widening the console's own confirm step just displayed, never a bare boolean unbound to
+*which* widening was shown — a single attachment the owner is deliberately turning off is a normal,
+everyday edit a confirm can clear; `deleteCatalogEntry` gives a caller no way to supply one at all,
+since a catalog-wide delete affecting agents the owner may not even have reviewed individually has no
+confirm step of its own. Neither function keeps a precheck of its own any more: an earlier version
+of this design ran the check before, and outside, the commit (a plain read with no lock at all),
+which a concurrent change landing in between it and the actual commit went unnoticed by, and which
+refused a keyed retry of an already-committed detach instead of replaying it (the retry's own precheck
+saw the post-commit state and could compute a different, or no, widening). Checking only inside
+`commitChangeIn` — after its own idempotent-replay lookup, so a committed key replays without
+re-evaluating anything — closes both gaps by construction: there is no window between a read and the
+commit for anything to race, because they are the same transaction.
+
+**Refused, the same way, while any agent effectively holds the deleted entry's capability only
+*implicitly*.** Clearing `affected` (every agent directly attached to the entry being deleted) misses
+a narrower case entirely: an agent that never attached the entry at all, but holds its
+`implementationKey` anyway because another attached tool implies it (`tests.run` implying
+`workspace.write`, with no `native-workspace-write` attachment of its own) — `affected` would be
+empty, the delete would commit cleanly reporting `affected: []`, and the hub would show the
+capability retired everywhere while the compiler, reading that other, still-attached tool's own
+implication, keeps granting it regardless. `agentsImplicitlyHoldingTool`
+(`attachment-validation.ts`) finds every hub-managed agent whose compiled `impliedBy` names the
+entry's `implementationKey` and refuses the delete outright — nothing committed, naming the agent and
+which attached tool implies it — the same way `legacyAgentsGrantingTool` already refuses while a
+*legacy* agent's own `permissions` still cover it; between the two, every agent that would keep the
+capability is caught, whichever kind of agent it is.
 
 **Returns what it actually affected, read fresh inside its own transaction.** A caller's own,
 separately-read "impact preview" (the console's entry-detail page, loaded before the owner clicks
@@ -556,7 +584,11 @@ content types, a timeout); and, for anything but `GET`, a required idempotency h
 `customHttpsDefinitionProblems` (`@agent-gateway/contracts`, pure) refuses a definition whose path
 placeholders and path parameters do not match exactly, whose slots collide (header names compared
 case-insensitively, since two differently-cased spellings are the same HTTP header; the
-idempotency header itself is one more name nothing else may target), that declares a parameter
+idempotency header itself is one more name nothing else may target), that declares two parameters
+sharing the same `name` even across different slots (a request resolves a value by `name` alone —
+`given.get(param.name)` — so two differently-slotted parameters named alike would otherwise
+silently resolve to the model's one supplied value in both places, never the two independent values
+a definition author naming them the same by mistake most likely intended), that declares a parameter
 named `custom_tool_definition_version` (reserved for the controller's own pin, below), that puts a
 secret in the path, or that is a write without an idempotency mechanism — a write cannot be saved
 at all without one. Editing a `custom_https` entry (`editCatalogEntry`) publishes a new version precisely
@@ -638,6 +670,41 @@ slot named by its slot only, never its value) into the card's own `customRequest
 shown in its own block — "Request preview (authoritative; no secret value is ever shown)" —
 separate from the model's own summary, since one is the agent's prose and the other is exactly what
 will run.
+
+**The owner always sees the complete preview, never a cut one.** A preview that does not fit
+`CUSTOM_REQUEST_PREVIEW_MAX` (`MattermostApprovalPayloadSchema.customRequestPreview`'s own schema
+bound, 4000 — a resolved path or query value is percent-encoded, and a long enough non-ASCII one,
+each CJK character three UTF-8 bytes, nine characters once percent-encoded, can make the rendering
+exceed that bound on its own) refuses the whole draft outright, before an approval ever exists
+(`customApprovalRequestPreview`, `packages/core`, returning a refusal rather than a truncated
+string) — never trimmed to fit: an owner must either see exactly what will run, or never be asked
+to approve it at all.
+
+A preview individually fitting its own field is not the same as the *whole card* fitting
+Mattermost's own post limit (16,383 characters): `fitApprovalCard`
+(`@agent-gateway/contracts`) — shared, verbatim, by the controller and the renderer, so the two can
+never disagree on what a finished card costs — lays out every other line (the model's own summary,
+the parameters, already bounded and refused rather than trimmed by `ApprovalRequestDraftSchema`'s
+own budget before the request is ever created, the mixed-script warning, the approval code and
+hash) alongside the preview in its own block, and, when the full card does not fit, shortens only
+the summary — never the preview, never the parameters — down to omitting the summary block
+entirely. The controller (`runs.ts`) calls this *before* an approval is created: once even an
+entirely-dropped summary still does not fit, the request is refused at request time, the same way
+an oversized preview is, rather than ever being stored. A request that passed this check always
+renders exactly as checked — the renderer (`@agent-gateway/mattermost`) calls the identical
+function and simply posts whatever it returns. `createApproval`
+(`packages/core/src/services/runs.ts`) still parses the finished card against
+`MattermostApprovalPayloadSchema` immediately before enqueuing it, as a defensive re-check of the
+schema's own field shapes, now that the whole-card-fit question is already decided before this
+point.
+
+The one case `fitApprovalCard` still returns "does not fit" to a caller is data a release before
+this rule existed already created and stored: such a row's own `customRequestPreview` was bounded
+only to its own 4000-character field, never checked against the whole card, so replaying it through
+today's renderer can still overflow even once its summary is dropped. The renderer never responds
+to that by trimming or omitting the stored preview — doing so would be exactly the weakness this
+rule exists to close — and instead renders a short, fixed notice with no approval code on it at
+all: the request cannot be shown in full, and so cannot be approved from this card.
 
 **Egress.** `resolvePinnedAddress` (`@agent-gateway/tool-broker`'s `egress.ts`) is the one gate
 every `custom_https` call passes through before a socket ever opens: `host` is resolved once (an

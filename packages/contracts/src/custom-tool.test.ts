@@ -94,6 +94,28 @@ describe("customHttpsDefinitionProblems", () => {
 		expect(problems.some((p) => p.includes("both target body 'summary'"))).toBe(true);
 	});
 
+	it("refuses two parameters sharing the same name even across different slots", () => {
+		// `id` already names the path parameter; a second parameter also called `id`, mapped into a
+		// header instead, targets a different slot entirely — the existing same-slot check above
+		// would not catch this, but `resolveCustomHttpRequest` resolves a value by `name` alone, so
+		// the model's one `id` value would silently land in both places.
+		const bad = definition({
+			parameters: [
+				...definition().parameters,
+				{
+					name: "id",
+					slot: "header",
+					slotName: "x-ticket-id",
+					type: "string",
+					minLength: 1,
+					maxLength: 50,
+				},
+			],
+		});
+		const problems = customHttpsDefinitionProblems(bad);
+		expect(problems).toContain("parameter 'id' is declared more than once");
+	});
+
 	it("refuses a secret mapped into the path", () => {
 		const bad = definition({
 			secretSlots: [{ alias: "api_key", slot: "path", slotName: "id" }],

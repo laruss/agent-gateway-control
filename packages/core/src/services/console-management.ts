@@ -211,7 +211,13 @@ export async function consoleShowAgent(
 				allowedChannels: agent.mattermost.allowed_channels,
 			},
 			runtime: agent.runtime,
-			rolePrompt: bundle.rolePrompts[agent.id] ?? "",
+			// Own-property lookup, never plain bracket access: an agent id like `constructor` has no
+			// own property in this plain-object dictionary but still resolves, through the prototype
+			// chain, to `Object.prototype.constructor` — truthy, and not a role prompt string — which
+			// `?? ""` alone would not catch.
+			rolePrompt:
+				(Object.hasOwn(bundle.rolePrompts, agent.id) ? bundle.rolePrompts[agent.id] : undefined) ??
+				"",
 			wakeRules: agent.wake_rules,
 			permissions: agent.permissions,
 			// Own-property check, never plain bracket access: an agent id like `constructor` has no

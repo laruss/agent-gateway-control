@@ -52,6 +52,25 @@ export const TOOL_ATTACHMENT_MODES = ["allow", "require_approval", "disabled"] a
 export const ToolAttachmentModeSchema = z.enum(TOOL_ATTACHMENT_MODES);
 export type ToolAttachmentMode = z.infer<typeof ToolAttachmentModeSchema>;
 
+/** A tool's effective access level, lowest to highest: `deny` (absence from every list enforces
+ * identically), `require_approval`, `allow`. Lives here, beside `ToolAttachmentModeSchema`, rather
+ * than in `@agent-gateway/policy`: the console's own widening confirm dialog needs this same shape
+ * (`PermissionWideningSchema` below) without pulling in that package's IO-adjacent logic —
+ * `@agent-gateway/policy`'s `compile.ts` re-exports both unchanged. */
+export const TOOL_ACCESS_LEVELS = ["deny", "require_approval", "allow"] as const;
+export const ToolAccessLevelSchema = z.enum(TOOL_ACCESS_LEVELS);
+export type ToolAccessLevel = z.infer<typeof ToolAccessLevelSchema>;
+
+/** One tool whose effective access level would increase, naming both levels (ADR-027: "a removal
+ * never widens effective permissions") — `describeWidenedTools`'s (`@agent-gateway/policy`) own
+ * result shape, and the canonical content `acceptWideningHash` hashes. */
+export const PermissionWideningSchema = z.strictObject({
+	tool: ToolNameSchema,
+	from: ToolAccessLevelSchema,
+	to: ToolAccessLevelSchema,
+});
+export type PermissionWidening = z.infer<typeof PermissionWideningSchema>;
+
 /**
  * Whether `mode` clears `riskFloor`: `mode: "allow"` is refused once `riskFloor` is
  * `require_approval` (only `require_approval` or `disabled` are accepted then); `disabled` is

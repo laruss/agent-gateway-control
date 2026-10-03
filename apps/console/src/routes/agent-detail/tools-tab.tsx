@@ -14,7 +14,7 @@ import {
 	TableHeader,
 	TableRow,
 } from "@/components/ui/table";
-import { ApiError, detachTool, fetchAgentTools } from "@/lib/api-client";
+import { ApiError, detachTool, fetchAgentTools, formatWidenedTools } from "@/lib/api-client";
 import { AdoptDialog } from "./adopt-dialog.tsx";
 import { AttachEntryDialog } from "./attach-entry-dialog.tsx";
 
@@ -54,17 +54,18 @@ export function ToolsTab({ agentId }: Readonly<{ agentId: string }>): React.Reac
 		void load();
 	}, [load]);
 
-	/** `confirmWidening`: the owner's own explicit acknowledgement, from the warning toast's own
-	 * "Detach anyway" action below — detaching never silently widens what this agent may do
-	 * (ADR-027: an attached `disabled`/`require_approval` can be the only thing suppressing a
-	 * native dependency's implication). */
-	async function handleDetach(entryId: string, confirmWidening = false) {
+	/** `acceptWidening`: the owner's own explicit acknowledgement, from the warning toast's own
+	 * "Detach anyway" action below (the hash that same `would_widen` response just showed) —
+	 * detaching never silently widens what this agent may do (ADR-027: an attached
+	 * `disabled`/`require_approval` can be the only thing suppressing a native dependency's
+	 * implication). */
+	async function handleDetach(entryId: string, acceptWidening?: string) {
 		setDetachingEntryId(entryId);
 		try {
 			const result = await detachTool(agentId, {
 				idempotencyKey: crypto.randomUUID(),
 				entryId,
-				...(confirmWidening ? { confirmWidening: true } : {}),
+				...(acceptWidening === undefined ? {} : { acceptWidening }),
 			});
 			if (result.kind === "conflict") {
 				toast.error(
@@ -74,10 +75,13 @@ export function ToolsTab({ agentId }: Readonly<{ agentId: string }>): React.Reac
 			}
 			if (result.kind === "would_widen") {
 				const summary = result.widenings
-					.map((widening) => `${widening.agentId}: ${widening.tools.join(", ")}`)
+					.map((widening) => `${widening.agentId}: ${formatWidenedTools(widening.tools)}`)
 					.join("; ");
 				toast.warning(`Detaching '${entryId}' would widen effective permissions — ${summary}.`, {
-					action: { label: "Detach anyway", onClick: () => void handleDetach(entryId, true) },
+					action: {
+						label: "Detach anyway",
+						onClick: () => void handleDetach(entryId, result.acceptWidening),
+					},
 				});
 				return;
 			}

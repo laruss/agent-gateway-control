@@ -695,7 +695,13 @@ async function findLastConfiguredAgent(
 		return null;
 	}
 	const agent = parsed.data.agents.find((candidate) => candidate.id === agentId);
-	const rolePrompt = parsed.data.rolePrompts[agentId];
+	// Own-property lookup: an agent id like `constructor` with no role prompt of its own in this
+	// historical snapshot would otherwise resolve, through the prototype chain, to
+	// `Object.prototype.constructor` — a function, not `undefined` — and so would never be treated as
+	// "missing" by the check below.
+	const rolePrompt = Object.hasOwn(parsed.data.rolePrompts, agentId)
+		? parsed.data.rolePrompts[agentId]
+		: undefined;
 	if (agent === undefined || rolePrompt === undefined) {
 		return null;
 	}

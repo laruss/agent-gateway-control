@@ -213,7 +213,13 @@ function buildExportFiles(
 	setFileContent(files, organization.organization.constitution_file, constitution);
 	for (const agent of [...agents].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
 		files.set(`${AGENTS_DIR}/${agent.id}.yaml`, yamlText(agent));
-		setFileContent(files, agent.prompts.role_file, rolePrompts[agent.id] ?? "");
+		// Own-property lookup, never plain bracket access: an agent id like `constructor` has no own
+		// property in `rolePrompts` when none was ever recorded for it, but still resolves, through
+		// the prototype chain, to `Object.prototype.constructor` — a function, not `undefined`, which
+		// `?? ""` would not catch and `setFileContent` would then write as this agent's role prompt.
+		const rolePrompt =
+			(Object.hasOwn(rolePrompts, agent.id) ? rolePrompts[agent.id] : undefined) ?? "";
+		setFileContent(files, agent.prompts.role_file, rolePrompt);
 	}
 	files.set(TOOL_ATTACHMENTS_FILE, toolAttachmentsText(toolAttachments));
 	const manifestFiles: Record<string, string> = {};

@@ -343,10 +343,10 @@ describe("applyChangeSet", () => {
 	// An agent id of `constructor` is a valid `AgentId` (lowercase letters only); `toolAttachments`
 	// is a plain-object dictionary, so a naive `draft.toolAttachments[op.agentId]` would otherwise
 	// resolve, through the prototype chain, to `Object.prototype.constructor` (a function) instead
-	// of `undefined` whenever this agent has no own entry yet — these assertions deliberately never
-	// read `draft.toolAttachments.constructor`/`draft.toolAttachments["constructor"]` directly for
-	// that same reason; `Object.hasOwn` is the only safe way to ask "does this agent have an entry
-	// at all".
+	// of `undefined` whenever this agent has no own entry yet. `Object.hasOwn` is the only safe way
+	// to ask "does this agent have an entry at all" first — once it has confirmed one does, reading
+	// it back (`draft.toolAttachments.constructor` below) is exactly as safe as any other key, since
+	// an own property always shadows the prototype regardless of dot or bracket notation.
 	describe("an agent literally named 'constructor'", () => {
 		it("attach_tool succeeds and records a real, own attachment entry", () => {
 			const base = bundleOf([agent("constructor")]);
@@ -360,7 +360,7 @@ describe("applyChangeSet", () => {
 			});
 			expect(problems).toEqual([]);
 			expect(Object.hasOwn(draft.toolAttachments, "constructor")).toBe(true);
-			expect(draft.toolAttachments["constructor"]).toEqual([
+			expect(draft.toolAttachments.constructor).toEqual([
 				{ entryId: "gateway-mattermost-post", pinnedVersion: null, mode: "allow", settings: {} },
 			]);
 		});
@@ -408,7 +408,7 @@ describe("applyChangeSet", () => {
 			});
 			expect(problems).toEqual([]);
 			expect(Object.hasOwn(draft.toolAttachments, "constructor")).toBe(true);
-			expect(draft.toolAttachments["constructor"]).toEqual([]);
+			expect(draft.toolAttachments.constructor).toEqual([]);
 		});
 	});
 
@@ -840,6 +840,60 @@ describe("configDiff", () => {
 				agentId: "alpha",
 				entryId: "gateway-mattermost-post",
 				fields: ["mode", "pinnedVersion", "settings"],
+			},
+		]);
+	});
+
+	it("diffs an agent literally named 'constructor' without crashing, whichever side it is missing from", () => {
+		// `toolAttachments` is a plain-object dictionary keyed by agent id; a naive
+		// `before["constructor"]`/`after["constructor"]` would otherwise resolve, through the
+		// prototype chain, to `Object.prototype.constructor` (a function, not an array) the moment
+		// the id is absent from one side, and `.map()` on it would throw instead of reading "no
+		// attachments".
+		const before: ConfigDraftBundle = {
+			...bundleOf([agent("constructor")]),
+			toolAttachments: {
+				constructor: [
+					{
+						entryId: "gateway-mattermost-post",
+						pinnedVersion: null,
+						mode: "allow" as const,
+						settings: {},
+					},
+				],
+			},
+		};
+		// Present only in `after`: the "added to a side that previously had no own key" case.
+		const addedOnly: ConfigDraftBundle = { ...before, toolAttachments: {} };
+		expect(() => configDiff(addedOnly, before).toolAttachments).not.toThrow();
+		expect(configDiff(addedOnly, before).toolAttachments).toEqual([
+			{ kind: "added", agentId: "constructor", entryId: "gateway-mattermost-post" },
+		]);
+		// Present only in `before`: the reverse, "removed" case.
+		expect(() => configDiff(before, addedOnly).toolAttachments).not.toThrow();
+		expect(configDiff(before, addedOnly).toolAttachments).toEqual([
+			{ kind: "removed", agentId: "constructor", entryId: "gateway-mattermost-post" },
+		]);
+	});
+
+	it("diffs an agent literally named 'constructor's own role prompt as real text, never Object.prototype.constructor", () => {
+		// `bundleOf` gives every agent a role prompt of its own; dropping it from one side's
+		// `rolePrompts` (never an own key there at all) is what would otherwise fall through to the
+		// prototype — a bare `rolePrompts[id] ?? ""` cannot tell "no own key" from "a truthy
+		// non-string value" apart, and would hand `textChange` a function to measure instead of "".
+		const before: ConfigDraftBundle = { ...bundleOf([agent("constructor")]), rolePrompts: {} };
+		const after = bundleOf([agent("constructor")]);
+		const diff = configDiff(before, after);
+		expect(diff.agents).toEqual([
+			{
+				kind: "changed",
+				agentId: "constructor",
+				fieldPaths: [],
+				rolePrompt: {
+					changed: true,
+					beforeSize: 0,
+					afterSize: "Role prompt for constructor.".length,
+				},
 			},
 		]);
 	});

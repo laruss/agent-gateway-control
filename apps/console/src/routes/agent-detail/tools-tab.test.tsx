@@ -136,19 +136,26 @@ describe("ToolsTab", () => {
 
 	it("a detach that would widen effective permissions warns instead of detaching, then detaches anyway once confirmed", async () => {
 		const user = userEvent.setup();
-		const detachBodies: Array<{ confirmWidening?: boolean }> = [];
+		const detachBodies: Array<{ acceptWidening?: string }> = [];
+		const WIDENING_HASH = "c".repeat(64);
 		vi.stubGlobal(
 			"fetch",
 			vi.fn(async (input: string | URL, init?: RequestInit) => {
 				const path = typeof input === "string" ? input : input.toString();
 				if (path.endsWith("/tools/detach")) {
-					const body = JSON.parse((init?.body as string) ?? "{}") as { confirmWidening?: boolean };
+					const body = JSON.parse((init?.body as string) ?? "{}") as { acceptWidening?: string };
 					detachBodies.push(body);
-					if (body.confirmWidening !== true) {
+					if (body.acceptWidening !== WIDENING_HASH) {
 						return jsonResponse(
 							{
 								error: "detaching this entry would widen the agent's effective permissions",
-								widenings: [{ agentId: "developer", tools: ["workspace.write"] }],
+								widenings: [
+									{
+										agentId: "developer",
+										tools: [{ tool: "workspace.write", from: "deny", to: "allow" }],
+									},
+								],
+								acceptWidening: WIDENING_HASH,
 							},
 							422,
 						);
@@ -169,8 +176,8 @@ describe("ToolsTab", () => {
 		const row = screen.getByText("native-repository-read").closest("tr");
 		await user.click((row as HTMLElement).querySelector("button") as HTMLButtonElement);
 
-		// First call refused: no `confirmWidening` sent, and the warning names the agent and tool.
-		expect(detachBodies[0]?.confirmWidening).toBeUndefined();
+		// First call refused: no `acceptWidening` sent, and the warning names the agent and tool.
+		expect(detachBodies[0]?.acceptWidening).toBeUndefined();
 		const warningCall = vi.mocked(toast.warning).mock.calls[0];
 		expect(warningCall?.[0]).toMatch(
 			/would widen effective permissions.*developer.*workspace\.write/,
@@ -178,10 +185,10 @@ describe("ToolsTab", () => {
 		const action = warningCall?.[1]?.action as { onClick: () => void } | undefined;
 		expect(action).toBeDefined();
 
-		// Invoking the toast's own "Detach anyway" action retries with `confirmWidening: true`.
+		// Invoking the toast's own "Detach anyway" action retries with the hash the 422 just showed.
 		action?.onClick();
 		await waitFor(() => expect(detachBodies).toHaveLength(2));
-		expect(detachBodies[1]?.confirmWidening).toBe(true);
+		expect(detachBodies[1]?.acceptWidening).toBe(WIDENING_HASH);
 	});
 
 	it("shows which capabilities require a human's approval", async () => {

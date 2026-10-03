@@ -316,6 +316,36 @@ export function toVerbatimPreview(value: string, max: number): string {
 	return candidate === "" ? "(empty)" : candidate;
 }
 
+/**
+ * `value` cut to at most `max` characters, marked with the same `…` truncation marker once cut —
+ * for `"text"`-safety content (a custom tool's resolved request preview) that must never end mid
+ * percent-escape (`%XX`): a resolved path or query value is percent-encoded, and cutting right
+ * after its `%` or its first hex digit would leave a dangling, misleading fragment where either the
+ * whole escape or none of it reads correctly. Unlike {@link toVerbatimPreview}, this never collapses
+ * characters (`"text"` safety already tolerates newlines/tabs) and never re-verifies against a
+ * schema — the caller's own content is already known-safe ASCII; only the cut point is adjusted.
+ */
+export function truncateRequestPreview(value: string, max: number): string {
+	if (value.length <= max) {
+		return value;
+	}
+	const marker = "…";
+	if (max <= marker.length) {
+		return value.slice(0, Math.max(0, max));
+	}
+	let cut = max - marker.length;
+	// A percent-escape is three characters (`%` plus two hex digits); if the boundary falls one or
+	// two characters past its own `%`, the escape is only partially included — back up to before
+	// the `%` so it is either whole or entirely omitted, never dangling.
+	for (const back of [1, 2]) {
+		if (cut - back >= 0 && value[cut - back] === "%") {
+			cut -= back;
+			break;
+		}
+	}
+	return `${value.slice(0, cut)}${marker}`;
+}
+
 /** Mention tokens as Mattermost reads them: `@name` not preceded by a letter, digit or `_`. */
 const MENTION = /(^|[^\p{L}\p{N}_])@([\p{L}\p{N}_.-]+)/gu;
 

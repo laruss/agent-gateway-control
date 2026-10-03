@@ -1,7 +1,9 @@
 import type {
 	AgentId,
 	AgentPermissions,
+	PermissionWidening,
 	RuntimeAdapterId,
+	ToolAccessLevel,
 	ToolAttachment,
 	ToolCatalogEntryId,
 	ToolCatalogEntryKind,
@@ -10,6 +12,13 @@ import type {
 } from "@agent-gateway/contracts";
 import { FINANCE_TOOLS, toolPatternCovers } from "@agent-gateway/contracts";
 
+/**
+ * `ToolAccessLevel`/`PermissionWidening` (ADR-027's "a removal never widens effective
+ * permissions"): the same reasoning as `modeSupportedByKind` above — a console confirm dialog needs
+ * these shapes to hash and display a widening without depending on this package's own IO-adjacent
+ * code, so both live in `@agent-gateway/contracts` and are re-exported here unchanged.
+ */
+export type { PermissionWidening, ToolAccessLevel } from "@agent-gateway/contracts";
 /**
  * Which attachment modes an entry's own `kind` supports at all: moved to
  * `@agent-gateway/contracts` (beside `riskFloorAllows`) so a console client can share the same
@@ -199,28 +208,37 @@ export function compileAttachments(input: CompileAttachmentsInput): CompiledTool
 	};
 }
 
+// `deny` (absence from every list enforces identically, `tools.ts`'s own resolution of an uncovered
+// action to "not granted") is the lowest effective access level, `require_approval` the middle,
+// `allow` the highest (`ToolAccessLevel`, `@agent-gateway/contracts`, re-exported above).
+
+const ACCESS_LEVEL_RANK: Readonly<Record<ToolAccessLevel, 0 | 1 | 2>> = {
+	deny: 0,
+	require_approval: 1,
+	allow: 2,
+};
+
+function accessLevel(compiled: CompiledToolPermissions, tool: ToolName): ToolAccessLevel {
+	if (compiled.allow.includes(tool)) {
+		return "allow";
+	}
+	return compiled.requireApproval.includes(tool) ? "require_approval" : "deny";
+}
+
 /**
- * Every tool whose effective access level in `after` exceeds what it was in `before` — `deny`
- * (absence from every list enforces identically, `tools.ts`'s own resolution of an uncovered
- * action to "not granted") is the lowest level, `require_approval` the middle, `allow` the
- * highest. Pure; the one comparison shared by every caller that removes an
- * attachment and must never, by doing so, increase what an agent may actually do (ADR-027):
- * deleting a catalog entry clears every agent's attachment of it, and detaching one agent's own
- * attachment does the same for just that agent — either can silently remove the one explicit
- * `disabled`/`require_approval` that was suppressing a native dependency's implication (`tests.run`
- * implying `workspace.write`), so both compare their own before/after compiled result through this
- * rather than inventing the comparison twice.
+ * Every tool whose effective access level in `after` exceeds what it was in `before`, naming both
+ * levels. Pure; the one comparison shared by every caller that removes an attachment (or replaces
+ * an existing hub-managed list wholesale) and must never, by doing so, increase what an agent may
+ * actually do (ADR-027): deleting a catalog entry clears every agent's attachment of it, and
+ * detaching one agent's own attachment does the same for just that agent — either can silently
+ * remove the one explicit `disabled`/`require_approval` that was suppressing a native dependency's
+ * implication (`tests.run` implying `workspace.write`), so both compare their own before/after
+ * compiled result through this rather than inventing the comparison twice.
  */
-export function widenedTools(
+export function describeWidenedTools(
 	before: CompiledToolPermissions,
 	after: CompiledToolPermissions,
-): Readonly<ToolName[]> {
-	const level = (compiled: CompiledToolPermissions, tool: ToolName): 0 | 1 | 2 => {
-		if (compiled.allow.includes(tool)) {
-			return 2;
-		}
-		return compiled.requireApproval.includes(tool) ? 1 : 0;
-	};
+): Readonly<PermissionWidening[]> {
 	const everyTool = new Set<ToolName>([
 		...before.allow,
 		...before.requireApproval,
@@ -229,7 +247,24 @@ export function widenedTools(
 		...after.requireApproval,
 		...after.deny,
 	]);
-	return [...everyTool].filter((tool) => level(after, tool) > level(before, tool)).sort();
+	const widenings: PermissionWidening[] = [];
+	for (const tool of everyTool) {
+		const from = accessLevel(before, tool);
+		const to = accessLevel(after, tool);
+		if (ACCESS_LEVEL_RANK[to] > ACCESS_LEVEL_RANK[from]) {
+			widenings.push({ tool, from, to });
+		}
+	}
+	return widenings.sort((a, b) => (a.tool < b.tool ? -1 : 1));
+}
+
+/** {@link describeWidenedTools}, the tool names alone — every existing caller that only ever
+ * needed "did this widen" plus "which tool", never the levels themselves. */
+export function widenedTools(
+	before: CompiledToolPermissions,
+	after: CompiledToolPermissions,
+): Readonly<ToolName[]> {
+	return describeWidenedTools(before, after).map((widening) => widening.tool);
 }
 
 /**

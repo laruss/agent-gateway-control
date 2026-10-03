@@ -15,11 +15,11 @@ import type {
 	ConsoleToolCatalogListResponse,
 	ConsoleUpdateAttachmentRequest,
 	ConsoleUpdateAttachmentResponse,
+	PermissionWidening,
 	ToolCatalogEntry,
 	ToolCatalogEntryId,
 	ToolCatalogEntryVersion,
 	ToolCatalogEntryView,
-	ToolName,
 } from "@agent-gateway/contracts";
 import { RuntimeAdapterIdSchema } from "@agent-gateway/contracts";
 import { agents, catalogAttachments } from "@agent-gateway/db";
@@ -31,7 +31,12 @@ import {
 	legacyAttachmentsFromPermissions,
 	loadEffectivePermissionsIn,
 } from "./effective-permissions.ts";
-import { activeConfigRevisionId, loadActiveBundle, ManagementConflictError } from "./management.ts";
+import {
+	activeConfigRevisionId,
+	loadActiveBundle,
+	ManagementConflictError,
+	WidensPermissionsError,
+} from "./management.ts";
 import { runtimeHealth } from "./runtime-health.ts";
 import {
 	adoptAgentToolAttachments,
@@ -53,7 +58,6 @@ import {
 	StaleConversionError,
 	type ToolCatalogAvailabilityContext,
 	updateAttachment,
-	WidensPermissionsError,
 } from "./tool-catalog.ts";
 
 // ---------------------------------------------------------------------------
@@ -239,7 +243,10 @@ export async function consoleEditCatalogEntry(
 /** One agent `WidensPermissionsError` names, and the tools its effective permissions would gain
  * (ADR-027) — the console's own structured shape for the same data the error carries, so a caller
  * (a confirm dialog) never has to parse it back out of an error message string. */
-export type ConsoleWideningResult = Readonly<{ agentId: AgentId; tools: Readonly<ToolName[]> }>;
+export type ConsoleWideningResult = Readonly<{
+	agentId: AgentId;
+	tools: Readonly<PermissionWidening[]>;
+}>;
 
 export type ConsoleDeleteCatalogEntryResult =
 	| Readonly<{ kind: "ok"; affectedAgentIds: Readonly<AgentId[]> }>
@@ -423,14 +430,20 @@ export async function consoleAttachTool(
 export type ConsoleDetachToolResult =
 	| (Readonly<{ kind: "ok" }> & ConsoleDetachToolResponse)
 	| Readonly<{ kind: "conflict"; currentRevisionId: number | null }>
-	| Readonly<{ kind: "would_widen"; widenings: Readonly<ConsoleWideningResult[]> }>
+	| Readonly<{
+			kind: "would_widen";
+			widenings: Readonly<ConsoleWideningResult[]>;
+			/** `WidensPermissionsError.acceptWidening`: echoed back as this same request's own
+			 * `acceptWidening` to proceed anyway, once the owner has seen `widenings`. */
+			acceptWidening: string;
+	  }>
 	| Readonly<{ kind: "invalid"; problems: Readonly<string[]> }>;
 
 /** `POST /api/agents/:id/tools/detach`: a no-op (still a fresh revision) when `agentId` has no
  * attachment of `input.entryId`. Refused (`kind: "would_widen"`, carrying the structured tool list
- * `WidensPermissionsError` names) when detaching it would widen the agent's effective permissions,
- * unless `input.confirmWidening` is set (ADR-027, `detachTool`'s own doc comment) — the console's
- * own confirm step, once it has shown the owner which tool would widen. */
+ * and hash `WidensPermissionsError` names) when detaching it would widen the agent's effective
+ * permissions, unless `input.acceptWidening` matches (ADR-027, `detachTool`'s own doc comment) — the
+ * console's own confirm step, once it has shown the owner which tool would widen. */
 export async function consoleDetachTool(
 	deps: ControlPlaneDeps,
 	agentId: string,
@@ -445,7 +458,7 @@ export async function consoleDetachTool(
 			source: "console",
 			idempotencyKey: input.idempotencyKey,
 			...(input.reason === undefined ? {} : { reason: input.reason }),
-			...(input.confirmWidening === undefined ? {} : { confirmWidening: input.confirmWidening }),
+			...(input.acceptWidening === undefined ? {} : { acceptWidening: input.acceptWidening }),
 		});
 		return {
 			kind: "ok",
@@ -460,7 +473,11 @@ export async function consoleDetachTool(
 			return { kind: "conflict", currentRevisionId: error.currentRevisionId };
 		}
 		if (error instanceof WidensPermissionsError) {
-			return { kind: "would_widen", widenings: error.widenings };
+			return {
+				kind: "would_widen",
+				widenings: error.widenings,
+				acceptWidening: error.acceptWidening,
+			};
 		}
 		if (error instanceof AdminError) {
 			return { kind: "invalid", problems: [error.message] };

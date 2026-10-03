@@ -8,6 +8,7 @@ import type {
 import {
 	AgentConfigSchema,
 	CUSTOM_DEFINITION_VERSION_PARAM,
+	CUSTOM_REQUEST_PREVIEW_MAX,
 	OrganizationConfigSchema,
 } from "@agent-gateway/contracts";
 import { createPool, migrateSchema } from "@agent-gateway/db";
@@ -114,6 +115,29 @@ function parameterlessDefinition(): CustomHttpsDefinition {
  * content" apart in a test, without any typed parameter machinery getting in the way. */
 function versionedDefinition(pathTemplate: string): CustomHttpsDefinition {
 	return { ...parameterlessDefinition(), pathTemplate };
+}
+
+/** One string path parameter, wide enough that a CJK-heavy value (each character three UTF-8 bytes,
+ * nine characters once percent-encoded) makes the resolved preview exceed 4000 characters on its
+ * own — the exact shape of case the model's own `id` value, percent-encoded into the path, pushes
+ * `customRequestSummary`'s rendering past `CUSTOM_REQUEST_PREVIEW_MAX`. */
+function cjkPathDefinition(): CustomHttpsDefinition {
+	return {
+		host: "api.example.com",
+		pathTemplate: "/items/{id}",
+		method: "GET",
+		parameters: [
+			{ name: "id", slot: "path", slotName: "id", type: "string", minLength: 1, maxLength: 2000 },
+		],
+		secretSlots: [],
+		idempotency: null,
+		responseLimits: {
+			maxResponseBytes: 65_536,
+			allowedContentTypes: ["application/json"],
+			timeoutMs: 5000,
+			includeBodyPreview: true,
+		},
+	};
 }
 
 describe("prepareCustomApprovalDraft / customGrantTimeIssues (ADR-027)", () => {
@@ -274,8 +298,11 @@ describe("prepareCustomApprovalDraft / customGrantTimeIssues (ADR-027)", () => {
 			customApprovalRequestPreview(uow.tx.db, result.draft.actionType, result.draft.actionParams),
 		);
 		// The preview is built from v1's own definition content, not v2's.
-		expect(preview).toContain("/v1/status");
-		expect(preview).not.toContain("/v2/status");
+		expect(preview.kind).toBe("ok");
+		if (preview.kind === "ok") {
+			expect(preview.preview).toContain("/v1/status");
+			expect(preview.preview).not.toContain("/v2/status");
+		}
 		const issues = await inTransaction(deps, (uow) =>
 			customGrantTimeIssues(uow.tx.db, FINANCE, {
 				actionType: result.draft.actionType,
@@ -348,18 +375,51 @@ describe("prepareCustomApprovalDraft / customGrantTimeIssues (ADR-027)", () => {
 		const preview = await inTransaction(deps, (uow) =>
 			customApprovalRequestPreview(uow.tx.db, result.draft.actionType, result.draft.actionParams),
 		);
-		expect(preview).not.toBeNull();
-		expect(preview).toContain("GET https://api.example.com/status");
+		expect(preview.kind).toBe("ok");
+		if (preview.kind !== "ok") {
+			return;
+		}
+		expect(preview.preview).toContain("GET https://api.example.com/status");
 		// The secret's own slot name, marked as a secret — never a value, since none is resolved
 		// until the tool runner executes.
-		expect(preview).toContain("x-api-key(secret)");
-		expect(preview).not.toMatch(/x-api-key=/);
+		expect(preview.preview).toContain("x-api-key(secret)");
+		expect(preview.preview).not.toMatch(/x-api-key=/);
 	});
 
-	it("customApprovalRequestPreview: null for a non-custom action type", async () => {
+	it("customApprovalRequestPreview: 'none' for a non-custom action type", async () => {
 		const preview = await inTransaction(deps, (uow) =>
 			customApprovalRequestPreview(uow.tx.db, "repository.read", []),
 		);
-		expect(preview).toBeNull();
+		expect(preview).toEqual({ kind: "none" });
+	});
+
+	it("customApprovalRequestPreview: a percent-encoded CJK path whose preview exceeds CUSTOM_REQUEST_PREVIEW_MAX is refused, never truncated", async () => {
+		const entryId = "cjk-preview-tool";
+		await createEntry(entryId, cjkPathDefinition());
+		// 500 CJK characters, each 9 characters once percent-encoded (plus the fixed host/path
+		// prefix), lands around 4534 characters — comfortably over the 4000-character bound on its
+		// own, the exact case a long path value can create (ADR-027). The owner must always see the
+		// complete request, never a cut one: this draft is refused outright, not stored with a
+		// preview shorter than what would actually run.
+		const result = await inTransaction(deps, (uow) =>
+			prepareCustomApprovalDraft(uow.tx.db, FINANCE, {
+				actionType: `custom.${entryId}`,
+				actionParams: [{ name: "id", value: "中".repeat(500) }],
+				actionSummary: "Looks up an item by its (very long) id.",
+			}),
+		);
+		expect(result.kind).toBe("ok");
+		if (result.kind !== "ok") {
+			return;
+		}
+		const preview = await inTransaction(deps, (uow) =>
+			customApprovalRequestPreview(uow.tx.db, result.draft.actionType, result.draft.actionParams),
+		);
+		expect(preview.kind).toBe("refused");
+		if (preview.kind !== "refused") {
+			return;
+		}
+		expect(preview.issues.join(" ")).toMatch(/too large/);
+		expect(preview.issues.join(" ")).toContain(String(CUSTOM_REQUEST_PREVIEW_MAX));
 	});
 });

@@ -176,6 +176,50 @@ async function createEntry(): Promise<string> {
 	return entryId;
 }
 
+/** A fixed `GET` with one long string path parameter — the shape the mock's own
+ * "approval-huge" scenario fills with a 500-character CJK value (ADR-027's own cited case: each
+ * character three UTF-8 bytes, nine characters once percent-encoded, well past the resolved
+ * request preview's 4000-character bound on its own). */
+function cjkPathDefinition(): CustomHttpsDefinition {
+	return {
+		host: TEST_CUSTOM_TOOL_HOST,
+		pathTemplate: "/items/{id}",
+		method: "GET",
+		parameters: [
+			{ name: "id", slot: "path", slotName: "id", type: "string", minLength: 1, maxLength: 2000 },
+		],
+		secretSlots: [],
+		idempotency: null,
+		responseLimits: {
+			maxResponseBytes: 65_536,
+			allowedContentTypes: ["application/json"],
+			timeoutMs: 5000,
+			includeBodyPreview: true,
+		},
+	};
+}
+
+async function createCjkEntry(): Promise<string> {
+	entryCounter += 1;
+	const entryId = `cjk-tool-${entryCounter}`;
+	await createCustomHttpsTool(gateway.deps(), {
+		entryId,
+		name: "CJK path tool",
+		description: "A test custom HTTPS tool with a long path parameter.",
+		httpsDefinition: cjkPathDefinition(),
+		actor: "test",
+	});
+	await attachTool(gateway.deps(), {
+		agentId: "finance",
+		entryId,
+		pinnedVersion: null,
+		mode: "require_approval",
+		actor: "test",
+		source: "cli_apply",
+	});
+	return entryId;
+}
+
 /**
  * Asks @finance for the named custom action and returns its approval once the card is delivered
  * — mirroring `approvals.integration.test.ts`'s own `requestPayment`, but for a custom tool: the
@@ -385,5 +429,48 @@ describe("custom HTTPS tools: the real, database-backed wiring", () => {
 			action.id,
 		]);
 		await idle("finance");
+	});
+
+	it("refuses a request whose preview cannot fit, at request time: no approval, wait or outbox row is ever created (ADR-027)", async () => {
+		await idle("finance");
+		const entryId = await createCjkEntry();
+		const event = humanPost(
+			`@finance do it [mock:approval-huge ${customToolActionType(entryId)}]`,
+			["finance"],
+		);
+		await ingestEvent(gateway.deps(), event);
+		const run = await eventually(
+			async () => {
+				const [row] = await query<{ id: string; status: string; error_code: string | null }>(
+					`select r.id, r.status, r.error_code
+					   from agent_runs r join events e on e.id = r.trigger_event_id
+					  where e.external_id = $1`,
+					[event.id],
+				);
+				return row !== undefined && row.status !== "queued" && row.status !== "running"
+					? row
+					: null;
+			},
+			30_000,
+			"finance run finished",
+		);
+		expect(run).toMatchObject({ status: "failed", error_code: "invalid_output" });
+		const approvals = await query<{ id: string }>(
+			"select id from approval_requests where run_id = $1",
+			[run.id],
+		);
+		expect(approvals).toHaveLength(0);
+		const waits = await query<{ id: string }>(
+			"select id from wait_subscriptions where created_by_run_id = $1",
+			[run.id],
+		);
+		expect(waits).toHaveLength(0);
+		const outboxRows = await query<{ id: string }>("select id from outbox where run_id = $1", [
+			run.id,
+		]);
+		expect(outboxRows).toHaveLength(0);
+		// The run failed outright (`retryable: false`): the agent is left FAILED, not idle, exactly
+		// like any other terminal run failure (ADR-018) — never waited on here, since nothing after
+		// this, the suite's last test, depends on @finance being idle again.
 	});
 });

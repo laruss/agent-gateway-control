@@ -54,8 +54,8 @@ import {
 import { and, asc, eq, inArray, isNull, or } from "drizzle-orm";
 import { AdminError, inTransaction } from "./admin.ts";
 import {
+	agentsImplicitlyHoldingTool,
 	loadCompilableCatalogEntries,
-	widenedByRemovingAttachment,
 } from "./attachment-validation.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
 import {
@@ -73,6 +73,7 @@ import {
 	findConfigRevisionByIdempotencyKey,
 	loadActiveBundle,
 	ManagementConflictError,
+	WidensPermissionsError,
 } from "./management.ts";
 import type { RuntimeHealth } from "./runtime-health.ts";
 import { audit } from "./store.ts";
@@ -898,28 +899,6 @@ export async function legacyAgentsGrantingTool(
 }
 
 /**
- * Thrown by {@link deleteCatalogEntry}/{@link detachTool} when removing an attachment would widen
- * what one or more agents may actually do (ADR-027: a `disabled`/`require_approval` attachment can
- * be the only thing suppressing a native dependency's implication, {@link widenedByRemovingAttachment}).
- * A dedicated class, not a bare `AdminError`, so a caller (the console) can distinguish "this would
- * widen access" from an ordinary validation problem and offer its own explicit confirm step —
- * `detachTool`'s own `confirmWidening` — rather than making the owner read and re-type an error
- * message. Carries the structured list `widenings` ever needs: `deleteCatalogEntry` may name
- * several agents at once; `detachTool` always names exactly the one it was called for.
- */
-export class WidensPermissionsError extends Error {
-	constructor(readonly widenings: Readonly<{ agentId: AgentId; tools: Readonly<ToolName[]> }[]>) {
-		super(
-			"would widen effective permissions for: " +
-				widenings
-					.map((widening) => `${widening.agentId} (${widening.tools.join(", ")})`)
-					.join("; "),
-		);
-		this.name = "WidensPermissionsError";
-	}
-}
-
-/**
  * Deletes `entryId`, removing every agent's attachment of it atomically in the same transaction
  * (one `clear_tool_attachments` change, committed through `commitChangeIn` exactly like any other
  * managed-configuration change — a conflict is retried once against the revision it names, the
@@ -935,16 +914,23 @@ export class WidensPermissionsError extends Error {
  * `gateway tools adopt <agent-id>` (or the console's own Adopt), which converts that coverage into a
  * real attachment this delete would then also clear.
  *
+ * **Refused, the same way, while any hub-managed agent effectively holds it only through another
+ * attached tool's own implication** (`tests.run` implying `workspace.write`,
+ * {@link agentsImplicitlyHoldingTool}): the same discrepancy as above — the hub would show the
+ * capability as retired everywhere while the compiler keeps granting it, unaffected by this delete —
+ * restated for a hub-managed agent's *compiled* attachments, which the legacy check above cannot see.
+ *
  * **Never widens any affected agent's effective permissions, either.** Clearing a `disabled` (or
  * `require_approval`) attachment of this entry can be the one thing standing between an agent and
  * a native dependency's implication it would otherwise suppress (`tests.run` implying
- * `workspace.write`, {@link widenedByRemovingAttachment}, `@agent-gateway/policy`'s
- * `NATIVE_TOOL_DEPENDENCIES`): every affected agent's compiled attachments are compared before and
- * after the clear, and the whole delete is refused ({@link WidensPermissionsError}, nothing
- * committed) the moment any agent would gain anything, naming the agent and the tool it would
- * gain. The owner detaches or reconfigures that agent's attachments first, the same way a
- * legacy-grant refusal above points at an explicit next step rather than silently widening access
- * to make the delete succeed.
+ * `workspace.write`): `commitChangeIn`'s own shared boundary check (`changeSetWidenings`,
+ * `attachment-validation.ts`) compares every affected agent's compiled attachments before and after
+ * the clear, under its own lock and against the exact revision being committed, and refuses
+ * ({@link WidensPermissionsError}, nothing committed) the moment any agent would gain anything —
+ * this call supplies no `acceptWidening` at all, so there is no override, unlike the single
+ * attachment `detachTool` lets the owner deliberately turn off. The owner detaches or reconfigures
+ * that agent's attachments first, the same way a legacy-grant refusal above points at an explicit
+ * next step rather than silently widening access to make the delete succeed.
  *
  * Returns the agent ids actually affected, read fresh inside this same transaction right before
  * committing — never a caller's own, separately-read "impact preview" from moments earlier, which a
@@ -1017,6 +1003,24 @@ export async function deleteCatalogEntry(
 						"'gateway tools adopt <agent-id>' (or the console's Adopt) for each first",
 				);
 			}
+			const baseRevisionId = controls?.revision ?? null;
+			const { bundle } = await loadActiveBundle(db, baseRevisionId);
+			const financeAgentId = (bundle.organization?.organization.finance_agent_id ?? "") as AgentId;
+			const implicitHolders = await agentsImplicitlyHoldingTool(
+				db,
+				{ agents: bundle.agents, toolAttachments: bundle.toolAttachments, financeAgentId },
+				entryRow.implementationKey,
+			);
+			if (implicitHolders.length > 0) {
+				throw new AdminError(
+					`catalog entry '${entryId}' is still effectively granted, through another attached ` +
+						"tool's own implication, to: " +
+						implicitHolders
+							.map((holder) => `${holder.agentId} (implied by ${holder.impliedBy.join(", ")})`)
+							.join(", ") +
+						"; detach or reconfigure those agents' attachments first",
+				);
+			}
 			const affectedRows = await db
 				.selectDistinct({ agentId: catalogAttachments.agentId })
 				.from(catalogAttachments)
@@ -1036,47 +1040,11 @@ export async function deleteCatalogEntry(
 			}
 			if (affected.length > 0) {
 				// Never let clearing `affected`'s attachments of `entryId` widen what any of them may
-				// actually do: a `disabled`/`require_approval` attachment of this entry can be the
-				// only thing suppressing a native dependency's implication (`tests.run` implying
-				// `workspace.write`), which clearing it away would then let through.
-				const baseRevisionId = controls?.revision ?? null;
-				const { bundle } = await loadActiveBundle(db, baseRevisionId);
-				const financeAgentId = (bundle.organization?.organization.finance_agent_id ??
-					"") as AgentId;
-				const widenings = (
-					await Promise.all(
-						affected.map(async (agentId) => {
-							// `affected` is read, in this same transaction, from `catalog_attachments` —
-							// the current-state projection of this exact bundle's own attachments
-							// document — so every one of these agent ids is hub-managed and has an
-							// attachments entry here by construction; absent either, something upstream
-							// already disagrees with itself.
-							const attachments = Object.hasOwn(bundle.toolAttachments, agentId)
-								? bundle.toolAttachments[agentId]
-								: undefined;
-							const agent = bundle.agents.find((candidate) => candidate.id === agentId);
-							if (attachments === undefined || agent === undefined) {
-								throw new AdminError(
-									`internal: '${agentId}' is attached to '${entryId}' but has no attachments ` +
-										"document or no longer exists in the bundle this same transaction read",
-								);
-							}
-							const catalog = await loadCompilableCatalogEntries(db, { [agentId]: attachments });
-							const tools = widenedByRemovingAttachment({
-								agentId,
-								financeAgentId,
-								adapter: agent.runtime.adapter,
-								attachments,
-								entryId,
-								catalog,
-							});
-							return { agentId, tools };
-						}),
-					)
-				).filter((widening) => widening.tools.length > 0);
-				if (widenings.length > 0) {
-					throw new WidensPermissionsError(widenings);
-				}
+				// actually do: `commitChangeIn` computes this itself, under its own lock and against
+				// the exact revision it is about to replace, and refuses (`WidensPermissionsError`)
+				// before committing anything — this call supplies no `acceptWidening` at all, so any
+				// widening it finds always refuses the delete; there is no override, unlike a single
+				// attachment `detachTool` lets the owner deliberately turn off.
 				const changeSet: ChangeSet = [{ type: "clear_tool_attachments", entryId }];
 				const commit = await commitChangeIn(
 					uow,
@@ -1771,74 +1739,25 @@ export type DetachToolInput = Readonly<{
 	/** Detaching an attachment that currently suppresses a native dependency's implication
 	 * (`disabled`/`require_approval` on a tool another attached tool's grant would otherwise imply,
 	 * `NATIVE_TOOL_DEPENDENCIES`) widens `agentId`'s effective permissions the moment nothing
-	 * explicit governs the implied tool any more (ADR-027) — refused unless this is set, an
-	 * explicit acknowledgement that the owner actually intends that widening (the console's own
-	 * confirm step, once it has shown the owner which tool would widen). */
-	confirmWidening?: boolean;
+	 * explicit governs the implied tool any more (ADR-027) — refused (`WidensPermissionsError`,
+	 * `commitChangeIn`'s own shared boundary check) unless this names the exact hash
+	 * (`WidensPermissionsError.acceptWidening`) that same check already computed for a caller that
+	 * saw it (the console's own 422 response, once it has shown the owner which tool would widen) —
+	 * a stale or forged hash can never match what the commit computes again, under its own lock,
+	 * right now. */
+	acceptWidening?: string;
 }>;
 
-/** Every tool `agentId`'s effective permissions would gain if its attachment of `entryId` were
- * detached right now — `[]` once the agent is not hub-managed or holds no such attachment (nothing
- * to detach, `detachTool`'s own no-op case). A separate, earlier read, the same way `attachTool`'s
- * own `checkAttachable` is: `detachTool`'s real commit re-derives everything it needs from its own
- * transaction regardless, so a race against a concurrent change here only ever costs a friendlier
- * refusal that a retry (or the commit itself) would still catch. */
-async function widenedByDetaching(
-	deps: ControlPlaneDeps,
-	agentId: AgentId,
-	entryId: string,
-): Promise<Readonly<ToolName[]>> {
-	const { bundle, attachments: all } = await loadAllAgentToolAttachmentsWithRevision(deps);
-	const read = Object.hasOwn(all, agentId) ? all[agentId] : undefined;
-	if (
-		read === undefined ||
-		!read.hubManaged ||
-		!read.attachments.some((a) => a.entryId === entryId)
-	) {
-		return [];
-	}
-	// `read.hubManaged` came from this same `bundle`'s own `toolAttachments` document, so `agentId`
-	// must also be one of `bundle.agents` — the same assumption `deleteCatalogEntry`'s own widen
-	// check makes, for the same reason.
-	const agent = bundle.agents.find((candidate) => candidate.id === agentId);
-	if (agent === undefined) {
-		throw new AdminError(
-			`internal: '${agentId}' is hub-managed but no longer exists in the bundle this same read ` +
-				"found it in",
-		);
-	}
-	const financeAgentId = (bundle.organization?.organization.finance_agent_id ?? "") as AgentId;
-	const catalog = await inTransaction(deps, ({ tx }) =>
-		loadCompilableCatalogEntries(tx.db, { [agentId]: [...read.attachments] }),
-	);
-	return widenedByRemovingAttachment({
-		agentId,
-		financeAgentId,
-		adapter: agent.runtime.adapter,
-		attachments: read.attachments,
-		entryId,
-		catalog,
-	});
-}
-
 /** Removes `input.agentId`'s attachment of `input.entryId`; a no-op (still a fresh revision, per
- * `commitChange`'s own convention) when it has none.
- *
- * Refused ({@link WidensPermissionsError}, nothing committed) when detaching it would widen
- * `input.agentId`'s effective permissions — an attached `disabled`/`require_approval` that was the
- * only thing suppressing a native dependency's implication, {@link widenedByDetaching} — unless
- * `input.confirmWidening` is set, an explicit acknowledgement the owner actually intends it.
- */
+ * `commitChange`'s own convention) when it has none. Refused (`WidensPermissionsError`, nothing
+ * committed) when detaching it would widen `input.agentId`'s effective permissions, unless
+ * `input.acceptWidening` matches — `commitChangeIn`'s own shared boundary check, under its lock and
+ * against the exact revision being committed; this function keeps no separate precheck of its own
+ * (ADR-027: a separate, earlier read races a concurrent change between that read and the commit). */
 export async function detachTool(
 	deps: ControlPlaneDeps,
 	input: DetachToolInput,
 ): Promise<CommitChangeResult> {
-	if (input.confirmWidening !== true) {
-		const widened = await widenedByDetaching(deps, input.agentId, input.entryId);
-		if (widened.length > 0) {
-			throw new WidensPermissionsError([{ agentId: input.agentId, tools: widened }]);
-		}
-	}
 	const changeSet: ChangeSet = [
 		{ type: "detach_tool", agentId: input.agentId, entryId: input.entryId },
 	];
@@ -1850,6 +1769,7 @@ export async function detachTool(
 		source: input.source,
 		...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
 		...(input.reason === undefined ? {} : { reason: input.reason }),
+		...(input.acceptWidening === undefined ? {} : { acceptWidening: input.acceptWidening }),
 	});
 }
 

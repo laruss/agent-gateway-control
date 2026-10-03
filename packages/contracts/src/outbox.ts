@@ -36,6 +36,11 @@ export const MattermostPostPayloadSchema = z.strictObject({
 });
 export type MattermostPostPayload = z.infer<typeof MattermostPostPayloadSchema>;
 
+/** `MattermostApprovalPayloadSchema.customRequestPreview`'s own bound — shared with
+ * `customApprovalRequestPreview` (`@agent-gateway/core`), which truncates to exactly this before
+ * the field is ever stored, rather than letting an oversized preview make the card undeliverable. */
+export const CUSTOM_REQUEST_PREVIEW_MAX = 4000;
+
 /** A diagnostic in the alerts channel, posted by the listener bot. */
 export const MattermostAlertPayloadSchema = z.strictObject({
 	/** Null until a configuration is active; such an alert cannot be delivered. */
@@ -64,7 +69,7 @@ export const MattermostApprovalPayloadSchema = z.strictObject({
 	 * `undefined` for any other action type. Optional, never `nullable`-required: this schema is
 	 * re-parsed when an already-queued card is delivered, possibly after a rolling deploy, and an
 	 * older-shaped payload enqueued before this field existed must still parse. */
-	customRequestPreview: safeText(4000, "text").optional(),
+	customRequestPreview: safeText(CUSTOM_REQUEST_PREVIEW_MAX, "text").optional(),
 	riskLevel: RiskLevelSchema,
 	immutableActionHash: Sha256HexSchema,
 	expiresAt: TimestampSchema,

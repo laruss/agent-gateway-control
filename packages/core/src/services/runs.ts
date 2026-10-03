@@ -1,14 +1,18 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import {
 	type AgentTurnResult,
 	AgentTurnResultSchema,
+	type ApprovalCardFields,
 	type ApprovalRequestDraft,
 	checkTurnResultAuthority,
+	fitApprovalCard,
 	type JsonValue,
 	type MattermostApprovalPayload,
+	MattermostApprovalPayloadSchema,
 	type MattermostId,
 	type MattermostPostPayload,
 	QUEUES,
+	type RiskLevel,
 	type RunError,
 	type RunReport,
 	type RunTimeoutJob,
@@ -529,6 +533,8 @@ async function applyCompletion(
 
 	let approvers: MattermostId[] = [];
 	let preparedApprovalDraft: ApprovalRequestDraft | null = null;
+	let preparedApprovalIdentity: ApprovalIdentity | null = null;
+	let preparedCustomRequestPreview: string | null = null;
 	if (result.nextState.kind === "needs_human") {
 		// A `custom_https` action is pinned to `agent`'s own selected version here (its attachment's
 		// pin, or the entry's current version when unpinned), before anything else sees the draft:
@@ -580,6 +586,76 @@ async function applyCompletion(
 				result.usage,
 			);
 		}
+
+		// The card's own authoritative, secret-free request preview (ADR-027) — separate from the
+		// model's own free-text `actionSummary` — resolved against the exact pinned version
+		// `prepareCustomApprovalDraft` already added to `preparedApprovalDraft.actionParams`; `none`
+		// for any action type that is not a custom tool. A preview too large for its own field is
+		// refused outright, never truncated: the owner must always see the complete request, or not
+		// be asked to approve it at all.
+		const previewResult = await customApprovalRequestPreview(
+			db,
+			preparedApprovalDraft.actionType,
+			preparedApprovalDraft.actionParams,
+		);
+		if (previewResult.kind === "refused") {
+			await raiseAlert(
+				uow,
+				`approval-policy:${run.id}`,
+				`Run ${run.id} of @${agent.id} asked to approve a custom tool action whose request preview is too large to show in full; no approval card was posted.`,
+				{ action_type: preparedApprovalDraft.actionType },
+			);
+			return applyFailure(
+				uow,
+				run,
+				agent,
+				{ code: "invalid_output", retryable: false, detail: previewResult.issues.join("; ") },
+				runtimeVersion,
+				result.usage,
+			);
+		}
+		preparedCustomRequestPreview = previewResult.kind === "ok" ? previewResult.preview : null;
+
+		// Everything the finished card needs that has nothing to do with persistence, computed once,
+		// so the whole card's own fit against Mattermost's post limit can be checked — and the
+		// request refused — before anything about it is ever stored (ADR-027). `createApproval`
+		// reuses these same values for the row it inserts and the card it posts, never recomputing
+		// them, so a request that fit here can never disagree with what is actually created.
+		preparedApprovalIdentity = prepareApprovalIdentity(preparedApprovalDraft, uow.now);
+		if (preparedCustomRequestPreview !== null) {
+			const fields: ApprovalCardFields = {
+				riskLevel: preparedApprovalIdentity.riskLevel,
+				expiresAt: preparedApprovalIdentity.expiresAt.toISOString(),
+				requestedByAgentId: agent.id,
+				actionType: preparedApprovalDraft.actionType,
+				actionSummary: preparedApprovalDraft.actionSummary,
+				actionParams: preparedApprovalDraft.actionParams,
+				approvalCode: preparedApprovalIdentity.approvalCode,
+				approvalId: preparedApprovalIdentity.approvalId,
+				immutableActionHash: preparedApprovalIdentity.immutableActionHash,
+			};
+			if (fitApprovalCard(fields, preparedCustomRequestPreview) === null) {
+				await raiseAlert(
+					uow,
+					`approval-policy:${run.id}`,
+					`Run ${run.id} of @${agent.id} asked to approve a custom tool action whose card cannot fit Mattermost's own post limit even with its summary shortened; no approval card was posted.`,
+					{ action_type: preparedApprovalDraft.actionType },
+				);
+				return applyFailure(
+					uow,
+					run,
+					agent,
+					{
+						code: "invalid_output",
+						retryable: false,
+						detail: "the request is too large to show in full for approval; use shorter values",
+					},
+					runtimeVersion,
+					result.usage,
+				);
+			}
+		}
+
 		approvers = await loadOwnerUserIds(uow.tx.db);
 		if (approvers.length === 0) {
 			return applyFailure(
@@ -652,12 +728,15 @@ async function applyCompletion(
 			);
 			break;
 		case "needs_human": {
+			const draft = preparedApprovalDraft ?? result.nextState.approvalRequest;
 			await createApproval(
 				uow,
 				run,
 				agent.id,
-				preparedApprovalDraft ?? result.nextState.approvalRequest,
+				draft,
 				approvers,
+				preparedApprovalIdentity ?? prepareApprovalIdentity(draft, uow.now),
+				preparedCustomRequestPreview,
 			);
 			await setAgentState(
 				uow,
@@ -955,8 +1034,42 @@ async function approvalPolicyIssues(
 }
 
 /**
+ * Everything an approval card needs that has nothing to do with persistence: a fresh id, nonce,
+ * immutable hash, risk level, expiry and the code derived from them — deterministic from `draft`
+ * and the moment it is decided, computed once, early, so the whole card's own fit against
+ * Mattermost's post limit (ADR-027) can be checked, and the request refused, before anything about
+ * it is ever persisted. `createApproval` reuses these same values for the row it inserts and the
+ * card it posts, never recomputing them, so a request that fit at that check can never disagree
+ * with what is actually stored.
+ */
+type ApprovalIdentity = Readonly<{
+	approvalId: string;
+	nonce: string;
+	immutableActionHash: string;
+	riskLevel: RiskLevel;
+	expiresAt: Date;
+	approvalCode: string;
+}>;
+
+function prepareApprovalIdentity(draft: ApprovalRequestDraft, now: Date): ApprovalIdentity {
+	const approvalId = randomUUID();
+	const nonce = randomBytes(24).toString("hex");
+	const immutableActionHash = approvalActionHash(draft);
+	return {
+		approvalId,
+		nonce,
+		immutableActionHash,
+		riskLevel: riskLevelFor(draft.actionType),
+		expiresAt: new Date(now.getTime() + APPROVAL_TTL_MS),
+		approvalCode: approvalCode({ id: approvalId, nonce, immutableActionHash }),
+	};
+}
+
+/**
  * Persists an immutable approval request, posts its card through the outbox, and makes the
- * agent wait for how it ends (ADR-018): one wait on `approval.resolved`.
+ * agent wait for how it ends (ADR-018): one wait on `approval.resolved`. `identity` and
+ * `customRequestPreview` are reused exactly as already computed and checked (ADR-027's own
+ * whole-card-fit rule), never recomputed here.
  */
 async function createApproval(
 	uow: UnitOfWork,
@@ -964,30 +1077,29 @@ async function createApproval(
 	agentId: string,
 	draft: ApprovalRequestDraft,
 	approvers: Readonly<MattermostId[]>,
+	identity: ApprovalIdentity,
+	customRequestPreview: string | null,
 ): Promise<void> {
 	const config = await loadActiveConfig(uow.tx.db);
 	if (config === null) {
 		throw new Error("approval requested without an active configuration");
 	}
-	const expiresAt = new Date(uow.now.getTime() + APPROVAL_TTL_MS);
-	const immutableActionHash = approvalActionHash(draft);
-	const riskLevel = riskLevelFor(draft.actionType);
-	const nonce = randomBytes(24).toString("hex");
 	const [approval] = await uow.tx.db
 		.insert(approvalRequests)
 		.values({
+			id: identity.approvalId,
 			requestedByAgentId: agentId,
 			runId: run.id,
 			actionType: draft.actionType,
 			actionParams: draft.actionParams,
-			immutableActionHash,
+			immutableActionHash: identity.immutableActionHash,
 			actionSummary: draft.actionSummary,
-			riskLevel,
+			riskLevel: identity.riskLevel,
 			status: "pending",
 			allowedApproverUserIds: [...approvers],
-			nonce,
+			nonce: identity.nonce,
 			createdAt: uow.now,
-			expiresAt,
+			expiresAt: identity.expiresAt,
 		})
 		.returning({ id: approvalRequests.id });
 	if (approval === undefined) {
@@ -995,15 +1107,6 @@ async function createApproval(
 	}
 	const channels = await loadTeamChannels(uow.tx.db);
 	const channelName = config.organization.mattermost.approvals_channel;
-	// The card's own authoritative, secret-free request preview (ADR-027) — separate from the
-	// model's own free-text `actionSummary` above — resolved against the exact pinned version
-	// `prepareCustomApprovalDraft` already added to `draft.actionParams`; `null` for any action type
-	// that is not a custom tool.
-	const customRequestPreview = await customApprovalRequestPreview(
-		uow.tx.db,
-		draft.actionType,
-		draft.actionParams,
-	);
 	const card: MattermostApprovalPayload = {
 		approvalId: approval.id,
 		channelName,
@@ -1012,12 +1115,20 @@ async function createApproval(
 		actionType: draft.actionType,
 		actionSummary: draft.actionSummary,
 		actionParams: draft.actionParams,
-		riskLevel,
-		immutableActionHash,
-		expiresAt: expiresAt.toISOString(),
-		approvalCode: approvalCode({ id: approval.id, nonce, immutableActionHash }),
+		riskLevel: identity.riskLevel,
+		immutableActionHash: identity.immutableActionHash,
+		expiresAt: identity.expiresAt.toISOString(),
+		approvalCode: identity.approvalCode,
 		...(customRequestPreview === null ? {} : { customRequestPreview }),
 	};
+	// Refused here, at request time, rather than only once the outbox deliverer re-parses this same
+	// schema and finds it does not fit: an undeliverable card would otherwise leave the approval
+	// sitting `pending` forever, retried until the outbox item's own attempts run out, with no card
+	// an owner could ever decide on. The whole card's own fit against Mattermost's post limit was
+	// already checked, with this exact preview, before this function was ever called (ADR-027); this
+	// re-parse guards the schema's other bounds (field shapes, the preview's own individual cap),
+	// never a size this function itself could still disagree with.
+	MattermostApprovalPayloadSchema.parse(card);
 	await enqueueOutbox(uow, {
 		kind: "mattermost.approval",
 		destination: `channel/${channelName}`,
@@ -1035,9 +1146,9 @@ async function createApproval(
 			expectedSenderAgentIds: [],
 			expectedSenderUserIds: [],
 			requireTargetAgentId: null,
-			timeoutAt: expiresAt.toISOString(),
+			timeoutAt: identity.expiresAt.toISOString(),
 		},
-		expiresAt,
+		identity.expiresAt,
 		null,
 	);
 	await audit(uow, "system", "approval.requested", "approval", approval.id, {

@@ -21,6 +21,7 @@ import {
 	loadActiveBundle,
 	ManagementConflictError,
 	prepareChange,
+	WidensPermissionsError,
 } from "./management.ts";
 import {
 	adoptAgentToolAttachments,
@@ -40,7 +41,6 @@ import {
 	loadEffectivePermissionsIn,
 	StaleConversionError,
 	updateAttachment,
-	WidensPermissionsError,
 } from "./tool-catalog.ts";
 
 function organization(): OrganizationConfig {
@@ -978,7 +978,9 @@ describe("tool catalog service (ADR-027)", () => {
 		const deleteAttempt = deleteCatalogEntry(deps, "native-workspace-write", "test");
 		await expect(deleteAttempt).rejects.toThrow(WidensPermissionsError);
 		await expect(deleteAttempt).rejects.toMatchObject({
-			widenings: [{ agentId: "alpha", tools: ["workspace.write"] }],
+			widenings: [
+				{ agentId: "alpha", tools: [{ tool: "workspace.write", from: "deny", to: "allow" }] },
+			],
 		});
 		// Nothing committed: the entry still exists and alpha's attachment of it is untouched.
 		expect(
@@ -996,7 +998,7 @@ describe("tool catalog service (ADR-027)", () => {
 		);
 	});
 
-	it("detachTool refuses the same widening unless confirmWidening is set, then succeeds", async () => {
+	it("detachTool refuses the same widening unless acceptWidening matches, then succeeds", async () => {
 		await attachTool(deps, {
 			agentId: "alpha",
 			entryId: "native-tests-run",
@@ -1024,19 +1026,33 @@ describe("tool catalog service (ADR-027)", () => {
 		});
 		await expect(detachAttempt).rejects.toThrow(WidensPermissionsError);
 		await expect(detachAttempt).rejects.toMatchObject({
-			widenings: [{ agentId: "alpha", tools: ["workspace.write"] }],
+			widenings: [
+				{ agentId: "alpha", tools: [{ tool: "workspace.write", from: "deny", to: "allow" }] },
+			],
 		});
 		const stillAttached = await loadAgentToolAttachments(deps, "alpha");
 		expect(stillAttached.attachments.some((a) => a.entryId === "native-workspace-write")).toBe(
 			true,
 		);
 
+		// The hash a caller echoes back is exactly what the refusal itself just computed — never a
+		// bare boolean (ADR-027: `confirmWidening` was "a bare boolean not bound to the widening the
+		// owner saw").
+		const refusal = await detachTool(deps, {
+			agentId: "alpha",
+			entryId: "native-workspace-write",
+			actor: "test",
+			source: "cli_apply",
+		}).catch((error: unknown) => error);
+		expect(refusal).toBeInstanceOf(WidensPermissionsError);
+		const { acceptWidening } = refusal as InstanceType<typeof WidensPermissionsError>;
+
 		await detachTool(deps, {
 			agentId: "alpha",
 			entryId: "native-workspace-write",
 			actor: "test",
 			source: "cli_apply",
-			confirmWidening: true,
+			acceptWidening,
 		});
 		const afterConfirm = await loadAgentToolAttachments(deps, "alpha");
 		expect(afterConfirm.attachments.some((a) => a.entryId === "native-workspace-write")).toBe(
@@ -1060,7 +1076,233 @@ describe("tool catalog service (ADR-027)", () => {
 		expect(effective.toolPolicy.allow).toContain("workspace.write");
 	});
 
-	it("detachTool does not require confirmWidening when detaching widens nothing", async () => {
+	it("detachTool refuses a stale acceptWidening hash, naming the fresh one actually computed now", async () => {
+		await attachTool(deps, {
+			agentId: "alpha",
+			entryId: "native-tests-run",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+		await attachTool(deps, {
+			agentId: "alpha",
+			entryId: "native-workspace-write",
+			pinnedVersion: null,
+			mode: "disabled",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+
+		// A well-formed hash (the right shape) that simply never matches what this commit, run right
+		// now, actually computes — a forged or merely out-of-date confirm can never slip through.
+		const staleHash = "f".repeat(64);
+		const attempt = detachTool(deps, {
+			agentId: "alpha",
+			entryId: "native-workspace-write",
+			actor: "test",
+			source: "cli_apply",
+			acceptWidening: staleHash,
+		});
+		await expect(attempt).rejects.toThrow(WidensPermissionsError);
+		const rejection = await attempt.catch((error: unknown) => error);
+		const { acceptWidening, widenings } = rejection as InstanceType<typeof WidensPermissionsError>;
+		expect(acceptWidening).not.toBe(staleHash);
+		expect(widenings).toEqual([
+			{ agentId: "alpha", tools: [{ tool: "workspace.write", from: "deny", to: "allow" }] },
+		]);
+		const stillAttached = await loadAgentToolAttachments(deps, "alpha");
+		expect(stillAttached.attachments.some((a) => a.entryId === "native-workspace-write")).toBe(
+			true,
+		);
+	});
+
+	it("a keyed detach retry replays its own committed result rather than re-evaluating the widening check against newer state", async () => {
+		await attachTool(deps, {
+			agentId: "alpha",
+			entryId: "native-tests-run",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+		await attachTool(deps, {
+			agentId: "alpha",
+			entryId: "native-workspace-write",
+			pinnedVersion: null,
+			mode: "disabled",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+
+		const idempotencyKey = randomUUID();
+		const refusal = await detachTool(deps, {
+			agentId: "alpha",
+			entryId: "native-workspace-write",
+			actor: "test",
+			source: "cli_apply",
+			idempotencyKey,
+		}).catch((error: unknown) => error);
+		expect(refusal).toBeInstanceOf(WidensPermissionsError);
+		const { acceptWidening } = refusal as InstanceType<typeof WidensPermissionsError>;
+
+		const committed = await detachTool(deps, {
+			agentId: "alpha",
+			entryId: "native-workspace-write",
+			actor: "test",
+			source: "cli_apply",
+			idempotencyKey,
+			acceptWidening,
+		});
+		expect(committed.replayed).toBe(false);
+
+		// The catalog moves on after the commit: re-evaluating the widening check fresh right now
+		// would no longer find the same thing (or anything at all, once `native-tests-run` no longer
+		// implies anything) — the retry below must never reach that check, only replay what this
+		// exact key already committed (ADR-027: "a keyed detach retry is refused by the precheck
+		// instead of replaying").
+		await updateAttachment(deps, {
+			agentId: "alpha",
+			entryId: "native-tests-run",
+			mode: "disabled",
+			actor: "test",
+			source: "cli_apply",
+		});
+
+		const retried = await detachTool(deps, {
+			agentId: "alpha",
+			entryId: "native-workspace-write",
+			actor: "test",
+			source: "cli_apply",
+			idempotencyKey,
+		});
+		expect(retried.replayed).toBe(true);
+		expect(retried.revisionId).toBe(committed.revisionId);
+	});
+
+	it("detachTool's widening check runs against whichever state actually committed first, never a separate, earlier read a concurrent change could race", async () => {
+		// alpha starts attached only to `native-workspace-write` (disabled); nothing implies
+		// `workspace.write` yet, so detaching it right now would widen nothing — the old precheck
+		// (a separate, non-transactional read taken before the commit even began) and the new, single
+		// boundary check inside the commit both agree, up to this point.
+		await attachTool(deps, {
+			agentId: "alpha",
+			entryId: "native-workspace-write",
+			pinnedVersion: null,
+			mode: "disabled",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+
+		// Every commit serializes on the same `gateway_controls` lock: whichever of the two below
+		// actually acquires it first commits and moves the active revision on, and the other then
+		// finds its own, earlier-read `baseRevisionId` stale — an ordinary optimistic-concurrency
+		// conflict, unrelated to this fix (the same thing any two unrelated concurrent configuration
+		// writes race on), retried here exactly as a real caller would. What this proves is what
+		// happens next: once retried, each one's own widening check reads whichever state actually
+		// committed first — never a separate, earlier read a concurrent change could land after.
+		async function retryOnConflict<T>(run: () => Promise<T>): Promise<T> {
+			for (;;) {
+				try {
+					return await run();
+				} catch (error) {
+					if (error instanceof ManagementConflictError) {
+						continue;
+					}
+					throw error;
+				}
+			}
+		}
+
+		const [detaching, attaching] = await Promise.allSettled([
+			retryOnConflict(() =>
+				detachTool(deps, {
+					agentId: "alpha",
+					entryId: "native-workspace-write",
+					actor: "test",
+					source: "cli_apply",
+				}),
+			),
+			retryOnConflict(() =>
+				attachTool(deps, {
+					agentId: "alpha",
+					entryId: "native-tests-run",
+					pinnedVersion: null,
+					mode: "allow",
+					settings: {},
+					actor: "test",
+					source: "cli_apply",
+				}),
+			),
+		]);
+		// The concurrent attach never depends on the detach, so it always eventually commits.
+		expect(attaching.status).toBe("fulfilled");
+
+		if (detaching.status === "fulfilled") {
+			// The detach's own commit (its first attempt, or a retry after losing the ordinary
+			// optimistic-concurrency race above) serialized before `native-tests-run`'s own effects
+			// were visible to it: nothing implied `workspace.write` yet, a clean, unwidened success.
+			const after = await loadAgentToolAttachments(deps, "alpha");
+			expect(after.attachments.some((a) => a.entryId === "native-tests-run")).toBe(true);
+			expect(after.attachments.some((a) => a.entryId === "native-workspace-write")).toBe(false);
+			return;
+		}
+		// `native-tests-run` was already committed and visible by the time the detach's own fresh
+		// check ran, under its own lock, never a separate, earlier read the attach could have landed
+		// after: it correctly refuses instead of silently widening access.
+		expect(detaching.reason).toBeInstanceOf(WidensPermissionsError);
+		const { acceptWidening, widenings } = detaching.reason as InstanceType<
+			typeof WidensPermissionsError
+		>;
+		expect(widenings).toEqual([
+			{ agentId: "alpha", tools: [{ tool: "workspace.write", from: "deny", to: "allow" }] },
+		]);
+		await detachTool(deps, {
+			agentId: "alpha",
+			entryId: "native-workspace-write",
+			actor: "test",
+			source: "cli_apply",
+			acceptWidening,
+		});
+		const after = await loadAgentToolAttachments(deps, "alpha");
+		expect(after.attachments.some((a) => a.entryId === "native-workspace-write")).toBe(false);
+	});
+
+	it("deleteCatalogEntry refuses while an agent effectively holds the entry's capability only through another attached tool's own implication", async () => {
+		// alpha attaches only `native-tests-run` (which implies `workspace.write`/`repository.read`)
+		// — never `native-workspace-write` itself, so no agent is directly attached to the entry being
+		// deleted (`affected` would be empty) even though the compiler still grants `workspace.write`
+		// through the implication.
+		await attachTool(deps, {
+			agentId: "alpha",
+			entryId: "native-tests-run",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+
+		await expect(deleteCatalogEntry(deps, "native-workspace-write", "test")).rejects.toThrow(
+			/still effectively granted, through another attached tool's own implication/,
+		);
+		expect(
+			await getCatalogEntry(deps, "native-workspace-write", {
+				installedAdapters: new Set(),
+				registeredExecutorActionTypes: new Set(),
+				registeredNamespaces: new Set(),
+			}),
+		).not.toBeNull();
+		const stillImplied = await loadAgentToolAttachments(deps, "alpha");
+		expect(stillImplied.attachments.some((a) => a.entryId === "native-tests-run")).toBe(true);
+	});
+
+	it("detachTool does not require acceptWidening when detaching widens nothing", async () => {
 		await attachTool(deps, {
 			agentId: "alpha",
 			entryId: "native-web-search",

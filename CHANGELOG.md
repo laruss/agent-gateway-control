@@ -217,11 +217,22 @@ All notable changes are documented here. The project follows Semantic Versioning
   widen what an agent may actually do: clearing a `disabled`/`require_approval` attachment can be
   the only thing suppressing a native dependency's implication (`tests.run` implying
   `workspace.write`), which would otherwise let it through the moment nothing explicit governs the
-  implied tool any more. Every affected agent's compiled attachments are now compared before and
-  after the removal, and the whole operation is refused — naming the agent and the tool it would
-  gain — the moment any agent would gain anything; detaching one attachment can be confirmed anyway
-  once the owner has seen the warning (`confirmWidening`, the Tools tab's own "Detach anyway"),
-  deleting an entry has no such override.
+  implied tool any more. This is now enforced once, at the shared configuration-commit boundary
+  itself — under its own lock, against the exact revision actually being committed — for a
+  `detach_tool`/`clear_tool_attachments` or a `set_tool_attachments` that replaces an already
+  hub-managed agent's list, rather than by a separate, earlier read `detachTool`/`deleteCatalogEntry`
+  each used to take outside any transaction (a concurrent attach landing between that read and the
+  actual commit previously went unnoticed, and a keyed retry after the state changed was refused by
+  that same stale precheck instead of replaying its own already-committed result). The commit refuses
+  — naming the agent and the tool it would gain — the moment any agent would gain anything; detaching
+  one attachment can be confirmed anyway by resubmitting the exact hash of the widening the console
+  just displayed (`acceptWidening`, the Tools tab's own "Detach anyway" — no longer a bare
+  `confirmWidening` flag unbound to what the owner actually saw), refused once it no longer matches
+  what the commit computes fresh. Deleting an entry has no such override at all, and is now also
+  refused while any agent effectively holds the entry's capability only *implicitly*, through another
+  attached tool's own dependency, with no attachment of the deleted entry's own — previously this
+  case returned `affected: []` and deleted the entry cleanly while the compiler went on granting it
+  regardless.
 - A custom tool's approval is now resolved, hashed and (at grant time) executed against the
   requesting agent's own selected version — its attachment's pinned version, or the entry's current
   one when unpinned — instead of always the entry's current version: an agent pinned to an older
@@ -244,7 +255,32 @@ All notable changes are documented here. The project follows Semantic Versioning
   committed configuration change, nor gets misread as hub-managed when it is legacy: every
   attachment-bundle lookup now checks the dictionary's own property (`Object.hasOwn`) rather than
   bare bracket access, which previously resolved such a lookup to `Object.prototype.constructor`
-  (a function, not `undefined`) whenever the agent had no attachment entry of its own yet.
+  (a function, not `undefined`) whenever the agent had no attachment entry of its own yet. The same
+  fix now also covers every other plain-object dictionary keyed by agent id across the codebase that
+  had the identical gap: a config diff/export's own attachment and role-prompt lookups, the hourly
+  and pairwise rate limits in routing, a role prompt's own "missing or empty" check (previously
+  checked with `in`, which walks the prototype chain exactly like bracket access does), and a
+  historical snapshot's own role-prompt read used when restoring a retired agent — each previously
+  either crashed, silently exempted the agent from a limit, or fed a function where a string was
+  expected, specifically for an agent named `constructor`.
+- A custom HTTPS tool definition now refuses two parameters sharing the same `name` even across
+  different slots (a path parameter and a header parameter both called `id`, say): a request
+  resolves a value by `name` alone, so the model's one supplied value would otherwise silently land
+  in both places, never the two independent values a definition author likely intended.
+- A custom tool's approval card always shows the owner the complete request preview: a preview that
+  does not fit the stored payload's own schema limit (a resolved path or query value,
+  percent-encoded, can run well past 4000 characters for a long non-ASCII value) refuses the whole
+  draft at request time instead of being cut to fit — the owner either sees exactly what will run,
+  or is never asked to approve it at all. The finished card is also checked against Mattermost's own
+  post limit before the approval is ever created, sharing one layout function with the renderer
+  (`fitApprovalCard`, `@agent-gateway/contracts`) so the two can never disagree: if the full card
+  (full preview, full summary) does not fit, only the model's own summary is shortened to make room
+  — never the preview, never the parameters (already bounded, and refused rather than trimmed,
+  before the request is ever created) — and if the card still does not fit even with the summary
+  dropped entirely, the request is refused outright, nothing created. The renderer mirrors this
+  exactly and never trims or omits a stored preview; the one case it still renders a short,
+  non-approvable "too large" notice instead of a card is data a release before this rule shipped
+  already created.
 - The agent capability editor's own "Attach a tool" dialogs (the agent detail page's and the hub's
   "Attach to agent") now only ever offer a mode the selected entry's own `kind` actually supports
   — previously they offered every mode its risk floor alone would allow, regardless of kind, so

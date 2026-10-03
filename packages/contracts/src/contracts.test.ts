@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { AgentConfigSchema, AgentPermissionsSchema, WakeRuleSchema } from "./agent-config.ts";
 import {
+	type ApprovalCardFields,
 	type ApprovalRequest,
 	ApprovalRequestDraftSchema,
 	ApprovalRequestSchema,
+	fitApprovalCard,
 } from "./approval.ts";
 import { AgentIdSchema, PromptPathSchema, ToolPatternSchema } from "./common.ts";
 import { validateConfigBundle } from "./config-bundle.ts";
@@ -431,6 +433,78 @@ describe("ApprovalRequestDraft", () => {
 				JSON.stringify(value),
 			).toEqual(["actionParams.0.value"]);
 		}
+	});
+});
+
+describe("fitApprovalCard (ADR-027: the owner always sees the complete request preview)", () => {
+	const baseFields: ApprovalCardFields = {
+		riskLevel: "medium",
+		expiresAt: "2026-01-01T00:00:00.000Z",
+		requestedByAgentId: "finance",
+		actionType: "custom.ticket-tool",
+		actionSummary: "A short, ordinary summary.",
+		actionParams: [{ name: "note", value: "hello" }],
+		approvalCode: "ABCD-EFGH-JKLM",
+		approvalId: "0d7bc6f6-58a4-4a4b-8b7e-8b7c1f0d0a11",
+		immutableActionHash: "a".repeat(64),
+	};
+	const POST_MAX = 16_383;
+
+	it("returns the full card untouched once it already fits", () => {
+		const preview = "GET https://api.example.com/status";
+		const text = fitApprovalCard(baseFields, preview);
+		expect(text).not.toBeNull();
+		expect(text).toContain(baseFields.actionSummary);
+		expect(text).toContain(preview);
+		expect(text).toContain("note = hello");
+	});
+
+	it("never refuses a non-custom approval (no preview at all) at ordinary, schema-bounded sizes", () => {
+		const fields: ApprovalCardFields = {
+			...baseFields,
+			actionSummary: "S".repeat(2000),
+			actionParams: Array.from({ length: 5 }, (_, n) => ({
+				name: `p${n}`,
+				value: "v".repeat(2000),
+			})),
+		};
+		expect(fitApprovalCard(fields, null)).not.toBeNull();
+	});
+
+	it("shrinks only the summary to fit, leaving the full preview and parameters untouched", () => {
+		// A percent-encoded CJK path segment, comfortably under the preview's own
+		// `CUSTOM_REQUEST_PREVIEW_MAX` bound (4000) on its own, paired with a summary large enough
+		// (on its own, the same defensive-sizing precedent `render.test.ts` already uses) that the
+		// full card overflows unless the summary — never the preview, never the parameters — gives
+		// way.
+		const preview = `GET https://api.example.com/items/${"%E4%B8%AD".repeat(400)}`;
+		const fields: ApprovalCardFields = { ...baseFields, actionSummary: "S".repeat(14_000) };
+		const text = fitApprovalCard(fields, preview);
+		expect(text).not.toBeNull();
+		const rendered = text ?? "";
+		expect(rendered.length).toBeLessThanOrEqual(POST_MAX);
+		expect(rendered).toContain(preview);
+		expect(rendered).toContain("note = hello");
+		expect(rendered).not.toContain("S".repeat(14_000));
+	});
+
+	it("refuses (returns null) once the parameters and preview alone cannot fit, even with the summary dropped entirely", () => {
+		// Six 1900-character header-slot values and one 2000-character body-slot value: individually
+		// within every per-parameter bound, comfortably under the draft's own combined 15,000-
+		// character budget, and yet — alongside a preview near its own 4000-character bound — too
+		// large for one Mattermost post once rendered, with or without a summary at all.
+		const actionParams = [
+			{ name: "h1", value: "x".repeat(1900) },
+			{ name: "h2", value: "x".repeat(1900) },
+			{ name: "h3", value: "x".repeat(1900) },
+			{ name: "h4", value: "x".repeat(1900) },
+			{ name: "h5", value: "x".repeat(1900) },
+			{ name: "h6", value: "x".repeat(1900) },
+			{ name: "body1", value: "x".repeat(2000) },
+		];
+		const preview = "P".repeat(4000);
+		const fields: ApprovalCardFields = { ...baseFields, actionSummary: "short", actionParams };
+		expect(fitApprovalCard(fields, preview)).toBeNull();
 	});
 });
 

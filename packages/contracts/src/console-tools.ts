@@ -279,10 +279,12 @@ export type ConsoleAttachToolResponse = z.infer<typeof ConsoleAttachToolResponse
 export const ConsoleDetachToolRequestSchema = z.strictObject({
 	idempotencyKey: UuidSchema,
 	entryId: ToolCatalogEntryIdSchema,
-	/** An explicit acknowledgement that detaching this attachment would widen the agent's effective
-	 * permissions (`detachTool`'s own doc comment, ADR-027) and the owner actually intends that —
-	 * otherwise refused (`422`) once the console has shown the owner which tool would widen. */
-	confirmWidening: z.boolean().optional(),
+	/** `WidensPermissionsError.acceptWidening`, from a widening the console already showed the owner
+	 * (a prior `422` from this same route, `detachTool`'s own doc comment, ADR-027): an explicit
+	 * acknowledgement that the owner actually intends it — refused (`422`) otherwise, or once a
+	 * concurrent change makes the commit's own fresh check compute a different widening than this
+	 * hash names. */
+	acceptWidening: Sha256HexSchema.optional(),
 	reason: ConfigRevisionReasonSchema.optional(),
 });
 export type ConsoleDetachToolRequest = z.infer<typeof ConsoleDetachToolRequestSchema>;

@@ -3,6 +3,7 @@ import {
 	type AgentId,
 	type ApprovalRequestDraft,
 	CUSTOM_DEFINITION_VERSION_PARAM,
+	CUSTOM_REQUEST_PREVIEW_MAX,
 	type CustomHttpsDefinition,
 	customToolEntryId,
 } from "@agent-gateway/contracts";
@@ -123,6 +124,10 @@ export type CustomApprovalDraftResult =
  * (`customGrantTimeIssues`) is what lets the definition being edited further, or the attachment
  * itself being re-pinned, invalidate a still-pending request. A draft naming any other action type
  * is returned unchanged (`kind: "ok"`).
+ *
+ * This function never itself renders the approval card's own request preview (see
+ * `customApprovalRequestPreview`) — it only resolves and validates the version the model's
+ * parameters are checked against.
  */
 export async function prepareCustomApprovalDraft(
 	db: Db,
@@ -210,33 +215,59 @@ export async function customGrantTimeIssues(
 	return customToolParamIssues(expected.definition, action.actionParams);
 }
 
+export type CustomApprovalPreviewResult =
+	/** Not a custom tool action at all, or the pinned version param is missing, invalid, or no
+	 * longer names a real version (defensive: should not happen for anything that already passed
+	 * {@link prepareCustomApprovalDraft}) — no preview belongs on this card. */
+	| Readonly<{ kind: "none" }>
+	| Readonly<{ kind: "ok"; preview: string }>
+	/** The full preview does not fit `MattermostApprovalPayloadSchema.customRequestPreview`'s own
+	 * bound; the draft must be refused, never truncated (ADR-027). */
+	| Readonly<{ kind: "refused"; issues: Readonly<string[]> }>;
+
 /**
  * An authoritative, secret-free rendering of the exact HTTPS request `action` (a `custom_https`
  * approval's stored `actionType`/`actionParams`, its own pinned `CUSTOM_DEFINITION_VERSION_PARAM`
  * included) resolves to — the approval card's own preview, separate from the model's free-text
  * summary (ADR-027). Resolved against the exact pinned version (never "current"), the same version
  * execution itself reads through `gateway_custom_tool_definition`, so the preview never disagrees
- * with what actually runs. `null` for any action type that is not a custom tool, or when the pinned
- * version param is missing, invalid, or no longer names a real version (defensive: should not
- * happen for anything that already passed {@link prepareCustomApprovalDraft}).
+ * with what actually runs. `{ kind: "none" }` for any action type that is not a custom tool, or
+ * when the pinned version param is missing, invalid, or no longer names a real version.
+ *
+ * The owner must always see the complete request, never a cut one: a preview longer than
+ * `CUSTOM_REQUEST_PREVIEW_MAX` (`MattermostApprovalPayloadSchema.customRequestPreview`'s own
+ * schema bound — a resolved path or query value is percent-encoded, and a long enough one, a CJK
+ * path segment, each character three UTF-8 bytes wide, nine characters once percent-encoded, can
+ * make `customRequestSummary`'s rendering exceed that bound on its own) is `{ kind: "refused" }`,
+ * never truncated — the caller refuses the whole draft, before an approval ever exists, rather
+ * than storing a preview the owner cannot fully see.
  */
 export async function customApprovalRequestPreview(
 	db: Db,
 	actionType: string,
 	actionParams: Readonly<ActionParam[]>,
-): Promise<string | null> {
+): Promise<CustomApprovalPreviewResult> {
 	const entryId = customToolEntryId(actionType);
 	if (entryId === null) {
-		return null;
+		return { kind: "none" };
 	}
 	const pinned = actionParams.find((param) => param.name === CUSTOM_DEFINITION_VERSION_PARAM);
 	const version = pinned === undefined ? Number.NaN : Number(pinned.value);
 	if (!Number.isInteger(version)) {
-		return null;
+		return { kind: "none" };
 	}
 	const current = await loadCustomHttpsDefinitionAtVersion(db, entryId, version);
 	if (current === null) {
-		return null;
+		return { kind: "none" };
 	}
-	return customRequestSummary(resolveCustomHttpRequest(current.definition, actionParams));
+	const preview = customRequestSummary(resolveCustomHttpRequest(current.definition, actionParams));
+	if (preview.length > CUSTOM_REQUEST_PREVIEW_MAX) {
+		return {
+			kind: "refused",
+			issues: [
+				`the request preview is too large to show in full for approval (${preview.length} characters, limit ${CUSTOM_REQUEST_PREVIEW_MAX}); use shorter parameter values`,
+			],
+		};
+	}
+	return { kind: "ok", preview };
 }

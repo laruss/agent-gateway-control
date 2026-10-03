@@ -291,6 +291,7 @@ async function detachRoute(
 			body: {
 				error: "detaching this entry would widen the agent's effective permissions",
 				widenings: result.widenings,
+				acceptWidening: result.acceptWidening,
 			},
 		};
 	}

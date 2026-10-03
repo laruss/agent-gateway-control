@@ -1,22 +1,23 @@
 import {
 	type AgentConfig,
 	type AgentId,
-	type RuntimeAdapterId,
+	type ChangeSet,
 	riskFloorAllows,
 	type ToolAttachment,
 	type ToolAttachmentsBundle,
-	type ToolCatalogEntryId,
 	type ToolCatalogEntryKind,
 	type ToolCatalogRiskFloor,
 	type ToolName,
 } from "@agent-gateway/contracts";
 import { catalogEntries, catalogEntryVersions } from "@agent-gateway/db";
+import { canonicalHash } from "@agent-gateway/events";
 import {
 	type CompiledCatalogEntry,
 	compileAttachments,
 	compiledAgentPermissions,
+	describeWidenedTools,
 	modeSupportedByKind,
-	widenedTools,
+	type PermissionWidening,
 } from "@agent-gateway/policy";
 import { eq, inArray } from "drizzle-orm";
 import type { UnitOfWork } from "./deps.ts";
@@ -142,47 +143,192 @@ export async function mirrorCompiledAttachmentPermissions(
 }
 
 // ---------------------------------------------------------------------------
-// Removing an attachment must never widen what its agent may do (ADR-027): clearing a `disabled`
-// or `require_approval` attachment that was the only thing suppressing a native dependency's
-// implication (`tests.run` implying `workspace.write`, `NATIVE_TOOL_DEPENDENCIES`) would otherwise
-// let that implication through the moment nothing explicit governs the implied tool any more.
-// Shared by `deleteCatalogEntry` (every agent the entry's attachment would be cleared from) and
-// `detachTool` (the one agent detaching it) so neither re-derives the comparison on its own.
+// Removing an attachment, or replacing an existing hub-managed list wholesale, must never widen
+// what its agent may do (ADR-027): clearing a `disabled`/`require_approval` attachment that was the
+// only thing suppressing a native dependency's implication (`tests.run` implying `workspace.write`,
+// `NATIVE_TOOL_DEPENDENCIES`) would otherwise let that implication through the moment nothing
+// explicit governs the implied tool any more. Enforced once, here, at the shared commit boundary
+// (`commitChangeIn`) under its own lock and against the exact revision being committed — never a
+// separate, earlier read `detachTool`/`deleteCatalogEntry` used to take outside any transaction,
+// racing a concurrent change between that read and the commit itself.
 // ---------------------------------------------------------------------------
 
+/** One agent, and every tool whose effective access would increase for it — {@link
+ * changeSetWidenings}'s own result, keyed by agent. */
+export type AttachmentWidening = Readonly<{
+	agentId: AgentId;
+	tools: Readonly<PermissionWidening[]>;
+}>;
+
 /**
- * Every tool whose effective access for `agentId` would increase if its attachment of `entryId`
- * were removed outright — compares `compileAttachments`'s own result for `attachments` against the
- * same attachments with `entryId`'s removed, through {@link widenedTools} (`@agent-gateway/policy`).
- * Pure, given the agent's own full attachment list and the catalog metadata every one of them
- * needs; callers resolve both from whichever read fits their own transaction (a live bundle for
- * `deleteCatalogEntry`'s multi-agent pass, a single fresh read for `detachTool`).
+ * Every agent id a change set's own `detach_tool`/`clear_tool_attachments`/`set_tool_attachments`
+ * operations name, against `base`'s attachments document — the only operations a removal (or a
+ * wholesale replace) can hide a widening behind; `attach_tool`/`update_attachment` grant or restrict
+ * something the owner explicitly asked for and are never checked here. `set_tool_attachments` is
+ * named only when the agent it targets already had an attachments document in `base`: *replacing*
+ * an existing hub-managed list, never the first conversion that establishes one (legacy-to-hub
+ * conversion is "identical in effect" by construction, adoption's own invariant).
  */
-export function widenedByRemovingAttachment(
-	input: Readonly<{
-		agentId: AgentId;
+function changeSetWideningCandidates(
+	changeSet: ChangeSet,
+	base: ToolAttachmentsBundle,
+): ReadonlySet<AgentId> {
+	const agentIds = new Set<AgentId>();
+	for (const op of changeSet) {
+		if (op.type === "detach_tool") {
+			if (Object.hasOwn(base, op.agentId)) {
+				agentIds.add(op.agentId);
+			}
+		} else if (op.type === "clear_tool_attachments") {
+			for (const [agentId, attachments] of Object.entries(base)) {
+				if (attachments.some((attachment) => attachment.entryId === op.entryId)) {
+					agentIds.add(agentId as AgentId);
+				}
+			}
+		} else if (op.type === "set_tool_attachments") {
+			if (Object.hasOwn(base, op.agentId)) {
+				agentIds.add(op.agentId);
+			}
+		}
+	}
+	return agentIds;
+}
+
+/**
+ * Every widening a change set would cause, comparing each affected agent's compiled attachments in
+ * `base` against the same agent's in `draft` ({@link changeSetWideningCandidates} picks which
+ * agents are even worth comparing). `base`/`draft` are the exact bundles `commitChangeIn` already
+ * holds — the before state the commit is about to replace, and the after state
+ * `mirrorCompiledAttachmentPermissionsIn` already produced from the same change set — so this reuses
+ * reads the boundary already made rather than taking a separate one of its own. An agent `base`
+ * does not (yet) have an attachments document for is skipped: nothing to compare "before" against
+ * (a still-legacy agent `set_tool_attachments` is about to make hub-managed for the first time).
+ */
+export async function changeSetWidenings(
+	db: Db,
+	changeSet: ChangeSet,
+	base: Readonly<{
+		agents: Readonly<AgentConfig[]>;
+		toolAttachments: ToolAttachmentsBundle;
 		financeAgentId: AgentId;
-		adapter: RuntimeAdapterId;
-		attachments: Readonly<ToolAttachment[]>;
-		entryId: string;
-		catalog: ReadonlyMap<ToolCatalogEntryId, CompiledCatalogEntry>;
 	}>,
-): Readonly<ToolName[]> {
-	const before = compileAttachments({
-		agentId: input.agentId,
-		financeAgentId: input.financeAgentId,
-		adapter: input.adapter,
-		attachments: input.attachments,
-		catalog: input.catalog,
-	});
-	const after = compileAttachments({
-		agentId: input.agentId,
-		financeAgentId: input.financeAgentId,
-		adapter: input.adapter,
-		attachments: input.attachments.filter((attachment) => attachment.entryId !== input.entryId),
-		catalog: input.catalog,
-	});
-	return widenedTools(before, after);
+	draft: Readonly<{ toolAttachments: ToolAttachmentsBundle }>,
+): Promise<Readonly<AttachmentWidening[]>> {
+	const candidates = changeSetWideningCandidates(changeSet, base.toolAttachments);
+	if (candidates.size === 0) {
+		return [];
+	}
+	const merged: Record<string, ToolAttachment[]> = {};
+	for (const [agentId, attachments] of Object.entries(base.toolAttachments)) {
+		merged[agentId] = [...attachments];
+	}
+	for (const [agentId, attachments] of Object.entries(draft.toolAttachments)) {
+		// Own-property lookup: an agent id like `constructor`, present in `draft` but not (yet) an
+		// own property of `merged` (the first loop never reached it), would otherwise resolve through
+		// the prototype chain to `Object.prototype.constructor` — a function, not an array — which
+		// `[...fn]` would throw on rather than read as "nothing merged for this agent yet".
+		const already = (Object.hasOwn(merged, agentId) ? merged[agentId] : undefined) ?? [];
+		merged[agentId] = [...already, ...attachments];
+	}
+	const catalog = await loadCompilableCatalogEntries(db, merged);
+	const widenings: AttachmentWidening[] = [];
+	for (const agentId of candidates) {
+		const agent = base.agents.find((candidate) => candidate.id === agentId);
+		const beforeAttachments = Object.hasOwn(base.toolAttachments, agentId)
+			? base.toolAttachments[agentId]
+			: undefined;
+		if (agent === undefined || beforeAttachments === undefined) {
+			continue;
+		}
+		const afterAttachments = Object.hasOwn(draft.toolAttachments, agentId)
+			? (draft.toolAttachments[agentId] ?? [])
+			: [];
+		const before = compileAttachments({
+			agentId,
+			financeAgentId: base.financeAgentId,
+			adapter: agent.runtime.adapter,
+			attachments: beforeAttachments,
+			catalog,
+		});
+		const after = compileAttachments({
+			agentId,
+			financeAgentId: base.financeAgentId,
+			adapter: agent.runtime.adapter,
+			attachments: afterAttachments,
+			catalog,
+		});
+		const tools = describeWidenedTools(before, after);
+		if (tools.length > 0) {
+			widenings.push({ agentId, tools });
+		}
+	}
+	return widenings.sort((a, b) => (a.agentId < b.agentId ? -1 : 1));
+}
+
+/** The hash `commitChangeIn` compares `CommitChangeInput.acceptWidening` against: a caller that
+ * already saw this exact `widenings` list (the console's own 422 response) echoes it back to
+ * proceed anyway, refused the moment a concurrent change makes the catalog compute a different list
+ * now — a stale or forged hash can never match a list the server did not just compute itself. */
+export function acceptWideningHash(widenings: Readonly<AttachmentWidening[]>): string {
+	return canonicalHash(
+		widenings.map((widening) => ({
+			agentId: widening.agentId,
+			tools: widening.tools.map((tool) => ({ tool: tool.tool, from: tool.from, to: tool.to })),
+		})),
+	);
+}
+
+/** One hub-managed agent that effectively holds a tool only because another attached tool's own
+ * implication grants it (`NATIVE_TOOL_DEPENDENCIES`, `@agent-gateway/policy`) — naming which
+ * attached tool(s) imply it. */
+export type ImplicitToolHolder = Readonly<{ agentId: AgentId; impliedBy: Readonly<ToolName[]> }>;
+
+/**
+ * Every hub-managed agent of `bundle` that effectively holds `implementationKey` through another
+ * attached tool's own implication, never through an attachment of its own entry
+ * (`compileAttachments`'s own `impliedBy`). Deleting the catalog entry `implementationKey` names
+ * retires it from the hub — gone from every list, never attachable again — while the compiler goes
+ * on granting it regardless, for as long as whatever implies it (`tests.run` implying
+ * `workspace.write`) stays attached: the hub would show the capability as retired everywhere while
+ * an agent keeps using it, unaffected. The same discrepancy `tool-catalog.ts`'s own
+ * `legacyAgentsGrantingTool` already guards against for a legacy agent's own `permissions` — this
+ * restates it for a hub-managed agent's *compiled* attachments, which a legacy agent has none of, so
+ * the two never overlap: between them, every agent that would keep the capability is caught.
+ */
+export async function agentsImplicitlyHoldingTool(
+	db: Db,
+	bundle: Readonly<{
+		agents: Readonly<AgentConfig[]>;
+		toolAttachments: ToolAttachmentsBundle;
+		financeAgentId: AgentId;
+	}>,
+	implementationKey: ToolName,
+): Promise<Readonly<ImplicitToolHolder[]>> {
+	if (Object.keys(bundle.toolAttachments).length === 0) {
+		return [];
+	}
+	const catalog = await loadCompilableCatalogEntries(db, bundle.toolAttachments);
+	const holders: ImplicitToolHolder[] = [];
+	for (const agent of bundle.agents) {
+		const attachments = Object.hasOwn(bundle.toolAttachments, agent.id)
+			? bundle.toolAttachments[agent.id]
+			: undefined;
+		if (attachments === undefined) {
+			continue;
+		}
+		const compiled = compileAttachments({
+			agentId: agent.id,
+			financeAgentId: bundle.financeAgentId,
+			adapter: agent.runtime.adapter,
+			attachments,
+			catalog,
+		});
+		const impliers = compiled.impliedBy[implementationKey];
+		if (impliers !== undefined && impliers.length > 0) {
+			holders.push({ agentId: agent.id, impliedBy: impliers });
+		}
+	}
+	return holders.sort((a, b) => (a.agentId < b.agentId ? -1 : 1));
 }
 
 async function loadKnownEntryVersions(
