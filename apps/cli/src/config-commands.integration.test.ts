@@ -918,4 +918,18 @@ describe("attachTool: a retry of the attachment that converted a legacy agent re
 		expect(retry.replayed).toBe(true);
 		expect(retry.revisionId).toBe(first.revisionId);
 	});
+
+	it("refuses the same key for a different attachment", async () => {
+		await expect(
+			attachTool(harness.deps, {
+				agentId: "research",
+				entryId: "native-web-search",
+				pinnedVersion: null,
+				mode: "disabled",
+				actor: "test",
+				source: "cli_apply",
+				idempotencyKey: "attach-research-web-search",
+			}),
+		).rejects.toThrow(/already used with a different change set/);
+	});
 });

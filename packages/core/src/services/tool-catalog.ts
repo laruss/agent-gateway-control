@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import {
 	type AgentId,
 	type AgentPermissions,
@@ -39,7 +40,6 @@ import {
 	catalogEntries,
 	catalogEntryTombstones,
 	catalogEntryVersions,
-	configRevisions,
 	gatewayControls,
 } from "@agent-gateway/db";
 import {
@@ -63,6 +63,7 @@ import {
 	type ConfigDraftBundle,
 	commitChange,
 	commitChangeIn,
+	findConfigRevisionByIdempotencyKey,
 	loadActiveBundle,
 	ManagementConflictError,
 } from "./management.ts";
@@ -1285,6 +1286,40 @@ async function legacyConversionChangeSet(
 	return { ops, attachments };
 }
 
+/** The result of the commit made under `idempotencyKey`, when it carried exactly this attachment;
+ * a key reused for anything else is refused, as `commitChange` refuses it. `legacyConversion` is
+ * empty: it described the first call, not this replay. */
+async function replayAttachment(
+	deps: ControlPlaneDeps,
+	committed: Readonly<{ id: number; hash: string }>,
+	attach: Extract<ChangeOperation, { type: "attach_tool" }>,
+	idempotencyKey: string,
+): Promise<AttachToolResult> {
+	const { attachments } = await loadAllAgentToolAttachmentsWithRevision(deps, committed.id);
+	const read = attachments[attach.agentId];
+	const recorded = read?.hubManaged
+		? read.attachments.find((attachment) => attachment.entryId === attach.entryId)
+		: undefined;
+	const same =
+		recorded !== undefined &&
+		recorded.pinnedVersion === attach.pinnedVersion &&
+		recorded.mode === attach.mode &&
+		isDeepStrictEqual(recorded.settings, attach.settings);
+	if (!same) {
+		throw new AdminError(
+			`idempotency key '${idempotencyKey}' was already used with a different change set`,
+		);
+	}
+	return {
+		revisionId: committed.id,
+		hash: committed.hash,
+		noop: false,
+		replayed: true,
+		activeRevisionId: await activeConfigRevisionId(deps),
+		legacyConversion: [],
+	};
+}
+
 /** Binds (or rebinds) `input.entryId` to `input.agentId`, through the managed-configuration
  * writer: a config revision records it, and rollback/export/import cover it (ADR-027).
  *
@@ -1299,26 +1334,10 @@ async function legacyConversionChangeSet(
  * change set may ever hold: either way, `gateway tools adopt <agentId>` is the explicit, reviewed
  * path for an agent whose legacy permissions need a closer look before this hub ever touches them.
  */
-/** The parent revision of the revision committed under `idempotencyKey`, or `undefined` when
- * nothing was committed under it yet. */
-async function committedParentRevision(
-	deps: ControlPlaneDeps,
-	idempotencyKey: string,
-): Promise<number | null | undefined> {
-	return inTransaction(deps, async ({ tx }) => {
-		const [row] = await tx.db
-			.select({ parentRevisionId: configRevisions.parentRevisionId })
-			.from(configRevisions)
-			.where(eq(configRevisions.idempotencyKey, idempotencyKey));
-		return row === undefined ? undefined : row.parentRevisionId;
-	});
-}
-
 export async function attachTool(
 	deps: ControlPlaneDeps,
 	input: AttachToolInput,
 ): Promise<AttachToolResult> {
-	await checkAttachable(deps, input.entryId, input.pinnedVersion, input.mode);
 	const attach: ChangeOperation = {
 		type: "attach_tool",
 		agentId: input.agentId,
@@ -1327,18 +1346,18 @@ export async function attachTool(
 		mode: input.mode,
 		settings: input.settings ?? {},
 	};
-	// A retry under an idempotency key that already committed rebuilds its change set from the
-	// state that first commit read (its parent revision), not from now: the first attachment to a
-	// legacy agent also carried the conversion, which the agent, hub-managed since, would no
-	// longer produce — and `commitChange` replays only an identical change set.
-	const replayBase =
-		input.idempotencyKey === undefined
-			? undefined
-			: await committedParentRevision(deps, input.idempotencyKey);
-	const { revisionId, bundle, attachments } = await loadAllAgentToolAttachmentsWithRevision(
-		deps,
-		replayBase,
-	);
+	// A retry under an idempotency key that already committed is answered from that commit, never
+	// by rebuilding its change set: the first attachment to a legacy agent also carried a
+	// conversion that depended on the agent's permissions and the catalog at that moment, which
+	// neither now reproduces.
+	if (input.idempotencyKey !== undefined) {
+		const committed = await findConfigRevisionByIdempotencyKey(deps, input.idempotencyKey);
+		if (committed !== null) {
+			return replayAttachment(deps, committed, attach, input.idempotencyKey);
+		}
+	}
+	await checkAttachable(deps, input.entryId, input.pinnedVersion, input.mode);
+	const { revisionId, bundle, attachments } = await loadAllAgentToolAttachmentsWithRevision(deps);
 	const read = attachments[input.agentId];
 	if (read === undefined) {
 		throw new AdminError(`agent '${input.agentId}' does not exist`);
