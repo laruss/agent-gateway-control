@@ -2170,8 +2170,6 @@ Deliberate choices here ([ADR-026](docs/adr/026-agent-lifecycle.md)):
   no such operation, and is left to the membership synchronizer's own next pass (seconds away),
   which already removes a bot from a channel it has neither a grant nor a configuration entry for.
 
-Not yet released; see the Changelog's `[Unreleased]` section.
-
 ### Phase 14 review log
 
 - Per-change reviews (Codex) while building: retirement cleanup (1 P1 + 2 P2: bot identity
@@ -2388,4 +2386,4 @@ Acceptance:
   runtime cannot infer it, a byte budget for capability descriptions, unambiguous enum choices in
   the prompt) — fixed; the review of that fix found nothing further.
 
-Not yet released; see the Changelog's `[Unreleased]` section.
+Released as 0.7.0 (migrations `0028_tool_catalog` to `0034_gateway_custom_tool_definition`, all expand; head `0034_gateway_custom_tool_definition`, pg-boss schema 42).

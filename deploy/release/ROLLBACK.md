@@ -98,6 +98,20 @@ either in place breaks nothing.
 
 Once (a)-(d) are done, continue with the database-only steps below.
 
+## Rolling back from 0.7.0 to 0.6.0
+
+- Let queued turns finish or cancel them first: every turn 0.7.0 queues is a version 3 turn input,
+  which 0.6.0 refuses.
+- Settle custom HTTPS and utility actions first (`gateway tools settle` for an unknown outcome):
+  0.6.0's tool runner knows no `custom` or `utility` namespace, so a queued one is left for manual
+  settlement.
+- Hub-managed agents keep their effective permissions: 0.7.0 mirrors every agent's compiled
+  attachments into its `permissions`, which 0.6.0 enforces. The catalog tables and
+  `secrets/custom-tools` are left unused.
+- Re-upgrading is safe: on start, 0.7.0 reconciles attachments against the active revision, so a
+  configuration changed under 0.6.0 makes its agents legacy again instead of reviving stale
+  attachments.
+
 ## Rolling back from 0.6.0 to 0.5.0
 
 - Settle lifecycle operations first: `gateway agents operations` lists none `pending` or
