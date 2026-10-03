@@ -1,4 +1,3 @@
-import { isDeepStrictEqual } from "node:util";
 import {
 	type AgentId,
 	type AgentPermissions,
@@ -63,7 +62,6 @@ import {
 	type ConfigDraftBundle,
 	commitChange,
 	commitChangeIn,
-	findConfigRevisionByIdempotencyKey,
 	loadActiveBundle,
 	ManagementConflictError,
 } from "./management.ts";
@@ -1033,6 +1031,12 @@ export type AdoptToolAttachmentsInput = Readonly<{
 	dryRun: boolean;
 	actor: string;
 	reason?: string;
+	/** `cli_apply` (the default, unchanged — `gateway tools adopt`) or `console`, for the hub's own
+	 * "Adopt into the tools hub" action (ADR-025: every console-made commit carries this source). */
+	source?: ConfigRevisionSource;
+	/** A caller-supplied retry token, forwarded to `commitChange` exactly like every other console
+	 * mutation's own idempotency key; absent for the CLI, which has none of its own to give. */
+	idempotencyKey?: string;
 }>;
 
 /**
@@ -1171,7 +1175,8 @@ async function adoptOneAgent(
 		changeSet,
 		baseRevisionId: revisionId,
 		actor: input.actor,
-		source: "cli_apply",
+		source: input.source ?? "cli_apply",
+		...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
 		...(input.reason === undefined ? {} : { reason: input.reason }),
 	});
 	return {
@@ -1286,40 +1291,6 @@ async function legacyConversionChangeSet(
 	return { ops, attachments };
 }
 
-/** The result of the commit made under `idempotencyKey`, when it carried exactly this attachment;
- * a key reused for anything else is refused, as `commitChange` refuses it. `legacyConversion` is
- * empty: it described the first call, not this replay. */
-async function replayAttachment(
-	deps: ControlPlaneDeps,
-	committed: Readonly<{ id: number; hash: string }>,
-	attach: Extract<ChangeOperation, { type: "attach_tool" }>,
-	idempotencyKey: string,
-): Promise<AttachToolResult> {
-	const { attachments } = await loadAllAgentToolAttachmentsWithRevision(deps, committed.id);
-	const read = attachments[attach.agentId];
-	const recorded = read?.hubManaged
-		? read.attachments.find((attachment) => attachment.entryId === attach.entryId)
-		: undefined;
-	const same =
-		recorded !== undefined &&
-		recorded.pinnedVersion === attach.pinnedVersion &&
-		recorded.mode === attach.mode &&
-		isDeepStrictEqual(recorded.settings, attach.settings);
-	if (!same) {
-		throw new AdminError(
-			`idempotency key '${idempotencyKey}' was already used with a different change set`,
-		);
-	}
-	return {
-		revisionId: committed.id,
-		hash: committed.hash,
-		noop: false,
-		replayed: true,
-		activeRevisionId: await activeConfigRevisionId(deps),
-		legacyConversion: [],
-	};
-}
-
 /** Binds (or rebinds) `input.entryId` to `input.agentId`, through the managed-configuration
  * writer: a config revision records it, and rollback/export/import cover it (ADR-027).
  *
@@ -1338,6 +1309,7 @@ export async function attachTool(
 	deps: ControlPlaneDeps,
 	input: AttachToolInput,
 ): Promise<AttachToolResult> {
+	await checkAttachable(deps, input.entryId, input.pinnedVersion, input.mode);
 	const attach: ChangeOperation = {
 		type: "attach_tool",
 		agentId: input.agentId,
@@ -1346,24 +1318,18 @@ export async function attachTool(
 		mode: input.mode,
 		settings: input.settings ?? {},
 	};
-	// A retry under an idempotency key that already committed is answered from that commit, never
-	// by rebuilding its change set: the first attachment to a legacy agent also carried a
-	// conversion that depended on the agent's permissions and the catalog at that moment, which
-	// neither now reproduces.
-	if (input.idempotencyKey !== undefined) {
-		const committed = await findConfigRevisionByIdempotencyKey(deps, input.idempotencyKey);
-		if (committed !== null) {
-			return replayAttachment(deps, committed, attach, input.idempotencyKey);
-		}
-	}
-	await checkAttachable(deps, input.entryId, input.pinnedVersion, input.mode);
 	const { revisionId, bundle, attachments } = await loadAllAgentToolAttachmentsWithRevision(deps);
 	const read = attachments[input.agentId];
 	if (read === undefined) {
 		throw new AdminError(`agent '${input.agentId}' does not exist`);
 	}
+	// A legacy agent's permissions are converted in a revision of their own, ahead of the
+	// attachment: the attachment's own change set is then always just itself, so a retry under the
+	// same idempotency key replays it exactly, whatever the agent's permissions or the catalog were
+	// when the conversion ran. A crash between the two leaves the agent hub-managed with the very
+	// access its legacy permissions already gave it.
 	let legacyConversion: Readonly<ToolAttachment[]> = [];
-	let changeSet: ChangeSet = [attach];
+	let baseRevisionId = revisionId;
 	if (!read.hubManaged) {
 		const agent = bundle.agents.find((a) => a.id === input.agentId);
 		if (agent === undefined) {
@@ -1372,19 +1338,29 @@ export async function attachTool(
 		const conversion = await inTransaction(deps, ({ tx }) =>
 			legacyConversionChangeSet(tx.db, input.agentId, agent.permissions),
 		);
-		if (conversion === null || conversion.ops.length + 1 > MAX_CHANGE_SET_OPERATIONS) {
+		if (conversion === null || conversion.ops.length > MAX_CHANGE_SET_OPERATIONS) {
 			throw new AdminError(
 				`agent '${input.agentId}' is not yet managed in the tools hub and its legacy ` +
 					`permissions cannot be converted automatically here; run ` +
 					`'gateway tools adopt ${input.agentId}' first`,
 			);
 		}
+		const converted = await commitChange(deps, {
+			changeSet: [...conversion.ops],
+			baseRevisionId: revisionId,
+			actor: input.actor,
+			source: input.source,
+			reason: `convert '${input.agentId}' legacy permissions before attaching '${input.entryId}'`,
+			...(input.idempotencyKey === undefined
+				? {}
+				: { idempotencyKey: `${input.idempotencyKey}:legacy-conversion` }),
+		});
 		legacyConversion = conversion.attachments;
-		changeSet = [...conversion.ops, attach];
+		baseRevisionId = converted.revisionId;
 	}
 	const result = await commitChange(deps, {
-		changeSet,
-		baseRevisionId: revisionId,
+		changeSet: [attach],
+		baseRevisionId,
 		actor: input.actor,
 		source: input.source,
 		...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
