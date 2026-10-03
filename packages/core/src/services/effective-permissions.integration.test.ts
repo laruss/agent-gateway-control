@@ -705,9 +705,15 @@ describe("effective permissions: compiled attachments as the single source of tr
 						(a) => a.entryId === "native-web-search" && a.mode === "allow",
 					);
 					if (adoptedWebSearch === true) {
-						expect(adoptResult?.commit?.revisionId ?? 0).toBeLessThan(
-							revokeOutcome.value.revisionId,
-						);
+						// A revoke landing after the adoption edits a now hub-managed agent's `permissions`,
+						// which the bundle-mirror invariant discards: a no-op reporting the adoption's own
+						// revision. Otherwise it committed a later one.
+						const adoptRevisionId = adoptResult?.commit?.revisionId ?? 0;
+						if (revokeOutcome.value.noop) {
+							expect(adoptRevisionId).toBe(revokeOutcome.value.revisionId);
+						} else {
+							expect(adoptRevisionId).toBeLessThan(revokeOutcome.value.revisionId);
+						}
 					}
 				}
 			},

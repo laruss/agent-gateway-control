@@ -78,6 +78,11 @@
       "version": "0.6.0",
       "head": "0027_lifecycle_retry_of",
       "pgboss_schema": 42
+    },
+    {
+      "version": "0.7.0",
+      "head": "0034_gateway_custom_tool_definition",
+      "pgboss_schema": 42
     }
   ]
 }

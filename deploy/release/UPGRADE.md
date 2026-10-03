@@ -116,6 +116,22 @@ becomes a management UI:
 - Edits made in the console's Agents hub are configuration revisions with source `console`
   (`gateway config history`), the same as `config import`.
 
+## Upgrading to 0.7.0
+
+0.7.0 adds migrations `0028_tool_catalog` to `0034_gateway_custom_tool_definition`, all expand: the
+steps above apply unchanged. Tools become a catalog that agents attach to
+([ADR-027](../../docs/adr/027-tool-catalog.md),
+[docs/operations/tool-catalog.md](../../docs/operations/tool-catalog.md)):
+
+- `init-home.sh` (part of the steps above) creates `secrets/custom-tools` (mode 0700, owner
+  10001). `gateway tools secret set` writes custom HTTPS tool secrets there; the tool runner and
+  the controller mount it read-only at `/run/custom-tool-secrets`.
+- The built-in catalog entries are seeded on first start. Every existing agent stays legacy: it
+  keeps enforcing exactly its `permissions`, and nothing is converted automatically.
+- To manage an agent's tools from the hub, preview its conversion with
+  `gateway tools adopt <agent-id> --dry-run` and compare the effective permissions before and
+  after; then adopt it (CLI or the console's Adopt) or attach its first entry.
+
 ## Upgrading to 0.6.0
 
 0.6.0 adds migrations `0024_agent_lifecycle` to `0027_lifecycle_retry_of`, all expand: the steps
