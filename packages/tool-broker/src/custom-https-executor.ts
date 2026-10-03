@@ -1,6 +1,7 @@
 import {
 	CUSTOM_DEFINITION_VERSION_PARAM,
 	type CustomHttpsDefinition,
+	CustomHttpsDefinitionSchema,
 	customToolEntryId,
 	TOOL_RECEIPT_TEXT_MAX,
 	type ToolReceipt,
@@ -30,6 +31,18 @@ export type CustomToolDefinitionLookup = (
 	entryId: string,
 	version: number,
 ) => Promise<CustomHttpsDefinition | null>;
+
+/** A {@link CustomToolDefinitionLookup} over raw stored definitions: each one is parsed, not
+ * trusted as typed, so the schema's defaults fill fields a definition stored before they existed
+ * lacks (e.g. `responseLimits.includeBodyPreview`). */
+export function parsedDefinitionLookup(
+	load: (entryId: string, version: number) => Promise<object | null>,
+): CustomToolDefinitionLookup {
+	return async (entryId, version) => {
+		const stored = await load(entryId, version);
+		return stored === null ? null : CustomHttpsDefinitionSchema.parse(stored);
+	};
+}
 
 /** Resolves a secret alias to its value, from the runner's own secrets directory. Throws (never
  * returns a placeholder) when the alias has no file: a custom tool missing its secret cannot be

@@ -886,3 +886,36 @@ describe("config export/import: tool attachments round-trip (ADR-027)", () => {
 		);
 	});
 });
+
+describe("attachTool: a retry of the attachment that converted a legacy agent replays it", () => {
+	let harness: Awaited<ReturnType<typeof startHarness>>;
+
+	beforeAll(async () => {
+		harness = await startHarness();
+		await applyConfig(harness.deps, exampleInput(), "test");
+		await ensureToolCatalogSeeded(harness.deps, "test");
+	});
+
+	afterAll(async () => {
+		await harness.stop();
+	});
+
+	it("returns the first commit, not a key-reuse refusal, once the agent is hub-managed", async () => {
+		const input = {
+			agentId: "research",
+			entryId: "native-web-search",
+			pinnedVersion: null,
+			mode: "allow" as const,
+			actor: "test",
+			source: "cli_apply" as const,
+			idempotencyKey: "attach-research-web-search",
+		};
+		const first = await attachTool(harness.deps, input);
+		expect(first.replayed).toBe(false);
+		expect(first.legacyConversion.length).toBeGreaterThan(0);
+
+		const retry = await attachTool(harness.deps, input);
+		expect(retry.replayed).toBe(true);
+		expect(retry.revisionId).toBe(first.revisionId);
+	});
+});

@@ -217,6 +217,26 @@ describe("sendPinnedRequest: against a real local HTTPS server", () => {
 		).rejects.toThrow();
 	});
 
+	it("classifies a timed-out write as unknown even right after an earlier request to the same destination", async () => {
+		let calls = 0;
+		server = await startTestHttpsServer(tls, (_req, res) => {
+			calls += 1;
+			if (calls === 1) {
+				res.writeHead(200, { "content-type": "application/json" });
+				res.end("{}");
+				return;
+			}
+			// The second request reaches the server and is never answered within the deadline.
+			setTimeout(() => res.end(), 5000);
+		});
+		const first = await sendPinnedRequest(address, baseRequest({ method: "POST", body: "{}" }));
+		expect(first.kind).toBe("response");
+		await expect(
+			sendPinnedRequest(address, baseRequest({ method: "POST", body: "{}", timeoutMs: 200 })),
+		).rejects.toThrow();
+		expect(calls).toBe(2);
+	});
+
 	it("enforces one hard deadline even against a response that trickles just fast enough to never go idle", async () => {
 		server = await startTestHttpsServer(tls, (_req, res) => {
 			res.writeHead(200, { "content-type": "application/json" });

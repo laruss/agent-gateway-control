@@ -1,6 +1,5 @@
 import { promises as dns } from "node:dns";
 import {
-	type CustomHttpsDefinition,
 	type ToolNamespace,
 	type ToolReport,
 	toolExecuteQueue,
@@ -16,6 +15,7 @@ import {
 	type DnsResolver,
 	type DynamicExecutor,
 	executeCustomHttpsAction,
+	parsedDefinitionLookup,
 	processToolJob,
 	type SecretResolver,
 	sendEgressRequest,
@@ -143,13 +143,15 @@ export async function startToolRunner(options: ToolRunnerOptions): Promise<Runni
 	// `gateway_custom_tool_definition` gives the runner into the catalog (ADR-027). Built only when
 	// the runner actually serves `custom`: a runner of other namespaces never touches it.
 	const servesCustom = options.namespaces.includes("custom");
-	const customToolLookup: CustomToolDefinitionLookup = async (entryId, version) => {
-		const result = await pool.query<{ definition: CustomHttpsDefinition | null }>(
-			"select gateway_custom_tool_definition($1, $2) as definition",
-			[entryId, version],
-		);
-		return result.rows[0]?.definition ?? null;
-	};
+	const customToolLookup: CustomToolDefinitionLookup = parsedDefinitionLookup(
+		async (entryId, version) => {
+			const result = await pool.query<{ definition: object | null }>(
+				"select gateway_custom_tool_definition($1, $2) as definition",
+				[entryId, version],
+			);
+			return result.rows[0]?.definition ?? null;
+		},
+	);
 	const dynamicExecutor: DynamicExecutor | undefined = !servesCustom
 		? undefined
 		: (job, context) => {

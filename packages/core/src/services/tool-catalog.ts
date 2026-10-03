@@ -39,6 +39,7 @@ import {
 	catalogEntries,
 	catalogEntryTombstones,
 	catalogEntryVersions,
+	configRevisions,
 	gatewayControls,
 } from "@agent-gateway/db";
 import {
@@ -941,9 +942,10 @@ type AllAgentToolAttachmentsRead = Readonly<{
 
 async function loadAllAgentToolAttachmentsWithRevision(
 	deps: ControlPlaneDeps,
+	atRevisionId?: number | null,
 ): Promise<AllAgentToolAttachmentsRead> {
 	return inTransaction(deps, async ({ tx }) => {
-		const revisionId = await currentRevisionIdIn(tx.db);
+		const revisionId = atRevisionId === undefined ? await currentRevisionIdIn(tx.db) : atRevisionId;
 		const { bundle } = await loadActiveBundle(tx.db, revisionId);
 		const known = await knownCatalogEntries(tx.db);
 		const attachments: Record<string, AgentToolAttachmentsRead> = {};
@@ -1297,6 +1299,21 @@ async function legacyConversionChangeSet(
  * change set may ever hold: either way, `gateway tools adopt <agentId>` is the explicit, reviewed
  * path for an agent whose legacy permissions need a closer look before this hub ever touches them.
  */
+/** The parent revision of the revision committed under `idempotencyKey`, or `undefined` when
+ * nothing was committed under it yet. */
+async function committedParentRevision(
+	deps: ControlPlaneDeps,
+	idempotencyKey: string,
+): Promise<number | null | undefined> {
+	return inTransaction(deps, async ({ tx }) => {
+		const [row] = await tx.db
+			.select({ parentRevisionId: configRevisions.parentRevisionId })
+			.from(configRevisions)
+			.where(eq(configRevisions.idempotencyKey, idempotencyKey));
+		return row === undefined ? undefined : row.parentRevisionId;
+	});
+}
+
 export async function attachTool(
 	deps: ControlPlaneDeps,
 	input: AttachToolInput,
@@ -1310,7 +1327,18 @@ export async function attachTool(
 		mode: input.mode,
 		settings: input.settings ?? {},
 	};
-	const { revisionId, bundle, attachments } = await loadAllAgentToolAttachmentsWithRevision(deps);
+	// A retry under an idempotency key that already committed rebuilds its change set from the
+	// state that first commit read (its parent revision), not from now: the first attachment to a
+	// legacy agent also carried the conversion, which the agent, hub-managed since, would no
+	// longer produce — and `commitChange` replays only an identical change set.
+	const replayBase =
+		input.idempotencyKey === undefined
+			? undefined
+			: await committedParentRevision(deps, input.idempotencyKey);
+	const { revisionId, bundle, attachments } = await loadAllAgentToolAttachmentsWithRevision(
+		deps,
+		replayBase,
+	);
 	const read = attachments[input.agentId];
 	if (read === undefined) {
 		throw new AdminError(`agent '${input.agentId}' does not exist`);

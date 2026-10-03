@@ -219,6 +219,9 @@ export async function sendPinnedRequest(
 			servername: request.host,
 			headers,
 			signal: deadline,
+			// A fresh connection every time: a reused keep-alive socket never emits `secureConnect` again,
+			// which would misclassify a request that did reach the destination as never sent.
+			agent: false,
 			ca: request.ca as string[] | Buffer[] | undefined,
 		});
 		// `secureConnect` is a `tls.TLSSocket` event, never re-emitted on the request itself: it has

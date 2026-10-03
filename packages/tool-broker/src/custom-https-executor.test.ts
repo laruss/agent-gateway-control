@@ -5,6 +5,7 @@ import {
 	type CustomHttpsExecutorDeps,
 	type CustomToolDefinitionLookup,
 	executeCustomHttpsAction,
+	parsedDefinitionLookup,
 	type SecretResolver,
 } from "./custom-https-executor.ts";
 import { type EgressRequest, sendPinnedRequest } from "./egress.ts";
@@ -200,5 +201,20 @@ describe("executeCustomHttpsAction", () => {
 		expect(seenUrl).toContain("/tickets/..%2F..%2Fetc%2Fpasswd");
 		expect(seenUrl).not.toContain("/etc/passwd");
 		expect(seenUrl).toContain(`api_key=${SECRET_VALUE}`);
+	});
+});
+
+describe("parsedDefinitionLookup", () => {
+	it("fills a field a definition stored before it existed lacks, instead of reading it as off", async () => {
+		const { includeBodyPreview: _omitted, ...storedLimits } = definition().responseLimits;
+		const stored = { ...definition(), responseLimits: storedLimits };
+		const lookup = parsedDefinitionLookup(async () => stored);
+		const parsed = await lookup("zendesk", 1);
+		expect(parsed?.responseLimits.includeBodyPreview).toBe(true);
+	});
+
+	it("passes through a definition that does not exist", async () => {
+		const lookup = parsedDefinitionLookup(async () => null);
+		expect(await lookup("zendesk", 1)).toBeNull();
 	});
 });
