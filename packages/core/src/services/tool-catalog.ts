@@ -49,6 +49,7 @@ import {
 import {
 	activeConfigRevisionId,
 	type CommitChangeResult,
+	type ConfigDraftBundle,
 	commitChange,
 	commitChangeIn,
 	loadActiveBundle,
@@ -726,30 +727,46 @@ export type AgentToolAttachmentsRead = LegacyConversionResult &
 		hubManaged: boolean;
 	}>;
 
+/** {@link loadAllAgentToolAttachments}'s own revision and bundle, alongside the per-agent read —
+ * `adoptAgentToolAttachments` needs the exact revision the read came from (as the commit's own
+ * base revision, so a concurrent change is a conflict, never silently rebased onto), which the
+ * public function below has no reason to expose. */
+type AllAgentToolAttachmentsRead = Readonly<{
+	revisionId: number | null;
+	bundle: ConfigDraftBundle;
+	attachments: Readonly<Record<AgentId, AgentToolAttachmentsRead>>;
+}>;
+
+async function loadAllAgentToolAttachmentsWithRevision(
+	deps: ControlPlaneDeps,
+): Promise<AllAgentToolAttachmentsRead> {
+	return inTransaction(deps, async ({ tx }) => {
+		const revisionId = await currentRevisionIdIn(tx.db);
+		const { bundle } = await loadActiveBundle(tx.db, revisionId);
+		const known = await knownCatalogEntries(tx.db);
+		const attachments: Record<string, AgentToolAttachmentsRead> = {};
+		for (const agent of bundle.agents) {
+			const recorded = bundle.toolAttachments[agent.id];
+			if (recorded !== undefined) {
+				attachments[agent.id] = { attachments: recorded, unresolved: [], hubManaged: true };
+				continue;
+			}
+			attachments[agent.id] = {
+				...legacyAttachmentsFromPermissions(agent.permissions, known),
+				hubManaged: false,
+			};
+		}
+		return { revisionId, bundle, attachments };
+	});
+}
+
 /** Per agent, its current attachments and any unresolved legacy pattern (ADR-027): hub-managed
  * agents read their recorded attachments; every other agent is converted from its `permissions`
  * on the fly, against every catalog entry known right now. */
 export async function loadAllAgentToolAttachments(
 	deps: ControlPlaneDeps,
 ): Promise<Readonly<Record<AgentId, AgentToolAttachmentsRead>>> {
-	return inTransaction(deps, async ({ tx }) => {
-		const revisionId = await currentRevisionIdIn(tx.db);
-		const { bundle } = await loadActiveBundle(tx.db, revisionId);
-		const known = await knownCatalogEntries(tx.db);
-		const result: Record<string, AgentToolAttachmentsRead> = {};
-		for (const agent of bundle.agents) {
-			const recorded = bundle.toolAttachments[agent.id];
-			if (recorded !== undefined) {
-				result[agent.id] = { attachments: recorded, unresolved: [], hubManaged: true };
-				continue;
-			}
-			result[agent.id] = {
-				...legacyAttachmentsFromPermissions(agent.permissions, known),
-				hubManaged: false,
-			};
-		}
-		return result;
-	});
+	return (await loadAllAgentToolAttachmentsWithRevision(deps)).attachments;
 }
 
 /** `loadAllAgentToolAttachments`, for one agent; throws if the agent does not exist. */
@@ -827,28 +844,40 @@ export async function adoptAgentToolAttachments(
 	deps: ControlPlaneDeps,
 	input: AdoptToolAttachmentsInput,
 ): Promise<Readonly<AdoptAgentResult[]>> {
-	const all = await loadAllAgentToolAttachments(deps);
 	const results: AdoptAgentResult[] = [];
 	for (const agentId of input.agentIds) {
-		const read = all[agentId];
-		if (read === undefined) {
-			throw new AdminError(`agent '${agentId}' does not exist`);
-		}
-		results.push(await adoptOneAgent(deps, agentId, read, input));
+		results.push(await adoptOneAgent(deps, agentId, input));
 	}
 	return results;
 }
 
+/**
+ * Reads this one agent's own attachments/permissions and the revision they came from *together*,
+ * right before resolving what to commit, and commits against that exact revision
+ * (`baseRevisionId`) — never a separately re-read "current" one. A `--all` batch still commits one
+ * agent at a time, each against whatever is active when its own turn comes (an earlier agent's own
+ * commit in the same batch has already moved the revision on by the time this runs for the next
+ * one, same as always); what this closes is the gap *within* one agent's own adoption, where the
+ * attachments resolved from `permissions` and the revision committed against used to come from two
+ * different reads — a concurrent change landing in between (a revoke, another attach) was silently
+ * undone by a commit that still succeeded against the newer, unrelated base. Committing against the
+ * revision this read actually came from makes that same concurrent change a conflict
+ * (`ManagementConflictError`, from `commitChange`) instead.
+ */
 async function adoptOneAgent(
 	deps: ControlPlaneDeps,
 	agentId: AgentId,
-	read: AgentToolAttachmentsRead,
 	input: AdoptToolAttachmentsInput,
 ): Promise<AdoptAgentResult> {
-	const { bundle } = await inTransaction(deps, async ({ tx }) => {
-		const revisionId = await currentRevisionIdIn(tx.db);
-		return loadActiveBundle(tx.db, revisionId);
-	});
+	const {
+		revisionId,
+		bundle,
+		attachments: all,
+	} = await loadAllAgentToolAttachmentsWithRevision(deps);
+	const read = all[agentId];
+	if (read === undefined) {
+		throw new AdminError(`agent '${agentId}' does not exist`);
+	}
 	const agent = bundle.agents.find((a) => a.id === agentId);
 	if (agent === undefined) {
 		throw new AdminError(`agent '${agentId}' does not exist`);
@@ -905,30 +934,37 @@ async function adoptOneAgent(
 			commit: null,
 		};
 	}
-	if (read.attachments.length === 0 || input.dryRun) {
+	if (input.dryRun) {
 		return {
 			agentId,
 			alreadyHubManaged: false,
 			unresolved: read.unresolved,
 			before: agent.permissions,
-			after: read.attachments.length === 0 ? agent.permissions : compiledPermissions,
+			after: compiledPermissions,
 			attachments: read.attachments,
 			problems: [],
 			commit: null,
 		};
 	}
-	const changeSet: ChangeSet = read.attachments.map((attachment) => ({
-		type: "attach_tool",
-		agentId,
-		entryId: attachment.entryId,
-		pinnedVersion: attachment.pinnedVersion,
-		mode: attachment.mode,
-		settings: attachment.settings,
-	}));
-	const baseRevisionId = await activeConfigRevisionId(deps);
+	// An agent whose legacy conversion resolves to zero attachments (every pattern unresolved, or
+	// no `permissions` at all) still needs to become hub-managed with that explicitly empty list —
+	// `attach_tool` cannot express "no attachments at all", so this is the one case
+	// `set_tool_attachments` exists for (ADR-027); every other agent keeps the targeted,
+	// per-attachment `attach_tool` changeset it always has.
+	const changeSet: ChangeSet =
+		read.attachments.length === 0
+			? [{ type: "set_tool_attachments", agentId, attachments: [] }]
+			: read.attachments.map((attachment) => ({
+					type: "attach_tool",
+					agentId,
+					entryId: attachment.entryId,
+					pinnedVersion: attachment.pinnedVersion,
+					mode: attachment.mode,
+					settings: attachment.settings,
+				}));
 	const commit = await commitChange(deps, {
 		changeSet,
-		baseRevisionId,
+		baseRevisionId: revisionId,
 		actor: input.actor,
 		source: "cli_apply",
 		...(input.reason === undefined ? {} : { reason: input.reason }),

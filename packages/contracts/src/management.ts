@@ -191,6 +191,20 @@ export const ChangeOperationSchema = z.discriminatedUnion("type", [
 	 * how many agents that is (`deleteCatalogEntry`, ADR-027) — never expressed as one `detach_tool`
 	 * per agent, which `MAX_CHANGE_SET_OPERATIONS` could not bound for an entry attached widely. */
 	z.strictObject({ type: z.literal("clear_tool_attachments"), entryId: ToolCatalogEntryIdSchema }),
+	/** Replaces an *existing* agent's whole attachments list, marking it hub-managed even when
+	 * `attachments` is explicitly empty (ADR-027) — the one thing `attach_tool` cannot express, since
+	 * it always adds at least one row. `gateway tools adopt`'s only production caller: every other
+	 * targeted edit stays `attach_tool`/`detach_tool`/`update_attachment`, each of which reports its
+	 * own clear refusal rather than racing a stale whole-list read against a concurrent edit
+	 * elsewhere — the reason ADR-027 originally rejected a general-purpose version of this operation.
+	 * `adoptAgentToolAttachments` avoids that race the same way every other write path does: it
+	 * commits against the exact revision its own resolved `attachments` were read from, so a
+	 * concurrent change is a conflict, never silently rebased onto. */
+	z.strictObject({
+		type: z.literal("set_tool_attachments"),
+		agentId: AgentIdSchema,
+		attachments: AgentToolAttachmentsSchema,
+	}),
 ]);
 export type ChangeOperation = z.infer<typeof ChangeOperationSchema>;
 export type ChangeOperationType = ChangeOperation["type"];

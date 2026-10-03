@@ -1356,6 +1356,14 @@
           "mode": {
             "type": "string",
             "enum": ["allow", "require_approval"]
+          },
+          "impliedBy": {
+            "maxItems": 16,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)+$"
+            }
           }
         },
         "required": ["name", "description", "mode"],

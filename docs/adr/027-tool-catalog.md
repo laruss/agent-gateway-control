@@ -350,22 +350,33 @@ hub-managed (left untouched), every unresolved pattern, the effective permission
 any resolved attachment whose mode its entry's `kind` does not support (found before attempting a
 commit that would otherwise refuse it). `--dry-run` previews everything above without committing.
 An agent whose legacy conversion resolves to zero attachments (every pattern unresolved, or no
-permissions at all) is not adopted even without `--dry-run`: there is no change-set operation that
-marks an *existing* agent hub-managed with an explicitly empty list (only `add_agent`/
-`replace_bundle` can start one that way), so `tools adopt` reports this rather than silently doing
-nothing useful — attach at least one entry directly instead.
+permissions at all) is still adopted: `set_tool_attachments` (below) marks an *existing* agent
+hub-managed with an explicitly empty list, the one thing `attach_tool` cannot express on its own
+(it always adds at least one row) — every other agent keeps the targeted, per-attachment
+`attach_tool` changeset it always has. Each agent's own read (its resolved attachments, and the
+revision they came from) and its commit happen together, so a concurrent change elsewhere — a
+revoke landing between when `tools adopt` read an agent's permissions and when it commits — is a
+conflict (`ManagementConflictError`), never silently overwritten by a commit built from the earlier,
+now-stale read.
 
 **The bundle-mirror invariant.** Whenever a hub-managed agent's compiled attachments could have
-changed — any `attach_tool`/`detach_tool`/`update_attachment`/`clear_tool_attachments`, or a plain
-`replace_bundle` that supplies a `toolAttachments` document — `mirrorCompiledAttachmentPermissionsIn`
-(`management.ts`) recompiles every hub-managed agent's attachments and replaces its `permissions`
-field with the result (`compiledAgentPermissions`), in the very same draft the catalog-constraint
-check and the hash are computed from, so the mirror is never a separate write and never a separate
-revision. This is what keeps a binary rollback to a release before this step (0.6.0, which enforces
-only `permissions`) safe: it enforces exactly the effective permissions the compiler would have, not
-whatever `permissions` happened to say before the owner last touched an attachment. Tested directly:
-bundle `permissions` equals the compiled result of that same revision's attachments, after every
-attach/detach/delete/rollback.
+changed — any `attach_tool`/`detach_tool`/`update_attachment`/`clear_tool_attachments`/
+`set_tool_attachments`, or a plain `replace_bundle` that supplies a `toolAttachments` document, a
+plain YAML `config apply` included — every hub-managed agent's attachments are recompiled and its
+`permissions` field replaced with the result (`compiledAgentPermissions`). This runs inside
+`writeConfigRevisionIn` itself (`admin.ts`) — the one function every committing path ends in
+(`applyConfig`'s whole-bundle replace and the managed-config service's finer-grained operations
+alike) — rather than left to each caller to remember before it calls that writer: whatever bundle
+and hash a caller hands in, `writeConfigRevisionIn` recomputes both from the *mirrored* agents
+before anything is hashed or stored, so no committing path can skip the invariant or store a bundle
+that disagrees with it. (`commitChangeIn`'s own earlier mirror, needed before that point for its
+no-op check and diff, mirrors the same way; compiling an already-compiled result reproduces it
+exactly, so running it twice costs correctness nothing.) This is what keeps a binary rollback to a
+release before this step (0.6.0, which enforces only `permissions`) safe: it enforces exactly the
+effective permissions the compiler would have, not whatever `permissions` happened to say before the
+owner last touched an attachment. Tested directly, for every committing path (`commitChange`,
+`config import`'s `replace_bundle`, `config apply`, `config rollback`, restoring a retired agent,
+`tools adopt`): bundle `permissions` equals the compiled result of that same revision's attachments.
 
 **Enforcement points.** Every place that read `agent.config.permissions` for a policy decision now
 reads `loadEffectivePermissionsIn`'s result instead: the turn scheduler (`scheduler.ts`, once per
@@ -384,9 +395,15 @@ revokes or refuses either, with an audit entry, before it can execute.
 A version 3 `AgentTurnInput` always carries `capabilities`: bounded descriptions (name, a short,
 catalog-sourced description, mode) of the agent's own effective tools, compiled the same way for a
 hub-managed or a legacy agent (a read model, not an enforcement decision — an unresolved legacy
-pattern has no catalog entry to describe, and is simply left out). `packages/runtime-sdk`'s prompt
-renders them as a structured alternative to the bare tool-name lists it already shows. See ADR-023
-for the exact schema rule and its rollback consequence.
+pattern has no catalog entry to describe, and is simply left out). A pinned attachment's own
+description resolves to the version it is actually pinned to (name/description/risk floor as that
+version recorded them), never a later edit's, the same way its compiled mode already does; an
+implied tool (e.g. `repository.read`, implied by `tests.run`) is described too, from its own
+catalog entry's current version — looked up by implementation key rather than by attachment, since
+an implied tool has no attachment of its own — and carries `impliedBy`, naming the attached tool(s)
+that make it effectively usable. `packages/runtime-sdk`'s prompt renders them as a structured
+alternative to the bare tool-name lists it already shows. See ADR-023 for the exact schema rule and
+its rollback consequence.
 
 ## Alternatives
 
@@ -412,16 +429,27 @@ for the exact schema rule and its rollback consequence.
   to materialize it — the same reconstruction ADR-024 already refused for configuration history,
   for the same reason (it would misrepresent something nobody actually recorded as if they had).
 - **A single `set_tool_attachments` change operation (a whole per-agent list replace) instead of
-  `attach_tool`/`detach_tool`/`update_attachment`.** Rejected: a whole-list replace built from a
-  stale read races a concurrent edit from elsewhere invisibly (the last write wins, silently
-  discarding the other), where a targeted operation at least reports a clear "no attachment to
-  update" or produces a deterministic, independent result regardless of what else is in the list.
+  `attach_tool`/`detach_tool`/`update_attachment`, as a general editing primitive.** Rejected: a
+  whole-list replace built from a stale read races a concurrent edit from elsewhere invisibly (the
+  last write wins, silently discarding the other), where a targeted operation at least reports a
+  clear "no attachment to update" or produces a deterministic, independent result regardless of what
+  else is in the list. `set_tool_attachments` does exist, narrowly, for the one thing no targeted
+  operation can express at all — marking an *existing* legacy agent hub-managed with an explicitly
+  empty list (`tools adopt`'s own zero-attachments case, above); its only caller resolves the list
+  it replaces and the revision it commits against together, in the same read, so the staleness this
+  alternative was rejected for cannot arise through it.
 
 ## Consequences
 
-- No console route reads any of this yet; surfacing the catalog and its attachments in the
-  console is later work. `gateway config export`/`import`/`diff`/`rollback` print it as part of
-  the bundle, and `gateway tools adopt` (below) surfaces a legacy agent's own conversion.
+- No console route reads or edits the catalog itself yet (attaching, detaching, editing an entry);
+  surfacing that in the console is later work. `gateway config export`/`import`/`diff`/`rollback`
+  print attachments as part of the bundle, and `gateway tools adopt` surfaces a legacy agent's own
+  conversion. The one console touchpoint that does exist: the Agents hub's own editor
+  (`consoleShowAgent`'s `toolsHubManaged`) shows a hub-managed agent's tool lists read-only, with a
+  hint to use the hub instead, and refuses (preview and commit alike) a patch that edits them
+  directly — editing them there would preview a change the bundle-mirror invariant then silently
+  discards on commit, which is confusing precisely because that invariant is otherwise invisible
+  from the console. A legacy agent's own `permissions` stay fully editable there, unaffected.
 - Attaching, detaching or editing an attachment now changes what a hub-managed agent may actually
   do, on its very next turn — see "Effective permissions: compiled attachments as the single
   source of truth" below.

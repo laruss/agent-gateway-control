@@ -425,6 +425,10 @@ export const CapabilityDescriptionSchema = z.strictObject({
 	name: ToolNameSchema,
 	description: CapabilityDescriptionTextSchema,
 	mode: CapabilityModeSchema,
+	/** The tool(s) that make this one effectively usable without it being attached in its own
+	 * right (`compileAttachments`'s own `impliedBy`, ADR-027 — e.g. `repository.read` implied by
+	 * `tests.run`). Omitted for a capability attached (or legacy-resolved) in its own right. */
+	impliedBy: z.array(ToolNameSchema).max(16).optional(),
 });
 export type CapabilityDescription = z.infer<typeof CapabilityDescriptionSchema>;
 

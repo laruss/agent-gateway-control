@@ -21,8 +21,14 @@ not a reseed, not a rollback. An owner (or operator) opts an agent in explicitly
 
 ## Attaching and detaching
 
-There is no console route for this yet (ADR-027); use `gateway config` directly, or a future
-console surface once one exists. Attaching, detaching or editing an attachment takes effect on the
+There is no console route for attaching, detaching or editing an entry itself yet (ADR-027); use
+`gateway config` directly, or a future console surface once one exists. The Agents hub's own
+editor does show whether an agent is hub-managed: its tool lists are read-only there, with a hint
+to use the hub instead, and a patch that tries to edit them directly is refused (preview and
+commit alike) rather than silently discarded by the bundle-mirror invariant on commit. A legacy
+agent's `permissions` stay fully editable from the console, unaffected.
+
+Attaching, detaching or editing an attachment takes effect on the
 agent's **very next turn** — including a turn already scheduled but not yet started, and a queued
 tool action or a still-pending approval for a capability just detached or turned `disabled`, which
 are revoked or refused (with an audit entry) rather than left to run on a permission the hub no
@@ -109,9 +115,15 @@ Each agent's own JSON result names:
 change-set size limit, and one agent's adoption failing must never block another's.
 
 An agent whose legacy conversion resolves to zero attachments (every pattern unresolved, or no
-`permissions` at all) is not adopted even without `--dry-run` — there is no way to mark an existing
-agent hub-managed with an explicitly empty list through this command. Attach at least one entry to
-it directly instead.
+`permissions` at all) is still adopted — it becomes hub-managed with an explicitly empty list,
+denying every tool (the same default-deny effect as having no permissions at all). Review
+`unresolved` first: a non-empty list there means some of the agent's original intent had no known
+catalog entry to resolve against and is dropped by adopting, not preserved.
+
+Each agent's own resolved attachments and the revision they are committed against are read
+together, right before committing: a concurrent change elsewhere (another attach, a YAML edit to
+the same agent's `permissions`) between when `tools adopt` reads an agent and when it commits is
+refused as a conflict, rather than silently overwritten by a commit built from the stale read.
 
 ## Rollback safety
 

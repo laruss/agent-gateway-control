@@ -19,6 +19,7 @@ export function PermissionsTab({
 	patchDraft,
 }: AgentDetailTabProps): React.ReactElement {
 	const permissions = { ...original.permissions, ...draft.permissions };
+	const hubManaged = original.toolsHubManaged;
 
 	function setListField(field: ToolListField, next: string[]) {
 		const merged: AgentPermissionsPatch = { ...draft.permissions, [field]: next };
@@ -47,6 +48,12 @@ export function PermissionsTab({
 
 	return (
 		<div className="flex max-w-xl flex-col gap-6">
+			{hubManaged && (
+				<p className="text-sm text-muted-foreground">
+					This agent's tools are managed in the tools hub: its tool lists below are read-only here.
+					Use <code>gateway tools attach/detach</code> to change them.
+				</p>
+			)}
 			<div className="grid gap-2">
 				<Label>Tools allowed</Label>
 				<TagListInput
@@ -54,6 +61,7 @@ export function PermissionsTab({
 					onChange={(next) => setListField("tools_allow", next)}
 					placeholder="e.g. mattermost.post"
 					validate={validateToolPattern}
+					disabled={hubManaged}
 				/>
 			</div>
 			<div className="grid gap-2">
@@ -63,6 +71,7 @@ export function PermissionsTab({
 					onChange={(next) => setListField("tools_require_human_approval", next)}
 					placeholder="e.g. finance.payment.create"
 					validate={validateToolPattern}
+					disabled={hubManaged}
 				/>
 			</div>
 			<div className="grid gap-2">
@@ -72,6 +81,7 @@ export function PermissionsTab({
 					onChange={(next) => setListField("tools_deny", next)}
 					placeholder="e.g. deploy.*"
 					validate={validateToolPattern}
+					disabled={hubManaged}
 				/>
 			</div>
 			<div className="flex items-center gap-3">

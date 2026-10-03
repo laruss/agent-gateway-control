@@ -1,4 +1,6 @@
 import {
+	type AgentConfig,
+	type AgentId,
 	riskFloorAllows,
 	type ToolAttachmentsBundle,
 	type ToolCatalogEntryKind,
@@ -6,7 +8,12 @@ import {
 	type ToolName,
 } from "@agent-gateway/contracts";
 import { catalogEntries, catalogEntryVersions } from "@agent-gateway/db";
-import { type CompiledCatalogEntry, modeSupportedByKind } from "@agent-gateway/policy";
+import {
+	type CompiledCatalogEntry,
+	compileAttachments,
+	compiledAgentPermissions,
+	modeSupportedByKind,
+} from "@agent-gateway/policy";
 import { eq, inArray } from "drizzle-orm";
 import type { UnitOfWork } from "./deps.ts";
 
@@ -76,6 +83,48 @@ export async function loadCompilableCatalogEntries(
 		}
 	}
 	return result;
+}
+
+/**
+ * ADR-027's bundle-mirror invariant, the compiling step alone: `agentsIn`, with every agent
+ * `toolAttachments` names (even with an explicitly empty list) having its `permissions` replaced
+ * by its own compiled attachments. An agent absent from `toolAttachments` (legacy) is returned
+ * unchanged. A leaf function — plain agents and a finance agent id, not a whole draft bundle — so
+ * both `admin.ts`'s `writeConfigRevisionIn` (the single shared writer every committing path ends
+ * in) and `management.ts`'s own draft-level `mirrorCompiledAttachmentPermissionsIn` call it without
+ * either importing the other (`management.ts` already imports from `admin.ts`). Idempotent against
+ * a caller that already mirrored — compiling an already-compiled result reproduces it exactly — so
+ * calling it again here costs correctness nothing, only a repeat catalog read.
+ */
+export async function mirrorCompiledAttachmentPermissions(
+	db: Db,
+	financeAgentId: AgentId,
+	agentsIn: Readonly<AgentConfig[]>,
+	toolAttachments: ToolAttachmentsBundle,
+): Promise<Readonly<AgentConfig[]>> {
+	if (Object.keys(toolAttachments).length === 0) {
+		return agentsIn;
+	}
+	const catalog = await loadCompilableCatalogEntries(db, toolAttachments);
+	return agentsIn.map((agent) => {
+		const attachments = toolAttachments[agent.id];
+		if (attachments === undefined) {
+			return agent;
+		}
+		const compiled = compileAttachments({
+			agentId: agent.id,
+			financeAgentId,
+			adapter: agent.runtime.adapter,
+			attachments,
+			catalog,
+		});
+		const permissions = compiledAgentPermissions(compiled, {
+			agentId: agent.id,
+			financeAgentId,
+			observeSystem: agent.permissions.observe_system === true,
+		});
+		return { ...agent, permissions };
+	});
 }
 
 async function loadKnownEntryVersions(

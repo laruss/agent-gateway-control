@@ -1051,7 +1051,12 @@ async function runSessionCommand(
 	}
 }
 
-async function dispatchSessionCommand(
+/** Exported so integration tests can exercise one command's dispatch (argument parsing, the
+ * actual service call, its printed output and exit code) directly against a manually-built
+ * `Session`, the same way `doctor` already is — without `runCommand`'s own `DATABASE_URL`/
+ * deployment-lock machinery, which exists for the real CLI entrypoint, not for testing one
+ * command's own logic in isolation. */
+export async function dispatchSessionCommand(
 	session: Session,
 	command: string,
 	args: Readonly<string[]>,

@@ -32,6 +32,7 @@ function detail(rolePrompt: string) {
 		rolePrompt,
 		wakeRules: [],
 		permissions: { tools_allow: [], tools_require_human_approval: [], tools_deny: [] },
+		toolsHubManaged: false,
 		memory: { privateNamespace: "agents/director", sharedNamespaces: [] },
 		concurrency: { maxActiveRuns: 1, whileRunning: "enqueue" },
 	};

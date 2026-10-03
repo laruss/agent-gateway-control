@@ -380,6 +380,50 @@ describe("applyChangeSet", () => {
 		expect(draft.toolAttachments.beta).toEqual([]);
 	});
 
+	it("set_tool_attachments marks an existing agent hub-managed, even with an explicitly empty list", () => {
+		const base = bundleOf([agent("alpha")]);
+		const { draft, problems } = apply(base, {
+			type: "set_tool_attachments",
+			agentId: "alpha",
+			attachments: [],
+		});
+		expect(problems).toEqual([]);
+		expect(draft.toolAttachments.alpha).toEqual([]);
+	});
+
+	it("set_tool_attachments replaces the whole list in one operation", () => {
+		const attached = apply(bundleOf([agent("alpha")]), {
+			type: "attach_tool",
+			agentId: "alpha",
+			entryId: "gateway-mattermost-post",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+		}).draft;
+		const { draft, problems } = apply(attached, {
+			type: "set_tool_attachments",
+			agentId: "alpha",
+			attachments: [
+				{ entryId: "gateway-memory-write", pinnedVersion: null, mode: "allow", settings: {} },
+			],
+		});
+		expect(problems).toEqual([]);
+		expect(draft.toolAttachments.alpha).toEqual([
+			{ entryId: "gateway-memory-write", pinnedVersion: null, mode: "allow", settings: {} },
+		]);
+	});
+
+	it("set_tool_attachments for an agent that does not exist is a problem", () => {
+		const base = bundleOf([agent("alpha")]);
+		const { draft, problems } = apply(base, {
+			type: "set_tool_attachments",
+			agentId: "ghost",
+			attachments: [],
+		});
+		expect(draft).toEqual(base);
+		expect(problems).toEqual(["set_tool_attachments: agent 'ghost' does not exist"]);
+	});
+
 	it("remove_agent also drops the removed agent's own attachments", () => {
 		const base = bundleOf([agent("alpha")]);
 		const attached = apply(base, {

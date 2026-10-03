@@ -16,7 +16,7 @@ import {
 } from "@agent-gateway/contracts";
 import { catalogAttachments, catalogEntries, catalogEntryVersions } from "@agent-gateway/db";
 import { type CompiledCatalogEntry, compileAttachments } from "@agent-gateway/policy";
-import { eq, inArray, isNull } from "drizzle-orm";
+import { and, eq, inArray, isNull } from "drizzle-orm";
 import type { UnitOfWork } from "./deps.ts";
 
 type Db = UnitOfWork["tx"]["db"];
@@ -125,19 +125,110 @@ type CatalogMetadata = Readonly<{
 	riskFloor: ToolCatalogRiskFloor;
 }>;
 
-/** Catalog metadata of exactly the entries `entryIds` names, excluding deleted ones (an
- * attachment naming a deleted entry contributes nothing, the same as an unknown one). */
+/** Catalog metadata of exactly the entries `attachments` names, excluding deleted ones (an
+ * attachment naming a deleted entry contributes nothing, the same as an unknown one) — each
+ * resolved to its own *selected* version: a pinned attachment describes the version it is pinned
+ * to, even once the entry has since been edited further; an unpinned one tracks the entry's current
+ * version, same as before. */
 async function loadCatalogMetadata(
 	db: Db,
-	entryIds: ReadonlySet<ToolCatalogEntryId>,
+	attachments: Readonly<ToolAttachment[]>,
 ): Promise<ReadonlyMap<ToolCatalogEntryId, CatalogMetadata>> {
+	const entryIds = new Set(attachments.map((attachment) => attachment.entryId));
 	if (entryIds.size === 0) {
+		return new Map();
+	}
+	const pinnedVersionByEntry = new Map(
+		attachments
+			.filter((attachment) => attachment.pinnedVersion !== null)
+			.map((attachment) => [attachment.entryId, attachment.pinnedVersion as number]),
+	);
+	const entries = (
+		await db
+			.select({
+				id: catalogEntries.id,
+				deletedAt: catalogEntries.deletedAt,
+				kind: catalogEntries.kind,
+				implementationKey: catalogEntries.implementationKey,
+				currentVersionId: catalogEntries.currentVersionId,
+			})
+			.from(catalogEntries)
+			.where(inArray(catalogEntries.id, [...entryIds]))
+	).filter((entry) => entry.deletedAt === null && entry.currentVersionId !== null);
+	if (entries.length === 0) {
+		return new Map();
+	}
+	const pinnedEntryIds = entries
+		.filter((entry) => pinnedVersionByEntry.has(entry.id))
+		.map((entry) => entry.id);
+	const pinnedVersionRows =
+		pinnedEntryIds.length === 0
+			? []
+			: await db
+					.select({
+						entryId: catalogEntryVersions.entryId,
+						version: catalogEntryVersions.version,
+						name: catalogEntryVersions.name,
+						description: catalogEntryVersions.description,
+						riskFloor: catalogEntryVersions.riskFloor,
+					})
+					.from(catalogEntryVersions)
+					.where(inArray(catalogEntryVersions.entryId, pinnedEntryIds));
+	const pinnedByKey = new Map(
+		pinnedVersionRows.map((row) => [`${row.entryId}\u0000${row.version}`, row]),
+	);
+	const currentVersionRows = await db
+		.select({
+			id: catalogEntryVersions.id,
+			name: catalogEntryVersions.name,
+			description: catalogEntryVersions.description,
+			riskFloor: catalogEntryVersions.riskFloor,
+		})
+		.from(catalogEntryVersions)
+		.where(
+			inArray(
+				catalogEntryVersions.id,
+				entries.map((entry) => entry.currentVersionId as number),
+			),
+		);
+	const currentById = new Map(currentVersionRows.map((row) => [row.id, row]));
+	const result = new Map<ToolCatalogEntryId, CatalogMetadata>();
+	for (const entry of entries) {
+		const pinned = pinnedVersionByEntry.get(entry.id);
+		const version =
+			pinned === undefined
+				? currentById.get(entry.currentVersionId as number)
+				: pinnedByKey.get(`${entry.id}\u0000${pinned}`);
+		if (version === undefined) {
+			continue;
+		}
+		result.set(entry.id, {
+			kind: entry.kind,
+			implementationKey: entry.implementationKey,
+			name: version.name,
+			description: version.description,
+			riskFloor: version.riskFloor,
+		});
+	}
+	return result;
+}
+
+/** Catalog metadata of every active entry whose `implementationKey` names one of `toolNames`, by
+ * its own *current* version — an implied tool (e.g. `repository.read` implied by `tests.run`,
+ * ADR-027) has no attachment of its own to pin a version against. The fallback
+ * `buildCapabilityDescriptions` needs to describe a tool only present because another implies it,
+ * which {@link loadCatalogMetadata} (keyed, and resolved, by the attached entries alone) does not
+ * cover. */
+async function loadCatalogMetadataByImplementationKey(
+	db: Db,
+	toolNames: ReadonlySet<ToolName>,
+): Promise<ReadonlyMap<ToolCatalogEntryId, CatalogMetadata>> {
+	if (toolNames.size === 0) {
 		return new Map();
 	}
 	const rows = await db
 		.select({
 			id: catalogEntries.id,
-			deletedAt: catalogEntries.deletedAt,
 			kind: catalogEntries.kind,
 			implementationKey: catalogEntries.implementationKey,
 			name: catalogEntryVersions.name,
@@ -146,20 +237,23 @@ async function loadCatalogMetadata(
 		})
 		.from(catalogEntries)
 		.innerJoin(catalogEntryVersions, eq(catalogEntries.currentVersionId, catalogEntryVersions.id))
-		.where(inArray(catalogEntries.id, [...entryIds]));
+		.where(
+			and(
+				inArray(catalogEntries.implementationKey, [...toolNames]),
+				isNull(catalogEntries.deletedAt),
+			),
+		);
 	return new Map(
-		rows
-			.filter((row) => row.deletedAt === null)
-			.map((row) => [
-				row.id,
-				{
-					kind: row.kind,
-					implementationKey: row.implementationKey,
-					name: row.name,
-					description: row.description,
-					riskFloor: row.riskFloor,
-				},
-			]),
+		rows.map((row) => [
+			row.id,
+			{
+				kind: row.kind,
+				implementationKey: row.implementationKey,
+				name: row.name,
+				description: row.description,
+				riskFloor: row.riskFloor,
+			},
+		]),
 	);
 }
 
@@ -210,10 +304,12 @@ function buildCapabilityDescriptions(
 		if (mode === undefined || entry === undefined) {
 			return;
 		}
+		const impliedBy = compiled.impliedBy[tool];
 		descriptions.set(tool, {
 			name: tool,
 			description: entry.description.slice(0, CAPABILITY_DESCRIPTION_MAX),
 			mode,
+			...(impliedBy === undefined ? {} : { impliedBy: [...impliedBy] }),
 		});
 	};
 	for (const attachment of attachments) {
@@ -277,15 +373,27 @@ export async function loadEffectivePermissionsIn(
 	const read: LegacyConversionResult = hubManaged
 		? { attachments: await loadAgentAttachmentsFromProjection(db, agent.id), unresolved: [] }
 		: legacyAttachmentsFromPermissions(agent.config.permissions, await knownCatalogEntries(db));
-	const entryIds = new Set(read.attachments.map((attachment) => attachment.entryId));
-	const metadata = await loadCatalogMetadata(db, entryIds);
+	const attachedMetadata = await loadCatalogMetadata(db, read.attachments);
 	const compiled = compileAttachments({
 		agentId: agent.id,
 		financeAgentId,
 		adapter: agent.config.runtime.adapter,
 		attachments: read.attachments,
-		catalog: catalogForCompile(metadata),
+		catalog: catalogForCompile(attachedMetadata),
 	});
+	// Every tool the compiled result actually grants, beyond the entries `attachedMetadata` already
+	// covers: a tool only present because another implies it (e.g. `repository.read` implied by
+	// `tests.run`) has no attachment of its own, so its own catalog entry (by implementation key,
+	// its current version) is loaded separately — otherwise `buildCapabilityDescriptions` has
+	// nothing to describe it with at all.
+	const describedKeys = new Set(
+		[...attachedMetadata.values()].map((entry) => entry.implementationKey),
+	);
+	const impliedToolNames = new Set(
+		[...compiled.allow, ...compiled.requireApproval].filter((tool) => !describedKeys.has(tool)),
+	);
+	const impliedMetadata = await loadCatalogMetadataByImplementationKey(db, impliedToolNames);
+	const metadata = new Map([...attachedMetadata, ...impliedMetadata]);
 	const capabilities = buildCapabilityDescriptions(read.attachments, metadata, compiled);
 	if (hubManaged) {
 		return {

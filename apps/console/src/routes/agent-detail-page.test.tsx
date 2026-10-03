@@ -48,6 +48,7 @@ function detailFixture(): ConsoleAgentDetailResponse {
 				tools_require_human_approval: [],
 				tools_deny: ["finance.*"],
 			},
+			toolsHubManaged: false,
 			memory: { privateNamespace: "agents/director", sharedNamespaces: [] },
 			concurrency: { maxActiveRuns: 1, whileRunning: "enqueue-and-coalesce" },
 		},

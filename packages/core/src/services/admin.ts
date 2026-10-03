@@ -67,7 +67,10 @@ import {
 import { grantedChannels } from "../channel-access.ts";
 import { nextAgentState, requireTransition } from "../state-machine.ts";
 import { revokeQueuedActions, sweepApprovals, withdrawOpenApprovals } from "./approvals.ts";
-import { attachmentCatalogProblems } from "./attachment-validation.ts";
+import {
+	attachmentCatalogProblems,
+	mirrorCompiledAttachmentPermissions,
+} from "./attachment-validation.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
 import {
 	rejectLifecycleOwnedRemovals,
@@ -658,14 +661,18 @@ export async function ackConfigRevision(
 
 /** Everything {@link writeConfigRevisionIn} needs to write one configuration change. */
 export type WriteConfigRevisionInput = Readonly<{
+	/** The resolved agent definitions this change applies, *before* the bundle-mirror invariant
+	 * below runs — a hub-managed agent's own `permissions` field here may already be stale (a plain
+	 * YAML `config apply` carries whatever the directory says) or may already agree with
+	 * `toolAttachments` (every other write path already mirrors before calling this). Either way,
+	 * `writeConfigRevisionIn` recomputes the bundle and its hash from the *mirrored* agents, never
+	 * from this value directly, so what is actually hashed and stored always agrees with
+	 * `toolAttachments`. */
 	input: ConfigApplyInput;
-	bundle: ConfigSnapshotBundle;
-	version: string;
 	/** This revision's own, final, already-canonicalized attachments document (ADR-027) —
-	 * stored as its own content-addressed snapshot, separate from `bundle`; `{}` when no agent has
+	 * stored as its own content-addressed snapshot, separate from the bundle; `{}` when no agent has
 	 * ever been touched through the tool-catalog hub. Resolved by the caller
-	 * (`commitChangeIn`/`applyConfig`'s own `resolveApplyToolAttachments`), never derived from
-	 * `input`/`bundle` here. */
+	 * (`commitChangeIn`/`applyConfig`'s own `resolveApplyToolAttachments`). */
 	toolAttachments: ToolAttachmentsBundle;
 	generation: number;
 	parentRevisionId: number | null;
@@ -684,15 +691,21 @@ export type WriteConfigRevisionInput = Readonly<{
  * `gateway_controls` lock; this function only writes. Agents that left the configuration are
  * disabled, never deleted: their history stays referenced. An agent with a run in progress cannot
  * be disabled; pause it first.
+ *
+ * ADR-027's bundle-mirror invariant is enforced here, not left to each caller to remember: every
+ * hub-managed agent's `permissions` field is (re)compiled from `toolAttachments` before the bundle
+ * is hashed or stored, so the stored bundle (and so `gateway config export`/`gateway agents show`)
+ * can never disagree with enforcement, whichever path committed the change — a plain YAML `config
+ * apply` included. Idempotent against a caller that already mirrored (`commitChangeIn` mirrors
+ * earlier too, for its own no-op check and diff): compiling an already-compiled result reproduces
+ * it exactly, so this never undoes or duplicates that work, only repeats a cheap catalog read.
  */
 export async function writeConfigRevisionIn(
 	uow: UnitOfWork,
 	write: WriteConfigRevisionInput,
 ): Promise<ConfigApplyResult> {
 	const {
-		input,
-		bundle,
-		version,
+		input: rawInput,
 		toolAttachments,
 		generation,
 		parentRevisionId,
@@ -703,6 +716,15 @@ export async function writeConfigRevisionIn(
 		changeHash,
 	} = write;
 	const { db } = uow.tx;
+	const mirroredAgents = await mirrorCompiledAttachmentPermissions(
+		db,
+		rawInput.organization.organization.finance_agent_id,
+		rawInput.agents,
+		toolAttachments,
+	);
+	const input: ConfigApplyInput = { ...rawInput, agents: mirroredAgents };
+	const bundle = configSnapshotBundle(input);
+	const version = canonicalHash(bundle);
 	const previous = await loadActiveConfig(db);
 	if (
 		previous !== null &&
@@ -1217,8 +1239,6 @@ export async function applyConfig(
 	if (problems.length > 0) {
 		throw new AdminError(`configuration is invalid:\n- ${problems.join("\n- ")}`);
 	}
-	const bundle = configSnapshotBundle(input);
-	const version = canonicalHash(bundle);
 	return inTransaction(deps, async (uow) => {
 		const { db } = uow.tx;
 		// The configuration row first, for update: applies are serialized, and the generation and
@@ -1324,8 +1344,6 @@ export async function applyConfig(
 		}
 		const result = await writeConfigRevisionIn(uow, {
 			input,
-			bundle,
-			version,
 			toolAttachments,
 			generation,
 			parentRevisionId,

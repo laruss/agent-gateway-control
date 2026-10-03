@@ -49,16 +49,25 @@ All notable changes are documented here. The project follows Semantic Versioning
   `agents.tool_attachments_managed` column, migration `0032`) gets only its compiled attachments;
   every other agent keeps today's behaviour, its `permissions` lists unchanged. Whenever a
   hub-managed agent's attachments could have changed, its `permissions` field is replaced with the
-  compiled result in the same revision (never a separate write), so a binary rollback to 0.6.0
-  still enforces the same effective permissions. `gateway tools adopt <agent>|--all [--dry-run]`
-  is the explicit, never-implicit migration from a legacy agent's `permissions` into real
-  attachments, one committed revision per agent, reporting unresolved patterns and the
-  before/after effective permissions. A queued tool action or a still-pending approval for a
-  capability just detached or turned `disabled` is revoked or refused, with an audit entry, before
-  it can execute. `AgentTurnInput.schemaVersion` 3 (ADR-023) carries bounded capability
-  descriptions (name, short description, mode) of an agent's effective tools for the runtime
-  prompt to describe structurally; versions 1 and 2 are still accepted, for a job a release before
-  this one already queued.
+  compiled result before anything is hashed or stored — enforced inside the single shared
+  configuration writer every committing path ends in (a plain YAML `config apply` included), so no
+  path can skip it — and always in the same revision, never a separate write, so a binary rollback
+  to 0.6.0 still enforces the same effective permissions. The Agents hub's own console editor shows
+  a hub-managed agent's tool lists read-only, with a hint to use the hub instead, and refuses
+  (preview and commit alike) a patch that edits them directly, rather than silently discarding it
+  on commit; a legacy agent's `permissions` stay fully editable there. `gateway tools adopt
+  <agent>|--all [--dry-run]` is the explicit, never-implicit migration from a legacy agent's
+  `permissions` into real attachments, one committed revision per agent (including an agent whose
+  conversion resolves to zero attachments, marked hub-managed with an explicitly empty list),
+  reporting unresolved patterns and the before/after effective permissions; each agent's own read
+  and its commit are resolved together, so a concurrent change elsewhere is refused as a conflict
+  rather than silently overwritten by a commit built from a stale read. A queued tool action or a
+  still-pending approval for a capability just detached or turned `disabled` is revoked or refused,
+  with an audit entry, before it can execute. `AgentTurnInput.schemaVersion` 3 (ADR-023) carries
+  bounded capability descriptions (name, short description, mode, and — for a tool only usable
+  because another implies it — which one) of an agent's effective tools for the runtime prompt to
+  describe structurally, each resolved against the exact catalog version it is actually pinned to;
+  versions 1 and 2 are still accepted, for a job a release before this one already queued.
 
 ## [0.6.0] - 2026-10-02
 

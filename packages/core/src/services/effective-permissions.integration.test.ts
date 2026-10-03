@@ -9,7 +9,12 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { applyConfig, inTransaction } from "./admin.ts";
 import type { ControlPlaneDeps } from "./deps.ts";
 import { loadEffectivePermissionsIn } from "./effective-permissions.ts";
-import { loadActiveBundle } from "./management.ts";
+import {
+	activeConfigRevisionId,
+	commitChange,
+	loadActiveBundle,
+	ManagementConflictError,
+} from "./management.ts";
 import { loadAgents } from "./store.ts";
 import {
 	adoptAgentToolAttachments,
@@ -48,6 +53,15 @@ function organization(): OrganizationConfig {
 			},
 		},
 	});
+}
+
+/** `organization()`, naming a different finance agent — every non-finance agent must explicitly
+ * deny `finance.*` (`config-bundle.ts`'s own `financeIssues`), which always resolves to the two
+ * seeded finance executor entries; the *finance* agent itself has no such requirement, so it is the
+ * only agent whose legacy conversion can ever resolve to truly zero attachments. */
+function organizationWithFinanceAgent(financeAgentId: string): OrganizationConfig {
+	const base = organization();
+	return { ...base, organization: { ...base.organization, finance_agent_id: financeAgentId } };
 }
 
 function agent(id: string, overrides: Partial<AgentConfig> = {}): AgentConfig {
@@ -392,5 +406,164 @@ describe("effective permissions: compiled attachments as the single source of tr
 			});
 			expect(results.every((r) => r.commit !== null || r.alreadyHubManaged)).toBe(true);
 		});
+
+		/** The *finance* agent is the only one a bare `permissions` list can ever resolve to zero
+		 * attachments for (see `organizationWithFinanceAgent`): every other agent's own forced
+		 * `finance.*` deny always resolves to the two seeded finance entries. */
+		async function resetWithEmptyFinanceAgent(): Promise<void> {
+			await applyConfig(
+				deps,
+				{
+					organization: organizationWithFinanceAgent("gamma"),
+					agents: [
+						agent("gamma", {
+							permissions: { tools_allow: [], tools_require_human_approval: [], tools_deny: [] },
+						}),
+					],
+					constitution: "Be helpful.",
+					rolePrompts: { gamma: "Role prompt for gamma." },
+				},
+				"test",
+			);
+		}
+
+		async function effectiveForGamma() {
+			const record = (await inTransaction(deps, ({ tx }) => loadAgents(tx.db))).find(
+				(a) => a.id === "gamma",
+			);
+			if (record === undefined) {
+				throw new Error("agent 'gamma' does not exist");
+			}
+			return inTransaction(deps, ({ tx }) => loadEffectivePermissionsIn(tx, record, "gamma"));
+		}
+
+		it("adopts an agent whose legacy permissions resolve to zero attachments, marking it hub-managed with an explicitly empty list", async () => {
+			await resetWithEmptyFinanceAgent();
+			const [result] = await adoptAgentToolAttachments(deps, {
+				agentIds: ["gamma"],
+				dryRun: false,
+				actor: "test",
+			});
+			expect(result).toMatchObject({ agentId: "gamma", alreadyHubManaged: false });
+			expect(result?.attachments).toEqual([]);
+			expect(result?.unresolved).toEqual([]);
+			expect(result?.commit).not.toBeNull();
+			const effective = await effectiveForGamma();
+			expect(effective.hubManaged).toBe(true);
+			expect(effective.toolPolicy).toEqual({
+				allow: [],
+				requireHumanApproval: [],
+				deny: ["memory.write"],
+			});
+
+			// Idempotent: adopting it again is a no-op, same as any other already hub-managed agent.
+			const [again] = await adoptAgentToolAttachments(deps, {
+				agentIds: ["gamma"],
+				dryRun: false,
+				actor: "test",
+			});
+			expect(again).toMatchObject({ alreadyHubManaged: true, commit: null });
+		});
+
+		it("dry-run previews the zero-attachments case too, without committing", async () => {
+			await resetWithEmptyFinanceAgent();
+			const [result] = await adoptAgentToolAttachments(deps, {
+				agentIds: ["gamma"],
+				dryRun: true,
+				actor: "test",
+			});
+			expect(result?.commit).toBeNull();
+			expect(result?.after).toEqual({
+				tools_allow: [],
+				tools_require_human_approval: [],
+				tools_deny: ["memory.write"],
+			});
+			expect((await effectiveForGamma()).hubManaged).toBe(false);
+		});
+
+		it(
+			"a concurrent revoke of a resolved capability between the read and the commit is never " +
+				"silently undone: the adoption conflicts, or its own read already reflects the revoke",
+			async () => {
+				const configured = [
+					agent("finance"),
+					agent("alpha", {
+						permissions: {
+							tools_allow: ["web.search"],
+							tools_require_human_approval: [],
+							tools_deny: ["finance.*"],
+						},
+					}),
+					agent("beta"),
+				];
+				await applyConfig(
+					deps,
+					{
+						organization: organization(),
+						agents: configured,
+						constitution: "Be helpful.",
+						rolePrompts: Object.fromEntries(
+							configured.map((a) => [a.id, `Role prompt for ${a.id}.`]),
+						),
+					},
+					"test",
+				);
+
+				// The "concurrent" change: an operator's own `config apply`/console edit revokes
+				// `web.search` from alpha's legacy `permissions`, directly (never through the hub —
+				// alpha is not adopted yet).
+				const revoke = async () => {
+					const baseRevisionId = await activeConfigRevisionId(deps);
+					return commitChange(deps, {
+						changeSet: [
+							{
+								type: "update_agent",
+								agent: agent("alpha", {
+									permissions: {
+										tools_allow: [],
+										tools_require_human_approval: [],
+										tools_deny: ["finance.*"],
+									},
+								}),
+							},
+						],
+						baseRevisionId,
+						actor: "test",
+						source: "cli_apply",
+					});
+				};
+
+				const [adoptOutcome, revokeOutcome] = await Promise.allSettled([
+					adoptAgentToolAttachments(deps, { agentIds: ["alpha"], dryRun: false, actor: "test" }),
+					revoke(),
+				]);
+
+				// Either race loser is refused as a conflict (its own base revision went stale while it
+				// was still reading or about to commit) — never silently applied on top of data the
+				// other side already moved past.
+				for (const outcome of [adoptOutcome, revokeOutcome]) {
+					if (outcome.status === "rejected") {
+						expect(outcome.reason).toBeInstanceOf(ManagementConflictError);
+					}
+				}
+				// If the adoption committed `web.search` as an `allow` attachment, that is only ever
+				// legitimate when its own commit landed *before* the revoke's (so the revoke simply
+				// hadn't happened yet when the adoption's read — and base revision — were taken);
+				// never when the revoke's commit came first, which is exactly the bug this closes: the
+				// old code could commit a changeset built from a read taken before the revoke against a
+				// base revision taken after it, silently resurrecting what the revoke had just removed.
+				if (adoptOutcome.status === "fulfilled" && revokeOutcome.status === "fulfilled") {
+					const [adoptResult] = adoptOutcome.value;
+					const adoptedWebSearch = adoptResult?.attachments.some(
+						(a) => a.entryId === "native-web-search" && a.mode === "allow",
+					);
+					if (adoptedWebSearch === true) {
+						expect(adoptResult?.commit?.revisionId ?? 0).toBeLessThan(
+							revokeOutcome.value.revisionId,
+						);
+					}
+				}
+			},
+		);
 	});
 });

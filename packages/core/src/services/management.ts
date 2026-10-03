@@ -36,7 +36,6 @@ import {
 	gatewayControls,
 } from "@agent-gateway/db";
 import { canonicalHash } from "@agent-gateway/events";
-import { compileAttachments, compiledAgentPermissions } from "@agent-gateway/policy";
 import { asc, desc, eq, inArray, or } from "drizzle-orm";
 import {
 	AdminError,
@@ -50,7 +49,7 @@ import {
 } from "./admin.ts";
 import {
 	attachmentCatalogProblems,
-	loadCompilableCatalogEntries,
+	mirrorCompiledAttachmentPermissions,
 } from "./attachment-validation.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
 import {
@@ -495,6 +494,18 @@ function applyOperation(draft: ConfigDraftBundle, op: ChangeOperation): Operatio
 			}
 			return { draft: { ...draft, toolAttachments }, problems: [] };
 		}
+		case "set_tool_attachments": {
+			if (!draft.agents.some((agent) => agent.id === op.agentId)) {
+				return { draft, problems: [`set_tool_attachments: agent '${op.agentId}' does not exist`] };
+			}
+			return {
+				draft: {
+					...draft,
+					toolAttachments: { ...draft.toolAttachments, [op.agentId]: [...op.attachments] },
+				},
+				problems: [],
+			};
+		}
 	}
 }
 
@@ -577,33 +588,13 @@ export async function mirrorCompiledAttachmentPermissionsIn(
 	if (draft.organization === null || Object.keys(draft.toolAttachments).length === 0) {
 		return draft;
 	}
-	const financeAgentId = draft.organization.organization.finance_agent_id;
-	const catalog = await loadCompilableCatalogEntries(db, draft.toolAttachments);
-	let changed = false;
-	const agents = draft.agents.map((agent) => {
-		const attachments = draft.toolAttachments[agent.id];
-		if (attachments === undefined) {
-			return agent;
-		}
-		const compiled = compileAttachments({
-			agentId: agent.id,
-			financeAgentId,
-			adapter: agent.runtime.adapter,
-			attachments,
-			catalog,
-		});
-		const permissions = compiledAgentPermissions(compiled, {
-			agentId: agent.id,
-			financeAgentId,
-			observeSystem: agent.permissions.observe_system === true,
-		});
-		if (deepEqual(agent.permissions, permissions)) {
-			return agent;
-		}
-		changed = true;
-		return { ...agent, permissions };
-	});
-	return changed ? { ...draft, agents } : draft;
+	const agents = await mirrorCompiledAttachmentPermissions(
+		db,
+		draft.organization.organization.finance_agent_id,
+		draft.agents,
+		draft.toolAttachments,
+	);
+	return { ...draft, agents };
 }
 
 // ---------------------------------------------------------------------------
@@ -1458,8 +1449,6 @@ export async function commitChangeIn(
 
 	const result = await writeConfigRevisionIn(uow, {
 		input: resolvedInput,
-		bundle,
-		version,
 		toolAttachments: draft.toolAttachments,
 		generation,
 		parentRevisionId: currentRevisionId,
