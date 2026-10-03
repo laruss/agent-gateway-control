@@ -35,14 +35,17 @@ import {
 	ToolCatalogSupportedAdaptersSchema,
 	type ToolName,
 	type ToolNamespace,
+	toolPatternCovers,
 } from "@agent-gateway/contracts";
 import {
+	agents,
 	catalogAttachments,
 	catalogEntries,
 	catalogEntryTombstones,
 	catalogEntryVersions,
 	gatewayControls,
 } from "@agent-gateway/db";
+import { canonicalHash } from "@agent-gateway/events";
 import {
 	compileAttachments,
 	compiledAgentPermissions,
@@ -511,6 +514,14 @@ export type EditCatalogEntryInput = Readonly<{
 	 * `supportedAdapters` replaces the whole list. */
 	httpsDefinition?: CustomHttpsDefinition;
 	actor: string;
+	/** The entry's own `currentVersion.version` as the caller last read it (the console's own
+	 * entry-detail load, typically): refused (`StaleCatalogEntryVersionError`) once it no longer
+	 * matches the version this edit would actually publish over, rather than silently merging this
+	 * edit's own fields forward over a version the caller never saw — an edit this old could
+	 * otherwise overwrite someone else's very recent change to the same field with stale data from
+	 * before it, last-writer-wins, with no warning either edit ever happened. Absent for the CLI,
+	 * which keeps the ordinary "edit over whatever is current" behaviour unchanged. */
+	expectedVersion?: number;
 }>;
 
 /**
@@ -590,11 +601,30 @@ export function editCatalogEntryInputProblems(input: EditCatalogEntryInput): Rea
 	return problems;
 }
 
+/** Thrown by {@link editCatalogEntry} when a caller's `expectedVersion` no longer names the
+ * entry's actual current version — someone else published a new one since the caller last read
+ * it. Mapped to a `409` by the console, distinct from `ManagementConflictError` (a config revision
+ * conflict): a catalog entry's own version advances independently of any config revision. */
+export class StaleCatalogEntryVersionError extends Error {
+	constructor(
+		readonly entryId: string,
+		readonly currentVersion: number,
+	) {
+		super(
+			`catalog entry '${entryId}' is now at version ${currentVersion}, not the version this edit expected; reload and try again`,
+		);
+	}
+}
+
 /**
  * Publishes a new, immutable version of `entryId`, copying forward whatever `input` leaves unset.
  * Refused for a built-in entry whose patch touches `configSchema`/`riskFloor`/`supportedAdapters`
  * (`builtInEditProblems`); its `name`/`description` may still change. The entry's own
- * `currentVersion` advances to the new version in the same transaction.
+ * `currentVersion` advances to the new version in the same transaction. Refused
+ * (`StaleCatalogEntryVersionError`) when `input.expectedVersion` no longer names the version this
+ * edit would actually publish over (checked fresh, inside this same transaction, right where
+ * `current` is read — never a caller's own, separately-read "is it still version N" moments
+ * earlier).
  */
 export async function editCatalogEntry(
 	deps: ControlPlaneDeps,
@@ -637,6 +667,12 @@ export async function editCatalogEntry(
 		const current = await loadEntry(db, input.entryId);
 		if (current === null) {
 			throw new AdminError(`internal: catalog entry '${input.entryId}' has no current version`);
+		}
+		if (
+			input.expectedVersion !== undefined &&
+			input.expectedVersion !== current.currentVersion.version
+		) {
+			throw new StaleCatalogEntryVersionError(input.entryId, current.currentVersion.version);
 		}
 		const [inserted] = await db
 			.insert(catalogEntryVersions)
@@ -806,6 +842,53 @@ export async function createCustomHttpsTool(
 }
 
 /**
+ * Every currently enabled, legacy (not hub-managed) agent whose own `permissions` actually grants
+ * `implementationKey` outright or with approval (`tools_allow`/`tools_require_human_approval`,
+ * never `tools_deny` — denying it is not "holding" it) — read straight from the live `agents`
+ * projection, never the catalog: a legacy agent's enforcement (`loadEffectivePermissionsIn`)
+ * consults its `permissions` lists alone and never the catalog at all, so deleting a catalog entry
+ * can revoke a hub-managed agent's access (its attachment is cleared) but has no effect whatsoever
+ * on a legacy agent whose own pattern happens to cover the same tool. `enabled = false` is excluded:
+ * a disabled (retired, or simply removed from the active configuration) agent's `config` column is
+ * only its last-known projection, never actually enforced any more, and a retired agent that was
+ * never hub-managed also reports `tool_attachments_managed = false` once it leaves the active
+ * configuration, which would otherwise flag it here for a tool it can no longer use at all. Shared
+ * by `deleteCatalogEntry` (refuses while this is non-empty) and the console's own entry-detail read
+ * (shows it as part of the deletion's impact, alongside `attachedAgents`).
+ */
+export async function legacyAgentsGrantingTool(
+	db: Db,
+	implementationKey: ToolName,
+): Promise<Readonly<{ agentId: AgentId; displayName: string }[]>> {
+	// Every agent of the active configuration, enabled or not: a disabled legacy agent re-enabled
+	// later would otherwise get a deleted tool back. Rows kept only for history (retired, removed)
+	// belong to an older configuration version and are left out.
+	const [controls] = await db
+		.select({ activeConfigVersion: gatewayControls.activeConfigVersion })
+		.from(gatewayControls);
+	const activeConfigVersion = controls?.activeConfigVersion ?? null;
+	const rows = await db
+		.select({ id: agents.id, displayName: agents.displayName, config: agents.config })
+		.from(agents)
+		.where(
+			and(
+				eq(agents.toolAttachmentsManaged, false),
+				activeConfigVersion === null
+					? eq(agents.enabled, true)
+					: eq(agents.configVersion, activeConfigVersion),
+			),
+		);
+	const granting = rows
+		.filter(({ config }) =>
+			[...config.permissions.tools_allow, ...config.permissions.tools_require_human_approval].some(
+				(pattern) => toolPatternCovers(pattern, implementationKey),
+			),
+		)
+		.map((row) => ({ agentId: row.id, displayName: row.displayName }));
+	return granting.sort((a, b) => (a.agentId < b.agentId ? -1 : 1));
+}
+
+/**
  * Deletes `entryId`, removing every agent's attachment of it atomically in the same transaction
  * (one `clear_tool_attachments` change, committed through `commitChangeIn` exactly like any other
  * managed-configuration change — a conflict is retried once against the revision it names, the
@@ -813,6 +896,21 @@ export async function createCustomHttpsTool(
  * tombstone is written too, so `ensureToolCatalogSeeded` never re-adds it. A failure anywhere
  * rolls back everything: the change set and the attachment-clearing commit, the entry's own
  * `deleted_at`/`deleted_by`, and the tombstone.
+ *
+ * Refused outright, nothing committed, while {@link legacyAgentsGrantingTool} finds any agent still
+ * holding this entry's `implementationKey` through its own legacy `permissions` — deleting the
+ * entry would make the hub show it as gone everywhere while that agent goes on using the exact same
+ * tool, unaffected (see {@link legacyAgentsGrantingTool}'s own doc comment); the message points at
+ * `gateway tools adopt <agent-id>` (or the console's own Adopt), which converts that coverage into a
+ * real attachment this delete would then also clear.
+ *
+ * Returns the agent ids actually affected, read fresh inside this same transaction right before
+ * committing — never a caller's own, separately-read "impact preview" from moments earlier, which a
+ * concurrent attach or detach could have already made stale. `expectedAffectedAgentIds`, when given
+ * (the console's own last-shown impact), binds the delete to that exact set: refused
+ * (`ManagementConflictError`, the same `409` every other stale-preview conflict already is) the
+ * moment it no longer matches what this fresh read finds, rather than silently deleting a
+ * different — wider or narrower — set of agents than the one the owner actually confirmed.
  *
  * The entry row itself is never removed — only marked deleted (`deleted_at`/`deleted_by`), its
  * `current_version_id` left exactly as it was: deleting the row outright would FK-fail the very
@@ -827,7 +925,15 @@ export async function deleteCatalogEntry(
 	deps: ControlPlaneDeps,
 	entryId: string,
 	actor: string,
-): Promise<void> {
+	/** `cli_apply` (the default, unchanged — `gateway tools delete`) or `console`, for the hub's own
+	 * delete action — threaded into the `clear_tool_attachments` commit this writes, the same
+	 * convention every other catalog-mutating call already carries its own source with. */
+	source: ConfigRevisionSource = "cli_apply",
+	/** Binds the delete to an impact preview a caller already showed: refused (`409`) once the
+	 * agents this fresh read actually finds differ from this set (as sets, order-independent).
+	 * Absent for the CLI and every test, which both skip this check entirely. */
+	expectedAffectedAgentIds?: Readonly<AgentId[]>,
+): Promise<Readonly<{ affected: Readonly<AgentId[]> }>> {
 	const MAX_ATTEMPTS = 3;
 	for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
 		const outcome = await inTransaction(deps, async (uow) => {
@@ -851,6 +957,7 @@ export async function deleteCatalogEntry(
 				.select({
 					id: catalogEntries.id,
 					kind: catalogEntries.kind,
+					implementationKey: catalogEntries.implementationKey,
 					isBuiltin: catalogEntries.isBuiltin,
 					deletedAt: catalogEntries.deletedAt,
 				})
@@ -860,16 +967,37 @@ export async function deleteCatalogEntry(
 			if (entryRow === undefined || entryRow.deletedAt !== null) {
 				throw new AdminError(`catalog entry '${entryId}' does not exist`);
 			}
-			const affected = await db
+			const legacyGrantingAgents = await legacyAgentsGrantingTool(db, entryRow.implementationKey);
+			if (legacyGrantingAgents.length > 0) {
+				throw new AdminError(
+					`catalog entry '${entryId}' is still granted by legacy permissions of: ` +
+						`${legacyGrantingAgents.map((agent) => agent.agentId).join(", ")}; run ` +
+						"'gateway tools adopt <agent-id>' (or the console's Adopt) for each first",
+				);
+			}
+			const affectedRows = await db
 				.selectDistinct({ agentId: catalogAttachments.agentId })
 				.from(catalogAttachments)
 				.where(eq(catalogAttachments.entryId, entryId));
+			const affected = affectedRows.map((row) => row.agentId);
+			if (expectedAffectedAgentIds !== undefined) {
+				const actualSet = new Set(affected);
+				const expectedSet = new Set(expectedAffectedAgentIds);
+				const same =
+					actualSet.size === expectedSet.size && [...actualSet].every((id) => expectedSet.has(id));
+				if (!same) {
+					return {
+						kind: "conflict" as const,
+						currentRevisionId: controls?.revision ?? null,
+					};
+				}
+			}
 			if (affected.length > 0) {
 				const changeSet: ChangeSet = [{ type: "clear_tool_attachments", entryId }];
 				const baseRevisionId = controls?.revision ?? null;
 				const commit = await commitChangeIn(
 					uow,
-					{ changeSet, baseRevisionId, actor, source: "cli_apply" },
+					{ changeSet, baseRevisionId, actor, source },
 					changeSet,
 				);
 				if (commit.kind === "conflict") {
@@ -897,15 +1025,17 @@ export async function deleteCatalogEntry(
 				builtin: entryRow.isBuiltin,
 				affectedAgents: affected.length,
 			});
-			return { kind: "committed" as const };
+			return { kind: "committed" as const, affected };
 		});
 		if (outcome.kind === "committed") {
-			return;
+			return { affected: outcome.affected };
 		}
 		if (attempt === MAX_ATTEMPTS) {
 			throw new ManagementConflictError(outcome.currentRevisionId);
 		}
 	}
+	// Unreachable: the loop above always returns or throws by the last attempt.
+	throw new ManagementConflictError(null);
 }
 
 // ---------------------------------------------------------------------------
@@ -1002,6 +1132,37 @@ async function currentRevisionIdIn(db: Db): Promise<number | null> {
 // name, or `--all`, every time.
 // ---------------------------------------------------------------------------
 
+/**
+ * The one hash a console confirm binds itself to, alongside `baseRevisionId`: a config revision
+ * change is not the only thing that can move what a legacy pattern resolves to — a catalog entry
+ * created, edited or deleted between the preview and the confirm changes it too, with no config
+ * revision of its own at all (catalog entries are not part of a config revision, ADR-027). Sorted
+ * by `entryId` first, the same canonicalization `canonicalizeAttachments` already gives a
+ * committed attachments document, so two resolutions that differ only in the order their
+ * attachments happened to be produced in still hash identically.
+ */
+export function attachmentsConversionHash(attachments: Readonly<ToolAttachment[]>): string {
+	return canonicalHash(
+		[...attachments].sort((a, b) => (a.entryId < b.entryId ? -1 : a.entryId > b.entryId ? 1 : 0)),
+	);
+}
+
+/**
+ * Thrown by {@link adoptOneAgent} when a caller's `expectedAttachmentsHash` no longer matches what
+ * `agentId`'s legacy `permissions` resolve to right now — the catalog moved on since whatever
+ * conversion the caller reviewed (a console preview, typically), never silently committed against
+ * the newer resolution instead. Mapped to a `409`, the same as `ManagementConflictError`, by
+ * `consoleAdoptCommit`; never thrown at all for a caller that gives no `expectedAttachmentsHash`
+ * (the CLI, and every preview, console included).
+ */
+export class StaleConversionError extends Error {
+	constructor(readonly agentId: AgentId) {
+		super(
+			`agent '${agentId}': the catalog changed since this conversion was last previewed; reload the preview and try again`,
+		);
+	}
+}
+
 export type AdoptAgentResult = Readonly<{
 	agentId: AgentId;
 	/** The revision this result was read against (`AdoptToolAttachmentsInput.baseRevisionId` when
@@ -1021,6 +1182,10 @@ export type AdoptAgentResult = Readonly<{
 	/** The attachments this call resolved (and, unless `dryRun` or `problems` is non-empty,
 	 * committed) for this agent; empty when there was nothing to resolve. */
 	attachments: Readonly<ToolAttachment[]>;
+	/** `attachmentsConversionHash(attachments)` — a console preview echoes this back as
+	 * `expectedAttachmentsHash` on its own confirm, refused (`StaleConversionError`) once the
+	 * catalog has changed what the same legacy patterns resolve to. */
+	conversionHash: string;
 	/** A resolved pattern's mode its own catalog entry's `kind` does not support
 	 * (`modeSupportedByKind`): a legacy `permissions` list naming a pattern in a way the catalog
 	 * model cannot express (e.g. a native tool in `tools_require_human_approval`, which has no
@@ -1052,6 +1217,11 @@ export type AdoptToolAttachmentsInput = Readonly<{
 	 * preview never displayed. Absent for the CLI (and for a preview, console included), which both
 	 * want the ordinary "read whatever is live, commit against exactly that" behaviour unchanged. */
 	baseRevisionId?: number | null;
+	/** Binds a real commit (`dryRun: false`) to the exact conversion a caller already reviewed
+	 * (`attachmentsConversionHash` of a prior preview's own `attachments`): refused
+	 * (`StaleConversionError`) when the catalog has changed what this agent's legacy patterns
+	 * resolve to since. Absent for the CLI and every preview, which both skip this check entirely. */
+	expectedAttachmentsHash?: string;
 }>;
 
 /**
@@ -1127,6 +1297,7 @@ async function adoptOneAgent(
 		financeAgentId,
 		observeSystem: agent.permissions.observe_system === true,
 	});
+	const conversionHash = attachmentsConversionHash(read.attachments);
 	if (read.hubManaged) {
 		return {
 			agentId,
@@ -1136,6 +1307,7 @@ async function adoptOneAgent(
 			before: compiledPermissions,
 			after: compiledPermissions,
 			attachments: read.attachments,
+			conversionHash,
 			problems: [],
 			commit: null,
 		};
@@ -1172,6 +1344,7 @@ async function adoptOneAgent(
 			before: agent.permissions,
 			after: agent.permissions,
 			attachments: read.attachments,
+			conversionHash,
 			problems,
 			commit: null,
 		};
@@ -1185,9 +1358,21 @@ async function adoptOneAgent(
 			before: agent.permissions,
 			after: compiledPermissions,
 			attachments: read.attachments,
+			conversionHash,
 			problems: [],
 			commit: null,
 		};
+	}
+	// The console's own confirm step binds itself to the exact conversion its preview showed
+	// (`attachmentsConversionHash`): a catalog entry created, edited or deleted since changes what
+	// these same legacy patterns resolve to without moving the config revision at all (catalog
+	// entries carry no config revision of their own), which `baseRevisionId` alone cannot catch.
+	// Checked here, before anything commits — never after, which would already be too late.
+	if (
+		input.expectedAttachmentsHash !== undefined &&
+		input.expectedAttachmentsHash !== conversionHash
+	) {
+		throw new StaleConversionError(agentId);
 	}
 	// One bounded operation regardless of how many attachments resolved (`MAX_CHANGE_SET_OPERATIONS`
 	// could not bound one `attach_tool` per attachment for a wide legacy pattern; the check above
@@ -1217,6 +1402,7 @@ async function adoptOneAgent(
 		before: agent.permissions,
 		after: compiledPermissions,
 		attachments: read.attachments,
+		conversionHash,
 		problems: [],
 		commit,
 	};
@@ -1270,6 +1456,13 @@ export type AttachToolInput = Readonly<{
 	source: ConfigRevisionSource;
 	idempotencyKey?: string;
 	reason?: string;
+	/** Pins the read (and the commit's own base) to this exact revision instead of whatever is live
+	 * when this call runs — the console's own agent-tools read, echoing back the revision it already
+	 * showed, so a configuration change landing in between is a conflict
+	 * (`ManagementConflictError`) rather than committing (for a still-legacy agent, converting its
+	 * `permissions`) against newer state the owner never saw on that page. Absent for the CLI, which
+	 * wants the ordinary "read whatever is live, commit against exactly that" behaviour unchanged. */
+	baseRevisionId?: number | null;
 }>;
 
 export type AttachToolResult = CommitChangeResult &
@@ -1367,7 +1560,10 @@ export async function attachTool(
 		};
 	}
 	await checkAttachable(deps, input.entryId, input.pinnedVersion, input.mode);
-	const { revisionId, bundle, attachments } = await loadAllAgentToolAttachmentsWithRevision(deps);
+	const { revisionId, bundle, attachments } = await loadAllAgentToolAttachmentsWithRevision(
+		deps,
+		input.baseRevisionId,
+	);
 	const read = attachments[input.agentId];
 	if (read === undefined) {
 		throw new AdminError(`agent '${input.agentId}' does not exist`);

@@ -9,12 +9,7 @@ import type {
 	ToolName,
 	ToolPolicySnapshot,
 } from "@agent-gateway/contracts";
-import { toolPatternCovers } from "@agent-gateway/contracts";
-
-/** The only tool pattern that ever names every finance capability at once; kept here, not
- * imported from `@agent-gateway/contracts`' `config-bundle.ts`, so this pure package never
- * depends on that module's own IO-free but configuration-apply-specific surface. */
-const FINANCE_TOOLS = "finance.*";
+import { FINANCE_TOOLS, toolPatternCovers } from "@agent-gateway/contracts";
 
 // ---------------------------------------------------------------------------
 // Catalog-level native dependencies: data, not scattered ifs (step 1 of the phase this

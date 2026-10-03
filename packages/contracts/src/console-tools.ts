@@ -70,6 +70,15 @@ export const ConsoleCatalogAttachedAgentSchema = z.strictObject({
 });
 export type ConsoleCatalogAttachedAgent = z.infer<typeof ConsoleCatalogAttachedAgentSchema>;
 
+/** A legacy (not hub-managed) agent whose own `permissions` grants this entry's tool outright —
+ * never shown an attachment `mode`/`pinnedVersion`, since none exists: this coverage comes from a
+ * hand-authored `tools_allow`/`tools_require_human_approval` pattern, not a catalog attachment. */
+export const ConsoleLegacyGrantingAgentSchema = z.strictObject({
+	agentId: AgentIdSchema,
+	displayName: z.string(),
+});
+export type ConsoleLegacyGrantingAgent = z.infer<typeof ConsoleLegacyGrantingAgentSchema>;
+
 export const ConsoleCatalogSecretAliasStatusSchema = z.strictObject({
 	alias: z.string(),
 	/** `false`: `gateway tools secret set <alias>` has never written this alias's file on this
@@ -84,6 +93,10 @@ export const ConsoleToolCatalogEntryDetailResponseSchema = z.strictObject({
 	/** Oldest first, exactly like `gateway tools custom edit`'s own history. */
 	versions: z.array(ToolCatalogEntryVersionSchema),
 	attachedAgents: z.array(ConsoleCatalogAttachedAgentSchema),
+	/** Every legacy agent whose own `permissions` grants this entry's tool, unaffected by a delete
+	 * unless it adopts into the hub first (`legacyAgentsGrantingTool`, ADR-027) — part of the
+	 * deletion's impact alongside `attachedAgents`, blocking it while non-empty. */
+	legacyGrantingAgents: z.array(ConsoleLegacyGrantingAgentSchema),
 	/** Empty for every kind but `custom_https`. */
 	secretAliases: z.array(ConsoleCatalogSecretAliasStatusSchema),
 });
@@ -121,8 +134,19 @@ export const ConsoleEditCatalogEntryRequestSchema = z
 		name: ToolCatalogEntryNameSchema.optional(),
 		description: ToolCatalogEntryDescriptionSchema.optional(),
 		httpsDefinition: CustomHttpsDefinitionSchema.optional(),
+		/** The entry's own `currentVersion.version` as the console's entry-detail page last showed
+		 * it: refused with `409` once the entry has moved to a different version since (someone
+		 * else's edit) — last-writer-wins otherwise, silently merging this edit's own fields over a
+		 * version the owner never actually saw. */
+		expectedVersion: z.int().positive().optional(),
 	})
-	.refine((patch) => Object.keys(patch).length > 0, "edit must change at least one field");
+	.refine(
+		(patch) =>
+			patch.name !== undefined ||
+			patch.description !== undefined ||
+			patch.httpsDefinition !== undefined,
+		"edit must change at least one field",
+	);
 export type ConsoleEditCatalogEntryRequest = z.infer<typeof ConsoleEditCatalogEntryRequestSchema>;
 
 export const ConsoleEditCatalogEntryResponseSchema = z.strictObject({
@@ -132,14 +156,21 @@ export const ConsoleEditCatalogEntryResponseSchema = z.strictObject({
 });
 export type ConsoleEditCatalogEntryResponse = z.infer<typeof ConsoleEditCatalogEntryResponseSchema>;
 
-/** No fields of its own: a confirmation dialog already showed the entry detail's own
- * `attachedAgents` as the deletion's impact before this is ever sent. */
-export const ConsoleDeleteCatalogEntryRequestSchema = z.strictObject({});
+/** `expectedAttachedAgentIds` is optional: a confirmation dialog already showed the entry detail's
+ * own `attachedAgents` as the deletion's impact before this is ever sent, and echoing that exact
+ * set back here binds the delete to it — refused with `409` once the live set no longer matches
+ * (a concurrent attach or detach since the dialog loaded), rather than silently deleting whatever
+ * the server happens to find at the moment it runs. */
+export const ConsoleDeleteCatalogEntryRequestSchema = z.strictObject({
+	expectedAttachedAgentIds: z.array(AgentIdSchema).optional(),
+});
 
 export const ConsoleDeleteCatalogEntryResponseSchema = z.strictObject({
 	entryId: ToolCatalogEntryIdSchema,
-	/** Every agent that held this entry's attachment, read immediately before the delete committed
-	 * (the rows themselves are gone once it has) — what actually lost access. */
+	/** Every agent that held this entry's attachment, read fresh inside the delete's own
+	 * transaction, immediately before it committed (the rows themselves are gone once it has) —
+	 * what actually lost access, never a separate, earlier read that a concurrent change could have
+	 * made stale by the time the delete actually ran. */
 	affectedAgentIds: z.array(AgentIdSchema),
 });
 export type ConsoleDeleteCatalogEntryResponse = z.infer<
@@ -169,6 +200,11 @@ export const ConsoleAgentToolsResponseSchema = z.strictObject({
 	 * `false`: a legacy agent, whose `requested` is only a read-only preview of what its
 	 * `permissions` lists convert to — "Adopt into the tools hub" is what makes it editable. */
 	hubManaged: z.boolean(),
+	/** The active revision this read came from — echoed back on `attach`, which refuses with `409`
+	 * once the active configuration has moved past it (`ConsoleAttachToolRequestSchema`'s own
+	 * `baseRevisionId`), rather than silently converting a still-legacy agent's current `permissions`
+	 * against state the owner never actually saw on this page. */
+	baseRevisionId: z.int().positive().nullable(),
 	requested: z.array(ToolAttachmentSchema),
 	unresolved: z.array(ConsoleUnresolvedPatternSchema),
 	// A hub-managed agent's compiled lists are always concrete tool names (every catalog entry's
@@ -208,6 +244,13 @@ export const ConsoleAttachToolRequestSchema = z.strictObject({
 	pinnedVersion: z.int().positive().nullable(),
 	mode: ToolAttachmentModeSchema,
 	settings: ToolAttachmentSettingsSchema.optional(),
+	/** The agent-tools read's own `baseRevisionId`, when the console gives one: binds an implicit
+	 * legacy conversion (`attachTool`'s own, for a still-legacy agent) to the exact `permissions` the
+	 * owner actually saw on this page, refused (`409`) once the active configuration has moved past
+	 * it — never silently converting newer state the owner never reviewed. Absent for a hub-managed
+	 * agent's own attach (no conversion happens there) and for the CLI, both of which keep the
+	 * existing "whatever is live" behaviour unchanged. */
+	baseRevisionId: z.int().positive().nullable().optional(),
 	reason: ConfigRevisionReasonSchema.optional(),
 });
 export type ConsoleAttachToolRequest = z.infer<typeof ConsoleAttachToolRequestSchema>;
@@ -264,6 +307,12 @@ export const ConsoleAdoptPreviewResponseSchema = z.strictObject({
 	before: AgentPermissionsSchema,
 	after: AgentPermissionsSchema,
 	attachments: z.array(ToolAttachmentSchema),
+	/** `attachmentsConversionHash(attachments)` — echoed back on the commit request alongside
+	 * `baseRevisionId`, which refuses with `409` once the active configuration has moved past it, but
+	 * cannot by itself catch a catalog entry created, edited or deleted since (catalog entries carry
+	 * no config revision of their own, ADR-027): this hash closes that gap, refusing the commit once
+	 * the same legacy patterns resolve to something this preview never showed. */
+	conversionHash: Sha256HexSchema,
 	problems: z.array(z.string()),
 });
 export type ConsoleAdoptPreviewResponse = z.infer<typeof ConsoleAdoptPreviewResponseSchema>;
@@ -273,6 +322,10 @@ export const ConsoleAdoptCommitRequestSchema = z.strictObject({
 	/** The preview's own `baseRevisionId`; a commit against a configuration that has since moved on
 	 * is refused as a conflict (`409`), never silently recomputed against the newer, live state. */
 	baseRevisionId: z.int().positive().nullable(),
+	/** The preview's own `conversionHash`; a commit once the catalog has changed what the same
+	 * legacy patterns resolve to is refused (`409`), never silently committed against the newer
+	 * resolution the preview never showed. */
+	expectedConversionHash: Sha256HexSchema,
 	reason: ConfigRevisionReasonSchema.optional(),
 });
 export type ConsoleAdoptCommitRequest = z.infer<typeof ConsoleAdoptCommitRequestSchema>;

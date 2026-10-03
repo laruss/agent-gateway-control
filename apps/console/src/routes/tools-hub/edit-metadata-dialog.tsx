@@ -20,6 +20,10 @@ export type EditMetadataDialogProps = Readonly<{
 	entryId: string;
 	name: string;
 	description: string;
+	/** The entry's own `currentVersion.version`, as this page last loaded it: echoed back on
+	 * submit, refused with a clear message once someone else's edit already moved the entry past
+	 * it, rather than silently overwriting that edit. */
+	expectedVersion: number;
 	onSaved: () => void;
 }>;
 
@@ -35,6 +39,7 @@ export function EditMetadataDialog({
 	entryId,
 	name: initialName,
 	description: initialDescription,
+	expectedVersion,
 	onSaved,
 }: EditMetadataDialogProps): React.ReactElement {
 	const [name, setName] = React.useState(initialName);
@@ -69,7 +74,14 @@ export function EditMetadataDialog({
 			const result = await editCatalogEntry(entryId, {
 				...(name !== initialName ? { name } : {}),
 				...(description !== initialDescription ? { description } : {}),
+				expectedVersion,
 			});
+			if (result.kind === "conflict") {
+				setError(
+					"This entry was edited elsewhere since this page was loaded. Reload and try again.",
+				);
+				return;
+			}
 			if (result.kind === "invalid") {
 				setError(result.problems.join("; "));
 				return;

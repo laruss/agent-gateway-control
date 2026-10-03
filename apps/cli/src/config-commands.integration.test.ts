@@ -22,6 +22,7 @@ import {
 	configSnapshotBundle,
 	deleteCatalogEntry,
 	detachTool,
+	ensureConfigHistory,
 	ensureToolCatalogSeeded,
 	inTransaction,
 	loadActiveBundle,
@@ -869,21 +870,36 @@ describe("config export/import: tool attachments round-trip (ADR-027)", () => {
 	});
 
 	it("config apply refuses a directory that still attaches a since-deleted catalog entry", async () => {
+		// Not `native-web-fetch`/`native-web-search` (legacy-covered by `research`'s own
+		// `tools_allow`, `config/examples/agents/research.yaml`) or any other built-in an example
+		// agent's hand-authored permissions still grant: `deleteCatalogEntry` now refuses those
+		// outright until the covering agent adopts (this file's own
+		// "deleteCatalogEntry refuses while a legacy agent's permissions still grant the entry" test
+		// below). `utility-utility-text-transform` is the one built-in no example agent names.
 		const attached = await attachTool(harness.deps, {
 			agentId: "director",
-			entryId: "native-web-fetch",
+			entryId: "utility-utility-text-transform",
 			pinnedVersion: null,
-			mode: "allow",
+			mode: "require_approval",
 			settings: {},
 			actor: "test",
 			source: "cli_apply",
 		});
 		const dir = exportDir();
 		await configExport(harness.deps, { dir, revisionId: attached.revisionId }, noopPrint);
-		await deleteCatalogEntry(harness.deps, "native-web-fetch", "test");
+		await deleteCatalogEntry(harness.deps, "utility-utility-text-transform", "test");
 
 		await expect(applyConfig(harness.deps, loadConfigDirectory(dir, dir), "test")).rejects.toThrow(
-			/native-web-fetch' does not exist/,
+			/utility-utility-text-transform' does not exist/,
+		);
+	});
+
+	it("deleteCatalogEntry refuses while a legacy agent's permissions still grant the entry", async () => {
+		// `research` (`config/examples/agents/research.yaml`) is legacy: its own `tools_allow`
+		// grants `web.fetch` directly, unaffected by anything the hub does to the catalog entry
+		// behind it.
+		await expect(deleteCatalogEntry(harness.deps, "native-web-fetch", "test")).rejects.toThrow(
+			/legacy permissions of: research.*gateway tools adopt/s,
 		);
 	});
 });
@@ -1078,4 +1094,74 @@ describe("attachTool: a retry of the attachment that converted a legacy agent re
 		expect(retry.replayed).toBe(true);
 		expect(retry.revisionId).toBe(first.revisionId);
 	});
+});
+
+describe("ensureConfigHistory: backfill carries attachments forward (ADR-027)", () => {
+	it(
+		"a backfill triggered only by agents.enabled drifting carries the stale revision's own " +
+			"attachments document forward, never demoting a hub-managed agent to legacy on its own",
+		async () => {
+			const harness = await startHarness();
+			try {
+				await applyConfig(harness.deps, exampleInput(), "test");
+				await ensureToolCatalogSeeded(harness.deps, "test");
+				const attached = await attachTool(harness.deps, {
+					agentId: "director",
+					entryId: "gateway-mattermost-post",
+					pinnedVersion: null,
+					mode: "allow",
+					actor: "test",
+					source: "cli_apply",
+				});
+				const [beforeRow] = (
+					await harness.pool.query<{ hash: string | null }>(
+						"select attachments_snapshot_hash as hash from config_revisions where id = $1",
+						[attached.revisionId],
+					)
+				).rows;
+				expect(beforeRow?.hash).not.toBeNull();
+
+				// An older release toggling `agents.enabled` directly, bypassing the revision journal
+				// entirely (never touching any attachment): `config_generation` stays exactly where it
+				// was, but the live column now disagrees with what the active revision's own snapshot
+				// recorded for `operator` — `ensureConfigHistoryIn`'s own trigger for a backfill.
+				await harness.pool.query(
+					"update agents set enabled = false, state = 'disabled' where id = 'operator'",
+				);
+
+				await ensureConfigHistory(harness.deps, "test");
+				const [controls] = (
+					await harness.pool.query<{ revision: number }>(
+						"select active_config_revision as revision from gateway_controls where id = 1",
+					)
+				).rows;
+				const backfilledRevisionId = controls?.revision;
+				expect(backfilledRevisionId).not.toBe(attached.revisionId);
+
+				const [afterRow] = (
+					await harness.pool.query<{ hash: string | null }>(
+						"select attachments_snapshot_hash as hash from config_revisions where id = $1",
+						[backfilledRevisionId],
+					)
+				).rows;
+				// The fix: a backfill never carries a null attachments hash just because this write
+				// path otherwise never touches attachments — it carries the stale revision's own
+				// document forward, filtered to the agents still configured.
+				expect(afterRow?.hash).not.toBeNull();
+				expect(afterRow?.hash).toBe(beforeRow?.hash);
+
+				const { bundle } = await inTransaction(harness.deps, ({ tx }) =>
+					loadActiveBundle(tx.db, backfilledRevisionId ?? null),
+				);
+				expect(bundle.toolAttachments.director).toContainEqual({
+					entryId: "gateway-mattermost-post",
+					pinnedVersion: null,
+					mode: "allow",
+					settings: {},
+				});
+			} finally {
+				await harness.stop();
+			}
+		},
+	);
 });

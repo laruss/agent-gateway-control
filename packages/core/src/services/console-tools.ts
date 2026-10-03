@@ -10,6 +10,7 @@ import type {
 	ConsoleDetachToolRequest,
 	ConsoleDetachToolResponse,
 	ConsoleEditCatalogEntryRequest,
+	ConsoleLegacyGrantingAgent,
 	ConsoleToolCatalogListItem,
 	ConsoleToolCatalogListResponse,
 	ConsoleUpdateAttachmentRequest,
@@ -43,8 +44,11 @@ import {
 	editCatalogEntryInputProblems,
 	getCatalogEntry,
 	installedAdaptersFromHealth,
+	legacyAgentsGrantingTool,
 	listCatalogEntries,
 	listCatalogEntryVersions,
+	StaleCatalogEntryVersionError,
+	StaleConversionError,
 	type ToolCatalogAvailabilityContext,
 	updateAttachment,
 } from "./tool-catalog.ts";
@@ -138,6 +142,7 @@ export type ConsoleCatalogEntryCore = Readonly<{
 	entry: ToolCatalogEntryView;
 	versions: Readonly<ToolCatalogEntryVersion[]>;
 	attachedAgents: Readonly<ConsoleCatalogAttachedAgent[]>;
+	legacyGrantingAgents: Readonly<ConsoleLegacyGrantingAgent[]>;
 }>;
 
 /** `GET /api/tools/:entryId`, minus the secret-alias "is it set" status the controller layer adds
@@ -151,11 +156,12 @@ export async function consoleGetToolCatalogEntry(
 	if (entry === null) {
 		return null;
 	}
-	const [versions, attachedAgents] = await Promise.all([
+	const [versions, attachedAgents, legacyGrantingAgents] = await Promise.all([
 		listCatalogEntryVersions(deps, entryId),
 		listEntryAttachments(deps, entryId),
+		inTransaction(deps, ({ tx }) => legacyAgentsGrantingTool(tx.db, entry.implementationKey)),
 	]);
-	return { entry, versions, attachedAgents };
+	return { entry, versions, attachedAgents, legacyGrantingAgents };
 }
 
 export type ConsoleCreateCustomToolResult =
@@ -187,12 +193,17 @@ export async function consoleCreateCustomTool(
 export type ConsoleEditCatalogEntryResult =
 	| Readonly<{ kind: "ok"; entry: ToolCatalogEntry }>
 	| Readonly<{ kind: "not-found" }>
+	| Readonly<{ kind: "conflict"; currentVersion: number }>
 	| Readonly<{ kind: "invalid"; problems: Readonly<string[]> }>;
 
 /** `POST /api/tools/:entryId/edit`: publishes a new, immutable version (ADR-027). A built-in's own
  * `httpsDefinition` is never accepted by `ConsoleEditCatalogEntryRequestSchema`'s own shape, but a
  * non-built-in, non-`custom_https` edit of it is still refused here, at `editCatalogEntry`'s own
- * kind check — surfaced as `invalid`, same as every other business-rule refusal. */
+ * kind check — surfaced as `invalid`, same as every other business-rule refusal.
+ * `input.expectedVersion`, when the console gives it (the entry-detail page's own last-shown
+ * version), binds this edit to it — refused as `kind: "conflict"` once someone else's edit already
+ * moved the entry to a different version, rather than silently merging this one's own fields over
+ * changes the owner never saw (`StaleCatalogEntryVersionError`). */
 export async function consoleEditCatalogEntry(
 	deps: ControlPlaneDeps,
 	entryId: string,
@@ -212,6 +223,9 @@ export async function consoleEditCatalogEntry(
 		const entry = await editCatalogEntry(deps, { entryId, ...input, actor });
 		return { kind: "ok", entry };
 	} catch (error) {
+		if (error instanceof StaleCatalogEntryVersionError) {
+			return { kind: "conflict", currentVersion: error.currentVersion };
+		}
 		if (error instanceof AdminError) {
 			return { kind: "invalid", problems: [error.message] };
 		}
@@ -226,23 +240,33 @@ export type ConsoleDeleteCatalogEntryResult =
 	| Readonly<{ kind: "invalid"; problems: Readonly<string[]> }>;
 
 /** `POST /api/tools/:entryId/delete`: removes every agent's attachment of `entryId` atomically and
- * tombstones a built-in (`deleteCatalogEntry`, ADR-027). `affectedAgentIds` is read immediately
- * before the delete commits — the rows themselves are gone once it has — so the response can still
- * name exactly what lost access, not only that something did. */
+ * tombstones a built-in (`deleteCatalogEntry`, ADR-027). `affectedAgentIds` comes back from
+ * `deleteCatalogEntry` itself — read fresh inside its own transaction, immediately before it
+ * commits — never a separate, earlier read of this function's own that a concurrent attach or
+ * detach could have made stale by the time the delete actually ran. `expectedAttachedAgentIds`,
+ * when the caller gives it (the console's own last-shown impact preview), binds the delete to that
+ * exact set: refused as a conflict the moment the live set no longer matches, rather than silently
+ * deleting a different one than what the owner actually confirmed. */
 export async function consoleDeleteCatalogEntry(
 	deps: ControlPlaneDeps,
 	entryId: string,
 	actor: string,
+	expectedAttachedAgentIds?: Readonly<AgentId[]>,
 ): Promise<ConsoleDeleteCatalogEntryResult> {
 	const context = await availabilityContext(deps);
 	const existing = await getCatalogEntry(deps, entryId, context);
 	if (existing === null) {
 		return { kind: "not-found" };
 	}
-	const attachedAgents = await listEntryAttachments(deps, entryId);
 	try {
-		await deleteCatalogEntry(deps, entryId, actor);
-		return { kind: "ok", affectedAgentIds: attachedAgents.map((agent) => agent.agentId) };
+		const { affected } = await deleteCatalogEntry(
+			deps,
+			entryId,
+			actor,
+			"console",
+			expectedAttachedAgentIds,
+		);
+		return { kind: "ok", affectedAgentIds: affected };
 	} catch (error) {
 		if (error instanceof ManagementConflictError) {
 			return { kind: "conflict", currentRevisionId: error.currentRevisionId };
@@ -293,6 +317,7 @@ export async function consoleAgentTools(
 		return {
 			agentId: agentId as AgentId,
 			hubManaged: toolAttachmentsManaged,
+			baseRevisionId: revisionId,
 			requested: [...requested],
 			unresolved: [...unresolved],
 			effective: {
@@ -337,6 +362,7 @@ export async function consoleAttachTool(
 			source: "console",
 			idempotencyKey: input.idempotencyKey,
 			...(input.reason === undefined ? {} : { reason: input.reason }),
+			...(input.baseRevisionId === undefined ? {} : { baseRevisionId: input.baseRevisionId }),
 		});
 		return {
 			kind: "ok",
@@ -470,6 +496,7 @@ export async function consoleAdoptPreview(
 		before: result.before,
 		after: result.after,
 		attachments: [...result.attachments],
+		conversionHash: result.conversionHash,
 		problems: [...result.problems],
 	};
 }
@@ -486,12 +513,18 @@ export type ConsoleAdoptCommitResult =
  * freshly re-read "current" one: a configuration change landing between the preview and this
  * confirm is a conflict (`ManagementConflictError` -> `kind: "conflict"`), the same as every other
  * preview/commit pair in the console, rather than a commit silently built from newer attachments the
- * preview never showed. */
+ * preview never showed. `expectedConversionHash` closes the same gap for the catalog itself, which
+ * carries no config revision of its own: a catalog entry created, edited or deleted since the
+ * preview changes what its legacy patterns resolve to without moving `baseRevisionId` at all —
+ * `StaleConversionError` reports it the same way, `kind: "conflict"` against the same
+ * `currentRevisionId` (unmoved; it is the catalog that changed, not the configuration), since
+ * either way the console's own remedy is identical: reload the preview and try again. */
 export async function consoleAdoptCommit(
 	deps: ControlPlaneDeps,
 	agentId: string,
 	actor: string,
 	baseRevisionId: number | null,
+	expectedConversionHash: string,
 	idempotencyKey: string,
 	reason: string | undefined,
 ): Promise<ConsoleAdoptCommitResult> {
@@ -506,6 +539,7 @@ export async function consoleAdoptCommit(
 			source: "console",
 			idempotencyKey,
 			baseRevisionId,
+			expectedAttachmentsHash: expectedConversionHash,
 			...(reason === undefined ? {} : { reason }),
 		});
 		if (result === undefined) {
@@ -520,12 +554,16 @@ export async function consoleAdoptCommit(
 			before: result.before,
 			after: result.after,
 			attachments: [...result.attachments],
+			conversionHash: result.conversionHash,
 			problems: [...result.problems],
 			commit: result.commit,
 		};
 	} catch (error) {
 		if (error instanceof ManagementConflictError) {
 			return { kind: "conflict", currentRevisionId: error.currentRevisionId };
+		}
+		if (error instanceof StaleConversionError) {
+			return { kind: "conflict", currentRevisionId: baseRevisionId };
 		}
 		if (error instanceof AdminError) {
 			return { kind: "invalid", problems: [error.message] };

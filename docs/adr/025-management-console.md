@@ -218,10 +218,18 @@ one of those checks.
   agent's attachment of it atomically, reporting which agents lost it); `GET /api/agents/:id/tools`
   (requested attachments against effective, compiled access), `POST /api/agents/:id/tools/attach`/
   `detach`/`update`, and `GET`/`POST /api/agents/:id/tools/adopt` ("Adopt into the tools hub"'s own
-  dry-run preview and commit). Every mutation still carries `source: "console"` and commits through
-  `prepareChange`/`commitChange` exactly like the Agents hub's own routes above — ADR-027 is the
-  authority for the catalog and compiler rules these translate into change operations for; this ADR
-  remains the authority only for how they are reached and protected. One thing these routes alone
+  dry-run preview and commit). Attach/detach/update/adopt always commit through
+  `prepareChange`/`commitChange` exactly like the Agents hub's own routes above, carrying
+  `source: "console"`, and so are always covered by `gateway config rollback`. Create and edit
+  (`POST /api/tools`, `POST /api/tools/:entryId/edit`) are not: a catalog entry's own row and
+  version history are not part of any config revision at all, so these two never call
+  `prepareChange`/`commitChange` and carry no `source` of their own. Delete is both: it commits
+  through `prepareChange`/`commitChange` (carrying `source: "console"`) only when something is
+  actually attached (nothing to clear otherwise commits nothing), while the entry's own
+  `deleted_at`/tombstone are written directly, outside any revision, every time. ADR-027 is the
+  authority for the catalog and compiler rules these translate into change operations for, and for
+  exactly which of these routes commit a revision at all; this ADR remains the authority only for
+  how they are reached and protected. One thing these routes alone
   need beyond `ControlPlaneDeps`: whether a named secret alias is actually set, read from the same
   read-only mount `gateway tools secret set` writes through — `apps/controller/src/console-tools.ts`
   (the routing layer, not `@agent-gateway/core`, which stays filesystem-free) resolves this itself,

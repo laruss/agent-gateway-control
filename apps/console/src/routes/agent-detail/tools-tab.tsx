@@ -246,6 +246,7 @@ export function ToolsTab({ agentId }: Readonly<{ agentId: string }>): React.Reac
 				onOpenChange={setAttachOpen}
 				agentId={agentId}
 				alreadyRequestedEntryIds={response.requested.map((attachment) => attachment.entryId)}
+				baseRevisionId={response.baseRevisionId}
 				onAttached={() => void load()}
 			/>
 			<AdoptDialog

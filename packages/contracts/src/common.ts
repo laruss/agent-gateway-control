@@ -78,6 +78,12 @@ export const ToolPatternSchema = z
 	);
 export type ToolPattern = z.infer<typeof ToolPatternSchema>;
 
+/** The only tool pattern that ever names every finance capability at once. A single shared
+ * constant so `@agent-gateway/contracts`' own finance rule, `@agent-gateway/policy`'s compiler
+ * and `core`'s agent-lifecycle service (restore/retire normalization) can never drift apart on
+ * what "finance" means as a tool pattern. */
+export const FINANCE_TOOLS: ToolPattern = "finance.*";
+
 /** True when `pattern` matches every tool that `other` matches. */
 export function toolPatternCovers(pattern: ToolPattern, other: ToolPattern): boolean {
 	if (!pattern.endsWith(".*")) {

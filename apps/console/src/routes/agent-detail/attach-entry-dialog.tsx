@@ -28,6 +28,11 @@ export type AttachEntryDialogProps = Readonly<{
 	/** Already-requested entry ids, excluded from the picker: re-attaching one is an edit
 	 * (`updateAttachment`), not this dialog's job. */
 	alreadyRequestedEntryIds: Readonly<string[]>;
+	/** The agent-tools read's own `baseRevisionId` (the Tools tab's already-loaded state): echoed
+	 * back on attach, which refuses with `409` once the active configuration has moved past it,
+	 * rather than silently converting a still-legacy agent's current `permissions` against state
+	 * this page never actually showed. */
+	baseRevisionId: number | null;
 	onAttached: () => void;
 }>;
 
@@ -39,6 +44,7 @@ export function AttachEntryDialog({
 	onOpenChange,
 	agentId,
 	alreadyRequestedEntryIds,
+	baseRevisionId,
 	onAttached,
 }: AttachEntryDialogProps): React.ReactElement {
 	const [entries, setEntries] = React.useState<Readonly<ConsoleToolCatalogListItem[]>>([]);
@@ -84,6 +90,7 @@ export function AttachEntryDialog({
 				entryId,
 				pinnedVersion: null,
 				mode,
+				baseRevisionId,
 			});
 			if (result.kind === "conflict") {
 				setError(

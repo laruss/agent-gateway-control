@@ -235,6 +235,66 @@ describe("executeCustomHttpsAction", () => {
 		expect(result.kind).toBe("failed");
 		expect(sent).toBe(false);
 	});
+
+	it("a GET answered with a redirect is a clean 'failed': redirects are never followed and nothing but a read was at stake", async () => {
+		server = await startTestHttpsServer(tls, (_req, res) => {
+			res.writeHead(302, { location: "https://elsewhere.example/ticket" });
+			res.end();
+		});
+		const getDefinition = definition({
+			method: "GET",
+			pathTemplate: "/tickets/{id}",
+			parameters: [
+				{ name: "id", slot: "path", slotName: "id", type: "string", minLength: 1, maxLength: 50 },
+			],
+			secretSlots: [],
+			idempotency: null,
+		});
+		const lookup: CustomToolDefinitionLookup = async () => getDefinition;
+		const result = await executeCustomHttpsAction(
+			{
+				actionType: "custom.zendesk",
+				actionParams: [
+					{ name: "id", value: "123" },
+					{ name: CUSTOM_DEFINITION_VERSION_PARAM, value: "1" },
+				],
+			},
+			deps(lookup),
+			{ idempotencyKey: "tool-action:approval-6:hash", signal: new AbortController().signal },
+		);
+		expect(result).toEqual({
+			kind: "failed",
+			error: "the destination answered 302 (a redirect); redirects are not followed",
+		});
+	});
+
+	it("a write answered with a redirect after it was fully sent is 'unknown': the destination may already have acted on it", async () => {
+		server = await startTestHttpsServer(tls, (req, res) => {
+			req.on("data", () => undefined);
+			req.on("end", () => {
+				// The classic post-redirect-get shape: a write the destination actually processed,
+				// pointing at a result it will never actually be followed to.
+				res.writeHead(303, { location: "https://elsewhere.example/ticket/t-1" });
+				res.end();
+			});
+		});
+		const lookup: CustomToolDefinitionLookup = async (entryId, version) =>
+			entryId === "zendesk" && version === 1 ? definition() : null;
+		await expect(
+			executeCustomHttpsAction(
+				{
+					actionType: "custom.zendesk",
+					actionParams: [
+						{ name: "id", value: "123" },
+						{ name: "title", value: "Printer is on fire" },
+						{ name: CUSTOM_DEFINITION_VERSION_PARAM, value: "1" },
+					],
+				},
+				deps(lookup),
+				{ idempotencyKey: "tool-action:approval-7:hash", signal: new AbortController().signal },
+			),
+		).rejects.toThrow(/303.*redirect.*redirects are not followed/s);
+	});
 });
 
 describe("parsedDefinitionLookup", () => {

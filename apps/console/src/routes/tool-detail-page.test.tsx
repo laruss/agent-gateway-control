@@ -69,6 +69,7 @@ function builtinDetail(): ConsoleToolCatalogEntryDetailResponse {
 		attachedAgents: [
 			{ agentId: "developer", displayName: "Developer", mode: "allow", pinnedVersion: null },
 		],
+		legacyGrantingAgents: [],
 		secretAliases: [],
 	};
 }
@@ -118,6 +119,7 @@ function customToolDetail(): ConsoleToolCatalogEntryDetailResponse {
 		},
 		versions: builtin.versions,
 		attachedAgents: [],
+		legacyGrantingAgents: [],
 		secretAliases: [{ alias: "demo_secret", set: false }],
 	};
 }
@@ -189,6 +191,22 @@ describe("ToolDetailPage", () => {
 		await user.click(screen.getByRole("button", { name: /^delete$/i }));
 		const dialog = screen.getByRole("dialog");
 		expect(dialog).toHaveTextContent("developer");
+	});
+
+	it("shows a legacy agent that still grants this entry directly, outside the hub", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () =>
+				jsonResponse({
+					...builtinDetail(),
+					legacyGrantingAgents: [{ agentId: "operator", displayName: "Operator" }],
+				}),
+			),
+		);
+		renderAt("native-repository-read");
+		expect(await screen.findByText(/also granted outside the hub/i)).toBeInTheDocument();
+		expect(screen.getByText(/Operator/)).toBeInTheDocument();
+		expect(screen.getByText(/gateway tools adopt/i)).toBeInTheDocument();
 	});
 
 	it("opens 'Attach to agent', fetching the agent list for its own picker", async () => {

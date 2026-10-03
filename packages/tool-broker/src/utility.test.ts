@@ -31,4 +31,16 @@ describe("utilityExecutor (utility.text-transform)", () => {
 		const result = await utilityExecutor().execute({ operation: "reverse", text }, context);
 		expect(result.kind).toBe("succeeded");
 	});
+
+	it("refuses a lowercase fold that fits the length but is not a representable receipt (Turkish 'İ' -> 'i' + combining dot above)", async () => {
+		// `"İ".toLowerCase()` is `"i̇"` (2 code units, well within any length bound) — a
+		// combining mark `ToolReceiptSchema`'s own `safeText(.., "verbatim")` refuses. Previously
+		// reported `succeeded` here and only discovered unrepresentable later, when `tool-job.ts`'s
+		// own re-parse withheld it (`{ receipt_withheld: true }`) behind an already-"succeeded" job.
+		const result = await utilityExecutor().execute({ operation: "lower", text: "İ" }, context);
+		expect(result.kind).toBe("failed");
+		expect(result).toMatchObject({
+			error: expect.stringContaining("cannot be represented in a tool receipt"),
+		});
+	});
 });

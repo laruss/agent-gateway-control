@@ -264,6 +264,10 @@ export async function executeCustomHttpsAction(
 	if (outcome.kind === "failed") {
 		return { kind: "failed", error: scrubSecrets(outcome.error, secretValues.values()) };
 	}
+	// A 3xx is decided in `sendPinnedRequest` itself (`egress.ts`), before this point: redirects are
+	// never followed, and the decision (a clean `failed` for a `GET`, `unknown` for a write already
+	// sent) does not depend on the response's content type or body the way the rest of this
+	// function's own classification does — a redirect commonly carries neither at all.
 	if (outcome.response.status >= 400) {
 		return {
 			kind: "failed",

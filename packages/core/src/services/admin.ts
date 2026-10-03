@@ -449,6 +449,13 @@ async function recordedEnabledAgreesWithLive(
  * its own recomputed hash — which can differ from `config_versions.version` of the same row, since
  * nothing here reconstructs a role prompt or an ordering the original apply alone knew — never
  * under a hash it does not actually reproduce.
+ *
+ * The stale revision's own attachments document (ADR-027), if it had one, carries forward into the
+ * backfill revision unchanged, filtered to the agents the backfilled bundle still configures (the
+ * same rule `resolveApplyToolAttachments` applies for a plain YAML `config apply`) — never silently
+ * dropped to `{}` just because this particular write path never otherwise touches attachments: a
+ * backfill triggered only by `agents.enabled` drifting (an older release's own direct toggle, no
+ * attachment ever touched) must not demote every hub-managed agent to legacy on its own.
  */
 export async function ensureConfigHistoryIn(
 	uow: UnitOfWork,
@@ -498,9 +505,25 @@ export async function ensureConfigHistoryIn(
 		constitution: versionRow.constitution,
 		rolePrompts: Object.fromEntries(agentRows.map((agent) => [agent.config.id, agent.rolePrompt])),
 	};
-	// A database upgraded from a release before ADR-027 never recorded any attachment: this
-	// backfill revision honestly carries none (`attachments_snapshot_hash` stays null below), the
-	// same way it never reconstructs lost history.
+	// The stale revision's own attachments document (if any) carries forward, filtered to the
+	// agents this backfill bundle still configures — the same rule `resolveApplyToolAttachments`
+	// already applies for a plain YAML `config apply`. Never reconstructed from nothing: a database
+	// upgraded from a release before ADR-027 ever recorded one has none to carry forward, and this
+	// backfill honestly carries none either (`attachmentsSnapshotHash` stays null below). Without
+	// this, a backfill triggered only by `agents.enabled` drifting (an older release's own direct
+	// toggle, no attachment ever touched) would otherwise demote every hub-managed agent to legacy —
+	// `attachments_snapshot_hash` null means exactly that (ADR-027's own rollback-recovery rule),
+	// which is only actually true for a release that predates attachments altogether.
+	const configuredAgentIds = new Set(bundle.agents.map((agent) => agent.id));
+	const toolAttachments = canonicalizeAttachmentsIn(
+		Object.fromEntries(
+			Object.entries(await loadToolAttachmentsIn(db, row.revision)).filter(([agentId]) =>
+				configuredAgentIds.has(agentId),
+			),
+		),
+	);
+	const hasToolAttachments = Object.keys(toolAttachments).length > 0;
+	const attachmentsSnapshotHash = hasToolAttachments ? canonicalHash(toolAttachments) : null;
 	const hash = canonicalHash(bundle);
 	await db
 		.insert(configSnapshots)
@@ -512,10 +535,22 @@ export async function ensureConfigHistoryIn(
 			createdAt: uow.now,
 		})
 		.onConflictDoNothing();
+	if (attachmentsSnapshotHash !== null) {
+		await db
+			.insert(configAttachmentSnapshots)
+			.values({
+				hash: attachmentsSnapshotHash,
+				bundle: toolAttachments,
+				format: CONFIG_ATTACHMENTS_SNAPSHOT_FORMAT,
+				createdAt: uow.now,
+			})
+			.onConflictDoNothing();
+	}
 	const [revision] = await db
 		.insert(configRevisions)
 		.values({
 			snapshotHash: hash,
+			attachmentsSnapshotHash,
 			// The stale revision (if any) becomes this one's parent, same as a fresh backfill's
 			// null parent when none was ever recorded.
 			parentRevisionId: row.revision,
@@ -598,9 +633,13 @@ export async function ensureConfigHistory(deps: ControlPlaneDeps, actor: string)
  * `permissions` edit actually changed, since nothing before this ever re-read the active revision's
  * attachments document again to check. A revision with a null `attachments_snapshot_hash` carries no
  * attachments document at all — only this release's own writer ever records one — so every agent it
- * names is legacy: this reconciles both projections to the empty document (`{}`), identically to how
- * `writeConfigRevisionIn` already reconciles them to `{}` for a plain YAML apply that supplies no
- * `tool-attachments.json`. A revision with a non-null hash was necessarily written by this release's
+ * names is legacy: this reconciles both projections to the empty document (`{}`). This is *not* the
+ * same case as a plain YAML apply with no `tool-attachments.json` (a common point of confusion):
+ * that apply still carries every agent's existing attachments forward unchanged, filtered to the
+ * agents it still configures (`resolveApplyToolAttachments`), and so still ends up with a real,
+ * non-null `attachments_snapshot_hash` whenever there was anything to carry forward — `{}` here is
+ * reached only for a revision with no attachments document at all, the pre-ADR-027-writer case
+ * above. A revision with a non-null hash was necessarily written by this release's
  * own writer, which already reconciled both projections to match it in the same transaction; this
  * still re-reads and reconciles against it rather than trusting that, so a database nudged out of
  * sync by anything else (a restored backup, a hand edit) is corrected the same way.

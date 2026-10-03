@@ -13,6 +13,7 @@ import {
 	type ConfigRevisionSource,
 	ConfigSnapshotBundleSchema,
 	defaultAgentPermissions,
+	FINANCE_TOOLS,
 	type RequestAgentCreateInput,
 	RequestAgentCreateInputSchema,
 	type RequestAgentRestoreInput,
@@ -25,6 +26,7 @@ import {
 	type SecretFile,
 	type ToolAttachment,
 	ToolAttachmentsBundleSchema,
+	toolPatternCovers,
 	toolPatternsOverlap,
 } from "@agent-gateway/contracts";
 import {
@@ -36,6 +38,7 @@ import {
 	runtimeWorkers,
 } from "@agent-gateway/db";
 import { redactForStorage } from "@agent-gateway/logging";
+import type { CompiledCatalogEntry } from "@agent-gateway/policy";
 import { and, asc, desc, eq, gt, inArray } from "drizzle-orm";
 import type { z } from "zod";
 import {
@@ -46,6 +49,7 @@ import {
 	pauseInTransaction,
 } from "./admin.ts";
 import { sweepApprovals } from "./approvals.ts";
+import { loadCompilableCatalogEntries } from "./attachment-validation.ts";
 import { endAgentRuntimeSessions, revokeAllActiveGrantsIn } from "./channel-grants.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
 import {
@@ -705,8 +709,6 @@ async function findLastConfiguredAgent(
 	return { agent, rolePrompt, toolAttachments };
 }
 
-const FINANCE_TOOLS = "finance.*";
-
 /**
  * Permissions an agent's historical configuration carried as the finance agent (free to hold
  * finance tools, so never required `finance.*` in `tools_deny`), normalized for one that is not
@@ -733,6 +735,37 @@ function normalizeNonFinancePermissions(
 			? permissions.tools_deny
 			: [...permissions.tools_deny, FINANCE_TOOLS],
 	};
+}
+
+/**
+ * The attachment-level counterpart of {@link normalizeNonFinancePermissions}: a hub-managed
+ * agent's carried-forward attachments may still name a finance-kind catalog entry in `allow` or
+ * `require_approval` from when it was the finance agent (the compiler already treats such an
+ * attachment held by any other agent as contributing nothing, ADR-027 — but the attachment
+ * document itself would otherwise keep claiming a mode the agent no longer has any right to, which
+ * is exactly what the permission-level normalization above already refuses to leave behind).
+ * Forces every attachment naming a finance-kind entry to `disabled`, the same shape
+ * `attachTool`/`gateway tools adopt` already give a `tools_deny: ["finance.*"]` pattern; an
+ * attachment to an entry this map does not know (already dropped elsewhere, e.g.
+ * {@link dropAttachmentsToUnknownEntriesIn}) passes through unchanged. Pure; no catalog kind is
+ * consulted, only each entry's own `implementationKey`, exactly like `@agent-gateway/policy`'s own
+ * `compileAttachments`.
+ */
+function normalizeNonFinanceAttachments(
+	attachments: Readonly<ToolAttachment[]>,
+	catalog: ReadonlyMap<string, CompiledCatalogEntry>,
+): ToolAttachment[] {
+	return attachments.map((attachment) => {
+		const entry = catalog.get(attachment.entryId);
+		if (
+			entry === undefined ||
+			attachment.mode === "disabled" ||
+			!toolPatternCovers(FINANCE_TOOLS, entry.implementationKey)
+		) {
+			return attachment;
+		}
+		return { ...attachment, mode: "disabled" };
+	});
 }
 
 /**
@@ -816,15 +849,19 @@ export async function requestAgentRestore(
 		const { bundle: base } = await loadActiveBundle(db, baseRevisionId);
 		const financeAgentId = base.organization?.organization.finance_agent_id ?? null;
 		const makeFinanceAgent = parsed.makeFinanceAgent === true;
+		// Whether this restore reclaims (or keeps) the finance role for `parsed.agentId`: either the
+		// request says so explicitly, or the role never actually left it (defensive — `requestAgentRetire`
+		// always reassigns it elsewhere first, see `reassignFinanceTo`). Both the permission-level and
+		// the attachment-level normalization below are skipped in exactly this case.
+		const reclaimsFinanceRole = makeFinanceAgent || historical.agent.id === financeAgentId;
 		// A former finance agent's historical permissions are normalized for anyone else (never
 		// required `finance.*` in `tools_deny` while it was finance, see `normalizeNonFinancePermissions`)
 		// unless this request reassigns the role back to it atomically, in which case they are
 		// restored unchanged and `validateConfigBundle` is trusted to still refuse them if they are
 		// not actually finance-shaped.
-		const permissions =
-			makeFinanceAgent || historical.agent.id === financeAgentId
-				? historical.agent.permissions
-				: normalizeNonFinancePermissions(historical.agent.permissions);
+		const permissions = reclaimsFinanceRole
+			? historical.agent.permissions
+			: normalizeNonFinancePermissions(historical.agent.permissions);
 
 		// The token reference always migrates to the provisioner's own, server-generated path, never
 		// kept as historical.agent.mattermost.token_secret_file named it: for an agent restored from
@@ -853,7 +890,18 @@ export async function requestAgentRestore(
 			const { toolAttachments: filtered, dropped } = await dropAttachmentsToUnknownEntriesIn(db, {
 				[parsed.agentId]: [...historical.toolAttachments],
 			});
-			toolAttachmentsForAdd = filtered[parsed.agentId] ?? [];
+			const carriedForward = filtered[parsed.agentId] ?? [];
+			// The attachment-level counterpart of the permission normalization just above: a
+			// carried-forward attachment naming a finance-kind entry in `allow`/`require_approval`
+			// (held while this agent still was the finance agent) is forced `disabled`, matching what
+			// the permission normalization already means for it — never left claiming a mode the
+			// agent has no right to the moment it is restored as anyone but the finance agent.
+			toolAttachmentsForAdd = reclaimsFinanceRole
+				? carriedForward
+				: normalizeNonFinanceAttachments(
+						carriedForward,
+						await loadCompilableCatalogEntries(db, { [parsed.agentId]: carriedForward }),
+					);
 			droppedAttachments = dropped.map((entry) => ({ entryId: entry.entryId }));
 		}
 		const changeSet: ChangeSet = [

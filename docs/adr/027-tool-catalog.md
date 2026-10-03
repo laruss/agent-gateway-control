@@ -71,6 +71,13 @@ a plain TypeScript type, never itself runtime-checked, so a caller handing this 
 parsed from JSON (a future console route, say) is held to the same bounds `ToolCatalogEntryVersionSchema`
 already enforces for a seeded or freshly inserted version.
 
+An optional `expectedVersion` binds an edit to the version a caller already read (the console's own
+entry-detail load): refused (`StaleCatalogEntryVersionError`, mapped to a `409` by the console)
+once the entry's actual current version — read fresh, inside the same transaction the new version
+is inserted in — no longer matches it, rather than silently merging this edit's own fields forward
+over a version the caller never saw (last-writer-wins). Absent for the CLI, which keeps the
+ordinary "edit over whatever is current" behaviour unchanged.
+
 `catalog_entry_versions.entry_id` carries no foreign key: deleting an entry (below) never touches
 its past versions, which stay exactly as recorded, entry gone or not — the same reasoning
 `agent_lifecycle_operations.retry_of` already applies to a reference that must survive the row it
@@ -230,6 +237,25 @@ rather than failing the operation outright or silently bringing a retired capabi
 configuration writer keeps (`commitChangeIn`'s own first lock): taking the entry row first risks a
 deadlock against a concurrent `attach_tool`/`update_attachment` commit, which always reaches for
 `gateway_controls` first.
+
+**Refused while a legacy agent still grants it.** Clearing every `catalog_attachments` row only
+ever revokes a *hub-managed* agent's access: a legacy agent's own enforcement
+(`loadEffectivePermissionsIn`) reads its `permissions` lists directly and never consults the
+catalog at all, so a `tools_allow`/`tools_require_human_approval` pattern that happens to cover the
+deleted entry's `implementationKey` keeps granting it, unaffected, while the hub shows the entry as
+gone everywhere. `deleteCatalogEntry` refuses outright — nothing committed — while
+`legacyAgentsGrantingTool` finds any such agent, naming it and pointing at `gateway tools adopt
+<agent-id>` (or the console's own Adopt), which converts that legacy coverage into a real
+attachment this delete would then also clear; the console's own entry-detail read shows the same
+agents as part of the deletion's impact, alongside `attachedAgents`.
+
+**Returns what it actually affected, read fresh inside its own transaction.** A caller's own,
+separately-read "impact preview" (the console's entry-detail page, loaded before the owner clicks
+delete) can go stale the moment a concurrent attach or detach lands — `deleteCatalogEntry` returns
+the affected agent ids from the exact same read its `clear_tool_attachments` commit uses, never a
+caller's earlier one, and optionally binds the delete to a caller-supplied expected set
+(`expectedAffectedAgentIds`, the console's own last-shown impact): a mismatch refuses the delete as
+a conflict rather than silently deleting a different set of agents than the one actually confirmed.
 
 ### Legacy conversion: a read model, never written back
 
@@ -395,6 +421,21 @@ revoke landing between when `tools adopt` read an agent's permissions and when i
 conflict (`ManagementConflictError`), never silently overwritten by a commit built from the earlier,
 now-stale read.
 
+**A config revision is not the only thing that can move what a legacy pattern resolves to.** A
+catalog entry created, edited or deleted carries no config revision of its own at all, so
+`baseRevisionId` alone cannot catch it: the console's own "Adopt into the tools hub" confirm step
+additionally binds itself to `attachmentsConversionHash` — a canonical hash of the exact resolved
+attachments its own dry-run preview showed — and is refused (`StaleConversionError`, surfaced the
+same way as a `baseRevisionId` conflict) once a fresh read, inside the same transaction the commit
+would use, no longer matches it. `attachTool`'s own implicit legacy conversion (a still-legacy
+agent's first attach, above) takes an optional `baseRevisionId` the same way, for the narrower
+config-revision race that already applied to it: the console's agent-tools read (`GET
+/api/agents/:id/tools`) echoes back the revision it showed, and a configuration change landing
+before the owner's own attach lands is a conflict rather than a conversion silently built from
+`permissions` the owner never actually saw. Absent for the CLI and for every dry-run preview, both
+of which keep the ordinary "resolve against whatever is live, commit against exactly that" behaviour
+unchanged.
+
 **The bundle-mirror invariant.** Whenever a hub-managed agent's compiled attachments could have
 changed — any `attach_tool`/`detach_tool`/`update_attachment`/`clear_tool_attachments`/
 `set_tool_attachments`, or a plain `replace_bundle` that supplies a `toolAttachments` document, a
@@ -440,6 +481,15 @@ an implied tool has no attachment of its own — and carries `impliedBy`, naming
 that make it effectively usable. `packages/runtime-sdk`'s prompt renders them as a structured
 alternative to the bare tool-name lists it already shows. See ADR-023 for the exact schema rule and
 its rollback consequence.
+
+`capabilities` is bounded to `MAX_CAPABILITIES` (128): a wide legacy wildcard (`custom.*` covering
+more owner-created tools than that) must never fail the turn input's own schema parse just because
+describing every one of them structurally would exceed it — `buildCapabilityDescriptions` sorts
+deterministically (a capability attached in its own right before one only present because another
+implies it, then by name) and truncates, reporting how many it left out as `capabilitiesOmitted`
+(present only once it is nonzero). `toolPolicy.allow`/`requireHumanApproval` — the lists enforcement
+actually reads — are never trimmed, only this read model is; the runtime prompt notes the omitted
+count as a trailing line once `capabilities` itself is shown.
 
 ### Custom HTTPS tools: definitions, egress and outcomes
 
@@ -577,6 +627,15 @@ all) is `unknown`. A `GET` with an unexpected content type stays `failed` regard
 before. Neither `failed` nor `unknown` is ever retried automatically — an `unknown` custom-tool
 action is settled by hand (`gateway tools settle`), the same as any other namespace's.
 
+**A 3xx is never a success.** Redirects are never followed (above), and a 3xx answer is decided in
+`sendPinnedRequest` itself, before the content-type gate — a redirect commonly carries neither a
+body nor a `Content-Type` at all, which that gate alone would otherwise call "unexpected content
+type" rather than what it actually is. A `GET` (or a write whose own request never finished sending)
+is a clean `failed`, the same as an oversized `GET` response — nothing but a read was ever at stake.
+A write already fully sent is `unknown`: a 3xx commonly means the destination *did* act on it (a
+`303 See Other` pointing at a result is the classic post-redirect-get shape), and the response alone
+cannot prove it did not.
+
 **Secrets never reach anywhere but the request.** A definition names a secret by alias only; the
 runner resolves it from its own secrets directory (file per alias, `gateway tools secret set
 <alias>`, read-only to the runner) at the moment it builds the request, and the value is used to
@@ -610,6 +669,15 @@ minimal. Being side-effect-free does not exempt it from a human turn: `MODES_BY_
 `utility` the identical `require_approval`/`disabled` pair `executor`/`custom_https` have, because
 the broker's approval gate is not a risk-based convenience this kind happens to clear on its own
 merits — it is the only execution path the broker has at all.
+
+Fitting the length bound is not the same as being representable at all: `upper`/`lower` are Unicode
+case mapping, not 1:1 (Turkish `"İ".toLowerCase()` is `"i"` followed by a combining dot above,
+U+0307), and a result can be the right length while still containing a character a receipt's own
+`safeText(.., "verbatim")` field refuses (a control, invisible or combining character). The
+executor validates its own output against `ToolReceiptSchema` itself — the exact schema
+`tool-job.ts`'s own re-parse later checks it against — before ever returning `succeeded`: refused
+explicitly when not representable, never reported `succeeded` only to have the receipt silently
+withheld (`{ receipt_withheld: true }`) the moment that later parse runs.
 
 ## Alternatives
 
@@ -713,3 +781,14 @@ merits — it is the only execution path the broker has at all.
   (`{}` when its hash is null, the document itself otherwise) — a no-op, by canonical-hash
   comparison, whenever they already agree, which is every startup except one right after a rollback
   interval like this.
+- **`ensureConfigHistoryIn`'s own backfill (ADR-024) is not one of those null-hash cases, and must
+  not be treated as one.** It can trigger for a reason that has nothing to do with attachments at
+  all — the live `agents.enabled` projection drifting from what the active revision's snapshot
+  recorded, an older release's own direct toggle that never touched a single attachment. Writing the
+  backfilled revision with a null `attachments_snapshot_hash` regardless (as an earlier version of
+  this function did) would demote every hub-managed agent to legacy on the next read, for a change
+  that was never about attachments at all. The backfill instead carries the stale revision's own
+  attachments document forward unchanged, filtered to the agents the backfilled bundle still
+  configures (the same rule `resolveApplyToolAttachments` applies for a plain YAML `config apply`) —
+  `{}` only when the stale revision itself had no document (the genuine pre-ADR-027-writer case
+  above).

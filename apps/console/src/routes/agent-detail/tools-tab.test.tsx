@@ -16,6 +16,7 @@ function legacyResponse(): ConsoleAgentToolsResponse {
 	return {
 		agentId: "developer",
 		hubManaged: false,
+		baseRevisionId: 1,
 		requested: [
 			{ entryId: "native-repository-read", pinnedVersion: null, mode: "allow", settings: {} },
 		],

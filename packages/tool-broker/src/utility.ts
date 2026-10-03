@@ -3,6 +3,7 @@ import {
 	TextTransformOperationSchema,
 	TOOL_RECEIPT_TEXT_MAX,
 	type ToolReceipt,
+	ToolReceiptSchema,
 	textTransform,
 	UTILITY_TEXT_TRANSFORM,
 } from "@agent-gateway/contracts";
@@ -49,7 +50,24 @@ export function utilityExecutor(): ToolExecutor {
 				};
 			}
 			const receipt: ToolReceipt = { result: result === "" ? "(empty)" : result };
-			return { kind: "succeeded", receipt };
+			// Fits the length, but `upper`/`lower` case mapping is not always representable as a
+			// receipt's own `safeText(.., "verbatim")` field: Turkish `İ.toLowerCase()` is `i` followed
+			// by a combining dot above (U+0307), a character outside the verbatim allowlist (no
+			// control, invisible or combining character), and NFKD-only (`result.normalize("NFKC")`
+			// would differ) either way. Checked against the exact schema a receipt is later re-parsed
+			// through (`tool-job.ts`'s own `execute`) so this can never again diverge from what that
+			// re-parse accepts: reported `failed` here, with the reason, rather than `succeeded` now
+			// and silently `{ receipt_withheld: true }` the moment that later parse runs.
+			const parsed = ToolReceiptSchema.safeParse(receipt);
+			if (!parsed.success) {
+				return {
+					kind: "failed",
+					error:
+						"the transformed text cannot be represented in a tool receipt (control, invisible or " +
+						"combining characters are not allowed there); try a different operation or input",
+				};
+			}
+			return { kind: "succeeded", receipt: parsed.data };
 		},
 	};
 }

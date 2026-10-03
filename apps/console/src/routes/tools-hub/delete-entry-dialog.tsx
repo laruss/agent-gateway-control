@@ -54,7 +54,7 @@ export function DeleteEntryDialog({
 		setSubmitting(true);
 		setError(null);
 		try {
-			const result = await deleteCatalogEntry(entryId);
+			const result = await deleteCatalogEntry(entryId, attachedAgentIds);
 			if (result.kind === "conflict") {
 				setError(
 					"The active configuration changed since this page was loaded. Reload and try again.",

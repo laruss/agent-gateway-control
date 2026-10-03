@@ -176,6 +176,43 @@ All notable changes are documented here. The project follows Semantic Versioning
   A submission error (an invalid entry id, a network failure, any non-`422` response) now shows in
   the dialog instead of leaving it silently stuck; the entry id is also validated client-side
   against the same rule the create request's own schema enforces.
+- Restoring a retired agent that was both hub-managed and a former finance agent no longer leaves
+  its carried-forward attachments claiming a finance-kind mode (`allow`/`require_approval`) it has
+  no right to once it is restored as anyone but the organization's finance agent — they are now
+  forced `disabled`, the attachment-level counterpart of the permission normalization this already
+  did.
+- Deleting a catalog entry now refuses (listing which agents, and pointing at `gateway tools adopt`)
+  while any legacy agent's own `permissions` still grant it directly — catalog deletion only ever
+  revoked a hub-managed agent's attachment, silently leaving a legacy agent's equivalent coverage
+  untouched and the hub showing the entry as gone everywhere regardless. The entry detail page shows
+  the same agents as part of the deletion's impact, alongside attached agents; the delete itself now
+  also returns (and can be bound to) the agents actually affected, read fresh at commit time rather
+  than from an earlier, separately-read preview.
+- A custom HTTPS tool's 3xx response is no longer reported `succeeded`: redirects are never
+  followed, so a `GET` answered with one is now a clean `failed`, and a write already fully sent is
+  `unknown` (settled by hand) rather than assumed to have succeeded.
+- A version 3 turn input's `capabilities` is now bounded to 128 entries even when a legacy wildcard
+  resolves to more known catalog entries than that — reporting the rest as an omitted count instead
+  of failing the turn's own schema and stopping the agent from running at all.
+- `utility.text-transform` now refuses a transform result that fits a receipt's length but is not
+  otherwise representable there (e.g. a Unicode case fold producing a combining mark), instead of
+  reporting success and having the receipt silently withheld once re-validated.
+- "Adopt into the tools hub"'s confirm step now also binds itself to the exact conversion its
+  preview showed (not only the config revision): a catalog entry created, edited or deleted in
+  between — which moves no config revision on its own — is now a conflict too, rather than silently
+  committing a different resolution than the one reviewed. Attaching a tool to a still-legacy agent
+  now accepts the same kind of binding to the console's own last-loaded state.
+- Editing a catalog entry now accepts an expected version, refusing (`409`) once someone else's edit
+  already published a different one, instead of silently merging the two edits' fields
+  last-writer-wins with no warning either one happened.
+- A configuration-history backfill triggered only by `agents.enabled` drifting (an older release's
+  own direct toggle, no attachment ever touched) no longer demotes every hub-managed agent to legacy
+  on its own: the stale revision's own attachments document now carries forward into the backfill,
+  filtered to the agents still configured, the same as a plain YAML `config apply` already does.
+- The custom tool form's parameter and secret-slot rows now key by a stable id assigned at
+  creation instead of their array position: deleting one no longer reuses the next row's position
+  for an enum field's own uncommitted text, corrupting its values the moment it next lost focus.
+  The secret-slot remove button also now has an accessible name.
 
 ## [0.6.0] - 2026-10-02
 

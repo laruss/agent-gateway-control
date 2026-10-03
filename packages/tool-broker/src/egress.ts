@@ -276,6 +276,25 @@ export async function sendPinnedRequest(
 					return;
 				}
 				const status = res.statusCode;
+				// Redirects are never followed (this module's own header comment) — a 3xx is never a
+				// success, decided before the content-type gate below even runs: a redirect commonly
+				// carries neither a body nor a `Content-Type` at all, which the gate alone would
+				// otherwise misclassify as "unexpected content type" rather than "a redirect". A `GET`
+				// (or a write whose own request never finished sending) is a clean `failed` — nothing
+				// but a read was ever at stake, the same way an oversized `GET` response already is. A
+				// write already fully sent is left genuinely ambiguous: a 3xx commonly means the
+				// destination *did* act on it (a `303 See Other` pointing at a result is the classic
+				// post-redirect-get shape), and this response alone cannot prove it did not — `unknown`,
+				// settled by hand, exactly like any other write an answer left ambiguous after sending.
+				if (typeof status === "number" && status >= 300 && status < 400) {
+					const message = `the destination answered ${status} (a redirect); redirects are not followed`;
+					if (!isWrite || !sentFully) {
+						succeed({ kind: "failed", error: message });
+					} else {
+						uncertain(new Error(`${message}, so whether it acted on the write is unknown`));
+					}
+					return;
+				}
 				if (allowed) {
 					succeed({
 						kind: "response",

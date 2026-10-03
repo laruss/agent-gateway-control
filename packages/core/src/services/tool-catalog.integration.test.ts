@@ -18,6 +18,7 @@ import {
 	commitChange,
 	dropAttachmentsToUnknownEntriesIn,
 	loadActiveBundle,
+	ManagementConflictError,
 	prepareChange,
 } from "./management.ts";
 import {
@@ -31,6 +32,7 @@ import {
 	getCatalogEntry,
 	listCatalogEntries,
 	listCatalogEntryVersions,
+	StaleConversionError,
 	updateAttachment,
 } from "./tool-catalog.ts";
 
@@ -268,7 +270,10 @@ describe("tool catalog service (ADR-027)", () => {
 		).rows;
 		expect(attachedRows).toHaveLength(2);
 
-		await deleteCatalogEntry(deps, "gateway-mattermost-post", "test");
+		// `source` defaults to `cli_apply` when a caller gives none (the CLI's own convention), but
+		// the console's own delete action threads its caller's source through the same way every
+		// other catalog-mutating call already does, rather than hard-coding `cli_apply` regardless.
+		await deleteCatalogEntry(deps, "gateway-mattermost-post", "test", "console");
 
 		const remaining = (
 			await pool.query("select agent_id from catalog_attachments where entry_id = $1", [
@@ -276,6 +281,12 @@ describe("tool catalog service (ADR-027)", () => {
 			])
 		).rows;
 		expect(remaining).toHaveLength(0);
+		const [revision] = (
+			await pool.query(
+				"select source from config_revisions where id = (select max(id) from config_revisions)",
+			)
+		).rows;
+		expect(revision.source).toBe("console");
 		expect(
 			await getCatalogEntry(deps, "gateway-mattermost-post", {
 				installedAdapters: new Set(),
@@ -306,6 +317,263 @@ describe("tool catalog service (ADR-027)", () => {
 			])
 		).rows;
 		expect(stillThere).toHaveLength(1);
+	});
+
+	it("refuses to delete an entry still granted by a legacy agent's own permissions, until it adopts", async () => {
+		const entryId = "legacy-covered-tool";
+		await createCustomHttpsTool(deps, {
+			entryId,
+			name: "Legacy covered tool",
+			description: "A test custom HTTPS tool.",
+			httpsDefinition: {
+				host: "api.example.test",
+				pathTemplate: "/items/{id}",
+				method: "GET",
+				parameters: [
+					{ name: "id", slot: "path", slotName: "id", type: "string", minLength: 1, maxLength: 20 },
+				],
+				secretSlots: [],
+				idempotency: null,
+				responseLimits: {
+					maxResponseBytes: 65_536,
+					allowedContentTypes: ["application/json"],
+					timeoutMs: 5000,
+					includeBodyPreview: true,
+				},
+			},
+			actor: "test",
+		});
+
+		// `beta` is still legacy (no attachments document of its own): its own
+		// `tools_require_human_approval` names this entry's own tool (`custom.<entry-id>`) directly,
+		// which the catalog never consults for a legacy agent's own enforcement (ADR-027) — deleting
+		// the entry would make the hub show it as gone everywhere while `beta` keeps using the exact
+		// same tool, unaffected.
+		const [betaConfig] = (await pool.query("select config from agents where id = 'beta'")).rows;
+		await commitChange(deps, {
+			changeSet: [
+				{
+					type: "update_agent",
+					agent: {
+						...betaConfig.config,
+						permissions: {
+							tools_allow: [],
+							tools_require_human_approval: [`custom.${entryId}`],
+							tools_deny: ["finance.*"],
+						},
+					},
+				},
+			],
+			baseRevisionId: await activeConfigRevisionId(deps),
+			actor: "test",
+			source: "cli_apply",
+		});
+
+		// Disabled, not removed: re-enabling it later would hand the deleted tool straight back.
+		await commitChange(deps, {
+			changeSet: [{ type: "set_agent_enabled", agentId: "beta", enabled: false }],
+			baseRevisionId: await activeConfigRevisionId(deps),
+			actor: "test",
+			source: "cli_apply",
+		});
+		await expect(deleteCatalogEntry(deps, entryId, "test")).rejects.toThrow(
+			/legacy permissions.*beta.*gateway tools adopt/s,
+		);
+		await commitChange(deps, {
+			changeSet: [{ type: "set_agent_enabled", agentId: "beta", enabled: true }],
+			baseRevisionId: await activeConfigRevisionId(deps),
+			actor: "test",
+			source: "cli_apply",
+		});
+		expect(
+			await getCatalogEntry(deps, entryId, {
+				installedAdapters: new Set(),
+				registeredExecutorActionTypes: new Set(),
+				registeredNamespaces: new Set(),
+			}),
+		).not.toBeNull();
+
+		// Adopting `beta` converts its legacy coverage into a real attachment; the delete then
+		// succeeds and clears it like any other hub-managed attachment.
+		await adoptAgentToolAttachments(deps, {
+			agentIds: ["beta"],
+			dryRun: false,
+			actor: "test",
+		});
+		await deleteCatalogEntry(deps, entryId, "test");
+		expect(
+			await getCatalogEntry(deps, entryId, {
+				installedAdapters: new Set(),
+				registeredExecutorActionTypes: new Set(),
+				registeredNamespaces: new Set(),
+			}),
+		).toBeNull();
+	});
+
+	it("a console confirm bound to a stale preview's conversion is refused, even though baseRevisionId alone would not catch it", async () => {
+		// A catalog entry created between preview and confirm changes what `custom.*` resolves to
+		// without moving any config revision at all (catalog entries carry no revision of their own,
+		// ADR-027) — `baseRevisionId` alone cannot catch this; `expectedAttachmentsHash` does.
+		// Placed early in this file, before any test that pushes the shared catalog's own `custom.*`
+		// coverage toward `MAX_ATTACHMENTS_PER_AGENT` (the "wide legacy wildcard"/"past
+		// MAX_ATTACHMENTS_PER_AGENT" tests below) — this agent's own resolution must stay small and
+		// clean, or it would hit that problem path (an unrelated, already-covered case) instead of the
+		// one this test is actually about.
+		const definition: CustomHttpsDefinition = {
+			host: "api.example.test",
+			pathTemplate: "/items",
+			method: "GET",
+			parameters: [],
+			secretSlots: [],
+			idempotency: null,
+			responseLimits: {
+				maxResponseBytes: 65_536,
+				allowedContentTypes: ["application/json"],
+				timeoutMs: 5000,
+				includeBodyPreview: true,
+			},
+		};
+		await createCustomHttpsTool(deps, {
+			entryId: "race-tool-1",
+			name: "Race tool 1",
+			description: "A test custom HTTPS tool.",
+			httpsDefinition: definition,
+			actor: "test",
+		});
+		await applyConfig(
+			deps,
+			{
+				organization: organization(),
+				agents: [
+					agent("finance"),
+					agent("racer", {
+						permissions: {
+							tools_allow: [],
+							// `custom_https` entries support only `require_approval`/`disabled`
+							// (`MODES_BY_KIND`), never `allow` — `tools_require_human_approval`, not
+							// `tools_allow`, is the legacy list that resolves cleanly against them.
+							tools_require_human_approval: ["custom.*"],
+							tools_deny: ["finance.*"],
+						},
+					}),
+				],
+				constitution: "Be helpful.",
+				rolePrompts: { finance: "x", racer: "x" },
+			},
+			"test",
+		);
+
+		// `custom.*` also matches every `custom_https` entry earlier tests in this shared-catalog file
+		// already created (`reset`'s own doc comment: catalog entries are never reset between tests),
+		// so the exact count here is relative, never an absolute number.
+		const [stalePreview] = await adoptAgentToolAttachments(deps, {
+			agentIds: ["racer"],
+			dryRun: true,
+			actor: "test",
+		});
+		const staleCount = stalePreview?.attachments.length ?? 0;
+		expect(staleCount).toBeGreaterThan(0);
+		const staleHash = stalePreview?.conversionHash;
+		expect(typeof staleHash).toBe("string");
+
+		// A second entry, also matching `custom.*`, created while the (simulated) owner is still
+		// looking at the first preview.
+		await createCustomHttpsTool(deps, {
+			entryId: "race-tool-2",
+			name: "Race tool 2",
+			description: "A test custom HTTPS tool.",
+			httpsDefinition: definition,
+			actor: "test",
+		});
+
+		await expect(
+			adoptAgentToolAttachments(deps, {
+				agentIds: ["racer"],
+				dryRun: false,
+				actor: "test",
+				expectedAttachmentsHash: staleHash,
+			}),
+		).rejects.toThrow(StaleConversionError);
+		// Nothing committed: `racer` is still legacy.
+		const [stillLegacy] = await adoptAgentToolAttachments(deps, {
+			agentIds: ["racer"],
+			dryRun: true,
+			actor: "test",
+		});
+		expect(stillLegacy?.alreadyHubManaged).toBe(false);
+		expect(stillLegacy?.attachments).toHaveLength(staleCount + 1);
+
+		// A fresh preview's own (now one entry wider) hash commits cleanly.
+		const freshHash = stillLegacy?.conversionHash;
+		const [committed] = await adoptAgentToolAttachments(deps, {
+			agentIds: ["racer"],
+			dryRun: false,
+			actor: "test",
+			expectedAttachmentsHash: freshHash,
+		});
+		expect(committed?.commit).not.toBeNull();
+		expect(committed?.attachments).toHaveLength(staleCount + 1);
+	});
+
+	it("attachTool's own implicit legacy conversion is refused once baseRevisionId no longer names the active revision", async () => {
+		await applyConfig(
+			deps,
+			{
+				organization: organization(),
+				agents: [agent("finance"), agent("staleattach")],
+				constitution: "Be helpful.",
+				rolePrompts: { finance: "x", staleattach: "x" },
+			},
+			"test",
+		);
+		const staleBase = await activeConfigRevisionId(deps);
+
+		// An unrelated commit moves the active revision on, exactly like a second browser tab (or
+		// another operator) committing something else while the console's own agent-tools page sits
+		// open, its `baseRevisionId` now stale.
+		await attachTool(deps, {
+			agentId: "finance",
+			entryId: "native-repository-read",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "console",
+		});
+
+		await expect(
+			attachTool(deps, {
+				agentId: "staleattach",
+				entryId: "native-repository-read",
+				pinnedVersion: null,
+				mode: "allow",
+				settings: {},
+				actor: "test",
+				source: "console",
+				baseRevisionId: staleBase,
+			}),
+		).rejects.toThrow(ManagementConflictError);
+		// Nothing committed: `staleattach` is still legacy.
+		const [stillLegacy] = await adoptAgentToolAttachments(deps, {
+			agentIds: ["staleattach"],
+			dryRun: true,
+			actor: "test",
+		});
+		expect(stillLegacy?.alreadyHubManaged).toBe(false);
+
+		// A fresh `baseRevisionId` (what the console's own reloaded page would show) commits cleanly.
+		const freshBase = await activeConfigRevisionId(deps);
+		const attached = await attachTool(deps, {
+			agentId: "staleattach",
+			entryId: "native-repository-read",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "console",
+			baseRevisionId: freshBase,
+		});
+		expect(attached.noop).toBe(false);
 	});
 
 	it("attach/detach/update each commit a config revision carrying the given source, covered by rollback", async () => {

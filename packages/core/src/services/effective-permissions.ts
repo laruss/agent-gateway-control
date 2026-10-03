@@ -4,6 +4,7 @@ import {
 	type AgentPermissions,
 	type CapabilityDescription,
 	type CapabilityMode,
+	MAX_CAPABILITIES,
 	type ToolAttachment,
 	type ToolAttachmentMode,
 	type ToolCatalogEntryId,
@@ -271,6 +272,13 @@ function catalogForCompile(
 
 const CAPABILITY_DESCRIPTION_MAX = 200;
 
+export type CapabilityDescriptions = Readonly<{
+	descriptions: Readonly<CapabilityDescription[]>;
+	/** How many further capabilities had to be left out to stay within `MAX_CAPABILITIES` — a
+	 * wildcard resolving to more entries than that bound, never a reason to fail the turn. */
+	omitted: number;
+}>;
+
 /**
  * Bounded capability descriptions (name, short description, mode) of every tool `compiled` grants
  * outright or with approval, for a version 3 turn input: the catalog entry an attachment named
@@ -278,12 +286,21 @@ const CAPABILITY_DESCRIPTION_MAX = 200;
  * implied by `tests.run`) whichever known entry names that implementation key. A tool with no
  * known entry at all (an unresolved legacy pattern has none) is left out: there is nothing to
  * describe it with.
+ *
+ * Bounded to `MAX_CAPABILITIES` (`AgentTurnInputSchema`'s own limit, ADR-027): a wildcard
+ * resolving to more known entries than that would otherwise fail the whole turn input's own
+ * schema parse the moment any attached pattern's coverage grows past it — never a reason to stop
+ * an agent from running at all, only to describe fewer of its tools structurally.
+ * `toolPolicy.allow`/`requireHumanApproval` (the lists enforcement actually reads) are never
+ * trimmed; only this read model is. Deterministic: a capability attached in its own right (never
+ * `impliedBy`) sorts before one only present because another implies it, then by name — so a
+ * truncation always drops the same, least specific entries first, run to run.
  */
 function buildCapabilityDescriptions(
 	attachments: Readonly<ToolAttachment[]>,
 	metadata: ReadonlyMap<ToolCatalogEntryId, CatalogMetadata>,
 	compiled: ReturnType<typeof compileAttachments>,
-): Readonly<CapabilityDescription[]> {
+): CapabilityDescriptions {
 	const modeByTool = new Map<ToolName, CapabilityMode>();
 	for (const tool of compiled.allow) {
 		modeByTool.set(tool, "allow");
@@ -321,7 +338,15 @@ function buildCapabilityDescriptions(
 	for (const tool of [...compiled.allow, ...compiled.requireApproval]) {
 		describe(tool);
 	}
-	return [...descriptions.values()].sort((a, b) => (a.name < b.name ? -1 : 1));
+	const ordered = [...descriptions.values()].sort((a, b) => {
+		const aImplied = a.impliedBy === undefined ? 0 : 1;
+		const bImplied = b.impliedBy === undefined ? 0 : 1;
+		return aImplied !== bImplied ? aImplied - bImplied : a.name < b.name ? -1 : 1;
+	});
+	return {
+		descriptions: ordered.slice(0, MAX_CAPABILITIES),
+		omitted: Math.max(0, ordered.length - MAX_CAPABILITIES),
+	};
 }
 
 /** Every attachment `agentId` currently holds, read from the live projection table
@@ -350,6 +375,9 @@ export type EffectiveAgentPermissions = Readonly<{
 	toolPolicy: Pick<ToolPolicySnapshot, "allow" | "requireHumanApproval" | "deny">;
 	memoryWriteAllowed: boolean;
 	capabilities: Readonly<CapabilityDescription[]>;
+	/** How many further capabilities `capabilities` left out to stay within `MAX_CAPABILITIES`
+	 * (`buildCapabilityDescriptions`) — `0` when nothing was left out. */
+	capabilitiesOmitted: number;
 	/** Legacy patterns that resolved to no known catalog entry; always empty when `hubManaged`. */
 	unresolved: Readonly<LegacyUnresolvedPattern[]>;
 	/** A tool in `toolPolicy.allow` whose adapter-specific prerequisite is not itself granted
@@ -399,7 +427,11 @@ export async function loadEffectivePermissionsIn(
 	);
 	const impliedMetadata = await loadCatalogMetadataByImplementationKey(db, impliedToolNames);
 	const metadata = new Map([...attachedMetadata, ...impliedMetadata]);
-	const capabilities = buildCapabilityDescriptions(read.attachments, metadata, compiled);
+	const { descriptions: capabilities, omitted: capabilitiesOmitted } = buildCapabilityDescriptions(
+		read.attachments,
+		metadata,
+		compiled,
+	);
 	if (hubManaged) {
 		return {
 			hubManaged: true,
@@ -410,6 +442,7 @@ export async function loadEffectivePermissionsIn(
 			},
 			memoryWriteAllowed: compiled.memoryWriteAllowed,
 			capabilities,
+			capabilitiesOmitted,
 			unresolved: [],
 			missingPrerequisites: compiled.missingPrerequisites,
 		};
@@ -427,6 +460,7 @@ export async function loadEffectivePermissionsIn(
 		},
 		memoryWriteAllowed,
 		capabilities,
+		capabilitiesOmitted,
 		unresolved: read.unresolved,
 		missingPrerequisites: {},
 	};

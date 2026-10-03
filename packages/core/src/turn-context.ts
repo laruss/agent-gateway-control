@@ -30,6 +30,9 @@ export type EffectivePermissions = Readonly<{
 	toolPolicy: Pick<ToolPolicySnapshot, "allow" | "requireHumanApproval" | "deny">;
 	memoryWriteAllowed: boolean;
 	capabilities: Readonly<CapabilityDescription[]>;
+	/** How many further capabilities `capabilities` left out to stay within `MAX_CAPABILITIES`
+	 * (`buildCapabilityDescriptions`, ADR-027) — `0` when nothing was left out. */
+	capabilitiesOmitted: number;
 }>;
 
 /**
@@ -179,6 +182,9 @@ export function buildTurnContext(sources: TurnContextSources): TurnContextResult
 		deadline: new Date(now.getTime() + runtime.timeout_seconds * 1000).toISOString(),
 		systemStatus,
 		capabilities: effectivePermissions.capabilities,
+		...(effectivePermissions.capabilitiesOmitted > 0
+			? { capabilitiesOmitted: effectivePermissions.capabilitiesOmitted }
+			: {}),
 	};
 	const parsed = AgentTurnInputSchema.safeParse(candidate);
 	if (!parsed.success) {

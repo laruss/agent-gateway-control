@@ -68,16 +68,26 @@ function builtInTools(
 }
 
 /** One line per capability (version 3 only, ADR-023): the catalog's own short description beside
- * its mode, a bounded, structured alternative to inferring what a bare tool name means. */
-function capabilitiesList(capabilities: Readonly<AgentTurnInput["capabilities"]>): string {
+ * its mode, a bounded, structured alternative to inferring what a bare tool name means.
+ * `capabilitiesOmitted`, present only once `MAX_CAPABILITIES` left some out
+ * (`buildCapabilityDescriptions`, ADR-027), is noted as a trailing line: `toolPolicy.allow`/
+ * `requireHumanApproval` above already name every tool, described or not. */
+function capabilitiesList(
+	capabilities: Readonly<AgentTurnInput["capabilities"]>,
+	capabilitiesOmitted: AgentTurnInput["capabilitiesOmitted"],
+): string {
 	if (capabilities === undefined || capabilities.length === 0) {
 		return "(none)";
 	}
-	return list(
-		capabilities.map(
-			(c) => `${c.name} (${c.mode === "allow" ? "allowed" : "needs approval"}): ${c.description}`,
-		),
+	const lines = capabilities.map(
+		(c) => `${c.name} (${c.mode === "allow" ? "allowed" : "needs approval"}): ${c.description}`,
 	);
+	if (capabilitiesOmitted !== undefined) {
+		lines.push(
+			`(${capabilitiesOmitted} further capabilit${capabilitiesOmitted === 1 ? "y" : "ies"} not described here; see "Tools allowed"/"need human approval" above for the complete lists)`,
+		);
+	}
+	return list(lines);
 }
 
 /** JSON for a <data> block: `<` is escaped, so no content can close the block early. */
@@ -135,7 +145,9 @@ export function renderTurnPrompt(
 			`Tools denied: ${toolPolicy.deny.join(", ") || "(none)"}`,
 			...(input.capabilities === undefined
 				? []
-				: [`Your capabilities, described:\n${capabilitiesList(input.capabilities)}`]),
+				: [
+						`Your capabilities, described:\n${capabilitiesList(input.capabilities, input.capabilitiesOmitted)}`,
+					]),
 			`Built-in tools of your runtime, in your working directory (enforced by the runtime):\n${list(builtInTools(input, confinable))}`,
 			`Channels you may post to:\n${list(input.channels.map((c) => `#${c.name} (${c.channelId})`))}`,
 			memoryDenied

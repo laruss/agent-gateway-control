@@ -126,6 +126,16 @@ function ParamEditor({
 	onChange: (next: CustomToolParam[]) => void;
 	disabled: boolean;
 }>): React.ReactElement {
+	// A stable id per row, assigned once at creation and never recomputed from a row's own content
+	// (never sent to the server, which never sees this array at all): keying by array index instead
+	// made deleting one row reuse the next row's position for `EnumValuesInput`'s own uncommitted
+	// local text, corrupting its values the moment it next lost focus. One id per row in `parameters`
+	// at mount, extended on "Add parameter" and filtered in lockstep on "Remove parameter" — never
+	// otherwise recomputed, so editing a row's own fields leaves its id (and so its position's
+	// identity) untouched.
+	const [ids, setIds] = React.useState<Readonly<string[]>>(() =>
+		parameters.map(() => crypto.randomUUID()),
+	);
 	function update(index: number, patch: Partial<CustomToolParam>) {
 		onChange(
 			parameters.map((param, i) =>
@@ -149,11 +159,21 @@ function ParamEditor({
 						: { ...base, type: "enum", values: [""] };
 		onChange(parameters.map((param, i) => (i === index ? next : param)));
 	}
+	function addParam() {
+		onChange([...parameters, newParam()]);
+		setIds((prev) => [...prev, crypto.randomUUID()]);
+	}
+	function removeParam(index: number) {
+		onChange(parameters.filter((_, i) => i !== index));
+		setIds((prev) => prev.filter((_, i) => i !== index));
+	}
 	return (
 		<div className="flex flex-col gap-3">
 			{parameters.map((param, index) => (
-				// biome-ignore lint/suspicious/noArrayIndexKey: rows have no stable id of their own yet
-				<div key={index} className="flex flex-col gap-2 rounded-lg border border-input p-3">
+				<div
+					key={ids[index] ?? index}
+					className="flex flex-col gap-2 rounded-lg border border-input p-3"
+				>
 					<div className="grid grid-cols-4 gap-2">
 						<div className="flex flex-col gap-1">
 							<Label className="text-xs">Name</Label>
@@ -279,7 +299,7 @@ function ParamEditor({
 						size="sm"
 						className="w-fit text-destructive"
 						disabled={disabled}
-						onClick={() => onChange(parameters.filter((_, i) => i !== index))}
+						onClick={() => removeParam(index)}
 					>
 						<Trash2 /> Remove parameter
 					</Button>
@@ -291,7 +311,7 @@ function ParamEditor({
 				size="sm"
 				className="w-fit"
 				disabled={disabled}
-				onClick={() => onChange([...parameters, newParam()])}
+				onClick={addParam}
 			>
 				<Plus /> Add parameter
 			</Button>
@@ -308,14 +328,27 @@ function SecretEditor({
 	onChange: (next: CustomToolSecretSlot[]) => void;
 	disabled: boolean;
 }>): React.ReactElement {
+	// Same reasoning as `ParamEditor`'s own `ids`: a stable id per row, assigned once at creation,
+	// never sent to the server, so deleting a row never reuses another row's position for a
+	// different logical secret slot.
+	const [ids, setIds] = React.useState<Readonly<string[]>>(() =>
+		secretSlots.map(() => crypto.randomUUID()),
+	);
 	function update(index: number, patch: Partial<CustomToolSecretSlot>) {
 		onChange(secretSlots.map((slot, i) => (i === index ? { ...slot, ...patch } : slot)));
+	}
+	function addSecret() {
+		onChange([...secretSlots, newSecret()]);
+		setIds((prev) => [...prev, crypto.randomUUID()]);
+	}
+	function removeSecret(index: number) {
+		onChange(secretSlots.filter((_, i) => i !== index));
+		setIds((prev) => prev.filter((_, i) => i !== index));
 	}
 	return (
 		<div className="flex flex-col gap-2">
 			{secretSlots.map((slot, index) => (
-				// biome-ignore lint/suspicious/noArrayIndexKey: rows have no stable id of their own yet
-				<div key={index} className="grid grid-cols-4 items-end gap-2">
+				<div key={ids[index] ?? index} className="grid grid-cols-4 items-end gap-2">
 					<div className="flex flex-col gap-1">
 						<Label className="text-xs">Alias</Label>
 						<Input
@@ -360,7 +393,8 @@ function SecretEditor({
 						size="sm"
 						className="text-destructive"
 						disabled={disabled}
-						onClick={() => onChange(secretSlots.filter((_, i) => i !== index))}
+						aria-label="Remove secret alias"
+						onClick={() => removeSecret(index)}
 					>
 						<Trash2 />
 					</Button>
@@ -372,7 +406,7 @@ function SecretEditor({
 				size="sm"
 				className="w-fit"
 				disabled={disabled}
-				onClick={() => onChange([...secretSlots, newSecret()])}
+				onClick={addSecret}
 			>
 				<Plus /> Add secret alias
 			</Button>

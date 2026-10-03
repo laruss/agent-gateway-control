@@ -1,7 +1,12 @@
-import type { AgentConfig, OrganizationConfig } from "@agent-gateway/contracts";
+import type {
+	AgentConfig,
+	CustomHttpsDefinition,
+	OrganizationConfig,
+} from "@agent-gateway/contracts";
 import {
 	AgentConfigSchema,
 	CONFIG_SNAPSHOT_FORMAT,
+	MAX_CAPABILITIES,
 	OrganizationConfigSchema,
 } from "@agent-gateway/contracts";
 import { createPool, migrateSchema } from "@agent-gateway/db";
@@ -29,6 +34,7 @@ import { loadAgents } from "./store.ts";
 import {
 	adoptAgentToolAttachments,
 	attachTool,
+	createCustomHttpsTool,
 	detachTool,
 	ensureToolCatalogSeeded,
 	updateAttachment,
@@ -362,6 +368,63 @@ describe("effective permissions: compiled attachments as the single source of tr
 			requireHumanApproval: [],
 			deny: ["finance.*", "memory.write"],
 		});
+	});
+
+	it("bounds capability descriptions to MAX_CAPABILITIES, reporting the rest omitted rather than failing the turn", async () => {
+		// `beta`'s own `tools_allow: ["custom.*"]` resolves against every one of these 129
+		// `custom_https` entries (ADR-027's own legacy conversion, `legacyAttachmentsFromPermissions`)
+		// — one more than `MAX_CAPABILITIES`, which a version 3 turn input's own schema bounds.
+		const definition: CustomHttpsDefinition = {
+			host: "api.example.test",
+			pathTemplate: "/items",
+			method: "GET",
+			parameters: [],
+			secretSlots: [],
+			idempotency: null,
+			responseLimits: {
+				maxResponseBytes: 65_536,
+				allowedContentTypes: ["application/json"],
+				timeoutMs: 5000,
+				includeBodyPreview: true,
+			},
+		};
+		const entryCount = MAX_CAPABILITIES + 1;
+		for (let i = 0; i < entryCount; i += 1) {
+			await createCustomHttpsTool(deps, {
+				entryId: `wildcard-tool-${String(i).padStart(4, "0")}`,
+				name: `Wildcard tool ${i}`,
+				description: `Test tool number ${i}.`,
+				httpsDefinition: definition,
+				actor: "test",
+			});
+		}
+		const [betaConfig] = (await pool.query("select config from agents where id = 'beta'")).rows;
+		await commitChange(deps, {
+			changeSet: [
+				{
+					type: "update_agent",
+					agent: {
+						...betaConfig.config,
+						permissions: {
+							tools_allow: ["custom.*"],
+							tools_require_human_approval: [],
+							tools_deny: ["finance.*", "memory.write"],
+						},
+					},
+				},
+			],
+			baseRevisionId: await activeConfigRevisionId(deps),
+			actor: "test",
+			source: "cli_apply",
+		});
+
+		const effective = await effectiveFor("beta");
+		// Never a reason to stop the agent from running at all: `toolPolicy.allow` (what enforcement
+		// actually reads) stays exactly `beta`'s own, unexpanded legacy pattern — only the structured
+		// description `capabilities` resolves against the catalog, and only that is bounded.
+		expect(effective.toolPolicy.allow).toEqual(["custom.*"]);
+		expect(effective.capabilities.length).toBe(MAX_CAPABILITIES);
+		expect(effective.capabilitiesOmitted).toBe(1);
 	});
 
 	describe("gateway tools adopt: explicit migration", () => {

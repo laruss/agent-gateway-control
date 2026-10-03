@@ -70,6 +70,7 @@ export function AdoptDialog({
 			const result = await commitAdopt(agentId, {
 				idempotencyKey: crypto.randomUUID(),
 				baseRevisionId: state.preview.baseRevisionId,
+				expectedConversionHash: state.preview.conversionHash,
 			});
 			if (result.kind === "conflict") {
 				setState({ status: "conflict" });

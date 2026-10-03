@@ -90,7 +90,7 @@ export function ToolDetailPage(): React.ReactElement {
 		);
 	}
 
-	const { entry, versions, attachedAgents, secretAliases } = state.response;
+	const { entry, versions, attachedAgents, legacyGrantingAgents, secretAliases } = state.response;
 	const current = entry.currentVersion;
 
 	return (
@@ -225,6 +225,21 @@ export function ToolDetailPage(): React.ReactElement {
 							</TableBody>
 						</Table>
 					)}
+					{legacyGrantingAgents.length > 0 && (
+						<Alert className="mt-2">
+							<AlertCircle />
+							<AlertTitle>Also granted outside the hub</AlertTitle>
+							<AlertDescription>
+								These agents' own legacy permissions still grant this tool directly, unaffected by
+								attaching, editing or deleting it here, and blocking delete until each adopts:{" "}
+								<span className="font-medium">
+									{legacyGrantingAgents.map((agent) => agent.displayName).join(", ")}
+								</span>
+								. Run <code>gateway tools adopt &lt;agent-id&gt;</code> (or the agent's own Adopt
+								action) first.
+							</AlertDescription>
+						</Alert>
+					)}
 				</CardContent>
 			</Card>
 
@@ -284,8 +299,18 @@ export function ToolDetailPage(): React.ReactElement {
 							name: value.name,
 							description: value.description,
 							httpsDefinition: value.httpsDefinition,
+							expectedVersion: current.version,
 						});
-						return { problems: result.kind === "invalid" ? result.problems : [] };
+						return {
+							problems:
+								result.kind === "invalid"
+									? result.problems
+									: result.kind === "conflict"
+										? [
+												"This entry was edited elsewhere since this page was loaded. Reload and try again.",
+											]
+										: [],
+						};
 					}}
 					onSaved={() => void load()}
 				/>
@@ -296,6 +321,7 @@ export function ToolDetailPage(): React.ReactElement {
 					entryId={entry.id}
 					name={current.name}
 					description={current.description}
+					expectedVersion={current.version}
 					onSaved={() => void load()}
 				/>
 			)}

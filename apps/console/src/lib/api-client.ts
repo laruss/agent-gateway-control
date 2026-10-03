@@ -312,6 +312,10 @@ const ConflictBodySchema = z.strictObject({
 	error: z.string(),
 	currentRevisionId: z.int().positive().nullable(),
 });
+const CatalogEntryConflictBodySchema = z.strictObject({
+	error: z.string(),
+	currentVersion: z.int().positive(),
+});
 const InvalidBodySchema = z.strictObject({
 	error: z.string(),
 	problems: z.array(z.string()),
@@ -613,6 +617,7 @@ export async function createCustomTool(
 
 export type EditCatalogEntryOutcome =
 	| Readonly<{ kind: "ok"; response: ConsoleEditCatalogEntryResponse }>
+	| Readonly<{ kind: "conflict"; currentVersion: number }>
 	| Readonly<{ kind: "invalid"; problems: Readonly<string[]> }>;
 
 export async function editCatalogEntry(
@@ -624,6 +629,10 @@ export async function editCatalogEntry(
 		headers: { "content-type": "application/json" },
 		body: JSON.stringify(body),
 	});
+	if (response.status === 409) {
+		const parsed = CatalogEntryConflictBodySchema.parse(await response.json());
+		return { kind: "conflict", currentVersion: parsed.currentVersion };
+	}
 	if (response.status === 422) {
 		const parsed = InvalidBodySchema.parse(await response.json());
 		return { kind: "invalid", problems: parsed.problems };
@@ -642,11 +651,16 @@ export type DeleteCatalogEntryOutcome =
 	| Readonly<{ kind: "conflict"; currentRevisionId: number | null }>
 	| Readonly<{ kind: "invalid"; problems: Readonly<string[]> }>;
 
-export async function deleteCatalogEntry(entryId: string): Promise<DeleteCatalogEntryOutcome> {
+export async function deleteCatalogEntry(
+	entryId: string,
+	expectedAttachedAgentIds?: Readonly<string[]>,
+): Promise<DeleteCatalogEntryOutcome> {
 	const response = await request(`/api/tools/${encodeURIComponent(entryId)}/delete`, {
 		method: "POST",
 		headers: { "content-type": "application/json" },
-		body: "{}",
+		body: JSON.stringify(
+			expectedAttachedAgentIds === undefined ? {} : { expectedAttachedAgentIds },
+		),
 	});
 	if (response.status === 409) {
 		const parsed = ConflictBodySchema.parse(await response.json());

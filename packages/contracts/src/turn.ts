@@ -477,10 +477,21 @@ export const AgentTurnInputSchema = z
 		/** Version 3 only, always present (possibly empty): bounded descriptions of the agent's own
 		 * effective tools, for the runtime prompt to describe them structurally. */
 		capabilities: CapabilityDescriptionsSchema.optional(),
+		/** Version 3 only: how many further capabilities `capabilities` itself had to leave out to
+		 * stay within `MAX_CAPABILITIES` (a wildcard resolving to more entries than that bound,
+		 * ADR-027) — omitted entirely when nothing was left out, never a reason to fail the turn the
+		 * way exceeding `MAX_CAPABILITIES` itself would. `toolPolicy.allow`/`requireHumanApproval`
+		 * stay complete regardless: only the structured, catalog-sourced description is bounded. */
+		capabilitiesOmitted: z.int().positive().optional(),
 	})
 	.check((ctx) => {
-		const { schemaVersion, systemStatus, capabilities } = ctx.value;
-		if (schemaVersion === 1 && (systemStatus !== undefined || capabilities !== undefined)) {
+		const { schemaVersion, systemStatus, capabilities, capabilitiesOmitted } = ctx.value;
+		if (
+			schemaVersion === 1 &&
+			(systemStatus !== undefined ||
+				capabilities !== undefined ||
+				capabilitiesOmitted !== undefined)
+		) {
 			ctx.issues.push({
 				code: "custom",
 				input: schemaVersion,
@@ -488,12 +499,25 @@ export const AgentTurnInputSchema = z
 				message: "schemaVersion 1 carries neither systemStatus nor capabilities",
 			});
 		}
-		if (schemaVersion === 2 && (systemStatus === undefined || capabilities !== undefined)) {
+		if (
+			schemaVersion === 2 &&
+			(systemStatus === undefined ||
+				capabilities !== undefined ||
+				capabilitiesOmitted !== undefined)
+		) {
 			ctx.issues.push({
 				code: "custom",
 				input: schemaVersion,
 				path: ["schemaVersion"],
 				message: "schemaVersion 2 always carries systemStatus, and never capabilities",
+			});
+		}
+		if (capabilitiesOmitted !== undefined && capabilities === undefined) {
+			ctx.issues.push({
+				code: "custom",
+				input: capabilitiesOmitted,
+				path: ["capabilitiesOmitted"],
+				message: "capabilitiesOmitted requires capabilities",
 			});
 		}
 		if (schemaVersion === 3 && capabilities === undefined) {

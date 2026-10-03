@@ -306,6 +306,34 @@ describe("sendPinnedRequest: against a real local HTTPS server", () => {
 		expect(outcome).toMatchObject({ kind: "failed" });
 	});
 
+	it("fails a GET answered with a redirect, before the (absent) content type is ever considered", async () => {
+		server = await startTestHttpsServer(tls, (_req, res) => {
+			// No `Content-Type` at all — the common shape of a redirect's own response, which the
+			// content-type gate alone would otherwise call "unexpected content type" rather than what
+			// it actually is.
+			res.writeHead(302, { location: "https://elsewhere.example/" });
+			res.end();
+		});
+		const outcome = await sendPinnedRequest(address, baseRequest());
+		expect(outcome).toEqual({
+			kind: "failed",
+			error: "the destination answered 302 (a redirect); redirects are not followed",
+		});
+	});
+
+	it("treats a redirect to a write already fully sent as unknown (throws): the destination may have acted on it", async () => {
+		server = await startTestHttpsServer(tls, (req, res) => {
+			req.on("data", () => undefined);
+			req.on("end", () => {
+				res.writeHead(303, { location: "https://elsewhere.example/result" });
+				res.end();
+			});
+		});
+		await expect(
+			sendPinnedRequest(address, baseRequest({ method: "POST", body: "{}" })),
+		).rejects.toThrow(/303 \(a redirect\).*unknown/);
+	});
+
 	it("fails cleanly (never unknown) when the server's CA is not trusted", async () => {
 		const untrusted = generateTestTls();
 		server = await startTestHttpsServer(untrusted, (_req, res) => {

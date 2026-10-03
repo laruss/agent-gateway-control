@@ -948,6 +948,65 @@ describe("agent lifecycle service (ADR-026)", () => {
 		expect(org.finance_agent_id).toBe("finance");
 	});
 
+	it("restore normalizes a hub-managed former finance agent's attachments too, unless makeFinanceAgent reclaims the role", async () => {
+		await reset([agent("accountant")]);
+		await ensureToolCatalogSeeded(deps, "test");
+		await ensureAgentLifecycleAdoption(deps, "test");
+
+		// "finance" becomes hub-managed while it still is the organization's finance agent: one
+		// finance entry explicitly `require_approval`, converting its own `tools_deny: ["finance.*"]`
+		// (the default `agent()` shape) into a `disabled` attachment for the other.
+		await attachTool(deps, {
+			agentId: "finance",
+			entryId: "executor-finance-payment-create",
+			pinnedVersion: null,
+			mode: "require_approval",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+
+		const retired = await requestAgentRetire(deps, {
+			agentId: "finance",
+			actor: "test",
+			source: "cli",
+			reassignFinanceTo: "accountant",
+		});
+		await markProvisioning(deps, retired.operationId, "test");
+		await completeOperation(deps, retired.operationId, "test");
+
+		// Restoring without `makeFinanceAgent`: "accountant" is the active finance agent now, so
+		// this must not throw even though "finance"'s carried-forward attachments still name finance
+		// entries.
+		const restored = await requestAgentRestore(deps, {
+			agentId: "finance",
+			actor: "test",
+			source: "cli",
+		});
+		expect(await activeConfigRevisionId(deps)).toBe(restored.revisionId);
+
+		const { bundle } = await inTransaction(deps, ({ tx }) =>
+			loadActiveBundle(tx.db, restored.revisionId),
+		);
+		// No finance attachment may compile into anything for an agent that is no longer the
+		// finance agent: every finance entry carried forward is `disabled`, never `allow` or
+		// `require_approval`, matching what `normalizeNonFinancePermissions` already does for a
+		// legacy agent's permission patterns.
+		for (const attachment of bundle.toolAttachments.finance ?? []) {
+			if (attachment.entryId.startsWith("executor-finance-")) {
+				expect(attachment.mode).toBe("disabled");
+			}
+		}
+		const [{ config: normalized }] = (
+			await pool.query("select config from agents where id = 'finance'")
+		).rows;
+		expect(normalized.permissions.tools_allow).not.toContain("finance.payment.create");
+		expect(normalized.permissions.tools_require_human_approval).not.toContain(
+			"finance.payment.create",
+		);
+		expect(normalized.permissions.tools_deny).toContain("finance.*");
+	});
+
 	it("refuses to complete an operation a later request already superseded", async () => {
 		const created = await requestAgentCreate(deps, createInput("lambda"));
 		// Supersedes the create operation: a new `retire` operation and generation.

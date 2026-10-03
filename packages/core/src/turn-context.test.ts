@@ -131,6 +131,7 @@ function legacyEffectivePermissions(
 		},
 		memoryWriteAllowed: !tools_deny.some((pattern) => toolPatternCovers(pattern, "memory.write")),
 		capabilities: [],
+		capabilitiesOmitted: 0,
 	};
 }
 

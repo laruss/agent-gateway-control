@@ -508,6 +508,18 @@ be left with two agents holding finance tools at once (the outgoing one, and the
 `validateConfigBundle`'s own finance rule would refuse the commit for naming a finance agent that is
 not the only one still allowed to hold them.
 
+A hub-managed former finance agent's carried-forward *attachments* are normalized the identical way,
+not only its mirrored `permissions`: `compileAttachments` already compiles a finance-kind attachment
+held by any other agent as contributing nothing at all (ADR-027's own finance rule for the compiler),
+so the restored agent's effective permissions are correct either way — but the attachment document
+itself would otherwise still claim a mode (`allow`/`require_approval`) the agent has no right to the
+moment it is restored as anyone but the finance agent, confusing wherever the hub shows attachments
+verbatim (the console's own Tools tab, `gateway config export`). `requestAgentRestore` forces every
+carried-forward attachment naming a finance-kind entry to `disabled` in exactly the cases
+`normalizeNonFinancePermissions` already applies to (not reclaiming the role), resolving each
+attachment's own `implementationKey` through the same catalog read `adoptOneAgent` already uses
+(`loadCompilableCatalogEntries`).
+
 ### Retry
 
 `requestOperationRetry` asks for a fresh attempt of an agent's own current operation: refused

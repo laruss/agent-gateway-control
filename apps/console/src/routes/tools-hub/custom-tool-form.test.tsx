@@ -60,6 +60,62 @@ describe("CustomToolDialog", () => {
 		},
 	);
 
+	it("deleting a parameter never corrupts the next row's own enum values on blur (stable row ids, not array index)", async () => {
+		const user = userEvent.setup();
+		render(
+			<CustomToolDialog
+				open={true}
+				onOpenChange={() => {}}
+				mode="create"
+				initial={{
+					entryId: "status-check",
+					name: "Status check",
+					description: "Checks the status endpoint.",
+					httpsDefinition: validDefinition({
+						parameters: [
+							{
+								name: "alpha",
+								slot: "query",
+								slotName: "alpha",
+								type: "enum",
+								values: ["one"],
+							},
+							{
+								name: "beta",
+								slot: "query",
+								slotName: "beta",
+								type: "enum",
+								values: ["two"],
+							},
+						],
+					}),
+				}}
+				onSubmit={async () => ({ problems: [] })}
+				onSaved={() => {}}
+			/>,
+		);
+		const enumInputs = screen.getAllByPlaceholderText("low,high");
+		expect(enumInputs).toHaveLength(2);
+		// Types into "alpha"'s own enum input, but never blurs it (never commits) before deleting
+		// the row entirely — the uncommitted text that keying by array index used to carry over
+		// onto whatever row ends up at position 0 next.
+		await user.clear(enumInputs[0] as HTMLElement);
+		await user.type(enumInputs[0] as HTMLElement, "corrupted");
+
+		const removeButtons = screen.getAllByRole("button", { name: /remove parameter/i });
+		await user.click(removeButtons[0] as HTMLElement);
+
+		// "beta" is now the only (and first) row; its own enum input must still show its own,
+		// already-committed value, never "alpha"'s uncommitted, never-blurred text.
+		const remaining = screen.getAllByPlaceholderText("low,high");
+		expect(remaining).toHaveLength(1);
+		expect(remaining[0]).toHaveValue("two");
+		await user.click(remaining[0] as HTMLElement);
+		await user.tab();
+		// Blurring commits "beta"'s own value, unchanged — not "corrupted".
+		expect(remaining[0]).toHaveValue("two");
+	});
+
 	it(
 		"shows a submission error in the dialog instead of leaving it blank on an unhandled " +
 			"rejection (an invalid entry id, a network failure, any non-422 response)",

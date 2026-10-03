@@ -24,8 +24,10 @@ not a reseed, not a rollback. An owner (or operator) opts an agent in explicitly
 The **Instruments & utils** hub (the console's own sidebar entry) and the Agents hub's own
 **Tools** tab both attach, detach and update an attachment, through the same console routes
 (`/api/tools*`, `/api/agents/:id/tools*`) `gateway config`/`gateway tools adopt` already use
-underneath — every mutation still goes through `prepareChange`/`commitChange`, so a revision
-records it and rollback covers it exactly as before. The hub's own entry detail page shows an
+underneath — attaching, detaching or updating an attachment always goes through
+`prepareChange`/`commitChange`, so a config revision records it and `gateway config rollback`
+covers it exactly as before (see "What config rollback covers" below for what it does not). The
+hub's own entry detail page shows an
 entry's version history, every agent currently attached to it (with its mode and pinned version)
 and an "Attach to agent" action; deleting or editing it there affects every agent listed, shown as
 the delete confirmation's own impact before anything commits. The Agents hub's **Tools** tab shows
@@ -273,6 +275,24 @@ execution against the new definition instead of what was actually shown and hash
 entry's own **Edit** only ever offers name/description, in either surface — its `kind`,
 `implementationKey`, risk floor and supported adapters describe a real integration this release
 ships, not something an edit can redefine.
+
+### What config rollback covers
+
+`gateway config rollback <revision>` restores a config revision's own bundle and attachments
+document — so attaching, detaching, updating or (through "Adopt into the tools hub") converting a
+legacy agent's attachments is always covered, since each commits a revision. The catalog entry
+itself is not part of any config revision at all: creating a custom HTTPS tool, publishing a new
+version of one (`gateway tools custom edit`, the console's own **Edit**), and deleting an entry
+with nothing currently attached to it (no `clear_tool_attachments` commit, since there is nothing to
+clear) each change the catalog's own tables directly, with no revision recorded and so nothing a
+config rollback ever touches. Deleting an entry that *is* attached to at least one agent is a mix of
+both: the attachment-clearing half is a revision rollback restores, but the entry's own `deleted_at`
+and (for a built-in) its tombstone are not — rolling back to a revision that still named the entry
+re-creates its `catalog_attachments` row, never the entry itself, which would fail outright were the
+entry actually gone; a deleted entry's row and every past version instead stay readable forever
+(ADR-027), exactly so that this restore can still happen. There is no "rollback" for the catalog
+tables themselves: a wrong edit or an unwanted delete is undone with another edit, or (for a
+non-built-in entry) accepted as permanent — entry ids are never reused.
 
 ### Egress, outcomes and the response the agent sees
 

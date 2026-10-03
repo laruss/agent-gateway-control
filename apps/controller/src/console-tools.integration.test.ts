@@ -260,6 +260,44 @@ describe("the Instruments & Utils hub's own management API (ADR-025/ADR-027)", (
 		expect((detail.body.versions as JsonBody[]).length).toBe(2);
 	});
 
+	it(
+		"refuses an edit bound to a stale expectedVersion with 409, never silently merging over " +
+			"someone else's very recent edit (last-writer-wins)",
+		async () => {
+			const { base } = await withServer();
+			const session = await signIn(base);
+			const { entryId } = await createCustomTool(base, session);
+			// Someone else's edit lands first.
+			const first = await postJson(base, `/api/tools/${entryId}/edit`, session, {
+				description: "Edited by someone else first.",
+			});
+			expect(first.status).toBe(200);
+
+			// This caller's own form still thinks the entry is at version 1.
+			const stale = await postJson(base, `/api/tools/${entryId}/edit`, session, {
+				name: "Stale writer's own name",
+				expectedVersion: 1,
+			});
+			expect(stale.status).toBe(409);
+			expect(stale.body.currentVersion).toBe(2);
+
+			// Nothing committed: the other edit's description survives, unchanged.
+			const detail = await getJson(base, `/api/tools/${entryId}`, session.cookie);
+			expect((detail.body.entry as JsonBody).currentVersion).toMatchObject({
+				version: 2,
+				description: "Edited by someone else first.",
+			});
+
+			// Reloading (what the console's own dialog does on a 409) and editing again, bound to the
+			// now-current version, commits cleanly.
+			const retried = await postJson(base, `/api/tools/${entryId}/edit`, session, {
+				name: "Retried writer's own name",
+				expectedVersion: 2,
+			});
+			expect(retried.status).toBe(200);
+		},
+	);
+
 	it("refuses a built-in's edit beyond name/description with 422", async () => {
 		const { base } = await withServer();
 		const session = await signIn(base);
@@ -304,6 +342,44 @@ describe("the Instruments & Utils hub's own management API (ADR-025/ADR-027)", (
 		expect((await getJson(base, `/api/tools/${entryId}`, session.cookie)).status).toBe(404);
 	});
 
+	it(
+		"refuses a delete bound to a stale impact preview with 409, never silently deleting a " +
+			"different set of agents than the one actually confirmed",
+		async () => {
+			const { base } = await withServer();
+			const session = await signIn(base);
+			const deleteImpactAgentId = "developer";
+			const { entryId } = await createCustomTool(base, session);
+			await postJson(base, `/api/agents/${deleteImpactAgentId}/tools/attach`, session, {
+				idempotencyKey: randomUUID(),
+				entryId,
+				pinnedVersion: null,
+				mode: "require_approval",
+			});
+
+			// The console's own confirm dialog loaded the entry detail before `developer` attached —
+			// an empty impact, stale the moment the attach above landed.
+			const stale = await postJson(base, `/api/tools/${entryId}/delete`, session, {
+				expectedAttachedAgentIds: [],
+			});
+			expect(stale.status).toBe(409);
+			// Nothing committed: the entry and its attachment both survive.
+			const stillThere = await getJson(base, `/api/tools/${entryId}`, session.cookie);
+			expect(stillThere.status).toBe(200);
+			expect((stillThere.body.attachedAgents as JsonBody[]).map((a) => a.agentId)).toEqual([
+				deleteImpactAgentId,
+			]);
+
+			// Reloading the preview (what the console's own dialog does on a 409) shows the real
+			// impact, which then deletes cleanly.
+			const del = await postJson(base, `/api/tools/${entryId}/delete`, session, {
+				expectedAttachedAgentIds: [deleteImpactAgentId],
+			});
+			expect(del.status).toBe(200);
+			expect(del.body.affectedAgentIds).toEqual([deleteImpactAgentId]);
+		},
+	);
+
 	// -----------------------------------------------------------------------
 	// The agent capability editor
 	// -----------------------------------------------------------------------
@@ -314,19 +390,22 @@ describe("the Instruments & Utils hub's own management API (ADR-025/ADR-027)", (
 		const res = await getJson(base, `/api/agents/${READ_ONLY_LEGACY_AGENT_ID}/tools`, cookie);
 		expect(res.status).toBe(200);
 		expect(res.body.hubManaged).toBe(false);
+		// The exact schema `fetchAgentTools` runs the response through, checked first, before
+		// `toMatchObject`'s own `expect.arrayContaining` touches `res.body.effective` below: this
+		// harness's own `expect` has been observed leaving a matched array key behind as an empty
+		// placeholder object once an asymmetric matcher has compared it, which would otherwise make
+		// a schema-parse assertion placed *after* those checks fail on a body the server never
+		// actually sent — a concrete-name-only schema here is what actually broke the Tools tab for
+		// any legacy agent whose `permissions` still name a wildcard.
+		expect(() => ConsoleAgentToolsResponseSchema.parse(res.body)).not.toThrow();
 		expect(res.body.effective).toMatchObject({
 			allow: expect.arrayContaining(["mattermost.post"]),
 		});
 		const unresolved = res.body.unresolved as JsonBody[];
 		expect(unresolved.some((u) => u.pattern === "deploy.*")).toBe(true);
-
 		// `research`'s own `tools_deny` (`finance.*`, `deploy.*`) carries forward unresolved into
-		// `effective.deny` unchanged, for a legacy agent: the console's own client-side parse (the
-		// exact schema `fetchAgentTools` runs the response through) must accept the wildcard, not
-		// just the raw HTTP call above — a concrete-name-only schema here is what actually broke the
-		// Tools tab for any legacy agent whose `permissions` still name a wildcard.
+		// `effective.deny` unchanged, for a legacy agent.
 		expect(res.body.effective).toMatchObject({ deny: expect.arrayContaining(["finance.*"]) });
-		expect(() => ConsoleAgentToolsResponseSchema.parse(res.body)).not.toThrow();
 	});
 
 	it("404s the agent-tools route for an agent that does not exist", async () => {
@@ -444,10 +523,12 @@ describe("the Instruments & Utils hub's own management API (ADR-025/ADR-027)", (
 		expect(preview.body.problems).toEqual([]);
 		expect((preview.body.unresolved as JsonBody[]).length).toBeGreaterThan(0);
 		expect(typeof preview.body.baseRevisionId).toBe("number");
+		expect(typeof preview.body.conversionHash).toBe("string");
 
 		const commit = await postJson(base, `/api/agents/${ADOPT_AGENT_ID}/tools/adopt`, session, {
 			idempotencyKey: randomUUID(),
 			baseRevisionId: preview.body.baseRevisionId,
+			expectedConversionHash: preview.body.conversionHash,
 		});
 		expect(commit.status).toBe(200);
 		expect(commit.body.commit).not.toBeNull();
@@ -483,6 +564,7 @@ describe("the Instruments & Utils hub's own management API (ADR-025/ADR-027)", (
 				await postJson(base, "/api/agents/no-such-agent/tools/adopt", session, {
 					idempotencyKey: randomUUID(),
 					baseRevisionId: null,
+					expectedConversionHash: "0".repeat(64),
 				})
 			).status,
 		).toBe(404);
@@ -501,6 +583,7 @@ describe("the Instruments & Utils hub's own management API (ADR-025/ADR-027)", (
 			);
 			expect(preview.status).toBe(200);
 			const staleBase = preview.body.baseRevisionId;
+			const conversionHash = preview.body.conversionHash;
 			expect(typeof staleBase).toBe("number");
 
 			// Moves the active revision on, unrelated to the agent being adopted — exactly like a
@@ -521,7 +604,11 @@ describe("the Instruments & Utils hub's own management API (ADR-025/ADR-027)", (
 				base,
 				`/api/agents/${ADOPT_CONFLICT_AGENT_ID}/tools/adopt`,
 				session,
-				{ idempotencyKey: randomUUID(), baseRevisionId: staleBase },
+				{
+					idempotencyKey: randomUUID(),
+					baseRevisionId: staleBase,
+					expectedConversionHash: conversionHash,
+				},
 			);
 			expect(stale.status).toBe(409);
 			expect(stale.body.currentRevisionId).toBe(bump.body.revisionId);
@@ -538,7 +625,11 @@ describe("the Instruments & Utils hub's own management API (ADR-025/ADR-027)", (
 				base,
 				`/api/agents/${ADOPT_CONFLICT_AGENT_ID}/tools/adopt`,
 				session,
-				{ idempotencyKey: randomUUID(), baseRevisionId: freshPreview.body.baseRevisionId },
+				{
+					idempotencyKey: randomUUID(),
+					baseRevisionId: freshPreview.body.baseRevisionId,
+					expectedConversionHash: freshPreview.body.conversionHash,
+				},
 			);
 			expect(commit.status).toBe(200);
 			expect(commit.body.commit).not.toBeNull();

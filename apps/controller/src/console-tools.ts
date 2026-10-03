@@ -142,6 +142,7 @@ async function entryDetailRoute(
 		entry: core.entry,
 		versions: [...core.versions],
 		attachedAgents: [...core.attachedAgents],
+		legacyGrantingAgents: [...core.legacyGrantingAgents],
 		secretAliases: [...secretAliasStatuses(core.entry, secretsDir)],
 	};
 	return { status: 200, body: response };
@@ -176,6 +177,15 @@ async function editToolRoute(
 	if (result.kind === "not-found") {
 		return notFound(`catalog entry '${entryId}' not found`);
 	}
+	if (result.kind === "conflict") {
+		return {
+			status: 409,
+			body: {
+				error: "this entry was edited elsewhere since this page was loaded",
+				currentVersion: result.currentVersion,
+			},
+		};
+	}
 	if (result.kind === "invalid") {
 		return { status: 422, body: { error: "the edit is invalid", problems: result.problems } };
 	}
@@ -192,7 +202,12 @@ async function deleteToolRoute(
 	if (!parsed.ok) {
 		return parsed.result;
 	}
-	const result = await consoleDeleteCatalogEntry(deps, entryId, CONSOLE_ACTOR);
+	const result = await consoleDeleteCatalogEntry(
+		deps,
+		entryId,
+		CONSOLE_ACTOR,
+		parsed.data.expectedAttachedAgentIds,
+	);
 	if (result.kind === "not-found") {
 		return notFound(`catalog entry '${entryId}' not found`);
 	}
@@ -329,6 +344,7 @@ async function adoptCommitRoute(
 		agentId,
 		CONSOLE_ACTOR,
 		parsed.data.baseRevisionId,
+		parsed.data.expectedConversionHash,
 		parsed.data.idempotencyKey,
 		parsed.data.reason,
 	);
@@ -349,6 +365,7 @@ async function adoptCommitRoute(
 		before: result.before,
 		after: result.after,
 		attachments: result.attachments,
+		conversionHash: result.conversionHash,
 		problems: result.problems,
 		commit: result.commit,
 	};
