@@ -352,6 +352,11 @@ export type EffectiveAgentPermissions = Readonly<{
 	capabilities: Readonly<CapabilityDescription[]>;
 	/** Legacy patterns that resolved to no known catalog entry; always empty when `hubManaged`. */
 	unresolved: Readonly<LegacyUnresolvedPattern[]>;
+	/** A tool in `toolPolicy.allow` whose adapter-specific prerequisite is not itself granted
+	 * (`compileAttachments`'s own `missingPrerequisites`, ADR-027) — informational only, never
+	 * removes anything from `allow`. Always empty for a legacy agent: its `permissions` lists carry
+	 * no such inference. */
+	missingPrerequisites: Readonly<Record<string, Readonly<ToolName[]>>>;
 }>;
 
 /**
@@ -406,6 +411,7 @@ export async function loadEffectivePermissionsIn(
 			memoryWriteAllowed: compiled.memoryWriteAllowed,
 			capabilities,
 			unresolved: [],
+			missingPrerequisites: compiled.missingPrerequisites,
 		};
 	}
 	const { tools_allow, tools_require_human_approval, tools_deny } = agent.config.permissions;
@@ -422,5 +428,6 @@ export async function loadEffectivePermissionsIn(
 		memoryWriteAllowed,
 		capabilities,
 		unresolved: read.unresolved,
+		missingPrerequisites: {},
 	};
 }

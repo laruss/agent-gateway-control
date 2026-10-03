@@ -51,7 +51,8 @@ export function PermissionsTab({
 			{hubManaged && (
 				<p className="text-sm text-muted-foreground">
 					This agent's tools are managed in the tools hub: its tool lists below are read-only here.
-					Use <code>gateway tools attach/detach</code> to change them.
+					Use the <strong>Tools</strong> tab (or <code>gateway tools attach/detach</code>) to change
+					them.
 				</p>
 			)}
 			<div className="grid gap-2">

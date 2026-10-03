@@ -265,6 +265,7 @@ describe("effective permissions: compiled attachments as the single source of tr
 		});
 		const mockAdapter = await effectiveFor("alpha");
 		expect(mockAdapter.toolPolicy.allow).toContain("repository.read");
+		expect(mockAdapter.missingPrerequisites).toEqual({});
 
 		await applyConfig(
 			deps,
@@ -290,6 +291,7 @@ describe("effective permissions: compiled attachments as the single source of tr
 		const codexAgent = await effectiveFor("alpha");
 		// Still granted — the adapter itself (not this compiler) is what makes it inert for Codex.
 		expect(codexAgent.toolPolicy.allow).toContain("repository.read");
+		expect(codexAgent.missingPrerequisites).toEqual({ "repository.read": ["tests.run"] });
 	});
 
 	it("detaching memory.write (or never attaching it) removes implicit memory authority", async () => {

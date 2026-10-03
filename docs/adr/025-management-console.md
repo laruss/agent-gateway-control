@@ -209,6 +209,23 @@ one of those checks.
   their own authority for what each one does and returns; this ADR's own authority is only that
   they are reached, authenticated and protected the same way every other mutating route here is —
   no new mechanism, no exception carved out for them.
+- **The Instruments & Utils hub's management API (ADR-027), the same way.** `GET /api/tools` /
+  `GET /api/tools/:entryId` (the catalog list and an entry's own detail — version history, attached
+  agents, and, for a `custom_https` entry, which secret aliases it needs and whether each is set,
+  a boolean only, never a value); `POST /api/tools` (create a `custom_https` entry),
+  `POST /api/tools/:entryId/edit` (publish a new version — name/description for a built-in, the
+  full definition for a `custom_https` entry), `POST /api/tools/:entryId/delete` (removes every
+  agent's attachment of it atomically, reporting which agents lost it); `GET /api/agents/:id/tools`
+  (requested attachments against effective, compiled access), `POST /api/agents/:id/tools/attach`/
+  `detach`/`update`, and `GET`/`POST /api/agents/:id/tools/adopt` ("Adopt into the tools hub"'s own
+  dry-run preview and commit). Every mutation still carries `source: "console"` and commits through
+  `prepareChange`/`commitChange` exactly like the Agents hub's own routes above — ADR-027 is the
+  authority for the catalog and compiler rules these translate into change operations for; this ADR
+  remains the authority only for how they are reached and protected. One thing these routes alone
+  need beyond `ControlPlaneDeps`: whether a named secret alias is actually set, read from the same
+  read-only mount `gateway tools secret set` writes through — `apps/controller/src/console-tools.ts`
+  (the routing layer, not `@agent-gateway/core`, which stays filesystem-free) resolves this itself,
+  never the catalog service.
 - **Actor and source.** Every commit this surface makes carries `source: "console"` (reserved for
   exactly this by ADR-024) and `actor: "console:owner"` — a fixed string, since the console has
   exactly one account and no per-user identity of its own (ADR-023/025). `gateway config history`

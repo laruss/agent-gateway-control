@@ -2201,8 +2201,8 @@ Released as 0.6.0 (migrations `0024_agent_lifecycle` to `0027_lifecycle_retry_of
 
 ## Phase 15 - Tool catalog: entries, versions and attachments
 
-Status: **in progress** (the catalog data model, the compiler, enforcement, custom HTTPS tools and
-packaged utilities are complete; a console surface is later work)
+Status: **done** (the catalog data model, the compiler, enforcement, custom HTTPS tools, packaged
+utilities and the console's own Instruments & Utils hub and agent capability editor)
 
 | Item | State | Evidence |
 |------|-------|----------|
@@ -2231,13 +2231,15 @@ packaged utilities are complete; a console surface is later work)
 | Packaged utilities: a new `utility` kind, fully static (like `executor`) — `utility.text-transform` (trim/case/reverse/slugify, bounded input/output) ships to prove the path; availability reflects whether a running tool runner actually registers it | done | `packages/contracts/src/custom-tool.ts`, `packages/tool-broker/src/utility.ts`, `apps/tool-runner/src/main.ts` |
 | `gateway tools secret set <alias>` (hidden entry, confirmed, written verbatim to a dedicated custom-tool secrets mount — never hashed, never the model, the database, logs, an approval or an error) and `gateway tools custom create\|edit <entry-id>` (a JSON definition file) | done | `apps/cli/src/custom-tool-commands.ts`, `apps/cli/src/commands.ts` |
 | Release configuration: a third secrets mount (`$GATEWAY_HOME/secrets/custom-tools`, `/run/custom-tool-secrets` read-only in the tool runner), `init-home.sh` creates it (0700, owner 10001), the CLI's own `/secrets` mount already covers writing to it, backed up the same way every other secret under `$GATEWAY_HOME` already is (no special-casing needed) | done | `deploy/release/compose.yaml`, `deploy/release/bin/init-home.sh` |
+| Console read models and change-set translation for the hub: `consoleListToolCatalog`/`consoleGetToolCatalogEntry` (availability from `runtimeHealth`, attached-agent count/list), `consoleCreateCustomTool`/`consoleEditCatalogEntry`/`consoleDeleteCatalogEntry`, `consoleAgentTools` (requested vs compiled effective, `missingPrerequisites` added to `EffectiveAgentPermissions`), `consoleAttachTool`/`consoleDetachTool`/`consoleUpdateAttachment`, `consoleAdoptPreview`/`consoleAdoptCommit` (`adoptAgentToolAttachments` gained an optional `source`/`idempotencyKey` so a console-driven adoption carries `source: "console"` and an idempotency key like every other console mutation, CLI callers unchanged) | done | `packages/core/src/services/console-tools.ts`, `packages/core/src/services/effective-permissions.ts`, `packages/core/src/services/tool-catalog.ts` |
+| Controller routes: `GET/POST /api/tools*`, `GET/POST /api/agents/:id/tools*` — session/CSRF/exact-Origin exactly like the Agents hub's own routes (ADR-025); a secret alias's "is it set" status is resolved here, not in `core`, from a read-only mount the controller now also has (`CUSTOM_TOOL_SECRETS_DIR`/`customToolSecretsDir`, release config and `ConsoleServerOptions` both extended) — `core` stays filesystem-free | done | `apps/controller/src/console-tools.ts`, `apps/controller/src/console-server.ts`, `apps/controller/src/main.ts`, `deploy/release/compose.yaml` |
+| Contracts for the new surface: `ConsoleToolCatalogListResponse`/`ConsoleToolCatalogEntryDetailResponse`, create/edit/delete request-response pairs, `ConsoleAgentToolsResponse` (requested/unresolved/effective/capabilities/missingPrerequisites/memoryWriteAllowed), attach/detach/update and adopt preview/commit DTOs | done | `packages/contracts/src/console-tools.ts` |
+| Console pages: **Instruments & utils** hub (searchable, grouped by kind, availability badges, create/edit/delete with review step and impact confirmation, attach-to-agent) and the Agents hub's own **Tools** tab (requested vs effective, implied capabilities, missing adapter prerequisites, attach/detach/mode-change acting immediately, "Adopt into the tools hub" with a dry-run preview) | done | `apps/console/src/routes/tools-hub-page.tsx`, `apps/console/src/routes/tool-detail-page.tsx`, `apps/console/src/routes/tools-hub/`, `apps/console/src/routes/agent-detail/tools-tab.tsx`, `apps/console/src/routes/agent-detail/{attach-entry-dialog,adopt-dialog}.tsx` |
 
-Not yet done: no console route surfaces the catalog, an agent's effective permissions, or a custom
-HTTPS tool's own definition to an owner (the CLI does: `gateway tools adopt --dry-run`,
-`gateway agents show`, `gateway tools custom create|edit`); executor/utility/`custom_https`
-availability all have the same gap — no live signal from a running tool runner yet
-(`registeredExecutorActionTypes`/`registeredNamespaces` are supplied by the caller, always empty in
-production today, same as before this step).
+Not yet done: executor/utility/`custom_https` availability still has no live signal from a running
+tool runner (`registeredExecutorActionTypes`/`registeredNamespaces` are supplied by the caller,
+always empty in production today, unchanged by this step) — the hub's own availability badge
+inherits this gap honestly rather than papering over it.
 
 Acceptance:
 
@@ -2318,5 +2320,38 @@ Acceptance:
   external network) destination, never touching it; a runner serving a different namespace can
   neither begin the action nor read the definition at all (cross-namespace denial, enforced by the
   database, not only by the application).
+- [x] Controller integration (`apps/controller/src/console-tools.integration.test.ts`): every
+  `/api/tools*`/`/api/agents/:id/tools*` route — catalog list/detail, create/edit/delete (a write
+  without an idempotency header refused at create, a built-in's edit beyond name/description
+  refused, delete reports and then 404s), secret-alias status (`set` toggles from `false` to `true`
+  once the file exists, the response body never contains the value itself), a legacy agent's
+  requested-vs-effective read with unresolved patterns, attach (legacy conversion carried forward
+  in the same revision), idempotent replay, detach (no-op vs real), update, adopt (dry-run preview,
+  commit, `alreadyHubManaged` the second time); 401 without a session, 403 missing CSRF or a
+  foreign Origin.
+- [x] Integration (`packages/core/src/services/effective-permissions.integration.test.ts`,
+  extended): `missingPrerequisites` now part of `EffectiveAgentPermissions`, empty under the mock
+  adapter and `{ "repository.read": ["tests.run"] }` under Codex for the same attachment —
+  populated straight from `compileAttachments`, already unit-tested on its own in
+  `packages/policy/src/compile.test.ts`.
+- [x] Console unit (Vitest + Testing Library): the hub's own list groups by kind and filters by
+  search text, shows an error banner on a failed load, opens the create dialog; an entry's detail
+  page shows version history and attached agents, a built-in's edit dialog offers only name/
+  description while a `custom_https` entry's own exposes the full definition, a secret alias's
+  status and the exact CLI command for one still unset, "Attach to agent"; the delete dialog names
+  every agent that would lose the entry and reports a 409 inline; the agent Tools tab previews a
+  legacy agent's conversion read-only with "Adopt into the tools hub" offered, shows effective
+  access/implied capabilities/a missing runtime prerequisite/memory-write authority, detaches
+  directly, and opens "Attach a tool" excluding already-requested entries; `customHttpsDefinitionProblems`
+  reused directly (not reimplemented) for the create/edit form's own client-side validation.
+- [x] End to end (`apps/tool-runner/src/console-custom-tools.e2e.test.ts`): a custom HTTPS tool
+  created and attached entirely through the console's own HTTP routes (not core functions called
+  directly), a real mock-runtime turn requests it, a real approval is granted, a real tool runner
+  attempts it (the egress guard correctly refuses the necessarily-loopback destination, the same
+  security-correct outcome `custom-tools.integration.test.ts` already establishes — never weakened
+  to force a success); detaching it through the console and requesting it again is refused outright
+  by the turn's own authority before any approval is ever created (`status: "failed"`,
+  `error_code: "invalid_output"`, the same non-retryable rejection a denied memory write already
+  proves end to end in `tool-catalog-enforcement.integration.test.ts`).
 
 Not yet released; see the Changelog's `[Unreleased]` section.

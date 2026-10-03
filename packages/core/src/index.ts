@@ -21,6 +21,7 @@ export { type BudgetReport, budgetHoldFor, budgetReport } from "./services/budge
 export * from "./services/channel-grants.ts";
 export * from "./services/console-management.ts";
 export * from "./services/console-sessions.ts";
+export * from "./services/console-tools.ts";
 export * from "./services/custom-tools.ts";
 export * from "./services/deps.ts";
 export * from "./services/gmail.ts";

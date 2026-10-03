@@ -152,12 +152,17 @@ services:
       # The exact Origin every console login and mutation must carry (ADR-025): the home
       # server's own Caddy site, never derived from a forwarded header.
       CONSOLE_ORIGIN: ${CONSOLE_ORIGIN:-https://gateway.local}
+      # ADR-027: read-only here too (the Instruments & Utils hub shows whether a custom tool's own
+      # named secret alias is set, never its value — `gateway tools secret set`, run through
+      # gateway-cli's own read-write mount of the same host directory, is the only writer).
+      CUSTOM_TOOL_SECRETS_DIR: /run/custom-tool-secrets
     volumes:
       - ${GATEWAY_HOME}/secrets/controller:/run/secrets:ro
       # ADR-026: where the lifecycle provisioner writes a lifecycle-created agent's bot token
       # (generated server-side, `mm_<agent>_token`), read-write, distinct from the operator-managed
       # secrets above — the controller never writes there, only here.
       - ${GATEWAY_HOME}/secrets/controller-bots:/run/bot-secrets
+      - ${GATEWAY_HOME}/secrets/custom-tools:/run/custom-tool-secrets:ro
     tmpfs:
       - /tmp:size=64m,nosuid,nodev,noexec
     networks:

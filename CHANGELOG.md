@@ -122,6 +122,25 @@ All notable changes are documented here. The project follows Semantic Versioning
   the shared configuration writer is about to commit is validated once more just before it is
   written (no two attachments of the same catalog entry, no agent's compiled permissions left
   overlapping), not only at whichever call site happens to check first.
+- An **Instruments & utils** hub in the console (a new sidebar entry, alongside Agents and Skills):
+  a searchable catalog list grouped by kind with availability badges; an entry's own detail page
+  (version history, every agent currently attached with its mode and pinned version, an "Attach to
+  agent" action); create/edit for a `custom_https` tool (every field the definition needs, with
+  client-side validation reusing `customHttpsDefinitionProblems` directly and a review step before
+  committing) and a metadata-only edit for a built-in; delete with its impact (which agents would
+  lose it) shown before confirming. The Agents hub's own editor gains a **Tools** tab: requested
+  attachments against effective, compiled access side by side, implied capabilities and an unmet
+  adapter prerequisite shown explicitly, unresolved legacy patterns, attach/detach/mode-change
+  acting immediately (no preview/commit round trip — attachments are their own document), and
+  "Adopt into the tools hub" with a dry-run preview before committing. A secret alias a
+  `custom_https` definition needs is shown by name and whether it is set — a boolean only, read
+  from the same mount `gateway tools secret set` writes through, read-only here, the exact command
+  printed for an alias still unset; no value is ever collected or shown. Every mutation reuses the
+  Agents hub's own session/CSRF/exact-Origin model and `prepareChange`/`commitChange` underneath —
+  no new way to write configuration, only a typed surface over the same catalog and attachment
+  functions the CLI already used (see [ADR-025](docs/adr/025-management-console.md) and
+  [ADR-027](docs/adr/027-tool-catalog.md), and the updated
+  [tool-catalog operations guide](docs/operations/tool-catalog.md)).
 
 ## [0.6.0] - 2026-10-02
 

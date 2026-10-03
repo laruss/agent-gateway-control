@@ -1,4 +1,9 @@
 import {
+	type ConsoleAdoptCommitRequest,
+	type ConsoleAdoptCommitResponse,
+	ConsoleAdoptCommitResponseSchema,
+	type ConsoleAdoptPreviewResponse,
+	ConsoleAdoptPreviewResponseSchema,
 	type ConsoleAgentChannelsResponse,
 	ConsoleAgentChannelsResponseSchema,
 	type ConsoleAgentCreateRequest,
@@ -15,8 +20,24 @@ import {
 	ConsoleAgentRetireResponseSchema,
 	type ConsoleAgentRetryRequest,
 	ConsoleAgentRetryResponseSchema,
+	type ConsoleAgentToolsResponse,
+	ConsoleAgentToolsResponseSchema,
+	type ConsoleAttachToolRequest,
+	type ConsoleAttachToolResponse,
+	ConsoleAttachToolResponseSchema,
 	type ConsoleCommitRequest,
 	ConsoleCommitResponseSchema,
+	type ConsoleCreateCustomToolRequest,
+	type ConsoleCreateCustomToolResponse,
+	ConsoleCreateCustomToolResponseSchema,
+	type ConsoleDeleteCatalogEntryResponse,
+	ConsoleDeleteCatalogEntryResponseSchema,
+	type ConsoleDetachToolRequest,
+	type ConsoleDetachToolResponse,
+	ConsoleDetachToolResponseSchema,
+	type ConsoleEditCatalogEntryRequest,
+	type ConsoleEditCatalogEntryResponse,
+	ConsoleEditCatalogEntryResponseSchema,
 	type ConsolePreviewRequest,
 	type ConsolePreviewResponse,
 	ConsolePreviewResponseSchema,
@@ -27,6 +48,13 @@ import {
 	ConsoleRevokeGrantResponseSchema,
 	type ConsoleSnapshot,
 	ConsoleSnapshotSchema,
+	type ConsoleToolCatalogEntryDetailResponse,
+	ConsoleToolCatalogEntryDetailResponseSchema,
+	type ConsoleToolCatalogListResponse,
+	ConsoleToolCatalogListResponseSchema,
+	type ConsoleUpdateAttachmentRequest,
+	type ConsoleUpdateAttachmentResponse,
+	ConsoleUpdateAttachmentResponseSchema,
 } from "@agent-gateway/contracts";
 import { z } from "zod";
 
@@ -531,4 +559,239 @@ export async function revokeAgentChannelGrant(agentId: string, channelId: string
 		throw new ApiError(response.status, await bodyText(response));
 	}
 	return ConsoleRevokeGrantResponseSchema.parse(await response.json());
+}
+
+// ---------------------------------------------------------------------------
+// The Instruments & Utils hub (ADR-025/ADR-027): the catalog itself (`/api/tools*`) and the agent
+// capability editor's own surface (`/api/agents/:id/tools*`). The same typed-outcome convention as
+// the Agents hub above — `conflict`/`invalid` are cases a caller reacts to directly, never a
+// generic `ApiError`.
+// ---------------------------------------------------------------------------
+
+export async function fetchToolCatalog(): Promise<ConsoleToolCatalogListResponse> {
+	const response = await request("/api/tools");
+	if (!response.ok) {
+		throw new ApiError(response.status, await bodyText(response));
+	}
+	return ConsoleToolCatalogListResponseSchema.parse(await response.json());
+}
+
+export async function fetchToolCatalogEntry(
+	entryId: string,
+): Promise<ConsoleToolCatalogEntryDetailResponse> {
+	const response = await request(`/api/tools/${encodeURIComponent(entryId)}`);
+	if (!response.ok) {
+		throw new ApiError(response.status, await bodyText(response));
+	}
+	return ConsoleToolCatalogEntryDetailResponseSchema.parse(await response.json());
+}
+
+export type CreateCustomToolOutcome =
+	| Readonly<{ kind: "ok"; response: ConsoleCreateCustomToolResponse }>
+	| Readonly<{ kind: "invalid"; problems: Readonly<string[]> }>;
+
+export async function createCustomTool(
+	body: ConsoleCreateCustomToolRequest,
+): Promise<CreateCustomToolOutcome> {
+	const response = await request("/api/tools", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+	});
+	if (response.status === 422) {
+		const parsed = InvalidBodySchema.parse(await response.json());
+		return { kind: "invalid", problems: parsed.problems };
+	}
+	if (!response.ok) {
+		throw new ApiError(response.status, await bodyText(response));
+	}
+	return {
+		kind: "ok",
+		response: ConsoleCreateCustomToolResponseSchema.parse(await response.json()),
+	};
+}
+
+export type EditCatalogEntryOutcome =
+	| Readonly<{ kind: "ok"; response: ConsoleEditCatalogEntryResponse }>
+	| Readonly<{ kind: "invalid"; problems: Readonly<string[]> }>;
+
+export async function editCatalogEntry(
+	entryId: string,
+	body: ConsoleEditCatalogEntryRequest,
+): Promise<EditCatalogEntryOutcome> {
+	const response = await request(`/api/tools/${encodeURIComponent(entryId)}/edit`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+	});
+	if (response.status === 422) {
+		const parsed = InvalidBodySchema.parse(await response.json());
+		return { kind: "invalid", problems: parsed.problems };
+	}
+	if (!response.ok) {
+		throw new ApiError(response.status, await bodyText(response));
+	}
+	return {
+		kind: "ok",
+		response: ConsoleEditCatalogEntryResponseSchema.parse(await response.json()),
+	};
+}
+
+export type DeleteCatalogEntryOutcome =
+	| Readonly<{ kind: "ok"; response: ConsoleDeleteCatalogEntryResponse }>
+	| Readonly<{ kind: "conflict"; currentRevisionId: number | null }>
+	| Readonly<{ kind: "invalid"; problems: Readonly<string[]> }>;
+
+export async function deleteCatalogEntry(entryId: string): Promise<DeleteCatalogEntryOutcome> {
+	const response = await request(`/api/tools/${encodeURIComponent(entryId)}/delete`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: "{}",
+	});
+	if (response.status === 409) {
+		const parsed = ConflictBodySchema.parse(await response.json());
+		return { kind: "conflict", currentRevisionId: parsed.currentRevisionId };
+	}
+	if (response.status === 422) {
+		const parsed = InvalidBodySchema.parse(await response.json());
+		return { kind: "invalid", problems: parsed.problems };
+	}
+	if (!response.ok) {
+		throw new ApiError(response.status, await bodyText(response));
+	}
+	return {
+		kind: "ok",
+		response: ConsoleDeleteCatalogEntryResponseSchema.parse(await response.json()),
+	};
+}
+
+export async function fetchAgentTools(agentId: string): Promise<ConsoleAgentToolsResponse> {
+	const response = await request(`/api/agents/${encodeURIComponent(agentId)}/tools`);
+	if (!response.ok) {
+		throw new ApiError(response.status, await bodyText(response));
+	}
+	return ConsoleAgentToolsResponseSchema.parse(await response.json());
+}
+
+export type AttachToolOutcome =
+	| Readonly<{ kind: "ok"; response: ConsoleAttachToolResponse }>
+	| Readonly<{ kind: "conflict"; currentRevisionId: number | null }>
+	| Readonly<{ kind: "invalid"; problems: Readonly<string[]> }>;
+
+export async function attachTool(
+	agentId: string,
+	body: ConsoleAttachToolRequest,
+): Promise<AttachToolOutcome> {
+	const response = await request(`/api/agents/${encodeURIComponent(agentId)}/tools/attach`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+	});
+	if (response.status === 409) {
+		const parsed = ConflictBodySchema.parse(await response.json());
+		return { kind: "conflict", currentRevisionId: parsed.currentRevisionId };
+	}
+	if (response.status === 422) {
+		const parsed = InvalidBodySchema.parse(await response.json());
+		return { kind: "invalid", problems: parsed.problems };
+	}
+	if (!response.ok) {
+		throw new ApiError(response.status, await bodyText(response));
+	}
+	return { kind: "ok", response: ConsoleAttachToolResponseSchema.parse(await response.json()) };
+}
+
+export type DetachToolOutcome =
+	| Readonly<{ kind: "ok"; response: ConsoleDetachToolResponse }>
+	| Readonly<{ kind: "conflict"; currentRevisionId: number | null }>
+	| Readonly<{ kind: "invalid"; problems: Readonly<string[]> }>;
+
+export async function detachTool(
+	agentId: string,
+	body: ConsoleDetachToolRequest,
+): Promise<DetachToolOutcome> {
+	const response = await request(`/api/agents/${encodeURIComponent(agentId)}/tools/detach`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+	});
+	if (response.status === 409) {
+		const parsed = ConflictBodySchema.parse(await response.json());
+		return { kind: "conflict", currentRevisionId: parsed.currentRevisionId };
+	}
+	if (response.status === 422) {
+		const parsed = InvalidBodySchema.parse(await response.json());
+		return { kind: "invalid", problems: parsed.problems };
+	}
+	if (!response.ok) {
+		throw new ApiError(response.status, await bodyText(response));
+	}
+	return { kind: "ok", response: ConsoleDetachToolResponseSchema.parse(await response.json()) };
+}
+
+export type UpdateAttachmentOutcome =
+	| Readonly<{ kind: "ok"; response: ConsoleUpdateAttachmentResponse }>
+	| Readonly<{ kind: "conflict"; currentRevisionId: number | null }>
+	| Readonly<{ kind: "invalid"; problems: Readonly<string[]> }>;
+
+export async function updateAttachment(
+	agentId: string,
+	body: ConsoleUpdateAttachmentRequest,
+): Promise<UpdateAttachmentOutcome> {
+	const response = await request(`/api/agents/${encodeURIComponent(agentId)}/tools/update`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+	});
+	if (response.status === 409) {
+		const parsed = ConflictBodySchema.parse(await response.json());
+		return { kind: "conflict", currentRevisionId: parsed.currentRevisionId };
+	}
+	if (response.status === 422) {
+		const parsed = InvalidBodySchema.parse(await response.json());
+		return { kind: "invalid", problems: parsed.problems };
+	}
+	if (!response.ok) {
+		throw new ApiError(response.status, await bodyText(response));
+	}
+	return {
+		kind: "ok",
+		response: ConsoleUpdateAttachmentResponseSchema.parse(await response.json()),
+	};
+}
+
+export async function fetchAdoptPreview(agentId: string): Promise<ConsoleAdoptPreviewResponse> {
+	const response = await request(`/api/agents/${encodeURIComponent(agentId)}/tools/adopt`);
+	if (!response.ok) {
+		throw new ApiError(response.status, await bodyText(response));
+	}
+	return ConsoleAdoptPreviewResponseSchema.parse(await response.json());
+}
+
+export type CommitAdoptOutcome =
+	| Readonly<{ kind: "ok"; response: ConsoleAdoptCommitResponse }>
+	| Readonly<{ kind: "conflict"; currentRevisionId: number | null }>
+	| Readonly<{ kind: "invalid"; problems: Readonly<string[]> }>;
+
+export async function commitAdopt(
+	agentId: string,
+	body: ConsoleAdoptCommitRequest,
+): Promise<CommitAdoptOutcome> {
+	const response = await request(`/api/agents/${encodeURIComponent(agentId)}/tools/adopt`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+	});
+	if (response.status === 409) {
+		const parsed = ConflictBodySchema.parse(await response.json());
+		return { kind: "conflict", currentRevisionId: parsed.currentRevisionId };
+	}
+	if (response.status === 422) {
+		const parsed = InvalidBodySchema.parse(await response.json());
+		return { kind: "invalid", problems: parsed.problems };
+	}
+	if (!response.ok) {
+		throw new ApiError(response.status, await bodyText(response));
+	}
+	return { kind: "ok", response: ConsoleAdoptCommitResponseSchema.parse(await response.json()) };
 }

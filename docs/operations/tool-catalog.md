@@ -21,14 +21,26 @@ not a reseed, not a rollback. An owner (or operator) opts an agent in explicitly
 
 ## Attaching and detaching
 
-There is no console route for attaching, detaching or editing an entry itself yet (ADR-027); use
-`gateway config` directly, or a future console surface once one exists. The Agents hub's own
-editor does show whether an agent is hub-managed: its `tools_allow`/`tools_require_human_approval`/
-`tools_deny` are read-only there, with a hint to use the hub instead, and a patch that tries to
-edit any of them directly is refused (preview and commit alike) rather than silently discarded by
-the bundle-mirror invariant on commit — `observe_system` is the one part of `permissions` still
-editable there even for a hub-managed agent, since compiled attachments never touch it. A legacy
-agent's whole `permissions` stays fully editable from the console, unaffected.
+The **Instruments & utils** hub (the console's own sidebar entry) and the Agents hub's own
+**Tools** tab both attach, detach and update an attachment, through the same console routes
+(`/api/tools*`, `/api/agents/:id/tools*`) `gateway config`/`gateway tools adopt` already use
+underneath — every mutation still goes through `prepareChange`/`commitChange`, so a revision
+records it and rollback covers it exactly as before. The hub's own entry detail page shows an
+entry's version history, every agent currently attached to it (with its mode and pinned version)
+and an "Attach to agent" action; deleting or editing it there affects every agent listed, shown as
+the delete confirmation's own impact before anything commits. The Agents hub's **Tools** tab shows
+one agent's requested attachments against its effective, compiled access side by side (below), and
+is where attach/detach/mode changes and "Adopt into the tools hub" (below) happen for that one
+agent. The CLI (`gateway tools adopt|custom|secret`, `gateway config`) remains fully equivalent —
+neither surface is the only way, and either one sees the other's changes immediately.
+
+The Agents hub's own general-purpose editor (the Permissions tab) still shows whether an agent is
+hub-managed: its `tools_allow`/`tools_require_human_approval`/`tools_deny` are read-only there,
+with a hint to use the Tools tab instead, and a patch that tries to edit any of them directly is
+refused (preview and commit alike) rather than silently discarded by the bundle-mirror invariant on
+commit — `observe_system` is the one part of `permissions` still editable there even for a
+hub-managed agent, since compiled attachments never touch it. A legacy agent's whole `permissions`
+stays fully editable from the console, unaffected.
 
 Attaching an entry to a still-**legacy** agent for the first time (its attachments document does
 not exist yet) converts its current `permissions` lists into real attachments first, in the same
@@ -88,7 +100,16 @@ all, exactly like `config-bundle.ts`'s finance rules already require for hand-au
 
 ## Checking an agent's effective permissions
 
-No console route yet. From a shell with access to the Gateway's database and `gateway` CLI:
+The Agents hub's own **Tools** tab (`GET /api/agents/:id/tools`) is the full compiled detail in one
+place: requested attachments (recorded, for a hub-managed agent; a read-only preview of what its
+`permissions` convert to, for a legacy one) against effective `allow`/`requireApproval`/`deny`,
+implied capabilities (`impliedBy`), an unmet adapter prerequisite (`missingPrerequisites`), unresolved
+legacy patterns and whether memory writes are allowed — the console explains there, plainly, that
+`tests.run` grants general sandboxed command execution: hiding a utility entry from the hub cannot
+retract a binary from an agent already granted a shell on an earlier turn.
+
+From a shell with access to the Gateway's database and `gateway` CLI, the same facts are reachable
+without the console:
 
 ```bash
 gateway config export /tmp/export   # tool-attachments.json alongside the bundle
@@ -96,9 +117,10 @@ gateway agents show <agent-id>      # permissions as currently stored (the compi
                                      # hub-managed agent)
 ```
 
-For the full compiled detail (`impliedBy`, `missingPrerequisites`, unresolved legacy patterns), use
-`gateway tools adopt <agent-id> --dry-run` (below) even on an agent you do not intend to adopt — it
-never commits anything in `--dry-run` and reports the before/after effective permissions either way.
+For the full compiled detail (`impliedBy`, `missingPrerequisites`, unresolved legacy patterns) from
+the CLI, use `gateway tools adopt <agent-id> --dry-run` (below) even on an agent you do not intend
+to adopt — it never commits anything in `--dry-run` and reports the before/after effective
+permissions either way.
 
 ## Adopting a legacy agent
 
@@ -106,7 +128,12 @@ never commits anything in `--dry-run` and reports the before/after effective per
 current `permissions` lists into real, recorded attachments (ADR-027's legacy conversion:
 `tools_deny` → `disabled`, `tools_require_human_approval` → `require_approval`, `tools_allow` →
 `allow`, matched against catalog entries known right now). It is the only way an agent becomes
-hub-managed from its existing configuration rather than from attaching entries one at a time.
+hub-managed from its existing configuration rather than from attaching entries one at a time. The
+Agents hub's own Tools tab offers the identical conversion as "Adopt into the tools hub", for one
+agent at a time: a dry-run preview (`GET /api/agents/:id/tools/adopt`) showing the same
+before/after/unresolved/problems this section describes, and a commit
+(`POST /api/agents/:id/tools/adopt`) once reviewed — `--all` stays CLI-only, since the console's own
+editor works one agent at a time by design.
 
 ```bash
 gateway tools adopt developer --dry-run   # preview: before/after, unresolved patterns
@@ -213,9 +240,17 @@ gateway tools secret set ticket_api_key
 Hidden entry, confirmed, written verbatim to the tool runner's own secrets mount
 (`$GATEWAY_HOME/secrets/custom-tools/<alias>` in the release bundle, `/run/custom-tool-secrets/`
 inside the container) — never the model, the database, logs, an approval or an error. Restart the
-tool runner (`bin/agw restart gateway-tool-runner`) to pick it up.
+tool runner (`bin/agw restart gateway-tool-runner`) to pick it up. Setting a value is CLI-only; the
+console entry detail page lists every alias a definition names and whether each is set (a boolean
+only, read from the same mount, read-only) and prints this exact command for an alias still
+unset — a value is never collected or shown there.
 
 ### 3. Create and attach it
+
+Through the console: **Instruments & utils → New custom HTTPS tool** — the same fields as the
+definition file below, with client-side validation mirroring `customHttpsDefinitionProblems` and a
+review step showing exactly what will be sent before it commits; then its own entry detail page's
+**Attach to agent** action. Through the CLI:
 
 ```bash
 gateway tools custom create zendesk-ticket \
@@ -230,10 +265,14 @@ grant-tool-runner <role> custom`).
 
 ### 4. Editing invalidates a pending request
 
-`gateway tools custom edit zendesk-ticket --definition updated.json` publishes a new, immutable
-version. An approval still pending against the previous version is refused at grant time — the
-owner sees "this custom tool was edited... it must be requested again", never a silent execution
-against the new definition instead of what was actually shown and hashed.
+`gateway tools custom edit zendesk-ticket --definition updated.json` (or the console entry detail
+page's own **Edit**, the identical form pre-filled with the current definition) publishes a new,
+immutable version. An approval still pending against the previous version is refused at grant
+time — the owner sees "this custom tool was edited... it must be requested again", never a silent
+execution against the new definition instead of what was actually shown and hashed. A built-in
+entry's own **Edit** only ever offers name/description, in either surface — its `kind`,
+`implementationKey`, risk floor and supported adapters describe a real integration this release
+ships, not something an edit can redefine.
 
 ### Egress, outcomes and the response the agent sees
 

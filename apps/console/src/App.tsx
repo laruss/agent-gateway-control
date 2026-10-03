@@ -18,6 +18,14 @@ const AgentsListPage = React.lazy(() =>
 const AgentDetailPage = React.lazy(() =>
 	import("@/routes/agent-detail-page").then((m) => ({ default: m.AgentDetailPage })),
 );
+// The Instruments & Utils hub is its own chunk too, for the same reason: its create/edit form
+// pulls in several shadcn components of its own, loaded only once a visitor actually opens it.
+const ToolsHubPage = React.lazy(() =>
+	import("@/routes/tools-hub-page").then((m) => ({ default: m.ToolsHubPage })),
+);
+const ToolDetailPage = React.lazy(() =>
+	import("@/routes/tool-detail-page").then((m) => ({ default: m.ToolDetailPage })),
+);
 
 function LazyPageFallback(): React.ReactElement {
 	return <div className="h-96 w-full animate-pulse rounded-lg bg-muted" />;
@@ -66,10 +74,17 @@ export function App(): React.ReactElement {
 								<Route
 									path="/tools"
 									element={
-										<PlaceholderPage
-											title="Instruments & utils"
-											description="Manage the Gateway's tools and utilities from here."
-										/>
+										<React.Suspense fallback={<LazyPageFallback />}>
+											<ToolsHubPage />
+										</React.Suspense>
+									}
+								/>
+								<Route
+									path="/tools/:entryId"
+									element={
+										<React.Suspense fallback={<LazyPageFallback />}>
+											<ToolDetailPage />
+										</React.Suspense>
 									}
 								/>
 								<Route path="*" element={<Navigate to="/" replace />} />

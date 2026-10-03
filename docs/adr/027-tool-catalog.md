@@ -641,15 +641,18 @@ merits — it is the only execution path the broker has at all.
 
 ## Consequences
 
-- No console route reads or edits the catalog itself yet (attaching, detaching, editing an entry);
-  surfacing that in the console is later work. `gateway config export`/`import`/`diff`/`rollback`
-  print attachments as part of the bundle, and `gateway tools adopt` surfaces a legacy agent's own
-  conversion. The one console touchpoint that does exist: the Agents hub's own editor
-  (`consoleShowAgent`'s `toolsHubManaged`) shows a hub-managed agent's tool lists read-only, with a
-  hint to use the hub instead, and refuses (preview and commit alike) a patch that edits them
-  directly — editing them there would preview a change the bundle-mirror invariant then silently
-  discards on commit, which is confusing precisely because that invariant is otherwise invisible
-  from the console. A legacy agent's own `permissions` stay fully editable there, unaffected.
+- The Instruments & Utils hub (ADR-025's own "Instruments & Utils hub's management API" section)
+  now reads and edits the catalog itself — listing, an entry's own detail, create/edit/delete for a
+  `custom_https` entry, attach/detach/update and "Adopt into the tools hub" for an agent — alongside
+  `gateway config export`/`import`/`diff`/`rollback` (which still print attachments as part of the
+  bundle) and `gateway tools adopt`/`custom`/`secret` (still the only way to set a secret's value,
+  or to adopt `--all` agents at once). The Agents hub's own general-purpose editor
+  (`consoleShowAgent`'s `toolsHubManaged`) still shows a hub-managed agent's tool lists read-only,
+  with a hint to use the Tools tab instead, and still refuses (preview and commit alike) a patch
+  that edits them directly — editing them there would preview a change the bundle-mirror invariant
+  then silently discards on commit, which is confusing precisely because that invariant is
+  otherwise invisible from the console. A legacy agent's own `permissions` stay fully editable
+  there, unaffected.
 - Attaching, detaching or editing an attachment now changes what a hub-managed agent may actually
   do, on its very next turn — see "Effective permissions: compiled attachments as the single
   source of truth" below.
@@ -659,10 +662,11 @@ merits — it is the only execution path the broker has at all.
   before `settings` drives anything real.
 - `catalog_entry_versions` grows without bound, like the configuration journal and the audit log;
   nothing here adds its own retention pass.
-- No console route creates or edits a `custom_https` tool either — `gateway tools custom
-  create|edit` and `gateway tools secret set` are the only way, this release; the console surface
-  for all of this (built-in and owner-defined alike) is the same later work the first bullet above
-  already names.
+- The Instruments & Utils hub also creates and edits a `custom_https` tool (client-side validation
+  reusing `customHttpsDefinitionProblems` directly, a review step before committing) — `gateway
+  tools custom create|edit` remains fully equivalent; `gateway tools secret set` remains the only
+  way to set a secret's actual value (the console shows only whether an alias is set, read from the
+  same mount, read-only).
 - Rolling back to a release before this one keeps every existing table fully readable (ADR-020's
   expand-migration guarantee); `catalog_entries`/`catalog_entry_versions`/`catalog_attachments`/
   `catalog_entry_tombstones`/`config_attachment_snapshots` are simply additional tables (and, for
