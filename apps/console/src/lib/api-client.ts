@@ -321,6 +321,17 @@ const InvalidBodySchema = z.strictObject({
 	problems: z.array(z.string()),
 });
 
+/** One agent, and the tools its effective permissions would gain — `detachTool`/`deleteCatalogEntry`'s
+ * own `would_widen` (422) outcome (ADR-027: removing an attachment must never widen access). A
+ * `problems`-less shape of its own, since `InvalidBodySchema` above is a `strictObject` and refuses
+ * an unknown `widenings` key just as it would refuse a missing `problems` one. */
+const WideningSchema = z.object({ agentId: z.string(), tools: z.array(z.string()) });
+const WidenBodySchema = z.strictObject({
+	error: z.string(),
+	widenings: z.array(WideningSchema),
+});
+export type Widening = z.infer<typeof WideningSchema>;
+
 /** `POST /api/agents/:id/preview`'s own documented outcomes (ADR-025): `conflict` (409) means
  * `baseRevisionId` is not the revision actually active right now — the editor's own loaded view,
  * never silently computed against the live state in its place — and is a case the review dialog
@@ -649,6 +660,7 @@ export async function editCatalogEntry(
 export type DeleteCatalogEntryOutcome =
 	| Readonly<{ kind: "ok"; response: ConsoleDeleteCatalogEntryResponse }>
 	| Readonly<{ kind: "conflict"; currentRevisionId: number | null }>
+	| Readonly<{ kind: "would_widen"; widenings: Readonly<Widening[]> }>
 	| Readonly<{ kind: "invalid"; problems: Readonly<string[]> }>;
 
 export async function deleteCatalogEntry(
@@ -667,8 +679,12 @@ export async function deleteCatalogEntry(
 		return { kind: "conflict", currentRevisionId: parsed.currentRevisionId };
 	}
 	if (response.status === 422) {
-		const parsed = InvalidBodySchema.parse(await response.json());
-		return { kind: "invalid", problems: parsed.problems };
+		const body = await response.json();
+		const widen = WidenBodySchema.safeParse(body);
+		if (widen.success) {
+			return { kind: "would_widen", widenings: widen.data.widenings };
+		}
+		return { kind: "invalid", problems: InvalidBodySchema.parse(body).problems };
 	}
 	if (!response.ok) {
 		throw new ApiError(response.status, await bodyText(response));
@@ -718,6 +734,7 @@ export async function attachTool(
 export type DetachToolOutcome =
 	| Readonly<{ kind: "ok"; response: ConsoleDetachToolResponse }>
 	| Readonly<{ kind: "conflict"; currentRevisionId: number | null }>
+	| Readonly<{ kind: "would_widen"; widenings: Readonly<Widening[]> }>
 	| Readonly<{ kind: "invalid"; problems: Readonly<string[]> }>;
 
 export async function detachTool(
@@ -734,8 +751,12 @@ export async function detachTool(
 		return { kind: "conflict", currentRevisionId: parsed.currentRevisionId };
 	}
 	if (response.status === 422) {
-		const parsed = InvalidBodySchema.parse(await response.json());
-		return { kind: "invalid", problems: parsed.problems };
+		const parsedBody = await response.json();
+		const widen = WidenBodySchema.safeParse(parsedBody);
+		if (widen.success) {
+			return { kind: "would_widen", widenings: widen.data.widenings };
+		}
+		return { kind: "invalid", problems: InvalidBodySchema.parse(parsedBody).problems };
 	}
 	if (!response.ok) {
 		throw new ApiError(response.status, await bodyText(response));

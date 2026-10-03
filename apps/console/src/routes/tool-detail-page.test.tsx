@@ -244,6 +244,31 @@ describe("ToolDetailPage", () => {
 		expect(await screen.findByRole("option", { name: "director" })).toBeInTheDocument();
 	});
 
+	it("'Attach to agent' never offers a mode its entry's own kind cannot support", async () => {
+		const user = userEvent.setup();
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: string | URL) => {
+				const path = typeof input === "string" ? input : input.toString();
+				if (path === "/api/agents") {
+					return jsonResponse({ agents: [], knownChannels: [], knownRuntimeAdapters: [] });
+				}
+				return jsonResponse(builtinDetail());
+			}),
+		);
+		// `native-repository-read`'s own risk floor is `allow` (no floor at all), so only its
+		// `kind` — nothing can pause a turn mid-flight for a human on a native capability — can
+		// explain `require_approval` never being offered; before this fix, the risk floor alone
+		// would have offered it, and the backend would then have refused the attach with a 422.
+		renderAt("native-repository-read");
+		await screen.findByRole("heading", { name: /read repository/i });
+		await user.click(screen.getByRole("button", { name: /attach to agent/i }));
+		await user.click(await screen.findByLabelText(/^mode$/i));
+		expect(await screen.findByRole("option", { name: "allow" })).toBeInTheDocument();
+		expect(screen.getByRole("option", { name: "disabled" })).toBeInTheDocument();
+		expect(screen.queryByRole("option", { name: "require_approval" })).not.toBeInTheDocument();
+	});
+
 	it("shows a 'not found' message for an unknown entry id", async () => {
 		vi.stubGlobal(
 			"fetch",

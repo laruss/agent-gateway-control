@@ -205,6 +205,14 @@ export const ConsoleAgentToolsResponseSchema = z.strictObject({
 	 * `baseRevisionId`), rather than silently converting a still-legacy agent's current `permissions`
 	 * against state the owner never actually saw on this page. */
 	baseRevisionId: z.int().positive().nullable(),
+	/** `attachmentsConversionHash(requested)`, only while `!hubManaged` (`null` once hub-managed,
+	 * where no conversion ever happens): echoed back on `attach` as
+	 * `ConsoleAttachToolRequestSchema`'s own `expectedConversionHash`, refused with `409` once a
+	 * catalog entry created, edited or deleted since changes what these same legacy patterns
+	 * resolve to — a gap `baseRevisionId` alone cannot catch (a catalog entry carries no config
+	 * revision of its own, ADR-027), the same way `ConsoleAdoptPreviewResponseSchema`'s own
+	 * `conversionHash` already closes it for "Adopt into the tools hub". */
+	conversionHash: Sha256HexSchema.nullable(),
 	requested: z.array(ToolAttachmentSchema),
 	unresolved: z.array(ConsoleUnresolvedPatternSchema),
 	// A hub-managed agent's compiled lists are always concrete tool names (every catalog entry's
@@ -251,6 +259,12 @@ export const ConsoleAttachToolRequestSchema = z.strictObject({
 	 * agent's own attach (no conversion happens there) and for the CLI, both of which keep the
 	 * existing "whatever is live" behaviour unchanged. */
 	baseRevisionId: z.int().positive().nullable().optional(),
+	/** The agent-tools read's own `conversionHash`, when the console gives one (a still-legacy
+	 * agent): binds the implicit legacy conversion `attachTool` would compute to the exact one the
+	 * owner actually reviewed, refused (`409`) once a catalog entry created, edited or deleted since
+	 * changes what it resolves to. Ignored for a hub-managed agent's own attach and absent for the
+	 * CLI, both of which keep the existing "whatever is live" behaviour unchanged. */
+	expectedConversionHash: Sha256HexSchema.optional(),
 	reason: ConfigRevisionReasonSchema.optional(),
 });
 export type ConsoleAttachToolRequest = z.infer<typeof ConsoleAttachToolRequestSchema>;
@@ -265,6 +279,10 @@ export type ConsoleAttachToolResponse = z.infer<typeof ConsoleAttachToolResponse
 export const ConsoleDetachToolRequestSchema = z.strictObject({
 	idempotencyKey: UuidSchema,
 	entryId: ToolCatalogEntryIdSchema,
+	/** An explicit acknowledgement that detaching this attachment would widen the agent's effective
+	 * permissions (`detachTool`'s own doc comment, ADR-027) and the owner actually intends that —
+	 * otherwise refused (`422`) once the console has shown the owner which tool would widen. */
+	confirmWidening: z.boolean().optional(),
 	reason: ConfigRevisionReasonSchema.optional(),
 });
 export type ConsoleDetachToolRequest = z.infer<typeof ConsoleDetachToolRequestSchema>;

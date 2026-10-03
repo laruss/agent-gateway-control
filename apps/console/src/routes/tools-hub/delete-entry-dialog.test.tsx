@@ -69,6 +69,37 @@ describe("DeleteEntryDialog", () => {
 		expect(onDeleted).not.toHaveBeenCalled();
 	});
 
+	it("shows which agent would gain what, inline, when the delete would widen effective permissions", async () => {
+		const user = userEvent.setup();
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () =>
+				jsonResponse(
+					{
+						error: "deleting this entry would widen one or more agents' effective permissions",
+						widenings: [{ agentId: "alpha", tools: ["workspace.write"] }],
+					},
+					422,
+				),
+			),
+		);
+		const onDeleted = vi.fn();
+		render(
+			<DeleteEntryDialog
+				open={true}
+				onOpenChange={() => {}}
+				entryId="native-workspace-write"
+				isBuiltin={true}
+				attachedAgentIds={["alpha"]}
+				onDeleted={onDeleted}
+			/>,
+		);
+		await user.click(screen.getByRole("button", { name: /^delete$/i }));
+		expect(await screen.findByText(/would widen effective permissions/i)).toBeInTheDocument();
+		expect(screen.getByText(/alpha \(workspace\.write\)/)).toBeInTheDocument();
+		expect(onDeleted).not.toHaveBeenCalled();
+	});
+
 	it("calls onDeleted after a successful delete", async () => {
 		const user = userEvent.setup();
 		vi.stubGlobal(

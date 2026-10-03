@@ -6,6 +6,7 @@ import {
 	compiledAgentPermissions,
 	compiledToolPolicyLists,
 	modeSupportedByKind,
+	widenedTools,
 } from "./compile.ts";
 
 const CATALOG = new Map<string, CompiledCatalogEntry>([
@@ -266,5 +267,123 @@ describe("modeSupportedByKind", () => {
 		expect(modeSupportedByKind("utility", "require_approval")).toBe(true);
 		expect(modeSupportedByKind("utility", "disabled")).toBe(true);
 		expect(modeSupportedByKind("utility", "allow")).toBe(false);
+	});
+});
+
+describe("widenedTools", () => {
+	it("is empty when before and after are identical", () => {
+		const compiled = compileAttachments({
+			...BASE,
+			attachments: [attachment("native-repository-read", "allow")],
+			catalog: CATALOG,
+		});
+		expect(widenedTools(compiled, compiled)).toEqual([]);
+	});
+
+	it("includes a tool that moved from deny to allow", () => {
+		const before = compileAttachments({
+			...BASE,
+			attachments: [attachment("native-web-search", "disabled")],
+			catalog: CATALOG,
+		});
+		const after = compileAttachments({
+			...BASE,
+			attachments: [attachment("native-web-search", "allow")],
+			catalog: CATALOG,
+		});
+		expect(widenedTools(before, after)).toEqual(["web.search"]);
+	});
+
+	it("includes a tool that moved from require_approval to allow", () => {
+		// `finance.payment.create` only ever compiles in for the finance agent, so attaching it to
+		// `BASE.agentId` ("developer") would contribute nothing at all to either side of the
+		// comparison — built against the finance agent itself instead, so the move is real.
+		const financeBefore = compileAttachments({
+			...BASE,
+			agentId: "finance",
+			financeAgentId: "finance",
+			attachments: [attachment("executor-finance-payment-create", "require_approval")],
+			catalog: CATALOG,
+		});
+		const financeAfter = compileAttachments({
+			...BASE,
+			agentId: "finance",
+			financeAgentId: "finance",
+			attachments: [attachment("executor-finance-payment-create", "require_approval")],
+			catalog: CATALOG,
+		});
+		// Sanity: identical finance compiles widen nothing.
+		expect(widenedTools(financeBefore, financeAfter)).toEqual([]);
+		// The actual require_approval -> allow case: `executor` only supports
+		// require_approval/disabled (`modeSupportedByKind`), so the realistic widening case for a
+		// tool already at require_approval is `tests.run`, a native capability that does support
+		// `allow`.
+		const requireApproval = compileAttachments({
+			...BASE,
+			attachments: [
+				attachment("native-tests-run", "require_approval"),
+				attachment("native-repository-read", "disabled"),
+				attachment("native-workspace-write", "disabled"),
+			],
+			catalog: CATALOG,
+		});
+		const allowed = compileAttachments({
+			...BASE,
+			attachments: [attachment("native-tests-run", "allow")],
+			catalog: CATALOG,
+		});
+		expect(widenedTools(requireApproval, allowed)).toEqual(
+			expect.arrayContaining(["repository.read", "tests.run", "workspace.write"]),
+		);
+	});
+
+	it("never reports a narrowing move (allow -> deny) as widened", () => {
+		const before = compileAttachments({
+			...BASE,
+			attachments: [attachment("native-web-search", "allow")],
+			catalog: CATALOG,
+		});
+		const after = compileAttachments({
+			...BASE,
+			attachments: [attachment("native-web-search", "disabled")],
+			catalog: CATALOG,
+		});
+		expect(widenedTools(before, after)).toEqual([]);
+	});
+
+	it("a tool absent from before entirely but present in after's requireApproval counts as widened (absence is level 0, same as deny)", () => {
+		const before = compileAttachments({ ...BASE, attachments: [], catalog: CATALOG });
+		const after = compileAttachments({
+			...BASE,
+			attachments: [attachment("native-web-search", "require_approval")],
+			catalog: CATALOG,
+		});
+		expect(before.requireApproval).not.toContain("web.search");
+		expect(before.allow).not.toContain("web.search");
+		expect(before.deny).not.toContain("web.search");
+		expect(widenedTools(before, after)).toEqual(["web.search"]);
+	});
+
+	it("reports an implied tool newly let through once the explicit attachment suppressing it is removed (the clear-attachment / detach scenario)", () => {
+		// `workspace.write` explicitly `disabled` wins over `tests.run`'s own implication
+		// (`compileAttachments`'s "an explicit restriction on the implied tool wins" rule).
+		const before = compileAttachments({
+			...BASE,
+			attachments: [
+				attachment("native-tests-run", "allow"),
+				attachment("native-workspace-write", "disabled"),
+			],
+			catalog: CATALOG,
+		});
+		expect(before.deny).toContain("workspace.write");
+		// Simulating the `workspace.write` attachment being cleared/detached: nothing governs it
+		// explicitly any more, so `tests.run`'s own implication lets it through.
+		const after = compileAttachments({
+			...BASE,
+			attachments: [attachment("native-tests-run", "allow")],
+			catalog: CATALOG,
+		});
+		expect(after.allow).toContain("workspace.write");
+		expect(widenedTools(before, after)).toEqual(["workspace.write"]);
 	});
 });

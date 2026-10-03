@@ -55,7 +55,7 @@ import { clampWaitTimeout, isThreadBound } from "../waits.ts";
 import { approvalCorrelation } from "./approval-store.ts";
 import { budgetHoldFor, recordRunUsage, reportedUsage } from "./budgets.ts";
 import { parseThreadRef, recordThreadSummary, threadCorrelationOf } from "./context-store.ts";
-import { prepareCustomApprovalDraft } from "./custom-tools.ts";
+import { customApprovalRequestPreview, prepareCustomApprovalDraft } from "./custom-tools.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
 import { lockMemoryKey, supersedeMemory } from "./memory.ts";
 import { enqueueAttempt, enqueueRunDeadline, scheduleAgent, sessionScope } from "./scheduler.ts";
@@ -530,11 +530,16 @@ async function applyCompletion(
 	let approvers: MattermostId[] = [];
 	let preparedApprovalDraft: ApprovalRequestDraft | null = null;
 	if (result.nextState.kind === "needs_human") {
-		// A `custom_https` action is pinned to its entry's *current* definition version here,
-		// before anything else sees the draft: the synthetic parameter this adds is what lets a
-		// definition edited after this point invalidate the request at grant time
+		// A `custom_https` action is pinned to `agent`'s own selected version here (its attachment's
+		// pin, or the entry's current version when unpinned), before anything else sees the draft:
+		// the synthetic parameter this adds is what lets the definition being edited further, or the
+		// attachment itself being re-pinned, invalidate the request at grant time
 		// (`customGrantTimeIssues`), never the model's own concern.
-		const prepared = await prepareCustomApprovalDraft(db, result.nextState.approvalRequest);
+		const prepared = await prepareCustomApprovalDraft(
+			db,
+			agent.id,
+			result.nextState.approvalRequest,
+		);
 		if (prepared.kind === "refused") {
 			await raiseAlert(
 				uow,
@@ -990,6 +995,15 @@ async function createApproval(
 	}
 	const channels = await loadTeamChannels(uow.tx.db);
 	const channelName = config.organization.mattermost.approvals_channel;
+	// The card's own authoritative, secret-free request preview (ADR-027) — separate from the
+	// model's own free-text `actionSummary` above — resolved against the exact pinned version
+	// `prepareCustomApprovalDraft` already added to `draft.actionParams`; `null` for any action type
+	// that is not a custom tool.
+	const customRequestPreview = await customApprovalRequestPreview(
+		uow.tx.db,
+		draft.actionType,
+		draft.actionParams,
+	);
 	const card: MattermostApprovalPayload = {
 		approvalId: approval.id,
 		channelName,
@@ -1002,6 +1016,7 @@ async function createApproval(
 		immutableActionHash,
 		expiresAt: expiresAt.toISOString(),
 		approvalCode: approvalCode({ id: approval.id, nonce, immutableActionHash }),
+		...(customRequestPreview === null ? {} : { customRequestPreview }),
 	};
 	await enqueueOutbox(uow, {
 		kind: "mattermost.approval",

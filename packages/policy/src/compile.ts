@@ -3,13 +3,21 @@ import type {
 	AgentPermissions,
 	RuntimeAdapterId,
 	ToolAttachment,
-	ToolAttachmentMode,
 	ToolCatalogEntryId,
 	ToolCatalogEntryKind,
 	ToolName,
 	ToolPolicySnapshot,
 } from "@agent-gateway/contracts";
 import { FINANCE_TOOLS, toolPatternCovers } from "@agent-gateway/contracts";
+
+/**
+ * Which attachment modes an entry's own `kind` supports at all: moved to
+ * `@agent-gateway/contracts` (beside `riskFloorAllows`) so a console client can share the same
+ * rule without depending on this package's own Node-only, IO-adjacent code (egress/IP
+ * classification among it); re-exported here unchanged so every existing import of this module
+ * keeps working.
+ */
+export { modeSupportedByKind } from "@agent-gateway/contracts";
 
 // ---------------------------------------------------------------------------
 // Catalog-level native dependencies: data, not scattered ifs (step 1 of the phase this
@@ -43,34 +51,6 @@ export const ADAPTER_NATIVE_PREREQUISITES: Readonly<
 > = {
 	codex: { "repository.read": ["tests.run"] },
 };
-
-/**
- * The attachment modes an entry's own `kind` actually supports, regardless of its `riskFloor`:
- * a native capability or a direct Gateway action (`mattermost.post`, `memory.write`) has no
- * enforcement point that can pause a turn mid-flight for a human's decision, so `require_approval`
- * is refused for them — only `allow`/`disabled` are. A tool-broker executor action always needs a
- * human (its risk floor is already `require_approval`; `riskFloorAllows` refuses `allow` for it),
- * so only `require_approval`/`disabled` are supported — `custom_https` (an owner's own HTTPS tool)
- * and `utility` (a packaged, image-shipped implementation) are both executed the same way, through
- * the tool broker and its approval flow, so they support exactly the same two modes.
- */
-const MODES_BY_KIND: Readonly<Record<ToolCatalogEntryKind, ReadonlySet<ToolAttachmentMode>>> = {
-	native: new Set(["allow", "disabled"]),
-	gateway: new Set(["allow", "disabled"]),
-	executor: new Set(["require_approval", "disabled"]),
-	custom_https: new Set(["require_approval", "disabled"]),
-	utility: new Set(["require_approval", "disabled"]),
-};
-
-/**
- * Whether `kind` supports `mode` at all, independent of any particular entry's `riskFloor`
- * (`riskFloorAllows` is the complementary, per-entry check). Pure; shared by the write-boundary
- * validation (`attachmentCatalogProblems`) and anything else that needs to reject an attachment
- * before it is ever compiled.
- */
-export function modeSupportedByKind(kind: ToolCatalogEntryKind, mode: ToolAttachmentMode): boolean {
-	return MODES_BY_KIND[kind].has(mode);
-}
 
 /** What the compiler needs to know about a catalog entry an attachment names; nothing else. */
 export type CompiledCatalogEntry = Readonly<{
@@ -217,6 +197,39 @@ export function compileAttachments(input: CompileAttachmentsInput): CompiledTool
 		missingPrerequisites: toSortedRecord(missingPrerequisites),
 		memoryWriteAllowed: allow.has("memory.write"),
 	};
+}
+
+/**
+ * Every tool whose effective access level in `after` exceeds what it was in `before` — `deny`
+ * (absence from every list enforces identically, `tools.ts`'s own resolution of an uncovered
+ * action to "not granted") is the lowest level, `require_approval` the middle, `allow` the
+ * highest. Pure; the one comparison shared by every caller that removes an
+ * attachment and must never, by doing so, increase what an agent may actually do (ADR-027):
+ * deleting a catalog entry clears every agent's attachment of it, and detaching one agent's own
+ * attachment does the same for just that agent — either can silently remove the one explicit
+ * `disabled`/`require_approval` that was suppressing a native dependency's implication (`tests.run`
+ * implying `workspace.write`), so both compare their own before/after compiled result through this
+ * rather than inventing the comparison twice.
+ */
+export function widenedTools(
+	before: CompiledToolPermissions,
+	after: CompiledToolPermissions,
+): Readonly<ToolName[]> {
+	const level = (compiled: CompiledToolPermissions, tool: ToolName): 0 | 1 | 2 => {
+		if (compiled.allow.includes(tool)) {
+			return 2;
+		}
+		return compiled.requireApproval.includes(tool) ? 1 : 0;
+	};
+	const everyTool = new Set<ToolName>([
+		...before.allow,
+		...before.requireApproval,
+		...before.deny,
+		...after.allow,
+		...after.requireApproval,
+		...after.deny,
+	]);
+	return [...everyTool].filter((tool) => level(after, tool) > level(before, tool)).sort();
 }
 
 /**

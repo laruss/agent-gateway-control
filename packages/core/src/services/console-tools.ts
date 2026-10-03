@@ -19,6 +19,7 @@ import type {
 	ToolCatalogEntryId,
 	ToolCatalogEntryVersion,
 	ToolCatalogEntryView,
+	ToolName,
 } from "@agent-gateway/contracts";
 import { RuntimeAdapterIdSchema } from "@agent-gateway/contracts";
 import { agents, catalogAttachments } from "@agent-gateway/db";
@@ -34,6 +35,7 @@ import { activeConfigRevisionId, loadActiveBundle, ManagementConflictError } fro
 import { runtimeHealth } from "./runtime-health.ts";
 import {
 	adoptAgentToolAttachments,
+	attachmentsConversionHash,
 	attachTool,
 	createCustomHttpsTool,
 	createCustomHttpsToolInputProblems,
@@ -51,6 +53,7 @@ import {
 	StaleConversionError,
 	type ToolCatalogAvailabilityContext,
 	updateAttachment,
+	WidensPermissionsError,
 } from "./tool-catalog.ts";
 
 // ---------------------------------------------------------------------------
@@ -233,10 +236,16 @@ export async function consoleEditCatalogEntry(
 	}
 }
 
+/** One agent `WidensPermissionsError` names, and the tools its effective permissions would gain
+ * (ADR-027) — the console's own structured shape for the same data the error carries, so a caller
+ * (a confirm dialog) never has to parse it back out of an error message string. */
+export type ConsoleWideningResult = Readonly<{ agentId: AgentId; tools: Readonly<ToolName[]> }>;
+
 export type ConsoleDeleteCatalogEntryResult =
 	| Readonly<{ kind: "ok"; affectedAgentIds: Readonly<AgentId[]> }>
 	| Readonly<{ kind: "not-found" }>
 	| Readonly<{ kind: "conflict"; currentRevisionId: number | null }>
+	| Readonly<{ kind: "would_widen"; widenings: Readonly<ConsoleWideningResult[]> }>
 	| Readonly<{ kind: "invalid"; problems: Readonly<string[]> }>;
 
 /** `POST /api/tools/:entryId/delete`: removes every agent's attachment of `entryId` atomically and
@@ -271,6 +280,9 @@ export async function consoleDeleteCatalogEntry(
 		if (error instanceof ManagementConflictError) {
 			return { kind: "conflict", currentRevisionId: error.currentRevisionId };
 		}
+		if (error instanceof WidensPermissionsError) {
+			return { kind: "would_widen", widenings: error.widenings };
+		}
 		if (error instanceof AdminError) {
 			return { kind: "invalid", problems: [error.message] };
 		}
@@ -302,13 +314,25 @@ export async function consoleAgentTools(
 			return null;
 		}
 		const financeAgentId = (bundle.organization?.organization.finance_agent_id ?? "") as AgentId;
-		const toolAttachmentsManaged = bundle.toolAttachments[agentId] !== undefined;
+		// Own-property lookup, never plain bracket access: an agent id like `constructor` has no
+		// own property in this plain-object dictionary but still resolves, through the prototype
+		// chain, to `Object.prototype.constructor` — truthy, and not an attachment list — which
+		// would otherwise be misread as "hub-managed" (and, below, as its recorded attachments).
+		const toolAttachmentsManaged = Object.hasOwn(bundle.toolAttachments, agentId);
 		const known = await knownCatalogEntries(tx.db);
 		const legacy = legacyAttachmentsFromPermissions(agent.permissions, known);
 		const requested = toolAttachmentsManaged
 			? (bundle.toolAttachments[agentId] ?? [])
 			: legacy.attachments;
 		const unresolved = toolAttachmentsManaged ? [] : legacy.unresolved;
+		// The still-legacy conversion's own hash (null once hub-managed, where no conversion ever
+		// happens): echoed back by the console on `attach`, refused with `409` once a catalog entry
+		// created, edited or deleted since changes what these same legacy patterns resolve to
+		// (`StaleConversionError`) — the same gap `baseRevisionId` alone cannot catch, `attachTool`'s
+		// own doc comment explains why (catalog entries carry no config revision of their own).
+		const conversionHash = toolAttachmentsManaged
+			? null
+			: attachmentsConversionHash(legacy.attachments);
 		const effective = await loadEffectivePermissionsIn(
 			tx,
 			{ id: agentId as AgentId, config: agent, toolAttachmentsManaged },
@@ -318,6 +342,7 @@ export async function consoleAgentTools(
 			agentId: agentId as AgentId,
 			hubManaged: toolAttachmentsManaged,
 			baseRevisionId: revisionId,
+			conversionHash,
 			requested: [...requested],
 			unresolved: [...unresolved],
 			effective: {
@@ -343,8 +368,13 @@ export type ConsoleAttachToolResult =
 	| Readonly<{ kind: "invalid"; problems: Readonly<string[]> }>;
 
 /** `POST /api/agents/:id/tools/attach`: binds `input.entryId` to `agentId`, converting a still-
- * legacy agent's `permissions` into real attachments in the same revision when needed
- * (`attachTool`, ADR-027). */
+ * legacy agent's `permissions` into real attachments in the same revision when needed (`attachTool`,
+ * ADR-027). `input.expectedConversionHash`, when given (the agent-tools read's own `conversionHash`,
+ * for a still-legacy agent), binds that conversion to the one the owner actually reviewed: refused
+ * (`StaleConversionError` -> `kind: "conflict"`, the same way `consoleAdoptCommit` already reports
+ * it) once a catalog entry created, edited or deleted since changes what these same legacy patterns
+ * resolve to — a gap `baseRevisionId` alone cannot catch, since a catalog entry carries no config
+ * revision of its own. */
 export async function consoleAttachTool(
 	deps: ControlPlaneDeps,
 	agentId: string,
@@ -363,6 +393,9 @@ export async function consoleAttachTool(
 			idempotencyKey: input.idempotencyKey,
 			...(input.reason === undefined ? {} : { reason: input.reason }),
 			...(input.baseRevisionId === undefined ? {} : { baseRevisionId: input.baseRevisionId }),
+			...(input.expectedConversionHash === undefined
+				? {}
+				: { expectedConversionHash: input.expectedConversionHash }),
 		});
 		return {
 			kind: "ok",
@@ -377,6 +410,9 @@ export async function consoleAttachTool(
 		if (error instanceof ManagementConflictError) {
 			return { kind: "conflict", currentRevisionId: error.currentRevisionId };
 		}
+		if (error instanceof StaleConversionError) {
+			return { kind: "conflict", currentRevisionId: input.baseRevisionId ?? null };
+		}
 		if (error instanceof AdminError) {
 			return { kind: "invalid", problems: [error.message] };
 		}
@@ -387,10 +423,14 @@ export async function consoleAttachTool(
 export type ConsoleDetachToolResult =
 	| (Readonly<{ kind: "ok" }> & ConsoleDetachToolResponse)
 	| Readonly<{ kind: "conflict"; currentRevisionId: number | null }>
+	| Readonly<{ kind: "would_widen"; widenings: Readonly<ConsoleWideningResult[]> }>
 	| Readonly<{ kind: "invalid"; problems: Readonly<string[]> }>;
 
 /** `POST /api/agents/:id/tools/detach`: a no-op (still a fresh revision) when `agentId` has no
- * attachment of `input.entryId`. */
+ * attachment of `input.entryId`. Refused (`kind: "would_widen"`, carrying the structured tool list
+ * `WidensPermissionsError` names) when detaching it would widen the agent's effective permissions,
+ * unless `input.confirmWidening` is set (ADR-027, `detachTool`'s own doc comment) — the console's
+ * own confirm step, once it has shown the owner which tool would widen. */
 export async function consoleDetachTool(
 	deps: ControlPlaneDeps,
 	agentId: string,
@@ -405,6 +445,7 @@ export async function consoleDetachTool(
 			source: "console",
 			idempotencyKey: input.idempotencyKey,
 			...(input.reason === undefined ? {} : { reason: input.reason }),
+			...(input.confirmWidening === undefined ? {} : { confirmWidening: input.confirmWidening }),
 		});
 		return {
 			kind: "ok",
@@ -417,6 +458,9 @@ export async function consoleDetachTool(
 	} catch (error) {
 		if (error instanceof ManagementConflictError) {
 			return { kind: "conflict", currentRevisionId: error.currentRevisionId };
+		}
+		if (error instanceof WidensPermissionsError) {
+			return { kind: "would_widen", widenings: error.widenings };
 		}
 		if (error instanceof AdminError) {
 			return { kind: "invalid", problems: [error.message] };

@@ -1,5 +1,10 @@
 import type { JsonValue } from "@agent-gateway/contracts";
-import { attachTool, detachTool, ingestEvent } from "@agent-gateway/core";
+import {
+	adoptAgentToolAttachments,
+	attachTool,
+	detachTool,
+	ingestEvent,
+} from "@agent-gateway/core";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { eventually, humanPost, startTestGateway, type TestGateway } from "./test-gateway.ts";
 
@@ -51,6 +56,16 @@ describe("tool catalog enforcement, end to end (ADR-027)", () => {
 		);
 
 	it("a broker action needs approval once attached; detaching it revokes the still-pending approval, with an audit entry", async () => {
+		// `finance`'s own example permissions carry patterns (`deploy.*`, `mail.*`) no catalog entry
+		// resolves yet; adopting it first (the explicit, reviewed path, which already tolerates an
+		// unresolved pattern by dropping and reporting it) makes it hub-managed before the first
+		// `attachTool` call below, which would otherwise refuse to auto-convert an unresolved
+		// pattern on its own (ADR-027).
+		await adoptAgentToolAttachments(gateway.deps(), {
+			agentIds: ["finance"],
+			dryRun: false,
+			actor: "test",
+		});
 		// `mattermost.post` too: the mock runtime's own reply once the wait resumes (after the
 		// approval is cancelled) needs it, same as any other turn.
 		await attachTool(gateway.deps(), {
@@ -112,6 +127,14 @@ describe("tool catalog enforcement, end to end (ADR-027)", () => {
 	});
 
 	it("detaching memory.write (never attaching it at all) leaves no writable namespace: a memory proposal is rejected by the turn's own authority", async () => {
+		// Same as above: `research`'s own example permissions carry unresolved patterns
+		// (`deploy.*`, `mail.*`), so it is adopted first to make it hub-managed before the first
+		// `attachTool` call below.
+		await adoptAgentToolAttachments(gateway.deps(), {
+			agentIds: ["research"],
+			dryRun: false,
+			actor: "test",
+		});
 		await attachTool(gateway.deps(), {
 			agentId: "research",
 			entryId: "gateway-mattermost-post",

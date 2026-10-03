@@ -661,14 +661,48 @@ describe("config export/import: tool attachments round-trip (ADR-027)", () => {
 	});
 
 	it("an attachment round-trips through export and import, losslessly, at the same hash", async () => {
-		// `director` is still legacy the first time anything ever attaches to it: `attachTool`
-		// converts its own `permissions` (`config/examples/agents/director.yaml`:
+		// `director`'s own example permissions (`config/examples/agents/director.yaml`:
 		// `tools_allow: [mattermost.post, memory.read, memory.write]`,
-		// `tools_deny: [finance.*, deploy.*, mail.send]`) the same way `gateway tools adopt` would,
-		// in this same revision, alongside the one attachment actually requested here — never just
-		// that one attachment on its own, which would otherwise make `director` hub-managed while
-		// silently dropping everything its legacy permissions covered (ADR-027). `memory.read`,
-		// `deploy.*` and `mail.send` resolve to no known catalog entry and so convert to nothing.
+		// `tools_deny: [finance.*, deploy.*, mail.send]`) also carry `memory.read`, `deploy.*` and
+		// `mail.send`, none of which resolve to a catalog entry this release seeds —
+		// `attachTool`'s own first-attach conversion refuses outright the moment any pattern is
+		// unresolved, rather than silently converting only what does resolve (ADR-027), so those
+		// three are trimmed here, once (the previous test's own `configImport` of `EXAMPLES_DIR`
+		// reset every agent back to its example file, undoing anything committed before it): every
+		// resolvable pattern (`mattermost.post`, `memory.write`, `finance.*`) stays exactly as the
+		// example ships it.
+		const active = await activeConfigRevisionId(harness.deps);
+		const { bundle } = await inTransaction(harness.deps, ({ tx }) =>
+			loadActiveBundle(tx.db, active),
+		);
+		const directorBefore = bundle.agents.find((agent) => agent.id === "director");
+		if (directorBefore === undefined) {
+			throw new Error("expected the director example agent");
+		}
+		await commitChange(harness.deps, {
+			changeSet: [
+				{
+					type: "update_agent",
+					agent: {
+						...directorBefore,
+						permissions: {
+							tools_allow: ["mattermost.post", "memory.write"],
+							tools_require_human_approval: [],
+							tools_deny: ["finance.*"],
+						},
+					},
+				},
+			],
+			baseRevisionId: active,
+			actor: "test",
+			source: "cli_apply",
+		});
+
+		// `director` is still legacy the first time anything ever attaches to it: `attachTool`
+		// converts its own (now-trimmed) `permissions` the same way `gateway tools adopt` would, in
+		// this same revision, alongside the one attachment actually requested here — never just that
+		// one attachment on its own, which would otherwise make `director` hub-managed while
+		// silently dropping everything its legacy permissions covered (ADR-027).
 		const attach = await attachTool(harness.deps, {
 			agentId: "director",
 			entryId: "gateway-memory-write",
@@ -911,6 +945,67 @@ describe("attachTool: a retry of the attachment that converted a legacy agent re
 		harness = await startHarness();
 		await applyConfig(harness.deps, exampleInput(), "test");
 		await ensureToolCatalogSeeded(harness.deps, "test");
+		// `research`, `operator` and `mail-follower`'s own example permissions each also carry
+		// `deploy.*` (and, for `mail-follower`, `mail.read`/`mail.send`/`mail.forward`) — none
+		// resolve to a catalog entry this release seeds, so `attachTool`'s own first-attach
+		// conversion would refuse each of them outright the moment it is actually exercised below
+		// (ADR-027: an unresolved allow or approval pattern refuses the conversion).
+		// Trimmed here, once, before any test below attaches to them — every resolvable pattern
+		// stays exactly as each example ships it, and none of the three gains an attachments
+		// document of its own from this (an `update_agent` never creates one; only attaching,
+		// detaching or adopting does), so each one stays exactly as legacy as it already was.
+		const active = await activeConfigRevisionId(harness.deps);
+		const { bundle } = await inTransaction(harness.deps, ({ tx }) =>
+			loadActiveBundle(tx.db, active),
+		);
+		const byId = (id: string) => {
+			const found = bundle.agents.find((agent) => agent.id === id);
+			if (found === undefined) {
+				throw new Error(`expected the '${id}' example agent`);
+			}
+			return found;
+		};
+		await commitChange(harness.deps, {
+			changeSet: [
+				{
+					type: "update_agent",
+					agent: {
+						...byId("research"),
+						permissions: {
+							tools_allow: ["mattermost.post", "web.search", "web.fetch"],
+							tools_require_human_approval: [],
+							tools_deny: ["finance.*", "workspace.write"],
+						},
+					},
+				},
+				{
+					type: "update_agent",
+					agent: {
+						...byId("operator"),
+						permissions: {
+							tools_allow: ["mattermost.post"],
+							tools_require_human_approval: [],
+							tools_deny: ["finance.*", "workspace.write", "memory.write"],
+							observe_system: true,
+						},
+					},
+				},
+				{
+					type: "update_agent",
+					agent: {
+						...byId("mail-follower"),
+						permissions: {
+							tools_allow: ["mattermost.post"],
+							tools_require_human_approval: [],
+							tools_deny: ["finance.*"],
+						},
+					},
+				},
+			],
+			baseRevisionId: active,
+			actor: "test",
+			source: "cli_apply",
+		});
 	});
 
 	afterAll(async () => {
@@ -938,7 +1033,11 @@ describe("attachTool: a retry of the attachment that converted a legacy agent re
 
 	it("keeps an explicit legacy denial that another attachment would otherwise imply", async () => {
 		// `tests.run` implies `repository.read`; this agent denies the latter explicitly. Converting
-		// it must carry that denial, never leave it to a later revision.
+		// it must carry that denial, never leave it to a later revision. `developer`'s own example
+		// `tools_deny` (`finance.*`, `deploy.*`, `mail.*`) is replaced outright here, never spread
+		// forward: `deploy.*`/`mail.*` resolve to no catalog entry this release seeds, which would
+		// otherwise be dropped by the conversion below (ADR-027)
+		// refuse before ever reaching the one denial this test is actually about.
 		const active = await activeConfigRevisionId(harness.deps);
 		const { bundle } = await inTransaction(harness.deps, ({ tx }) =>
 			loadActiveBundle(tx.db, active),
@@ -954,9 +1053,9 @@ describe("attachTool: a retry of the attachment that converted a legacy agent re
 					agent: {
 						...developer,
 						permissions: {
-							...developer.permissions,
 							tools_allow: ["mattermost.post", "tests.run"],
-							tools_deny: [...developer.permissions.tools_deny, "repository.read"],
+							tools_require_human_approval: [],
+							tools_deny: ["finance.*", "repository.read"],
 						},
 					},
 				},
@@ -1105,6 +1204,37 @@ describe("ensureConfigHistory: backfill carries attachments forward (ADR-027)", 
 			try {
 				await applyConfig(harness.deps, exampleInput(), "test");
 				await ensureToolCatalogSeeded(harness.deps, "test");
+				// `director`'s own example permissions also carry `memory.read`, `deploy.*` and
+				// `mail.send`, none of which resolve to a catalog entry this release seeds —
+				// `attachTool`'s own first-attach conversion below refuses outright the moment any
+				// pattern is unresolved (ADR-027), so those three are trimmed here first, keeping
+				// every resolvable pattern exactly as the example ships it.
+				const beforeActive = await activeConfigRevisionId(harness.deps);
+				const { bundle: beforeBundle } = await inTransaction(harness.deps, ({ tx }) =>
+					loadActiveBundle(tx.db, beforeActive),
+				);
+				const directorBefore = beforeBundle.agents.find((agent) => agent.id === "director");
+				if (directorBefore === undefined) {
+					throw new Error("expected the director example agent");
+				}
+				await commitChange(harness.deps, {
+					changeSet: [
+						{
+							type: "update_agent",
+							agent: {
+								...directorBefore,
+								permissions: {
+									tools_allow: ["mattermost.post", "memory.write"],
+									tools_require_human_approval: [],
+									tools_deny: ["finance.*"],
+								},
+							},
+						},
+					],
+					baseRevisionId: beforeActive,
+					actor: "test",
+					source: "cli_apply",
+				});
 				const attached = await attachTool(harness.deps, {
 					agentId: "director",
 					entryId: "gateway-mattermost-post",

@@ -1,9 +1,18 @@
 // @vitest-environment happy-dom
 import type { ConsoleAgentToolsResponse } from "@agent-gateway/contracts";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { toast } from "sonner";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ToolsTab } from "./tools-tab.tsx";
+
+// No `<Toaster />` is mounted in these tests (this app's own tests never assert on toast content
+// elsewhere either), so a `would_widen` refusal's own confirm action is verified by mocking
+// `sonner` directly and invoking the warning toast's own `action.onClick` by hand, rather than by
+// querying rendered toast DOM that nothing here actually mounts.
+vi.mock("sonner", () => ({
+	toast: Object.assign(vi.fn(), { success: vi.fn(), error: vi.fn(), warning: vi.fn() }),
+}));
 
 function jsonResponse(body: unknown, status = 200): Response {
 	return new Response(JSON.stringify(body), {
@@ -17,6 +26,7 @@ function legacyResponse(): ConsoleAgentToolsResponse {
 		agentId: "developer",
 		hubManaged: false,
 		baseRevisionId: 1,
+		conversionHash: "a".repeat(64),
 		requested: [
 			{ entryId: "native-repository-read", pinnedVersion: null, mode: "allow", settings: {} },
 		],
@@ -44,6 +54,7 @@ function hubManagedResponse(): ConsoleAgentToolsResponse {
 	return {
 		...legacyResponse(),
 		hubManaged: true,
+		conversionHash: null,
 		unresolved: [],
 		requested: [
 			{ entryId: "native-repository-read", pinnedVersion: null, mode: "allow", settings: {} },
@@ -123,6 +134,56 @@ describe("ToolsTab", () => {
 		expect(calls.some((c) => c.path.endsWith("/tools/detach") && c.method === "POST")).toBe(true);
 	});
 
+	it("a detach that would widen effective permissions warns instead of detaching, then detaches anyway once confirmed", async () => {
+		const user = userEvent.setup();
+		const detachBodies: Array<{ confirmWidening?: boolean }> = [];
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: string | URL, init?: RequestInit) => {
+				const path = typeof input === "string" ? input : input.toString();
+				if (path.endsWith("/tools/detach")) {
+					const body = JSON.parse((init?.body as string) ?? "{}") as { confirmWidening?: boolean };
+					detachBodies.push(body);
+					if (body.confirmWidening !== true) {
+						return jsonResponse(
+							{
+								error: "detaching this entry would widen the agent's effective permissions",
+								widenings: [{ agentId: "developer", tools: ["workspace.write"] }],
+							},
+							422,
+						);
+					}
+					return jsonResponse({
+						revisionId: 6,
+						hash: "b".repeat(64),
+						noop: false,
+						replayed: false,
+						activeRevisionId: 6,
+					});
+				}
+				return jsonResponse(hubManagedResponse());
+			}),
+		);
+		render(<ToolsTab agentId="developer" />);
+		await screen.findByText("native-repository-read");
+		const row = screen.getByText("native-repository-read").closest("tr");
+		await user.click((row as HTMLElement).querySelector("button") as HTMLButtonElement);
+
+		// First call refused: no `confirmWidening` sent, and the warning names the agent and tool.
+		expect(detachBodies[0]?.confirmWidening).toBeUndefined();
+		const warningCall = vi.mocked(toast.warning).mock.calls[0];
+		expect(warningCall?.[0]).toMatch(
+			/would widen effective permissions.*developer.*workspace\.write/,
+		);
+		const action = warningCall?.[1]?.action as { onClick: () => void } | undefined;
+		expect(action).toBeDefined();
+
+		// Invoking the toast's own "Detach anyway" action retries with `confirmWidening: true`.
+		action?.onClick();
+		await waitFor(() => expect(detachBodies).toHaveLength(2));
+		expect(detachBodies[1]?.confirmWidening).toBe(true);
+	});
+
 	it("shows which capabilities require a human's approval", async () => {
 		vi.stubGlobal(
 			"fetch",
@@ -179,5 +240,72 @@ describe("ToolsTab", () => {
 		await user.click(screen.getByRole("combobox", { name: /entry/i }));
 		expect(screen.queryByRole("option", { name: /read repository/i })).not.toBeInTheDocument();
 		expect(screen.getByRole("option", { name: /web search/i })).toBeInTheDocument();
+	});
+
+	it("offers only the modes a selected entry's own kind actually supports", async () => {
+		const user = userEvent.setup();
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: string | URL) => {
+				const path = typeof input === "string" ? input : input.toString();
+				if (path === "/api/tools") {
+					return jsonResponse({
+						entries: [
+							{
+								// Unrequested entry ids, distinct from `hubManagedResponse()`'s own `requested`
+								// list below — a requested entry is excluded from this picker entirely
+								// (re-attaching is `updateAttachment`'s job, not this dialog's), so reusing
+								// one of those ids here would leave the picker with nothing to select.
+								id: "native-web-fetch",
+								kind: "native",
+								name: "Fetch a URL",
+								description: "x",
+								isBuiltin: true,
+								riskFloor: "allow",
+								supportedAdapters: [],
+								available: true,
+								attachedAgentCount: 1,
+								deleted: false,
+							},
+							{
+								id: "executor-other-action",
+								kind: "executor",
+								name: "Issue a payment",
+								description: "x",
+								isBuiltin: true,
+								riskFloor: "require_approval",
+								supportedAdapters: [],
+								available: true,
+								attachedAgentCount: 0,
+								deleted: false,
+							},
+						],
+						knownRuntimeAdapters: ["mock"],
+					});
+				}
+				return jsonResponse(hubManagedResponse());
+			}),
+		);
+		render(<ToolsTab agentId="developer" />);
+		await user.click(await screen.findByRole("button", { name: /attach a tool/i }));
+		await user.click(screen.getByRole("combobox", { name: /entry/i }));
+		await user.click(await screen.findByRole("option", { name: /fetch a url/i }));
+		// `native`: nothing can pause a turn mid-flight for a human, so `require_approval` is never
+		// offered for it — only `allow`/`disabled`.
+		await user.click(screen.getByRole("combobox", { name: /mode/i }));
+		expect(await screen.findByRole("option", { name: "allow" })).toBeInTheDocument();
+		expect(screen.getByRole("option", { name: "disabled" })).toBeInTheDocument();
+		expect(screen.queryByRole("option", { name: "require_approval" })).not.toBeInTheDocument();
+		await user.keyboard("{Escape}");
+		await user.click(screen.getByRole("combobox", { name: /entry/i }));
+		await user.click(await screen.findByRole("option", { name: /issue a payment/i }));
+		// `executor`: the broker has no approval-free execution path, so `allow` is never offered
+		// for it — and the mode must reset off of `allow`, left over from the previous selection,
+		// rather than stay stale and only be refused once the backend sees the attach (a 422).
+		expect(screen.getByRole("combobox", { name: /mode/i })).not.toHaveTextContent("allow");
+		await user.click(screen.getByRole("combobox", { name: /mode/i }));
+		expect(await screen.findByRole("option", { name: "require_approval" })).toBeInTheDocument();
+		expect(screen.getByRole("option", { name: "disabled" })).toBeInTheDocument();
+		expect(screen.queryByRole("option", { name: "allow" })).not.toBeInTheDocument();
 	});
 });

@@ -1,5 +1,5 @@
 import type { ConsoleToolCatalogListItem, ToolAttachmentMode } from "@agent-gateway/contracts";
-import { riskFloorAllows } from "@agent-gateway/contracts";
+import { modeSupportedByKind, riskFloorAllows } from "@agent-gateway/contracts";
 import * as React from "react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -33,6 +33,11 @@ export type AttachEntryDialogProps = Readonly<{
 	 * rather than silently converting a still-legacy agent's current `permissions` against state
 	 * this page never actually showed. */
 	baseRevisionId: number | null;
+	/** The agent-tools read's own `conversionHash` (`null` once hub-managed, where no conversion
+	 * ever happens): echoed back on attach alongside `baseRevisionId`, which refuses with `409` once
+	 * a catalog entry created, edited or deleted since changes what this still-legacy agent's
+	 * patterns resolve to — a gap `baseRevisionId` alone cannot catch (ADR-027). */
+	conversionHash: string | null;
 	onAttached: () => void;
 }>;
 
@@ -45,6 +50,7 @@ export function AttachEntryDialog({
 	agentId,
 	alreadyRequestedEntryIds,
 	baseRevisionId,
+	conversionHash,
 	onAttached,
 }: AttachEntryDialogProps): React.ReactElement {
 	const [entries, setEntries] = React.useState<Readonly<ConsoleToolCatalogListItem[]>>([]);
@@ -64,11 +70,28 @@ export function AttachEntryDialog({
 	const options = entries.filter((entry) => !requested.has(entry.id));
 	const selected = options.find((entry) => entry.id === entryId);
 
+	// Bounded by both the entry's own risk floor (how strict a mode must be) and what its `kind`
+	// can express at all (`native`/`gateway` have no enforcement point that can pause a turn
+	// mid-flight for a human, so `require_approval` is never offered for them; `executor`/
+	// `custom_https`/`utility` always need one, so `allow` never is) — offering a mode the backend
+	// would then refuse with a 422 is worse than not offering it.
+	const availableModes: Readonly<ToolAttachmentMode[]> = (
+		["allow", "require_approval", "disabled"] as const
+	).filter(
+		(candidate) =>
+			selected === undefined ||
+			(riskFloorAllows(candidate, selected.riskFloor) &&
+				modeSupportedByKind(selected.kind, candidate)),
+	);
+
+	// Resets the selected mode once switching entries (or `options` loading in) leaves it
+	// unsupported — by risk floor or by kind — rather than leaving it stale and only discovered
+	// when the backend refuses the attach.
 	React.useEffect(() => {
-		if (selected !== undefined && !riskFloorAllows(mode, selected.riskFloor)) {
-			setMode("require_approval");
+		if (selected !== undefined && !availableModes.includes(mode)) {
+			setMode(availableModes[0] ?? "disabled");
 		}
-	}, [selected, mode]);
+	}, [selected, mode, availableModes]);
 
 	function handleOpenChange(next: boolean) {
 		onOpenChange(next);
@@ -91,6 +114,7 @@ export function AttachEntryDialog({
 				pinnedVersion: null,
 				mode,
 				baseRevisionId,
+				...(conversionHash === null ? {} : { expectedConversionHash: conversionHash }),
 			});
 			if (result.kind === "conflict") {
 				setError(
@@ -111,10 +135,6 @@ export function AttachEntryDialog({
 			setSubmitting(false);
 		}
 	}
-
-	const availableModes: Readonly<ToolAttachmentMode[]> = (
-		["allow", "require_approval", "disabled"] as const
-	).filter((candidate) => selected === undefined || riskFloorAllows(candidate, selected.riskFloor));
 
 	return (
 		<Dialog open={open} onOpenChange={handleOpenChange}>

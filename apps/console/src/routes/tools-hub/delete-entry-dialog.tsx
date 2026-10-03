@@ -61,6 +61,14 @@ export function DeleteEntryDialog({
 				);
 				return;
 			}
+			if (result.kind === "would_widen") {
+				setError(
+					`Deleting this entry would widen effective permissions for ${result.widenings
+						.map((widening) => `${widening.agentId} (${widening.tools.join(", ")})`)
+						.join("; ")} — detach or reconfigure those attachments first.`,
+				);
+				return;
+			}
 			if (result.kind === "invalid") {
 				setError(result.problems.join("; "));
 				return;

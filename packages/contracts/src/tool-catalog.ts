@@ -67,6 +67,38 @@ export function riskFloorAllows(
 	return mode !== "allow" || riskFloor === "allow";
 }
 
+/**
+ * The attachment modes an entry's own `kind` actually supports, regardless of its `riskFloor`:
+ * a native capability or a direct Gateway action (`mattermost.post`, `memory.write`) has no
+ * enforcement point that can pause a turn mid-flight for a human's decision, so `require_approval`
+ * is refused for them — only `allow`/`disabled` are. A tool-broker executor action always needs a
+ * human (its risk floor is already `require_approval`; `riskFloorAllows` refuses `allow` for it),
+ * so only `require_approval`/`disabled` are supported — `custom_https` (an owner's own HTTPS tool)
+ * and `utility` (a packaged, image-shipped implementation) are both executed the same way, through
+ * the tool broker and its approval flow, so they support exactly the same two modes. Lives here,
+ * beside `riskFloorAllows`, rather than in `@agent-gateway/policy`: a console client needs this
+ * same rule (to offer only a selected entry's actually-supported modes) without pulling in the
+ * rest of that package's IO-adjacent, Node-only logic (egress/IP classification among it).
+ */
+const MODES_BY_KIND: Readonly<Record<ToolCatalogEntryKind, ReadonlySet<ToolAttachmentMode>>> = {
+	native: new Set(["allow", "disabled"]),
+	gateway: new Set(["allow", "disabled"]),
+	executor: new Set(["require_approval", "disabled"]),
+	custom_https: new Set(["require_approval", "disabled"]),
+	utility: new Set(["require_approval", "disabled"]),
+};
+
+/**
+ * Whether `kind` supports `mode` at all, independent of any particular entry's `riskFloor`
+ * (`riskFloorAllows` is the complementary, per-entry check). Pure; shared by the write-boundary
+ * validation (`attachmentCatalogProblems`), anything else that needs to reject an attachment
+ * before it is ever compiled, and the console's own attach dialogs (which must never offer a mode
+ * the entry's kind cannot express in the first place).
+ */
+export function modeSupportedByKind(kind: ToolCatalogEntryKind, mode: ToolAttachmentMode): boolean {
+	return MODES_BY_KIND[kind].has(mode);
+}
+
 function boundedJson(maxChars: number, what: string) {
 	return JsonObjectSchema.refine(
 		(value) => JSON.stringify(value).length <= maxChars,

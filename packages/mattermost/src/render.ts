@@ -69,8 +69,12 @@ function mixedScriptWarning(card: MattermostApprovalPayload): string | null {
 
 /**
  * An approval card. The summary is the agent's prose and the parameters are what the hash
- * covers; both are shown verbatim in separate code blocks, never rendered as Markdown. The
- * card tells an owner how to decide: one line in its thread with the request's code.
+ * covers; both are shown verbatim in separate code blocks, never rendered as Markdown. A
+ * `custom_https` action also carries `customRequestPreview` — the authoritative, secret-free
+ * rendering of the exact request (method, resolved path, query/header/body field names, a
+ * secret-filled slot named but never its value) — shown in its own block, separate from the
+ * model's own summary, since one is the agent's prose and the other is what will actually run.
+ * The card tells an owner how to decide: one line in its thread with the request's code.
  */
 export function renderApprovalCard(card: MattermostApprovalPayload): string {
 	const params = approvalParamLines(card.actionParams);
@@ -82,6 +86,12 @@ export function renderApprovalCard(card: MattermostApprovalPayload): string {
 		codeBlock(card.actionSummary),
 		"Parameters (covered by the approval hash):",
 		codeBlock(params),
+		...(card.customRequestPreview === undefined
+			? []
+			: [
+					"Request preview (authoritative; no secret value is ever shown):",
+					codeBlock(card.customRequestPreview),
+				]),
 		...(warning === null ? [] : [warning]),
 		`To decide, an owner replies in this thread with exactly one line: \`approve ${card.approvalCode}\` or \`deny ${card.approvalCode}\`.`,
 		`Request \`${card.approvalId}\` · hash \`${card.immutableActionHash}\``,

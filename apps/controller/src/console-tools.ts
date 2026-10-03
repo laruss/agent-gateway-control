@@ -214,6 +214,15 @@ async function deleteToolRoute(
 	if (result.kind === "conflict") {
 		return staleConfiguration(result.currentRevisionId);
 	}
+	if (result.kind === "would_widen") {
+		return {
+			status: 422,
+			body: {
+				error: "deleting this entry would widen one or more agents' effective permissions",
+				widenings: result.widenings,
+			},
+		};
+	}
 	if (result.kind === "invalid") {
 		return { status: 422, body: { error: "the delete is invalid", problems: result.problems } };
 	}
@@ -275,6 +284,15 @@ async function detachRoute(
 	const result = await consoleDetachTool(deps, agentId, parsed.data, CONSOLE_ACTOR);
 	if (result.kind === "conflict") {
 		return staleConfiguration(result.currentRevisionId);
+	}
+	if (result.kind === "would_widen") {
+		return {
+			status: 422,
+			body: {
+				error: "detaching this entry would widen the agent's effective permissions",
+				widenings: result.widenings,
+			},
+		};
 	}
 	if (result.kind === "invalid") {
 		return { status: 422, body: { error: "the detach is invalid", problems: result.problems } };

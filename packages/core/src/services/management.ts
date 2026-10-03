@@ -425,7 +425,13 @@ function applyOperation(draft: ConfigDraftBundle, op: ChangeOperation): Operatio
 			if (!draft.agents.some((agent) => agent.id === op.agentId)) {
 				return { draft, problems: [`attach_tool: agent '${op.agentId}' does not exist`] };
 			}
-			const existing = draft.toolAttachments[op.agentId] ?? [];
+			// Own-property lookup, never plain bracket access: an agent id like `constructor` has no
+			// own property in this plain-object dictionary but still resolves, through the prototype
+			// chain, to `Object.prototype.constructor` — a function, not `undefined` — which `??`
+			// would not replace, and which has no `.filter` below.
+			const existing = Object.hasOwn(draft.toolAttachments, op.agentId)
+				? (draft.toolAttachments[op.agentId] ?? [])
+				: [];
 			const attachment: ToolAttachment = {
 				entryId: op.entryId,
 				pinnedVersion: op.pinnedVersion,
@@ -444,7 +450,11 @@ function applyOperation(draft: ConfigDraftBundle, op: ChangeOperation): Operatio
 			};
 		}
 		case "detach_tool": {
-			const existing = draft.toolAttachments[op.agentId];
+			// Own-property lookup: see `attach_tool` above — an agent id like `constructor` would
+			// otherwise resolve to `Object.prototype.constructor` instead of `undefined`.
+			const existing = Object.hasOwn(draft.toolAttachments, op.agentId)
+				? draft.toolAttachments[op.agentId]
+				: undefined;
 			if (existing === undefined || !existing.some((a) => a.entryId === op.entryId)) {
 				// Idempotent: detaching something never (or no longer) attached changes nothing.
 				return { draft, problems: [] };
@@ -461,7 +471,12 @@ function applyOperation(draft: ConfigDraftBundle, op: ChangeOperation): Operatio
 			};
 		}
 		case "update_attachment": {
-			const existing = draft.toolAttachments[op.agentId];
+			// Own-property lookup: see `attach_tool` above — an agent id like `constructor` would
+			// otherwise resolve to `Object.prototype.constructor` instead of `undefined`, and that
+			// function has no `.find` either.
+			const existing = Object.hasOwn(draft.toolAttachments, op.agentId)
+				? draft.toolAttachments[op.agentId]
+				: undefined;
 			const current = existing?.find((a) => a.entryId === op.entryId);
 			if (existing === undefined || current === undefined) {
 				return {

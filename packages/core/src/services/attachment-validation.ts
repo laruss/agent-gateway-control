@@ -1,8 +1,11 @@
 import {
 	type AgentConfig,
 	type AgentId,
+	type RuntimeAdapterId,
 	riskFloorAllows,
+	type ToolAttachment,
 	type ToolAttachmentsBundle,
+	type ToolCatalogEntryId,
 	type ToolCatalogEntryKind,
 	type ToolCatalogRiskFloor,
 	type ToolName,
@@ -13,6 +16,7 @@ import {
 	compileAttachments,
 	compiledAgentPermissions,
 	modeSupportedByKind,
+	widenedTools,
 } from "@agent-gateway/policy";
 import { eq, inArray } from "drizzle-orm";
 import type { UnitOfWork } from "./deps.ts";
@@ -107,6 +111,16 @@ export async function mirrorCompiledAttachmentPermissions(
 	}
 	const catalog = await loadCompilableCatalogEntries(db, toolAttachments);
 	return agentsIn.map((agent) => {
+		// Own-property lookup, never plain bracket access: `toolAttachments` is a plain-object
+		// dictionary keyed by agent id, and an agent id like `constructor` is a valid `AgentId`
+		// (lowercase letters only) that has no own property here but still resolves, through the
+		// prototype chain, to `Object.prototype.constructor` — a function, not `undefined` and not
+		// an attachment list — which would otherwise reach `compileAttachments` below and throw
+		// (`for...of` over a function) on every commit, for any configuration that happens to name
+		// such an agent at all, attached to anything or not.
+		if (!Object.hasOwn(toolAttachments, agent.id)) {
+			return agent;
+		}
 		const attachments = toolAttachments[agent.id];
 		if (attachments === undefined) {
 			return agent;
@@ -125,6 +139,50 @@ export async function mirrorCompiledAttachmentPermissions(
 		});
 		return { ...agent, permissions };
 	});
+}
+
+// ---------------------------------------------------------------------------
+// Removing an attachment must never widen what its agent may do (ADR-027): clearing a `disabled`
+// or `require_approval` attachment that was the only thing suppressing a native dependency's
+// implication (`tests.run` implying `workspace.write`, `NATIVE_TOOL_DEPENDENCIES`) would otherwise
+// let that implication through the moment nothing explicit governs the implied tool any more.
+// Shared by `deleteCatalogEntry` (every agent the entry's attachment would be cleared from) and
+// `detachTool` (the one agent detaching it) so neither re-derives the comparison on its own.
+// ---------------------------------------------------------------------------
+
+/**
+ * Every tool whose effective access for `agentId` would increase if its attachment of `entryId`
+ * were removed outright — compares `compileAttachments`'s own result for `attachments` against the
+ * same attachments with `entryId`'s removed, through {@link widenedTools} (`@agent-gateway/policy`).
+ * Pure, given the agent's own full attachment list and the catalog metadata every one of them
+ * needs; callers resolve both from whichever read fits their own transaction (a live bundle for
+ * `deleteCatalogEntry`'s multi-agent pass, a single fresh read for `detachTool`).
+ */
+export function widenedByRemovingAttachment(
+	input: Readonly<{
+		agentId: AgentId;
+		financeAgentId: AgentId;
+		adapter: RuntimeAdapterId;
+		attachments: Readonly<ToolAttachment[]>;
+		entryId: string;
+		catalog: ReadonlyMap<ToolCatalogEntryId, CompiledCatalogEntry>;
+	}>,
+): Readonly<ToolName[]> {
+	const before = compileAttachments({
+		agentId: input.agentId,
+		financeAgentId: input.financeAgentId,
+		adapter: input.adapter,
+		attachments: input.attachments,
+		catalog: input.catalog,
+	});
+	const after = compileAttachments({
+		agentId: input.agentId,
+		financeAgentId: input.financeAgentId,
+		adapter: input.adapter,
+		attachments: input.attachments.filter((attachment) => attachment.entryId !== input.entryId),
+		catalog: input.catalog,
+	});
+	return widenedTools(before, after);
 }
 
 async function loadKnownEntryVersions(

@@ -213,6 +213,50 @@ All notable changes are documented here. The project follows Semantic Versioning
   creation instead of their array position: deleting one no longer reuses the next row's position
   for an enum field's own uncommitted text, corrupting its values the moment it next lost focus.
   The secret-slot remove button also now has an accessible name.
+- Deleting a catalog entry, or detaching one agent's own attachment of it, can no longer silently
+  widen what an agent may actually do: clearing a `disabled`/`require_approval` attachment can be
+  the only thing suppressing a native dependency's implication (`tests.run` implying
+  `workspace.write`), which would otherwise let it through the moment nothing explicit governs the
+  implied tool any more. Every affected agent's compiled attachments are now compared before and
+  after the removal, and the whole operation is refused — naming the agent and the tool it would
+  gain — the moment any agent would gain anything; detaching one attachment can be confirmed anyway
+  once the owner has seen the warning (`confirmWidening`, the Tools tab's own "Detach anyway"),
+  deleting an entry has no such override.
+- A custom tool's approval is now resolved, hashed and (at grant time) executed against the
+  requesting agent's own selected version — its attachment's pinned version, or the entry's current
+  one when unpinned — instead of always the entry's current version: an agent pinned to an older
+  version no longer silently moves onto a newer one the entry has since published, which previously
+  let the approval card, the grant-time re-check and execution all agree with each other while
+  disagreeing with what the attachment and its capability description actually promised. The
+  approval card also now shows an authoritative, secret-free request preview (method, resolved
+  path, query/header/body field names, a secret-filled slot named but never its value) in its own
+  block, separate from the model's own free-text summary.
+- Attaching to a still-legacy agent no longer silently drops an unresolved legacy grant (an allow
+  or approval pattern naming no catalog entry known right now, e.g. `mail.send`): the automatic
+  conversion this performs now refuses the whole attach outright, with a pointer to
+  `gateway tools adopt <agent-id>` first, which shows every unresolved pattern before committing
+  anything instead of silently narrowing what the conversion actually covers. It also now binds
+  itself to the exact conversion the console's agent-tools read showed (the same
+  `attachmentsConversionHash` binding "Adopt into the tools hub"'s own confirm step already has),
+  refused as a conflict once a catalog entry created, edited or deleted since changes what it
+  resolves to.
+- An agent id of `constructor` (a valid, if unusual, lowercase agent id) no longer throws on every
+  committed configuration change, nor gets misread as hub-managed when it is legacy: every
+  attachment-bundle lookup now checks the dictionary's own property (`Object.hasOwn`) rather than
+  bare bracket access, which previously resolved such a lookup to `Object.prototype.constructor`
+  (a function, not `undefined`) whenever the agent had no attachment entry of its own yet.
+- The agent capability editor's own "Attach a tool" dialogs (the agent detail page's and the hub's
+  "Attach to agent") now only ever offer a mode the selected entry's own `kind` actually supports
+  — previously they offered every mode its risk floor alone would allow, regardless of kind, so
+  `require_approval` on a `native`/`gateway` entry (nothing can pause a turn mid-flight for a human
+  on either) or `allow` on an `executor`/`custom_https`/`utility` one (the broker has no
+  approval-free execution path) was always refused with a `422` the moment it was actually attached.
+- `legacyAgentsGrantingTool` (behind `deleteCatalogEntry`'s own refusal while a legacy agent still
+  grants the entry) now also finds an enabled agent whose own `config_version` simply lags the
+  active one, matching the same active-configuration rule `admin.ts` already applies elsewhere —
+  previously it missed exactly that row, while its own doc comment still described the narrower
+  "enabled agents only" rule it had already moved past. It also now excludes an agent whose own
+  `tools_deny` covers the entry (denying a tool is not "holding" it), which it previously ignored.
 
 ## [0.6.0] - 2026-10-02
 

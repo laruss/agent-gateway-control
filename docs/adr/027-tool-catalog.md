@@ -183,12 +183,24 @@ committing, and — only when the agent is still legacy — converts its `permis
 requested in the same revision, against the exact base revision that read came from (so a
 concurrent change is a conflict, never silently rebased onto). The conversion itself is reported
 back (`legacyConversion`). A legacy pattern whose resolved mode its own catalog entry's `kind` does
-not support, or whose resolution (together with the entry actually requested) would exceed
-`MAX_ATTACHMENTS_PER_AGENT`, refuses the whole attach outright — nothing committed — with a pointer
-to `gateway tools adopt <agent-id>` first, the explicit, reviewed path for resolving it; `detachTool`
-and `updateAttachment` need no such conversion, since neither can itself be the first write that
-makes a legacy agent hub-managed (a detach of nothing is a no-op, and an update of an attachment
-that does not exist yet is already refused).
+not support, whose resolution (together with the entry actually requested) would exceed
+`MAX_ATTACHMENTS_PER_AGENT`, or that grants something unresolved (an allow or approval pattern naming
+no catalog entry known right now — e.g. `tools_require_human_approval: ["mail.send"]` with no
+catalog entry yet) refuses the whole
+attach outright — nothing committed — with a pointer to `gateway tools adopt <agent-id>` first, the
+explicit, reviewed path for resolving it (which shows every unresolved pattern before committing,
+rather than this implicit shortcut silently dropping it). An unresolved *denial* (`deploy.*` with
+no such entry yet) does not refuse it: dropping it loses nothing, because a hub-managed agent is
+granted only what it is attached to; `detachTool` and `updateAttachment` need
+no such conversion, since neither can itself be the first write that makes a legacy agent
+hub-managed (a detach of nothing is a no-op, and an update of an attachment that does not exist yet
+is already refused). `attachTool` also takes an optional `expectedConversionHash`
+(`attachmentsConversionHash` of the resolved conversion, before the entry actually requested is
+merged in), the same binding "Adopt into the tools hub"'s own confirm step already has: a catalog
+entry created, edited or deleted between the console's agent-tools read and this attach changes what
+the same legacy patterns resolve to without moving `baseRevisionId` at all (a catalog entry carries
+no config revision of its own), so `baseRevisionId` alone cannot catch it — a mismatch refuses with
+the same `StaleConversionError` Adopt's own commit already throws, mapped to the same `409`.
 
 Each agent's own attachment list is canonicalized (sorted by `entryId`) once, right after a change
 set is applied and before anything hashes or stores the result: an attachment's position in its
@@ -197,6 +209,17 @@ list carries no meaning, but a canonical hash is sensitive to array order regard
 an untouched export of a revision whose attachments were attached in a different order than their
 sorted one, re-imported unchanged, would hash to different content than what is actually stored —
 manufacturing a new revision for what is, in truth, a no-op.
+
+**A bundle's `toolAttachments` document is a plain-object dictionary keyed by agent id, read only
+through `Object.hasOwn` — never bare bracket access.** `AgentIdSchema` allows any lowercase,
+hyphenated id, `constructor` included: a bracket lookup for an agent id absent as this dictionary's
+own property (a legacy agent, or any agent before its first hub attachment) does not return
+`undefined` for that one name — it resolves, through the prototype chain, to
+`Object.prototype.constructor` itself, a function neither `=== undefined` nor array-like. Every
+read of this document (and of the same-shaped per-agent read models built from it) checks
+`Object.hasOwn` first, so an agent that happens to be named this way is treated exactly like any
+other legacy agent rather than crashing the next commit (`compileAttachments` receiving a function
+where it expects an attachment array) or being silently misread as hub-managed when it is not.
 
 `catalog_attachments` is a database table, but it is the **current-state projection** of the active
 revision's own attachments document, exactly the way the existing `agents` table projects
@@ -247,7 +270,31 @@ gone everywhere. `deleteCatalogEntry` refuses outright — nothing committed —
 `legacyAgentsGrantingTool` finds any such agent, naming it and pointing at `gateway tools adopt
 <agent-id>` (or the console's own Adopt), which converts that legacy coverage into a real
 attachment this delete would then also clear; the console's own entry-detail read shows the same
-agents as part of the deletion's impact, alongside `attachedAgents`.
+agents as part of the deletion's impact, alongside `attachedAgents`. `legacyAgentsGrantingTool`
+scopes "legacy" to the *active configuration* — a row whose own `config_version` matches the
+active one, or any other row that is simply `enabled = true` regardless of its own version lagging
+behind (the same rule `admin.ts`'s `recordedEnabledAgreesWithLive` already applies for the
+identical reason: an older release's own direct toggle, or a release before configuration history
+existed re-enabling a row after it had already left the active configuration) — never only
+"enabled", which would miss exactly that lagging-but-live row; and it excludes a row whose own
+`tools_deny` already covers the key, since denying a tool is not "holding" it
+(`packages/policy/src/tools.ts`'s own enforcement checks `deny` before `allow`/`requireApproval`).
+
+**Never widens any affected agent's effective permissions, either.** Clearing a `disabled` or
+`require_approval` attachment of the deleted entry can be the one thing standing between an agent
+and a native dependency's implication it would otherwise suppress (`tests.run` implying
+`workspace.write`, `NATIVE_TOOL_DEPENDENCIES`): `deleteCatalogEntry` computes every affected agent's
+compiled attachments before and after the clear (`widenedByRemovingAttachment`,
+`attachment-validation.ts`, built on `compileAttachments` and `widenedTools`,
+`@agent-gateway/policy`) and refuses the whole delete — nothing committed, `WidensPermissionsError`
+naming every agent and the tool it would gain — the moment any agent would gain anything; the owner
+detaches or reconfigures that agent's attachments first. `detachTool` applies the identical check
+for the one agent it is called on, with an escape hatch `deleteCatalogEntry` deliberately has none
+of: `DetachToolInput.confirmWidening`, an explicit acknowledgement that the owner actually intends
+the widening (the console's own confirm step, once it has shown which tool would widen) — a single
+attachment the owner is deliberately turning off is a normal, everyday edit a confirm can clear,
+where a catalog-wide delete affecting agents the owner may not even have reviewed individually is
+not.
 
 **Returns what it actually affected, read fresh inside its own transaction.** A caller's own,
 separately-read "impact preview" (the console's entry-detail page, loaded before the owner clicks
@@ -328,7 +375,13 @@ two derived maps, `impliedBy` and `missingPrerequisites`, and a `memoryWriteAllo
 **Mode is bounded by an entry's own `kind`, not only its `riskFloor`.** `riskFloorAllows` (ADR-027's
 original rule) says how strict a mode must be; `modeSupportedByKind` says which modes an entry's
 `kind` can express at all, because not every kind has an enforcement point that can pause a turn
-for a human mid-flight:
+for a human mid-flight. Both live in `@agent-gateway/contracts` (not `@agent-gateway/policy`,
+re-exported from there unchanged for every existing import): a console client needs this exact
+rule too, to offer only a selected entry's actually-supported modes, without depending on
+`policy`'s own Node-only, IO-adjacent code (egress/IP classification among it) — the two attach
+dialogs (the agent capability editor's own, and the hub's "Attach to agent") both filter and
+auto-correct their own mode picker by it, alongside `riskFloorAllows`, so a mode the backend would
+refuse with a `422` is never offered in the first place:
 
 | Kind | Supported modes | Why |
 |------|------------------|-----|
@@ -545,26 +598,46 @@ own `https_definition` and nothing else of the catalog, and only to a role that 
 `wrong_namespace` boundary `begin` already enforces for execution itself.
 
 **Pinning an approval to the exact version it was resolved against.** A `needs_human` request
-naming a `custom_https` action is never approved against "whatever the entry currently is": the
-controller (`prepareCustomApprovalDraft`, `packages/core`) strips any `custom_tool_definition_version`
-the model's own draft already names — reserved for this call alone, never trusted from a model or a
-forged draft — validates the remaining parameters against the entry's *current* definition and,
-only once they pass, adds exactly one synthetic parameter, `custom_tool_definition_version`, pinned
-to that version — before the draft is ever hashed, shown on the card, or stored. A `custom_https`
+naming a `custom_https` action is never approved against "whatever the entry currently is", nor
+against "whatever the entry currently is unless pinned" in name only: the controller
+(`prepareCustomApprovalDraft`, `packages/core`) first resolves *the requesting agent's own selected
+version* — its attachment's `pinnedVersion` when it has one (read straight from `catalog_attachments`,
+a cheap indexed `(agentId, entryId)` lookup), the entry's current version when unpinned or when the
+agent has no attachment of it at all (both default to "track current") — strips any
+`custom_tool_definition_version` the model's own draft already names — reserved for this call
+alone, never trusted from a model or a forged draft — validates the remaining parameters against
+*that resolved version's* own definition content (never blindly "current": an agent pinned to an
+older version must be shown, hashed and (at grant time) executed against exactly that version, not
+one the entry has since moved on to, however its own capability description reads) and, only once
+they pass, adds exactly one synthetic parameter, `custom_tool_definition_version`, pinned to the
+resolved version — before the draft is ever hashed, shown on the card, or stored. A `custom_https`
 action is the one case `ApprovalRequestDraftSchema` allows zero model-supplied parameters at all
 (every other action type still needs at least one): a fixed call whose only moving part is a named
 secret — a definition with no typed parameters of its own — still ends up with this one, controller-
 added parameter and so is still approvable. Because this parameter is part of `actionParams` like
 any other, it is covered by the same immutable `approvalActionHash` every other action already uses,
-with no schema change to `ApprovalRequestSchema` or `ToolActionJobSchema` at all. At grant time (`customGrantTimeIssues`,
-re-run inside `executionIssues` alongside every other live policy check — never the run's stale
-snapshot) the pinned version is compared against the entry's version *now*: a mismatch — the
-definition was edited since the request was made — refuses the grant outright
-(`customDefinitionVersionIssues`), and the model's parameters are re-validated against the current
-definition too, independently of the version check. The tool runner, once an action is granted,
-reads the exact pinned version by (entry id, version) through `gateway_custom_tool_definition` —
-never "current" — so execution is always what was actually approved, immutable version content
-making that guarantee free rather than a race against a concurrent edit.
+with no schema change to `ApprovalRequestSchema` or `ToolActionJobSchema` at all. At grant time
+(`customGrantTimeIssues`, re-run inside `executionIssues` alongside every other live policy check —
+never the run's stale snapshot) the agent's own selected version is resolved fresh, exactly the same
+way, and compared against the stored action's pinned version: a mismatch — the definition was
+edited further, or the attachment itself was re-pinned or unpinned, since the request was made —
+refuses the grant outright (`customDefinitionVersionIssues`), and the model's parameters are
+re-validated against that resolved version's definition too, independently of the version check.
+The tool runner, once an action is granted, reads the exact pinned version by (entry id, version)
+through `gateway_custom_tool_definition` — never "current" — so execution is always what was
+actually approved, immutable version content making that guarantee free rather than a race against
+a concurrent edit.
+
+**The approval card's own authoritative request preview.** The card otherwise shows only the action
+name, the model's own free-text summary, and the raw `actionParams` name/value pairs the approval
+hash covers — never the actual method, destination, resolved path, or which secret slots will be
+filled, for a `custom_https` action specifically. `customApprovalRequestPreview` (`packages/core`)
+resolves the stored action's own pinned version's definition and renders `customRequestSummary`'s
+secret-free rendering of it (method, resolved path, query/header/body field names, a secret-filled
+slot named by its slot only, never its value) into the card's own `customRequestPreview` field,
+shown in its own block — "Request preview (authoritative; no secret value is ever shown)" —
+separate from the model's own summary, since one is the agent's prose and the other is exactly what
+will run.
 
 **Egress.** `resolvePinnedAddress` (`@agent-gateway/tool-broker`'s `egress.ts`) is the one gate
 every `custom_https` call passes through before a socket ever opens: `host` is resolved once (an

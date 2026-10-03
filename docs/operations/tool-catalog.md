@@ -53,16 +53,34 @@ agent an attachments document, so attaching one entry without first carrying the
 would silently drop everything else the agent's legacy `permissions` used to cover (an agent
 allowed `mattermost.post` loses it the moment anything else is attached, unless this conversion
 runs first). The command's own JSON result names what it converted, under `legacyConversion`; if
-the conversion cannot resolve cleanly (a legacy pattern's mode its own catalog entry's `kind` does
-not support — the same `problems` check `gateway tools adopt` makes), the attach is refused
-outright, nothing committed, with a pointer to run `gateway tools adopt <agent-id>` first to
-resolve it under full review before attaching anything new.
+the conversion cannot resolve cleanly — a legacy pattern's mode its own catalog entry's `kind` does
+not support (the same `problems` check `gateway tools adopt` makes), **or an allow or approval
+pattern is unresolved** (names no catalog entry known right now, e.g. `memory.read` or `mail.send`) —
+the attach is refused outright, nothing committed, with a pointer to run
+`gateway tools adopt <agent-id>` first to resolve it under full review (which shows every unresolved
+pattern before committing anything, rather than this implicit shortcut silently dropping it) before
+attaching anything new. The console's own attach dialog binds this implicit conversion to the exact
+one its agent-tools read showed, the same way "Adopt into the tools hub" already binds its own
+confirm step: a catalog entry created, edited or deleted since that read is a `409`, never a commit
+built from a conversion the owner never actually saw.
 
 Attaching, detaching or editing an attachment takes effect on the
 agent's **very next turn** — including a turn already scheduled but not yet started, and a queued
 tool action or a still-pending approval for a capability just detached or turned `disabled`, which
 are revoked or refused (with an audit entry) rather than left to run on a permission the hub no
 longer shows.
+
+**Detaching (or deleting an entry entirely) never widens what an agent may actually do.** An
+attached `disabled`/`require_approval` can be the only thing suppressing a native dependency's
+implication (`tests.run` implying `workspace.write`): removing it would otherwise let that
+implication through the moment nothing explicit governs the implied tool any more. Both the Tools
+tab's own "Detach" and the hub's own entry-delete each compute every affected agent's effective
+permissions before and after the removal, and refuse — nothing committed, the console shows which
+tool would widen, for which agent — the moment any agent would gain anything. Detaching one
+attachment for one agent can be confirmed anyway (the Tools tab's own "Detach anyway", once it has
+shown the warning) since it is a normal, deliberate edit; deleting a catalog entry has no such
+override — an owner who means to widen several agents at once detaches or reconfigures each one
+individually first, under full review, rather than through one blanket confirm.
 
 An attachment's `mode` is bounded by its catalog entry's own `kind`, not only its risk floor:
 
@@ -78,7 +96,8 @@ An attachment's `mode` is bounded by its catalog entry's own `kind`, not only it
 `utility` action, is refused at attach time: the broker-executed kinds have no enforcement point
 that can pause a turn mid-flight for a human on their own, and this release adds no second,
 approval-free path through the broker — so every one of them always needs a human, side-effect-free
-or not.
+or not. Both attach dialogs' own mode picker already filters to this table (and to the entry's own
+risk floor), so a mode that would be refused this way is never offered in the first place.
 
 Two things an attachment does **not** need restating:
 
@@ -265,16 +284,34 @@ Its action type is `custom.<entry-id>` (`custom.zendesk-ticket` here); a tool ru
 `custom` namespace for it to be reachable at all (`TOOL_RUNNER_NAMESPACES=custom`, `gateway db
 grant-tool-runner <role> custom`).
 
-### 4. Editing invalidates a pending request
+### 4. An agent's own pinned version, and what editing invalidates
+
+An agent's attachment of a custom tool either pins an exact version (a positive integer) or tracks
+current (`null`, the default when attaching without one). An approval request is always prepared,
+hashed and (at grant time) executed against **the requesting agent's own selected version** — its
+pin, or whatever is current when unpinned — never blindly "the entry's current version": an agent
+pinned to version 1 stays on version 1's exact definition content even once the entry has moved on
+to version 2, and the approval card's own request preview (below) reflects that same pinned
+content, never the newer one.
 
 `gateway tools custom edit zendesk-ticket --definition updated.json` (or the console entry detail
 page's own **Edit**, the identical form pre-filled with the current definition) publishes a new,
-immutable version. An approval still pending against the previous version is refused at grant
-time — the owner sees "this custom tool was edited... it must be requested again", never a silent
-execution against the new definition instead of what was actually shown and hashed. A built-in
-entry's own **Edit** only ever offers name/description, in either surface — its `kind`,
-`implementationKey`, risk floor and supported adapters describe a real integration this release
-ships, not something an edit can redefine.
+immutable version. For an agent that tracks current (unpinned), an approval still pending against
+the previous version is refused at grant time — the owner sees "this custom tool was edited... it
+must be requested again", never a silent execution against the new definition instead of what was
+actually shown and hashed. For an agent pinned to an older version, editing the entry changes
+nothing for it at all: its own pending and future requests keep resolving, and executing, against
+exactly the version it is pinned to — re-pinning or unpinning the attachment itself is what
+invalidates a still-pending request instead, caught the same way (the stored action's pinned
+version no longer matching what the agent is now configured to use). A built-in entry's own **Edit**
+only ever offers name/description, in either surface — its `kind`, `implementationKey`, risk floor
+and supported adapters describe a real integration this release ships, not something an edit can
+redefine.
+
+The approval card itself shows an authoritative, secret-free **request preview** — method, the
+resolved path, query/header/body field names, a secret-filled slot named but never its value — in
+its own block, separate from the model's own free-text summary: the summary is the agent's prose,
+the preview is exactly what will run.
 
 ### What config rollback covers
 

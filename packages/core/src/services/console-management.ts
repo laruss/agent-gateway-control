@@ -214,7 +214,11 @@ export async function consoleShowAgent(
 			rolePrompt: bundle.rolePrompts[agent.id] ?? "",
 			wakeRules: agent.wake_rules,
 			permissions: agent.permissions,
-			toolsHubManaged: bundle.toolAttachments[agent.id] !== undefined,
+			// Own-property check, never plain bracket access: an agent id like `constructor` has no
+			// own property in this plain-object dictionary but still resolves, through the prototype
+			// chain, to `Object.prototype.constructor` — truthy, and not an attachment list — which
+			// would otherwise misreport a legacy agent named `constructor` as hub-managed.
+			toolsHubManaged: Object.hasOwn(bundle.toolAttachments, agent.id),
 			memory: {
 				privateNamespace: agent.memory.private_namespace,
 				sharedNamespaces: agent.memory.shared_namespaces,
@@ -470,7 +474,11 @@ function hubManagedPermissionsEditProblems(
 	agentId: string,
 	patch: AgentPatch,
 ): Readonly<string[]> {
-	if (patch.permissions === undefined || bundle.toolAttachments[agentId] === undefined) {
+	// Own-property check, never plain bracket access: an agent id like `constructor` has no own
+	// property here but still resolves, through the prototype chain, to
+	// `Object.prototype.constructor` — not `undefined` — which would otherwise treat a legacy agent
+	// named `constructor` as hub-managed and wrongly refuse a direct `permissions` edit for it.
+	if (patch.permissions === undefined || !Object.hasOwn(bundle.toolAttachments, agentId)) {
 		return [];
 	}
 	const { tools_allow, tools_require_human_approval, tools_deny } = patch.permissions;

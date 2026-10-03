@@ -13,6 +13,7 @@ import type pg from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { applyConfig, configSnapshotBundle, inTransaction } from "./admin.ts";
 import type { ControlPlaneDeps } from "./deps.ts";
+import { knownCatalogEntries } from "./effective-permissions.ts";
 import {
 	activeConfigRevisionId,
 	commitChange,
@@ -23,6 +24,7 @@ import {
 } from "./management.ts";
 import {
 	adoptAgentToolAttachments,
+	attachmentsConversionHash,
 	attachTool,
 	createCustomHttpsTool,
 	deleteCatalogEntry,
@@ -30,10 +32,15 @@ import {
 	editCatalogEntry,
 	ensureToolCatalogSeeded,
 	getCatalogEntry,
+	legacyAgentsGrantingTool,
+	legacyAttachmentsFromPermissions,
 	listCatalogEntries,
 	listCatalogEntryVersions,
+	loadAgentToolAttachments,
+	loadEffectivePermissionsIn,
 	StaleConversionError,
 	updateAttachment,
+	WidensPermissionsError,
 } from "./tool-catalog.ts";
 
 function organization(): OrganizationConfig {
@@ -940,6 +947,139 @@ describe("tool catalog service (ADR-027)", () => {
 		return false;
 	}
 
+	it("deleteCatalogEntry refuses when clearing an attachment would widen an agent's effective permissions", async () => {
+		// `workspace.write` explicitly `disabled` wins over `tests.run`'s own implication
+		// (`compileAttachments`'s "an explicit restriction on the implied tool wins" rule); clearing
+		// it away (as deleting its entry would) lets `tests.run`'s implication through instead.
+		// Placed here, before "deleteCatalogEntry racing a concurrent attach" below (which
+		// permanently tombstones `native-tests-run`/`native-workspace-write`/`native-web-search`/
+		// `native-web-fetch` — a deleted built-in never comes back, and catalog entries are never
+		// reset between tests in this file): this test and the two after it only attach/detach
+		// (never delete) these entries, so they stay fresh for that test afterward.
+		await attachTool(deps, {
+			agentId: "alpha",
+			entryId: "native-tests-run",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+		await attachTool(deps, {
+			agentId: "alpha",
+			entryId: "native-workspace-write",
+			pinnedVersion: null,
+			mode: "disabled",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+
+		const deleteAttempt = deleteCatalogEntry(deps, "native-workspace-write", "test");
+		await expect(deleteAttempt).rejects.toThrow(WidensPermissionsError);
+		await expect(deleteAttempt).rejects.toMatchObject({
+			widenings: [{ agentId: "alpha", tools: ["workspace.write"] }],
+		});
+		// Nothing committed: the entry still exists and alpha's attachment of it is untouched.
+		expect(
+			await getCatalogEntry(deps, "native-workspace-write", {
+				installedAdapters: new Set(),
+				registeredExecutorActionTypes: new Set(),
+				registeredNamespaces: new Set(),
+			}),
+		).not.toBeNull();
+		const stillAttached = await loadAgentToolAttachments(deps, "alpha");
+		expect(stillAttached.attachments).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ entryId: "native-workspace-write", mode: "disabled" }),
+			]),
+		);
+	});
+
+	it("detachTool refuses the same widening unless confirmWidening is set, then succeeds", async () => {
+		await attachTool(deps, {
+			agentId: "alpha",
+			entryId: "native-tests-run",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+		await attachTool(deps, {
+			agentId: "alpha",
+			entryId: "native-workspace-write",
+			pinnedVersion: null,
+			mode: "disabled",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+
+		const detachAttempt = detachTool(deps, {
+			agentId: "alpha",
+			entryId: "native-workspace-write",
+			actor: "test",
+			source: "cli_apply",
+		});
+		await expect(detachAttempt).rejects.toThrow(WidensPermissionsError);
+		await expect(detachAttempt).rejects.toMatchObject({
+			widenings: [{ agentId: "alpha", tools: ["workspace.write"] }],
+		});
+		const stillAttached = await loadAgentToolAttachments(deps, "alpha");
+		expect(stillAttached.attachments.some((a) => a.entryId === "native-workspace-write")).toBe(
+			true,
+		);
+
+		await detachTool(deps, {
+			agentId: "alpha",
+			entryId: "native-workspace-write",
+			actor: "test",
+			source: "cli_apply",
+			confirmWidening: true,
+		});
+		const afterConfirm = await loadAgentToolAttachments(deps, "alpha");
+		expect(afterConfirm.attachments.some((a) => a.entryId === "native-workspace-write")).toBe(
+			false,
+		);
+
+		// workspace.write is now implied-allow via tests.run, with nothing explicit suppressing it.
+		const revisionId = await activeConfigRevisionId(deps);
+		const { bundle } = await inTransaction(deps, ({ tx }) => loadActiveBundle(tx.db, revisionId));
+		const alphaConfig = bundle.agents.find((a) => a.id === "alpha");
+		if (alphaConfig === undefined) {
+			throw new Error("expected 'alpha' to still be configured");
+		}
+		const effective = await inTransaction(deps, (uow) =>
+			loadEffectivePermissionsIn(
+				uow.tx,
+				{ id: "alpha", config: alphaConfig, toolAttachmentsManaged: true },
+				"finance",
+			),
+		);
+		expect(effective.toolPolicy.allow).toContain("workspace.write");
+	});
+
+	it("detachTool does not require confirmWidening when detaching widens nothing", async () => {
+		await attachTool(deps, {
+			agentId: "alpha",
+			entryId: "native-web-search",
+			pinnedVersion: null,
+			mode: "disabled",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+		await detachTool(deps, {
+			agentId: "alpha",
+			entryId: "native-web-search",
+			actor: "test",
+			source: "cli_apply",
+		});
+		const after = await loadAgentToolAttachments(deps, "alpha");
+		expect(after.attachments.some((a) => a.entryId === "native-web-search")).toBe(false);
+	});
+
 	it("deleteCatalogEntry racing a concurrent attach never deadlocks (lock order: gateway_controls, then catalog_entries)", async () => {
 		// `deleteCatalogEntry` now locks `gateway_controls` before `catalog_entries`, the same order
 		// every configuration writer keeps (`commitChangeIn`'s own first lock) — taking
@@ -1138,5 +1278,315 @@ describe("tool catalog service (ADR-027)", () => {
 				source: "console",
 			}),
 		).rejects.toThrow(/requires at least 'require_approval'/);
+	});
+
+	it("attachTool refuses converting a still-legacy agent whose permissions include an unresolved pattern", async () => {
+		const [betaRow] = (await pool.query("select config from agents where id = 'beta'")).rows;
+		await commitChange(deps, {
+			changeSet: [
+				{
+					type: "update_agent",
+					agent: {
+						...betaRow.config,
+						permissions: {
+							tools_allow: [],
+							// `mail.send` names no catalog entry known right now (not a seeded built-in,
+							// and no custom tool anywhere in this file ever creates one).
+							tools_require_human_approval: ["mail.send"],
+							tools_deny: ["finance.*"],
+						},
+					},
+				},
+			],
+			baseRevisionId: await activeConfigRevisionId(deps),
+			actor: "test",
+			source: "cli_apply",
+		});
+
+		await expect(
+			attachTool(deps, {
+				agentId: "beta",
+				entryId: "native-repository-read",
+				pinnedVersion: null,
+				mode: "allow",
+				settings: {},
+				actor: "test",
+				source: "cli_apply",
+			}),
+		).rejects.toThrow(/gateway tools adopt/);
+
+		const stillLegacy = await loadAgentToolAttachments(deps, "beta");
+		expect(stillLegacy.hubManaged).toBe(false);
+	});
+
+	it("attachTool converts a still-legacy agent whose only unresolved patterns are denials", async () => {
+		const [betaRow] = (await pool.query("select config from agents where id = 'beta'")).rows;
+		await commitChange(deps, {
+			changeSet: [
+				{
+					type: "update_agent",
+					agent: {
+						...betaRow.config,
+						permissions: {
+							tools_allow: [],
+							tools_require_human_approval: [],
+							// `deploy.*` names no catalog entry: dropping it loses nothing, since a
+							// hub-managed agent is granted only what it is attached to.
+							tools_deny: ["finance.*", "deploy.*"],
+						},
+					},
+				},
+			],
+			baseRevisionId: await activeConfigRevisionId(deps),
+			actor: "test",
+			source: "cli_apply",
+		});
+
+		await attachTool(deps, {
+			agentId: "beta",
+			entryId: "native-repository-read",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+
+		const converted = await loadAgentToolAttachments(deps, "beta");
+		expect(converted.hubManaged).toBe(true);
+		expect(converted.attachments.map((attachment) => attachment.entryId)).toContain(
+			"native-repository-read",
+		);
+	});
+
+	it("legacyAgentsGrantingTool includes an enabled agent whose own config_version lags behind the active one", async () => {
+		const [alphaRow] = (await pool.query("select config from agents where id = 'alpha'")).rows;
+		await commitChange(deps, {
+			changeSet: [
+				{
+					type: "update_agent",
+					agent: {
+						...alphaRow.config,
+						permissions: {
+							tools_allow: ["repository.read"],
+							tools_require_human_approval: [],
+							tools_deny: ["finance.*"],
+						},
+					},
+				},
+			],
+			baseRevisionId: await activeConfigRevisionId(deps),
+			actor: "test",
+			source: "cli_apply",
+		});
+		const [{ active_config_version: staleVersion }] = (
+			await pool.query("select active_config_version from gateway_controls")
+		).rows;
+
+		// A further, unrelated commit moves the active version on; `alpha`'s own row is pinned back
+		// to the stale one below, left `enabled`, simulating exactly the drift an older release's
+		// own direct toggle (or a pre-configuration-history re-enable) can leave behind —
+		// `legacyAgentsGrantingTool`'s own doc comment.
+		await commitChange(deps, {
+			changeSet: [{ type: "set_agent_enabled", agentId: "beta", enabled: false }],
+			baseRevisionId: await activeConfigRevisionId(deps),
+			actor: "test",
+			source: "cli_apply",
+		});
+		await pool.query("update agents set config_version = $1 where id = 'alpha'", [staleVersion]);
+		const [{ config_version: alphaVersion, enabled: alphaEnabled }] = (
+			await pool.query("select config_version, enabled from agents where id = 'alpha'")
+		).rows;
+		const [{ active_config_version: liveVersion }] = (
+			await pool.query("select active_config_version from gateway_controls")
+		).rows;
+		expect(alphaEnabled).toBe(true);
+		expect(alphaVersion).not.toBe(liveVersion);
+
+		const granting = await inTransaction(deps, ({ tx }) =>
+			legacyAgentsGrantingTool(tx.db, "repository.read"),
+		);
+		expect(granting.map((g) => g.agentId)).toContain("alpha");
+
+		await expect(deleteCatalogEntry(deps, "native-repository-read", "test")).rejects.toThrow(
+			/alpha/,
+		);
+	});
+
+	it("legacyAgentsGrantingTool excludes an agent whose own tools_deny covers the key", async () => {
+		// A fresh, disposable `custom_https` entry (never a shared built-in): this test actually
+		// deletes it on success, unlike every other test here, which only ever attaches/detaches the
+		// shared natives — deleting one of those would tombstone it forever for the rest of this
+		// file (catalog entries are never reset between tests).
+		const entryId = "deny-exclusion-tool";
+		await createCustomHttpsTool(deps, {
+			entryId,
+			name: "Deny exclusion tool",
+			description: "A test custom HTTPS tool.",
+			httpsDefinition: {
+				host: "api.example.test",
+				pathTemplate: "/items",
+				method: "GET",
+				parameters: [],
+				secretSlots: [],
+				idempotency: null,
+				responseLimits: {
+					maxResponseBytes: 65_536,
+					allowedContentTypes: ["application/json"],
+					timeoutMs: 5000,
+					includeBodyPreview: true,
+				},
+			},
+			actor: "test",
+		});
+		const implementationKey = `custom.${entryId}`;
+		const [betaRow] = (await pool.query("select config from agents where id = 'beta'")).rows;
+		await commitChange(deps, {
+			changeSet: [
+				{
+					type: "update_agent",
+					agent: {
+						...betaRow.config,
+						permissions: {
+							tools_allow: [],
+							tools_require_human_approval: [],
+							tools_deny: ["finance.*", implementationKey],
+						},
+					},
+				},
+			],
+			baseRevisionId: await activeConfigRevisionId(deps),
+			actor: "test",
+			source: "cli_apply",
+		});
+
+		const granting = await inTransaction(deps, ({ tx }) =>
+			legacyAgentsGrantingTool(tx.db, implementationKey),
+		);
+		expect(granting.map((g) => g.agentId)).not.toContain("beta");
+
+		// Nothing else grants it (alpha/finance keep their defaults), so the delete proceeds.
+		await deleteCatalogEntry(deps, entryId, "test");
+		expect(
+			await getCatalogEntry(deps, entryId, {
+				installedAdapters: new Set(),
+				registeredExecutorActionTypes: new Set(),
+				registeredNamespaces: new Set(),
+			}),
+		).toBeNull();
+	});
+
+	it("attachTool refuses an implicit legacy conversion whose expectedConversionHash is stale", async () => {
+		const [betaRow] = (await pool.query("select config from agents where id = 'beta'")).rows;
+		await commitChange(deps, {
+			changeSet: [
+				{
+					type: "update_agent",
+					agent: {
+						...betaRow.config,
+						permissions: {
+							tools_allow: ["repository.read"],
+							tools_require_human_approval: [],
+							tools_deny: ["finance.*"],
+						},
+					},
+				},
+			],
+			baseRevisionId: await activeConfigRevisionId(deps),
+			actor: "test",
+			source: "cli_apply",
+		});
+
+		// Any hash that does not match what beta's legacy `permissions` resolve to right now stands
+		// in for a catalog entry created, edited or deleted since a console preview was shown (and
+		// before its own confirm) — the mechanism under test is the comparison itself
+		// (`attachTool`'s own `expectedConversionHash` check), not reconstructing that whole race.
+		const staleHash = attachmentsConversionHash([]);
+
+		await expect(
+			attachTool(deps, {
+				agentId: "beta",
+				entryId: "native-repository-read",
+				pinnedVersion: null,
+				mode: "allow",
+				settings: {},
+				actor: "test",
+				source: "console",
+				expectedConversionHash: staleHash,
+			}),
+		).rejects.toThrow(StaleConversionError);
+		// Nothing committed: `beta` is still legacy, with no attachment of `native-repository-read`
+		// either.
+		const stillLegacy = await loadAgentToolAttachments(deps, "beta");
+		expect(stillLegacy.hubManaged).toBe(false);
+
+		// The correctly recomputed hash (what the console's own agent-tools read would now show)
+		// lets the same attach through.
+		const known = await inTransaction(deps, ({ tx }) => knownCatalogEntries(tx.db));
+		const correctHash = attachmentsConversionHash(
+			legacyAttachmentsFromPermissions(
+				{
+					tools_allow: ["repository.read"],
+					tools_require_human_approval: [],
+					tools_deny: ["finance.*"],
+				},
+				known,
+			).attachments,
+		);
+		await attachTool(deps, {
+			agentId: "beta",
+			entryId: "native-repository-read",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "console",
+			expectedConversionHash: correctHash,
+		});
+		const nowHubManaged = await loadAgentToolAttachments(deps, "beta");
+		expect(nowHubManaged.hubManaged).toBe(true);
+	});
+
+	it("an agent literally named 'constructor' never crashes a commit or a tool-attachments read", async () => {
+		await applyConfig(
+			deps,
+			{
+				organization: organization(),
+				agents: [agent("finance"), agent("alpha"), agent("beta"), agent("constructor")],
+				constitution: "Be helpful.",
+				rolePrompts: {
+					finance: "x",
+					alpha: "x",
+					beta: "x",
+					constructor: "x",
+				},
+			},
+			"test",
+		);
+
+		// Before the fix, `mirrorCompiledAttachmentPermissions` (reached from `writeConfigRevisionIn`
+		// on every committed change) would read `toolAttachments["constructor"]` through plain
+		// bracket access: absent as an own property, it resolves through the prototype chain to
+		// `Object.prototype.constructor` (a function, not `undefined`), which `compileAttachments`
+		// then fails to iterate over — a `TypeError` on this and every other commit, for any
+		// configuration that simply names such an agent, attached to anything or not. An ordinary
+		// attach for a different agent exercises exactly that path.
+		await attachTool(deps, {
+			agentId: "alpha",
+			entryId: "native-repository-read",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+
+		const read = await loadAgentToolAttachments(deps, "constructor");
+		expect(read.hubManaged).toBe(false);
+		// Legacy, converted fresh from its own (default) `tools_deny: ["finance.*"]` — never the
+		// inherited `Object.prototype.constructor` function a plain bracket lookup would otherwise
+		// have returned in its place.
+		expect(Array.isArray(read.attachments)).toBe(true);
+		expect(read.unresolved).toEqual([]);
 	});
 });

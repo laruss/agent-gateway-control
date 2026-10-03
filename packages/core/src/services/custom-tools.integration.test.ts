@@ -1,6 +1,7 @@
 import type {
 	ActionParam,
 	AgentConfig,
+	AgentId,
 	CustomHttpsDefinition,
 	OrganizationConfig,
 } from "@agent-gateway/contracts";
@@ -16,9 +17,20 @@ import { startTestPostgres, type TestPostgres } from "@agent-gateway/testkit";
 import type pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { applyConfig, inTransaction } from "./admin.ts";
-import { customGrantTimeIssues, prepareCustomApprovalDraft } from "./custom-tools.ts";
+import {
+	customApprovalRequestPreview,
+	customGrantTimeIssues,
+	prepareCustomApprovalDraft,
+} from "./custom-tools.ts";
 import type { ControlPlaneDeps } from "./deps.ts";
-import { createCustomHttpsTool, ensureToolCatalogSeeded } from "./tool-catalog.ts";
+import {
+	attachTool,
+	createCustomHttpsTool,
+	editCatalogEntry,
+	ensureToolCatalogSeeded,
+} from "./tool-catalog.ts";
+
+const FINANCE: AgentId = "finance" as AgentId;
 
 /**
  * `prepareCustomApprovalDraft`/`customGrantTimeIssues` against a real, migrated database: the
@@ -97,6 +109,13 @@ function parameterlessDefinition(): CustomHttpsDefinition {
 	};
 }
 
+/** `parameterlessDefinition`, but with `pathTemplate` as its one varying field — so publishing a
+ * new version with a different path is a minimal, unambiguous way to tell "v1's content" and "v2's
+ * content" apart in a test, without any typed parameter machinery getting in the way. */
+function versionedDefinition(pathTemplate: string): CustomHttpsDefinition {
+	return { ...parameterlessDefinition(), pathTemplate };
+}
+
 describe("prepareCustomApprovalDraft / customGrantTimeIssues (ADR-027)", () => {
 	let postgres: TestPostgres;
 	let pool: pg.Pool;
@@ -153,7 +172,7 @@ describe("prepareCustomApprovalDraft / customGrantTimeIssues (ADR-027)", () => {
 	it("allows a parameterless custom_https draft (a fixed GET with only a secret)", async () => {
 		await createEntry("status-check", parameterlessDefinition());
 		const result = await inTransaction(deps, (uow) =>
-			prepareCustomApprovalDraft(uow.tx.db, {
+			prepareCustomApprovalDraft(uow.tx.db, FINANCE, {
 				actionType: "custom.status-check",
 				actionParams: [],
 				actionSummary: "Checks the status endpoint.",
@@ -169,7 +188,7 @@ describe("prepareCustomApprovalDraft / customGrantTimeIssues (ADR-027)", () => {
 			{ name: CUSTOM_DEFINITION_VERSION_PARAM, value: "1" },
 		]);
 		const issues = await inTransaction(deps, (uow) =>
-			customGrantTimeIssues(uow.tx.db, {
+			customGrantTimeIssues(uow.tx.db, FINANCE, {
 				actionType: "custom.status-check",
 				actionParams: result.draft.actionParams,
 			}),
@@ -188,7 +207,7 @@ describe("prepareCustomApprovalDraft / customGrantTimeIssues (ADR-027)", () => {
 			{ name: CUSTOM_DEFINITION_VERSION_PARAM, value: "999" },
 		];
 		const result = await inTransaction(deps, (uow) =>
-			prepareCustomApprovalDraft(uow.tx.db, {
+			prepareCustomApprovalDraft(uow.tx.db, FINANCE, {
 				actionType: "custom.ticket-tool",
 				actionParams: forged,
 				actionSummary: "Attempts to forge the pinned version.",
@@ -210,12 +229,137 @@ describe("prepareCustomApprovalDraft / customGrantTimeIssues (ADR-027)", () => {
 
 	it("refuses a draft naming an entry that does not exist, unaffected by the above", async () => {
 		const result = await inTransaction(deps, (uow) =>
-			prepareCustomApprovalDraft(uow.tx.db, {
+			prepareCustomApprovalDraft(uow.tx.db, FINANCE, {
 				actionType: "custom.does-not-exist",
 				actionParams: [],
 				actionSummary: "x",
 			}),
 		);
 		expect(result.kind).toBe("refused");
+	});
+
+	it("pins the approval to the agent's own attached version, unaffected by the entry moving on (pin v1 -> edit to v2 -> call -> approval/execution use v1)", async () => {
+		const entryId = "versioned-tool";
+		await createEntry(entryId, versionedDefinition("/v1/status"));
+		await attachTool(deps, {
+			agentId: FINANCE,
+			entryId,
+			pinnedVersion: 1,
+			mode: "require_approval",
+			actor: "test",
+			source: "cli_apply",
+		});
+		// The entry moves on to v2 — a different `pathTemplate` — after the agent was pinned to v1.
+		await editCatalogEntry(deps, {
+			entryId,
+			httpsDefinition: versionedDefinition("/v2/status"),
+			actor: "test",
+		});
+		const result = await inTransaction(deps, (uow) =>
+			prepareCustomApprovalDraft(uow.tx.db, FINANCE, {
+				actionType: `custom.${entryId}`,
+				actionParams: [],
+				actionSummary: "Checks the versioned status endpoint.",
+			}),
+		);
+		expect(result.kind).toBe("ok");
+		if (result.kind !== "ok") {
+			return;
+		}
+		// Pinned to v1 — the agent's own attached version — never the entry's current v2.
+		expect(result.draft.actionParams).toEqual([
+			{ name: CUSTOM_DEFINITION_VERSION_PARAM, value: "1" },
+		]);
+		const preview = await inTransaction(deps, (uow) =>
+			customApprovalRequestPreview(uow.tx.db, result.draft.actionType, result.draft.actionParams),
+		);
+		// The preview is built from v1's own definition content, not v2's.
+		expect(preview).toContain("/v1/status");
+		expect(preview).not.toContain("/v2/status");
+		const issues = await inTransaction(deps, (uow) =>
+			customGrantTimeIssues(uow.tx.db, FINANCE, {
+				actionType: result.draft.actionType,
+				actionParams: result.draft.actionParams,
+			}),
+		);
+		// The grant succeeds against v1 — the version the agent is actually pinned to — even though
+		// the entry itself is now at v2.
+		expect(issues).toEqual([]);
+	});
+
+	it("refuses the grant once the entry moves on and the agent is NOT pinned (tracks current)", async () => {
+		const entryId = "unpinned-tool";
+		await createEntry(entryId, versionedDefinition("/v1/unpinned"));
+		await attachTool(deps, {
+			agentId: FINANCE,
+			entryId,
+			pinnedVersion: null,
+			mode: "require_approval",
+			actor: "test",
+			source: "cli_apply",
+		});
+		const result = await inTransaction(deps, (uow) =>
+			prepareCustomApprovalDraft(uow.tx.db, FINANCE, {
+				actionType: `custom.${entryId}`,
+				actionParams: [],
+				actionSummary: "Checks the unpinned endpoint.",
+			}),
+		);
+		expect(result.kind).toBe("ok");
+		if (result.kind !== "ok") {
+			return;
+		}
+		expect(result.draft.actionParams).toEqual([
+			{ name: CUSTOM_DEFINITION_VERSION_PARAM, value: "1" },
+		]);
+		// The entry moves on to v2 after the draft was prepared but before the grant: an unpinned
+		// attachment always tracks current, so the stale v1 pin the stored action carries is now a
+		// mismatch and the grant is refused — the same protection a pinned attachment gets from
+		// `customDefinitionVersionIssues`, just triggered by the entry moving instead of by a stale
+		// re-pin.
+		await editCatalogEntry(deps, {
+			entryId,
+			httpsDefinition: versionedDefinition("/v2/unpinned"),
+			actor: "test",
+		});
+		const issues = await inTransaction(deps, (uow) =>
+			customGrantTimeIssues(uow.tx.db, FINANCE, {
+				actionType: result.draft.actionType,
+				actionParams: result.draft.actionParams,
+			}),
+		);
+		expect(issues.length).toBeGreaterThan(0);
+	});
+
+	it("customApprovalRequestPreview: an authoritative, secret-free preview naming the secret slot but never a value", async () => {
+		const entryId = "preview-tool";
+		await createEntry(entryId, parameterlessDefinition());
+		const result = await inTransaction(deps, (uow) =>
+			prepareCustomApprovalDraft(uow.tx.db, FINANCE, {
+				actionType: `custom.${entryId}`,
+				actionParams: [],
+				actionSummary: "Checks the status endpoint.",
+			}),
+		);
+		expect(result.kind).toBe("ok");
+		if (result.kind !== "ok") {
+			return;
+		}
+		const preview = await inTransaction(deps, (uow) =>
+			customApprovalRequestPreview(uow.tx.db, result.draft.actionType, result.draft.actionParams),
+		);
+		expect(preview).not.toBeNull();
+		expect(preview).toContain("GET https://api.example.com/status");
+		// The secret's own slot name, marked as a secret — never a value, since none is resolved
+		// until the tool runner executes.
+		expect(preview).toContain("x-api-key(secret)");
+		expect(preview).not.toMatch(/x-api-key=/);
+	});
+
+	it("customApprovalRequestPreview: null for a non-custom action type", async () => {
+		const preview = await inTransaction(deps, (uow) =>
+			customApprovalRequestPreview(uow.tx.db, "repository.read", []),
+		);
+		expect(preview).toBeNull();
 	});
 });

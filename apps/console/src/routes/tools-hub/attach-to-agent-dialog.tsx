@@ -1,5 +1,9 @@
-import type { ToolAttachmentMode, ToolCatalogRiskFloor } from "@agent-gateway/contracts";
-import { riskFloorAllows } from "@agent-gateway/contracts";
+import type {
+	ToolAttachmentMode,
+	ToolCatalogEntryKind,
+	ToolCatalogRiskFloor,
+} from "@agent-gateway/contracts";
+import { modeSupportedByKind, riskFloorAllows } from "@agent-gateway/contracts";
 import * as React from "react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -25,6 +29,7 @@ export type AttachToAgentDialogProps = Readonly<{
 	open: boolean;
 	onOpenChange: (open: boolean) => void;
 	entryId: string;
+	kind: ToolCatalogEntryKind;
 	riskFloor: ToolCatalogRiskFloor;
 	onAttached: () => void;
 }>;
@@ -37,13 +42,16 @@ export function AttachToAgentDialog({
 	open,
 	onOpenChange,
 	entryId,
+	kind,
 	riskFloor,
 	onAttached,
 }: AttachToAgentDialogProps): React.ReactElement {
 	const [agentIds, setAgentIds] = React.useState<Readonly<string[]>>([]);
 	const [agentId, setAgentId] = React.useState("");
 	const [mode, setMode] = React.useState<ToolAttachmentMode>(
-		riskFloor === "require_approval" ? "require_approval" : "allow",
+		riskFloorAllows("allow", riskFloor) && modeSupportedByKind(kind, "allow")
+			? "allow"
+			: "require_approval",
 	);
 	const [submitting, setSubmitting] = React.useState(false);
 	const [error, setError] = React.useState<string | null>(null);
@@ -63,9 +71,26 @@ export function AttachToAgentDialog({
 		}
 	}
 
+	// Bounded by both the entry's own risk floor (how strict a mode must be) and what its `kind`
+	// can express at all (`native`/`gateway` have no enforcement point that can pause a turn
+	// mid-flight for a human, so `require_approval` is never offered for them; `executor`/
+	// `custom_https`/`utility` always need one, so `allow` never is) — offering a mode the backend
+	// would then refuse with a 422 is worse than not offering it.
 	const availableModes: Readonly<ToolAttachmentMode[]> = (
 		["allow", "require_approval", "disabled"] as const
-	).filter((candidate) => riskFloorAllows(candidate, riskFloor));
+	).filter(
+		(candidate) => riskFloorAllows(candidate, riskFloor) && modeSupportedByKind(kind, candidate),
+	);
+
+	// This dialog's own props (`kind`/`riskFloor`) are fixed for a given entry, but the dialog
+	// itself is not remounted between opens for different entries (the hub's entry-detail page
+	// reuses one instance) — without this, a mode valid for yesterday's entry could stay selected,
+	// stale, for an entry whose kind cannot support it at all.
+	React.useEffect(() => {
+		if (!availableModes.includes(mode)) {
+			setMode(availableModes[0] ?? "disabled");
+		}
+	}, [availableModes, mode]);
 
 	async function submit() {
 		if (agentId.length === 0) {

@@ -51,9 +51,12 @@ import {
 	compiledAgentPermissions,
 	modeSupportedByKind,
 } from "@agent-gateway/policy";
-import { and, asc, eq, inArray, isNull } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, or } from "drizzle-orm";
 import { AdminError, inTransaction } from "./admin.ts";
-import { loadCompilableCatalogEntries } from "./attachment-validation.ts";
+import {
+	loadCompilableCatalogEntries,
+	widenedByRemovingAttachment,
+} from "./attachment-validation.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
 import {
 	knownCatalogEntries,
@@ -842,27 +845,28 @@ export async function createCustomHttpsTool(
 }
 
 /**
- * Every currently enabled, legacy (not hub-managed) agent whose own `permissions` actually grants
- * `implementationKey` outright or with approval (`tools_allow`/`tools_require_human_approval`,
- * never `tools_deny` — denying it is not "holding" it) — read straight from the live `agents`
- * projection, never the catalog: a legacy agent's enforcement (`loadEffectivePermissionsIn`)
- * consults its `permissions` lists alone and never the catalog at all, so deleting a catalog entry
- * can revoke a hub-managed agent's access (its attachment is cleared) but has no effect whatsoever
- * on a legacy agent whose own pattern happens to cover the same tool. `enabled = false` is excluded:
- * a disabled (retired, or simply removed from the active configuration) agent's `config` column is
- * only its last-known projection, never actually enforced any more, and a retired agent that was
- * never hub-managed also reports `tool_attachments_managed = false` once it leaves the active
- * configuration, which would otherwise flag it here for a tool it can no longer use at all. Shared
- * by `deleteCatalogEntry` (refuses while this is non-empty) and the console's own entry-detail read
+ * Every legacy (not hub-managed) agent of the *active configuration* whose own `permissions`
+ * actually grants `implementationKey` outright or with approval (`tools_allow`/
+ * `tools_require_human_approval`; never `tools_deny`, which this excludes explicitly, since
+ * denying it is not "holding" it) — read straight from the live `agents` projection, never the
+ * catalog: a legacy agent's enforcement (`loadEffectivePermissionsIn`) consults its `permissions`
+ * lists alone and never the catalog at all, so deleting a catalog entry can revoke a hub-managed
+ * agent's access (its attachment is cleared) but has no effect whatsoever on a legacy agent whose
+ * own pattern happens to cover the same tool. "The active configuration" is the same rule
+ * `admin.ts`'s `recordedEnabledAgreesWithLive` already applies: a row whose own `config_version`
+ * matches the active one, *or* any other row that is `enabled` regardless of its own version
+ * lagging behind (an older release's own direct toggle, or a release before configuration history
+ * existed re-enabling a row after it had already left the active configuration — its `config_version`
+ * stays stale, but it is enabled and routing/scheduling runs it regardless of which version its row
+ * names). A row that is neither is excluded: kept only for history (retired, removed), its `config`
+ * column is just its last-known projection, never actually enforced any more. Shared by
+ * `deleteCatalogEntry` (refuses while this is non-empty) and the console's own entry-detail read
  * (shows it as part of the deletion's impact, alongside `attachedAgents`).
  */
 export async function legacyAgentsGrantingTool(
 	db: Db,
 	implementationKey: ToolName,
 ): Promise<Readonly<{ agentId: AgentId; displayName: string }[]>> {
-	// Every agent of the active configuration, enabled or not: a disabled legacy agent re-enabled
-	// later would otherwise get a deleted tool back. Rows kept only for history (retired, removed)
-	// belong to an older configuration version and are left out.
 	const [controls] = await db
 		.select({ activeConfigVersion: gatewayControls.activeConfigVersion })
 		.from(gatewayControls);
@@ -875,17 +879,44 @@ export async function legacyAgentsGrantingTool(
 				eq(agents.toolAttachmentsManaged, false),
 				activeConfigVersion === null
 					? eq(agents.enabled, true)
-					: eq(agents.configVersion, activeConfigVersion),
+					: or(eq(agents.configVersion, activeConfigVersion), eq(agents.enabled, true)),
 			),
 		);
 	const granting = rows
-		.filter(({ config }) =>
-			[...config.permissions.tools_allow, ...config.permissions.tools_require_human_approval].some(
-				(pattern) => toolPatternCovers(pattern, implementationKey),
-			),
+		.filter(
+			({ config }) =>
+				!config.permissions.tools_deny.some((pattern) =>
+					toolPatternCovers(pattern, implementationKey),
+				) &&
+				[
+					...config.permissions.tools_allow,
+					...config.permissions.tools_require_human_approval,
+				].some((pattern) => toolPatternCovers(pattern, implementationKey)),
 		)
 		.map((row) => ({ agentId: row.id, displayName: row.displayName }));
 	return granting.sort((a, b) => (a.agentId < b.agentId ? -1 : 1));
+}
+
+/**
+ * Thrown by {@link deleteCatalogEntry}/{@link detachTool} when removing an attachment would widen
+ * what one or more agents may actually do (ADR-027: a `disabled`/`require_approval` attachment can
+ * be the only thing suppressing a native dependency's implication, {@link widenedByRemovingAttachment}).
+ * A dedicated class, not a bare `AdminError`, so a caller (the console) can distinguish "this would
+ * widen access" from an ordinary validation problem and offer its own explicit confirm step —
+ * `detachTool`'s own `confirmWidening` — rather than making the owner read and re-type an error
+ * message. Carries the structured list `widenings` ever needs: `deleteCatalogEntry` may name
+ * several agents at once; `detachTool` always names exactly the one it was called for.
+ */
+export class WidensPermissionsError extends Error {
+	constructor(readonly widenings: Readonly<{ agentId: AgentId; tools: Readonly<ToolName[]> }[]>) {
+		super(
+			"would widen effective permissions for: " +
+				widenings
+					.map((widening) => `${widening.agentId} (${widening.tools.join(", ")})`)
+					.join("; "),
+		);
+		this.name = "WidensPermissionsError";
+	}
 }
 
 /**
@@ -903,6 +934,17 @@ export async function legacyAgentsGrantingTool(
  * tool, unaffected (see {@link legacyAgentsGrantingTool}'s own doc comment); the message points at
  * `gateway tools adopt <agent-id>` (or the console's own Adopt), which converts that coverage into a
  * real attachment this delete would then also clear.
+ *
+ * **Never widens any affected agent's effective permissions, either.** Clearing a `disabled` (or
+ * `require_approval`) attachment of this entry can be the one thing standing between an agent and
+ * a native dependency's implication it would otherwise suppress (`tests.run` implying
+ * `workspace.write`, {@link widenedByRemovingAttachment}, `@agent-gateway/policy`'s
+ * `NATIVE_TOOL_DEPENDENCIES`): every affected agent's compiled attachments are compared before and
+ * after the clear, and the whole delete is refused ({@link WidensPermissionsError}, nothing
+ * committed) the moment any agent would gain anything, naming the agent and the tool it would
+ * gain. The owner detaches or reconfigures that agent's attachments first, the same way a
+ * legacy-grant refusal above points at an explicit next step rather than silently widening access
+ * to make the delete succeed.
  *
  * Returns the agent ids actually affected, read fresh inside this same transaction right before
  * committing — never a caller's own, separately-read "impact preview" from moments earlier, which a
@@ -993,8 +1035,49 @@ export async function deleteCatalogEntry(
 				}
 			}
 			if (affected.length > 0) {
-				const changeSet: ChangeSet = [{ type: "clear_tool_attachments", entryId }];
+				// Never let clearing `affected`'s attachments of `entryId` widen what any of them may
+				// actually do: a `disabled`/`require_approval` attachment of this entry can be the
+				// only thing suppressing a native dependency's implication (`tests.run` implying
+				// `workspace.write`), which clearing it away would then let through.
 				const baseRevisionId = controls?.revision ?? null;
+				const { bundle } = await loadActiveBundle(db, baseRevisionId);
+				const financeAgentId = (bundle.organization?.organization.finance_agent_id ??
+					"") as AgentId;
+				const widenings = (
+					await Promise.all(
+						affected.map(async (agentId) => {
+							// `affected` is read, in this same transaction, from `catalog_attachments` —
+							// the current-state projection of this exact bundle's own attachments
+							// document — so every one of these agent ids is hub-managed and has an
+							// attachments entry here by construction; absent either, something upstream
+							// already disagrees with itself.
+							const attachments = Object.hasOwn(bundle.toolAttachments, agentId)
+								? bundle.toolAttachments[agentId]
+								: undefined;
+							const agent = bundle.agents.find((candidate) => candidate.id === agentId);
+							if (attachments === undefined || agent === undefined) {
+								throw new AdminError(
+									`internal: '${agentId}' is attached to '${entryId}' but has no attachments ` +
+										"document or no longer exists in the bundle this same transaction read",
+								);
+							}
+							const catalog = await loadCompilableCatalogEntries(db, { [agentId]: attachments });
+							const tools = widenedByRemovingAttachment({
+								agentId,
+								financeAgentId,
+								adapter: agent.runtime.adapter,
+								attachments,
+								entryId,
+								catalog,
+							});
+							return { agentId, tools };
+						}),
+					)
+				).filter((widening) => widening.tools.length > 0);
+				if (widenings.length > 0) {
+					throw new WidensPermissionsError(widenings);
+				}
+				const changeSet: ChangeSet = [{ type: "clear_tool_attachments", entryId }];
 				const commit = await commitChangeIn(
 					uow,
 					{ changeSet, baseRevisionId, actor, source },
@@ -1082,7 +1165,14 @@ async function loadAllAgentToolAttachmentsWithRevision(
 		const known = await knownCatalogEntries(tx.db);
 		const attachments: Record<string, AgentToolAttachmentsRead> = {};
 		for (const agent of bundle.agents) {
-			const recorded = bundle.toolAttachments[agent.id];
+			// Own-property lookup: an agent id like `constructor` has no own property in this
+			// plain-object dictionary but still resolves, through the prototype chain, to
+			// `Object.prototype.constructor` — a function, not `undefined` — which would otherwise be
+			// stored as this agent's own "recorded attachments" and crash the next thing that treats
+			// it as an array.
+			const recorded = Object.hasOwn(bundle.toolAttachments, agent.id)
+				? bundle.toolAttachments[agent.id]
+				: undefined;
 			if (recorded !== undefined) {
 				attachments[agent.id] = { attachments: recorded, unresolved: [], hubManaged: true };
 				continue;
@@ -1111,7 +1201,10 @@ export async function loadAgentToolAttachments(
 	agentId: AgentId,
 ): Promise<AgentToolAttachmentsRead> {
 	const all = await loadAllAgentToolAttachments(deps);
-	const entry = all[agentId];
+	// Own-property lookup: see `loadAllAgentToolAttachmentsWithRevision`'s own comment — an agent id
+	// like `constructor` that does not actually exist would otherwise resolve, through the
+	// prototype chain, to `Object.prototype.constructor` instead of `undefined`.
+	const entry = Object.hasOwn(all, agentId) ? all[agentId] : undefined;
 	if (entry === undefined) {
 		throw new AdminError(`agent '${agentId}' does not exist`);
 	}
@@ -1273,7 +1366,10 @@ async function adoptOneAgent(
 		bundle,
 		attachments: all,
 	} = await loadAllAgentToolAttachmentsWithRevision(deps, input.baseRevisionId);
-	const read = all[agentId];
+	// Own-property lookup: see `loadAllAgentToolAttachmentsWithRevision`'s own comment — an agent id
+	// like `constructor` that does not actually exist would otherwise resolve, through the
+	// prototype chain, to `Object.prototype.constructor` instead of `undefined`.
+	const read = Object.hasOwn(all, agentId) ? all[agentId] : undefined;
 	if (read === undefined) {
 		throw new AdminError(`agent '${agentId}' does not exist`);
 	}
@@ -1463,6 +1559,16 @@ export type AttachToolInput = Readonly<{
 	 * `permissions`) against newer state the owner never saw on that page. Absent for the CLI, which
 	 * wants the ordinary "read whatever is live, commit against exactly that" behaviour unchanged. */
 	baseRevisionId?: number | null;
+	/** Binds the still-legacy conversion this call would compute to the exact one a caller already
+	 * reviewed (the console's own agent-tools read, `attachmentsConversionHash` of its own
+	 * `requested`): refused (`StaleConversionError`, mapped to a `409` the same way
+	 * `adoptAgentToolAttachments`'s own commit already is) once a catalog entry created, edited or
+	 * deleted since changes what these same legacy patterns resolve to — a change `baseRevisionId`
+	 * alone cannot catch, since a catalog entry carries no config revision of its own (ADR-027).
+	 * Ignored once the agent is already hub-managed, where no conversion ever happens; absent for
+	 * the CLI, which keeps the ordinary "resolve against whatever is live, commit against exactly
+	 * that" behaviour unchanged. */
+	expectedConversionHash?: string;
 }>;
 
 export type AttachToolResult = CommitChangeResult &
@@ -1478,9 +1584,13 @@ export type AttachToolResult = CommitChangeResult &
  * The attachments {@link legacyAttachmentsFromPermissions} resolves for `agentId`'s current
  * `permissions` — its legacy coverage, carried forward into the same revision that attaches a new
  * entry on top (`attachTool`, which merges in the entry actually requested before committing).
- * `null` only when a resolved attachment's mode its own catalog entry's `kind` does not support
- * (`modeSupportedByKind`) — the same refusal `adoptOneAgent` gives, surfaced here instead of
- * silently dropping coverage or guessing a mode that was never actually configured.
+ * `null` when an allow or approval pattern is unresolved (covers no catalog entry known right now —
+ * dropping it here would silently drop a grant, e.g. `tools_require_human_approval: ["mail.send"]`
+ * with no catalog entry yet; an unresolved denial is dropped safely) or when a resolved attachment's mode its
+ * own catalog entry's `kind` does not support (`modeSupportedByKind`) — the same refusal
+ * `adoptOneAgent` gives, surfaced here instead of silently narrowing or guessing a mode that was
+ * never actually configured; either way, the caller points at `gateway tools adopt <agent-id>` (or
+ * the console's own Adopt), which previews every unresolved pattern before committing anything.
  */
 async function legacyConversionAttachments(
 	db: Db,
@@ -1491,7 +1601,13 @@ async function legacyConversionAttachments(
 	// Every legacy pattern converts, the entry about to be attached included: leaving one out could
 	// drop an explicit denial that another attachment's implied capabilities would then grant
 	// (`tests.run` implies `repository.read`).
-	const { attachments } = legacyAttachmentsFromPermissions(permissions, known);
+	const { attachments, unresolved } = legacyAttachmentsFromPermissions(permissions, known);
+	// Only an unresolved grant is a loss worth stopping for: a hub-managed agent gets nothing it is
+	// not explicitly attached to, so an unresolved denial (`deploy.*` with no such entry yet) keeps
+	// denying exactly as before once dropped.
+	if (unresolved.some((pattern) => pattern.list !== "tools_deny")) {
+		return null;
+	}
 	if (attachments.length === 0) {
 		return [];
 	}
@@ -1516,9 +1632,14 @@ async function legacyConversionAttachments(
  * everything its legacy `permissions` used to cover (ADR-027's bundle-mirror invariant replaces
  * `permissions` outright on the very commit that first gives an agent an attachments document).
  * Refused instead — nothing committed — when that conversion cannot resolve cleanly (a legacy
- * pattern's mode its own catalog entry does not support) or would need more operations than one
- * change set may ever hold: either way, `gateway tools adopt <agentId>` is the explicit, reviewed
- * path for an agent whose legacy permissions need a closer look before this hub ever touches them.
+ * pattern's mode its own catalog entry does not support, or an allow or approval pattern is
+ * unresolved — no known catalog entry covers it yet) or would need more operations than one change set may ever hold:
+ * either way, `gateway tools adopt <agentId>` is the explicit, reviewed path for an agent whose
+ * legacy permissions need a closer look before this hub ever touches them. Also refused
+ * (`StaleConversionError`) when `input.expectedConversionHash` is given and no longer matches what
+ * this same conversion resolves to right now — the console's own agent-tools read, echoing back
+ * `attachmentsConversionHash` of what it showed, so a catalog entry created, edited or deleted
+ * since can never be converted into a commit the owner never actually saw.
  */
 export async function attachTool(
 	deps: ControlPlaneDeps,
@@ -1564,7 +1685,10 @@ export async function attachTool(
 		deps,
 		input.baseRevisionId,
 	);
-	const read = attachments[input.agentId];
+	// Own-property lookup: see `loadAllAgentToolAttachmentsWithRevision`'s own comment — an agent id
+	// like `constructor` that does not actually exist would otherwise resolve, through the
+	// prototype chain, to `Object.prototype.constructor` instead of `undefined`.
+	const read = Object.hasOwn(attachments, input.agentId) ? attachments[input.agentId] : undefined;
 	if (read === undefined) {
 		throw new AdminError(`agent '${input.agentId}' does not exist`);
 	}
@@ -1587,6 +1711,17 @@ export async function attachTool(
 				`permissions cannot be converted automatically here; run ` +
 				`'gateway tools adopt ${input.agentId}' first`,
 		);
+	}
+	// The console's own agent-tools read echoes this same conversion's hash back on attach,
+	// exactly as it already does for "Adopt into the tools hub": a catalog entry created, edited or
+	// deleted since that read changes what these same legacy patterns resolve to without moving
+	// `baseRevisionId` at all (a catalog entry carries no config revision of its own, ADR-027), so
+	// `baseRevisionId` alone cannot catch it. Checked before anything commits.
+	if (
+		input.expectedConversionHash !== undefined &&
+		input.expectedConversionHash !== attachmentsConversionHash(conversion)
+	) {
+		throw new StaleConversionError(input.agentId);
 	}
 	// The entry actually requested wins over whatever the legacy conversion resolved for the same
 	// one, same as `attach_tool`'s own per-op semantics (replace any existing attachment of the same
@@ -1633,14 +1768,77 @@ export type DetachToolInput = Readonly<{
 	source: ConfigRevisionSource;
 	idempotencyKey?: string;
 	reason?: string;
+	/** Detaching an attachment that currently suppresses a native dependency's implication
+	 * (`disabled`/`require_approval` on a tool another attached tool's grant would otherwise imply,
+	 * `NATIVE_TOOL_DEPENDENCIES`) widens `agentId`'s effective permissions the moment nothing
+	 * explicit governs the implied tool any more (ADR-027) — refused unless this is set, an
+	 * explicit acknowledgement that the owner actually intends that widening (the console's own
+	 * confirm step, once it has shown the owner which tool would widen). */
+	confirmWidening?: boolean;
 }>;
 
+/** Every tool `agentId`'s effective permissions would gain if its attachment of `entryId` were
+ * detached right now — `[]` once the agent is not hub-managed or holds no such attachment (nothing
+ * to detach, `detachTool`'s own no-op case). A separate, earlier read, the same way `attachTool`'s
+ * own `checkAttachable` is: `detachTool`'s real commit re-derives everything it needs from its own
+ * transaction regardless, so a race against a concurrent change here only ever costs a friendlier
+ * refusal that a retry (or the commit itself) would still catch. */
+async function widenedByDetaching(
+	deps: ControlPlaneDeps,
+	agentId: AgentId,
+	entryId: string,
+): Promise<Readonly<ToolName[]>> {
+	const { bundle, attachments: all } = await loadAllAgentToolAttachmentsWithRevision(deps);
+	const read = Object.hasOwn(all, agentId) ? all[agentId] : undefined;
+	if (
+		read === undefined ||
+		!read.hubManaged ||
+		!read.attachments.some((a) => a.entryId === entryId)
+	) {
+		return [];
+	}
+	// `read.hubManaged` came from this same `bundle`'s own `toolAttachments` document, so `agentId`
+	// must also be one of `bundle.agents` — the same assumption `deleteCatalogEntry`'s own widen
+	// check makes, for the same reason.
+	const agent = bundle.agents.find((candidate) => candidate.id === agentId);
+	if (agent === undefined) {
+		throw new AdminError(
+			`internal: '${agentId}' is hub-managed but no longer exists in the bundle this same read ` +
+				"found it in",
+		);
+	}
+	const financeAgentId = (bundle.organization?.organization.finance_agent_id ?? "") as AgentId;
+	const catalog = await inTransaction(deps, ({ tx }) =>
+		loadCompilableCatalogEntries(tx.db, { [agentId]: [...read.attachments] }),
+	);
+	return widenedByRemovingAttachment({
+		agentId,
+		financeAgentId,
+		adapter: agent.runtime.adapter,
+		attachments: read.attachments,
+		entryId,
+		catalog,
+	});
+}
+
 /** Removes `input.agentId`'s attachment of `input.entryId`; a no-op (still a fresh revision, per
- * `commitChange`'s own convention) when it has none. */
+ * `commitChange`'s own convention) when it has none.
+ *
+ * Refused ({@link WidensPermissionsError}, nothing committed) when detaching it would widen
+ * `input.agentId`'s effective permissions — an attached `disabled`/`require_approval` that was the
+ * only thing suppressing a native dependency's implication, {@link widenedByDetaching} — unless
+ * `input.confirmWidening` is set, an explicit acknowledgement the owner actually intends it.
+ */
 export async function detachTool(
 	deps: ControlPlaneDeps,
 	input: DetachToolInput,
 ): Promise<CommitChangeResult> {
+	if (input.confirmWidening !== true) {
+		const widened = await widenedByDetaching(deps, input.agentId, input.entryId);
+		if (widened.length > 0) {
+			throw new WidensPermissionsError([{ agentId: input.agentId, tools: widened }]);
+		}
+	}
 	const changeSet: ChangeSet = [
 		{ type: "detach_tool", agentId: input.agentId, entryId: input.entryId },
 	];

@@ -340,6 +340,78 @@ describe("applyChangeSet", () => {
 		]);
 	});
 
+	// An agent id of `constructor` is a valid `AgentId` (lowercase letters only); `toolAttachments`
+	// is a plain-object dictionary, so a naive `draft.toolAttachments[op.agentId]` would otherwise
+	// resolve, through the prototype chain, to `Object.prototype.constructor` (a function) instead
+	// of `undefined` whenever this agent has no own entry yet — these assertions deliberately never
+	// read `draft.toolAttachments.constructor`/`draft.toolAttachments["constructor"]` directly for
+	// that same reason; `Object.hasOwn` is the only safe way to ask "does this agent have an entry
+	// at all".
+	describe("an agent literally named 'constructor'", () => {
+		it("attach_tool succeeds and records a real, own attachment entry", () => {
+			const base = bundleOf([agent("constructor")]);
+			const { draft, problems } = apply(base, {
+				type: "attach_tool",
+				agentId: "constructor",
+				entryId: "gateway-mattermost-post",
+				pinnedVersion: null,
+				mode: "allow",
+				settings: {},
+			});
+			expect(problems).toEqual([]);
+			expect(Object.hasOwn(draft.toolAttachments, "constructor")).toBe(true);
+			expect(draft.toolAttachments["constructor"]).toEqual([
+				{ entryId: "gateway-mattermost-post", pinnedVersion: null, mode: "allow", settings: {} },
+			]);
+		});
+
+		it("detach_tool of something never attached is an idempotent no-op, not a crash", () => {
+			const base = bundleOf([agent("constructor")]);
+			const { draft, problems } = apply(base, {
+				type: "detach_tool",
+				agentId: "constructor",
+				entryId: "gateway-mattermost-post",
+			});
+			expect(problems).toEqual([]);
+			expect(draft).toEqual(base);
+			expect(Object.hasOwn(draft.toolAttachments, "constructor")).toBe(false);
+		});
+
+		it("update_attachment of an entry never attached is a problem, not a crash", () => {
+			const base = bundleOf([agent("constructor")]);
+			const { draft, problems } = apply(base, {
+				type: "update_attachment",
+				agentId: "constructor",
+				entryId: "gateway-mattermost-post",
+				mode: "allow",
+			});
+			expect(draft).toEqual(base);
+			expect(problems).toEqual([
+				"update_attachment: agent 'constructor' has no attachment of 'gateway-mattermost-post'",
+			]);
+		});
+
+		it("attach then detach end-to-end leaves a real, empty own entry — never the inherited constructor function", () => {
+			const base = bundleOf([agent("constructor")]);
+			const attached = apply(base, {
+				type: "attach_tool",
+				agentId: "constructor",
+				entryId: "gateway-mattermost-post",
+				pinnedVersion: null,
+				mode: "allow",
+				settings: {},
+			}).draft;
+			const { draft, problems } = apply(attached, {
+				type: "detach_tool",
+				agentId: "constructor",
+				entryId: "gateway-mattermost-post",
+			});
+			expect(problems).toEqual([]);
+			expect(Object.hasOwn(draft.toolAttachments, "constructor")).toBe(true);
+			expect(draft.toolAttachments["constructor"]).toEqual([]);
+		});
+	});
+
 	it("clear_tool_attachments removes one entry's attachment from every agent that has it", () => {
 		const base = bundleOf([agent("alpha"), agent("beta")]);
 		const attached = apply(

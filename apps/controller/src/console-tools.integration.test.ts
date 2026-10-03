@@ -6,7 +6,13 @@ import {
 	ConsoleAgentToolsResponseSchema,
 	type CustomHttpsDefinition,
 } from "@agent-gateway/contracts";
-import { ensureAgentLifecycleAdoption } from "@agent-gateway/core";
+import {
+	activeConfigRevisionId,
+	commitChange,
+	ensureAgentLifecycleAdoption,
+	inTransaction,
+	loadActiveBundle,
+} from "@agent-gateway/core";
 import { silentLogger } from "@agent-gateway/logging";
 import { hashConsolePassword, writeSecretFile } from "@agent-gateway/service";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -130,6 +136,70 @@ describe("the Instruments & Utils hub's own management API (ADR-025/ADR-027)", (
 		passwordHash = await hashConsolePassword(PASSWORD);
 		await ensureAgentLifecycleAdoption(gateway.deps(), "test");
 		secretsDir = mkdtempSync(join(tmpdir(), "custom-tool-secrets-"));
+		// `ATTACH_AGENT_ID` ("mail-follower"), `developer` (the delete-impact tests' own
+		// `deleteImpactAgentId`) and `BUMP_AGENT_ID` ("director")'s own example permissions each
+		// also carry a pattern that resolves to no catalog entry this release seeds
+		// (`mail.read`/`mail.send`/`mail.forward`/`deploy.*` for mail-follower, `deploy.*`/`mail.*`
+		// for developer, `memory.read`/`deploy.*`/`mail.send` for director) — `attachTool`'s own
+		// first-attach conversion refuses outright when an allow or approval pattern is unresolved (ADR-027),
+		// rather than silently converting only what does resolve, and each of these three is
+		// attached to for the first time by a test below. Trimmed here, once, to every resolvable
+		// pattern each example still carries — an `update_agent` never creates an attachments
+		// document of its own, so each agent stays exactly as legacy as it already was.
+		const active = await activeConfigRevisionId(gateway.deps());
+		const { bundle } = await inTransaction(gateway.deps(), ({ tx }) =>
+			loadActiveBundle(tx.db, active),
+		);
+		const byId = (id: string) => {
+			const found = bundle.agents.find((agent) => agent.id === id);
+			if (found === undefined) {
+				throw new Error(`expected the '${id}' example agent`);
+			}
+			return found;
+		};
+		await commitChange(gateway.deps(), {
+			changeSet: [
+				{
+					type: "update_agent",
+					agent: {
+						...byId("mail-follower"),
+						permissions: {
+							// Not `web.search`: a later test attaches `native-web-search` fresh, expecting
+							// a genuinely new attachment to replay from, never a no-op this agent's own
+							// legacy conversion already produced.
+							tools_allow: ["mattermost.post", "web.fetch"],
+							tools_require_human_approval: [],
+							tools_deny: ["finance.*", "workspace.write"],
+						},
+					},
+				},
+				{
+					type: "update_agent",
+					agent: {
+						...byId("developer"),
+						permissions: {
+							tools_allow: ["mattermost.post", "repository.read", "workspace.write", "tests.run"],
+							tools_require_human_approval: [],
+							tools_deny: ["finance.*"],
+						},
+					},
+				},
+				{
+					type: "update_agent",
+					agent: {
+						...byId("director"),
+						permissions: {
+							tools_allow: ["mattermost.post", "memory.write"],
+							tools_require_human_approval: [],
+							tools_deny: ["finance.*"],
+						},
+					},
+				},
+			],
+			baseRevisionId: active,
+			actor: "test",
+			source: "cli_apply",
+		});
 	});
 
 	afterAll(async () => {

@@ -54,14 +54,31 @@ export function ToolsTab({ agentId }: Readonly<{ agentId: string }>): React.Reac
 		void load();
 	}, [load]);
 
-	async function handleDetach(entryId: string) {
+	/** `confirmWidening`: the owner's own explicit acknowledgement, from the warning toast's own
+	 * "Detach anyway" action below — detaching never silently widens what this agent may do
+	 * (ADR-027: an attached `disabled`/`require_approval` can be the only thing suppressing a
+	 * native dependency's implication). */
+	async function handleDetach(entryId: string, confirmWidening = false) {
 		setDetachingEntryId(entryId);
 		try {
-			const result = await detachTool(agentId, { idempotencyKey: crypto.randomUUID(), entryId });
+			const result = await detachTool(agentId, {
+				idempotencyKey: crypto.randomUUID(),
+				entryId,
+				...(confirmWidening ? { confirmWidening: true } : {}),
+			});
 			if (result.kind === "conflict") {
 				toast.error(
 					"The active configuration changed since this page was loaded. Reload and try again.",
 				);
+				return;
+			}
+			if (result.kind === "would_widen") {
+				const summary = result.widenings
+					.map((widening) => `${widening.agentId}: ${widening.tools.join(", ")}`)
+					.join("; ");
+				toast.warning(`Detaching '${entryId}' would widen effective permissions — ${summary}.`, {
+					action: { label: "Detach anyway", onClick: () => void handleDetach(entryId, true) },
+				});
 				return;
 			}
 			if (result.kind === "invalid") {
@@ -247,6 +264,7 @@ export function ToolsTab({ agentId }: Readonly<{ agentId: string }>): React.Reac
 				agentId={agentId}
 				alreadyRequestedEntryIds={response.requested.map((attachment) => attachment.entryId)}
 				baseRevisionId={response.baseRevisionId}
+				conversionHash={response.conversionHash}
 				onAttached={() => void load()}
 			/>
 			<AdoptDialog

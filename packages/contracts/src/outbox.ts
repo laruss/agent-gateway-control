@@ -59,6 +59,12 @@ export const MattermostApprovalPayloadSchema = z.strictObject({
 	actionType: ToolNameSchema,
 	actionSummary: safeText(2000, "text"),
 	actionParams: ActionParamsSchema,
+	/** A `custom_https` action's own authoritative, secret-free request preview (method, resolved
+	 * path, query/header/body field names, a secret-filled slot named but never its value) —
+	 * `undefined` for any other action type. Optional, never `nullable`-required: this schema is
+	 * re-parsed when an already-queued card is delivered, possibly after a rolling deploy, and an
+	 * older-shaped payload enqueued before this field existed must still parse. */
+	customRequestPreview: safeText(4000, "text").optional(),
 	riskLevel: RiskLevelSchema,
 	immutableActionHash: Sha256HexSchema,
 	expiresAt: TimestampSchema,

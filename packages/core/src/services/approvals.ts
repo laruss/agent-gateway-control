@@ -239,10 +239,10 @@ async function executionIssues(uow: UnitOfWork, approval: ApprovalRow): Promise<
 	const issues = [
 		...approvedActionIssues(effective.toolPolicy, { agentId: agent.id, financeAgentId }, action),
 		// A `custom_https` action only: refuses a grant once its pinned definition version no
-		// longer matches the entry's current one (edited since the request was made), or once its
-		// parameters no longer pass the current definition's own typed rules. `[]` for any other
-		// action type.
-		...(await customGrantTimeIssues(uow.tx.db, action)),
+		// longer matches `agent`'s own currently selected one (the definition edited further, or
+		// the attachment itself re-pinned or unpinned, since the request was made), or once its
+		// parameters no longer pass that version's own typed rules. `[]` for any other action type.
+		...(await customGrantTimeIssues(uow.tx.db, agent.id, action)),
 	];
 	if (approvalActionHash(action) !== approval.immutableActionHash) {
 		issues.push("the stored action no longer matches its hash");

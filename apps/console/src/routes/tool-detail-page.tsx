@@ -279,6 +279,7 @@ export function ToolDetailPage(): React.ReactElement {
 				open={attachOpen}
 				onOpenChange={setAttachOpen}
 				entryId={entry.id}
+				kind={entry.kind}
 				riskFloor={current.riskFloor}
 				onAttached={() => void load()}
 			/>
