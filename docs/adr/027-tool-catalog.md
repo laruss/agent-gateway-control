@@ -176,8 +176,9 @@ committing, and — only when the agent is still legacy — converts its `permis
 requested in the same revision, against the exact base revision that read came from (so a
 concurrent change is a conflict, never silently rebased onto). The conversion itself is reported
 back (`legacyConversion`). A legacy pattern whose resolved mode its own catalog entry's `kind` does
-not support refuses the whole attach outright — nothing committed — with a pointer to
-`gateway tools adopt <agent-id>` first, the explicit, reviewed path for resolving it; `detachTool`
+not support, or whose resolution (together with the entry actually requested) would exceed
+`MAX_ATTACHMENTS_PER_AGENT`, refuses the whole attach outright — nothing committed — with a pointer
+to `gateway tools adopt <agent-id>` first, the explicit, reviewed path for resolving it; `detachTool`
 and `updateAttachment` need no such conversion, since neither can itself be the first write that
 makes a legacy agent hub-managed (a detach of nothing is a no-op, and an update of an attachment
 that does not exist yet is already refused).
@@ -377,14 +378,19 @@ revision per agent (never combined: a batch could exceed `MAX_CHANGE_SET_OPERATI
 agent's adoption failing must never block another's). It reports, per agent: whether it was already
 hub-managed (left untouched), every unresolved pattern, the effective permissions before and after
 (identical in effect whenever every pattern resolved — the whole point of a safe migration), and
-any resolved attachment whose mode its entry's `kind` does not support (found before attempting a
-commit that would otherwise refuse it). `--dry-run` previews everything above without committing.
-An agent whose legacy conversion resolves to zero attachments (every pattern unresolved, or no
-permissions at all) is still adopted: `set_tool_attachments` (below) marks an *existing* agent
-hub-managed with an explicitly empty list, the one thing `attach_tool` cannot express on its own
-(it always adds at least one row) — every other agent keeps the targeted, per-attachment
-`attach_tool` changeset it always has. Each agent's own read (its resolved attachments, and the
-revision they came from) and its commit happen together, so a concurrent change elsewhere — a
+any resolved attachment whose mode its entry's `kind` does not support, or a resolution past
+`MAX_ATTACHMENTS_PER_AGENT` (a wide legacy pattern — `custom.*` covering dozens of owner-created
+tools — can resolve to more attachments than one agent may ever hold even though every one of them
+individually resolves cleanly) — both found and reported before attempting a commit that would
+otherwise refuse it, dry-run included. `--dry-run` previews everything above without committing.
+Every agent, zero resolved attachments or many, commits through the same single
+`set_tool_attachments` operation: the one thing that can mark an *existing* agent hub-managed with
+an explicitly empty list at all (`attach_tool` always adds at least one row), and, being one
+operation regardless of how many attachments it carries, the only shape `MAX_CHANGE_SET_OPERATIONS`
+could never bound if adoption committed one `attach_tool` per resolved attachment instead —
+`MAX_ATTACHMENTS_PER_AGENT` is the limit that actually applies here, checked above. Each agent's own
+read (its resolved attachments, and the revision they came from) and its commit happen together, so
+a concurrent change elsewhere — a
 revoke landing between when `tools adopt` read an agent's permissions and when it commits — is a
 conflict (`ManagementConflictError`), never silently overwritten by a commit built from the earlier,
 now-stale read.
@@ -633,11 +639,16 @@ merits — it is the only execution path the broker has at all.
   whole-list replace built from a stale read races a concurrent edit from elsewhere invisibly (the
   last write wins, silently discarding the other), where a targeted operation at least reports a
   clear "no attachment to update" or produces a deterministic, independent result regardless of what
-  else is in the list. `set_tool_attachments` does exist, narrowly, for the one thing no targeted
-  operation can express at all — marking an *existing* legacy agent hub-managed with an explicitly
-  empty list (`tools adopt`'s own zero-attachments case, above); its only caller resolves the list
-  it replaces and the revision it commits against together, in the same read, so the staleness this
-  alternative was rejected for cannot arise through it.
+  else is in the list. `set_tool_attachments` does exist, narrowly, as the one editing primitive
+  legacy conversion itself always commits through — adoption (`tools adopt`, any resolved attachment
+  count, not only the zero-attachments case that first needed it) and `attachTool`'s own conversion
+  of a still-legacy agent alike — rather than a general-purpose replacement for
+  `attach_tool`/`detach_tool`/`update_attachment`'s own targeted edits, which stay exactly as
+  rejected above for any caller editing an already hub-managed agent's attachments one at a time.
+  Every caller that does use it resolves the list it replaces and the revision it commits against
+  together, in the same read (`loadAllAgentToolAttachmentsWithRevision`'s own `atRevisionId`,
+  `attachTool`'s own pinned read), so the staleness this alternative was rejected for cannot arise
+  through it.
 
 ## Consequences
 
@@ -681,3 +692,24 @@ merits — it is the only execution path the broker has at all.
   unreadable; a queued custom-tool action an older release's own tool runner cannot execute (it
   knows no `custom`/`utility` namespace) is settled by hand, the same as any action a decommissioned
   executor left behind.
+- **Re-upgrading after a rollback interval never trusts `catalog_attachments`/
+  `agents.tool_attachments_managed` as already agreeing with the active revision — the active
+  revision is the source of truth, reconciled against at startup.** The rollback itself is safe
+  (above): an older release enforces only `permissions`, already mirrored to match what this
+  release's compiler would have computed. But an older release can still *change* the configuration
+  while it runs — a `config apply`, a direct toggle — through its own writer, which knows nothing of
+  `toolAttachments` at all and so records a new revision with `attachments_snapshot_hash` null,
+  never calling anything that would reconcile either projection. Left alone, those two projections
+  would simply stay exactly as the last *pre-rollback*, hub-managed commit set them — stale, and
+  disagreeing with the revision that is now active — and re-upgrading to this release would trust
+  them anyway, resurrecting (or continuing to withhold) whatever access the older release's own
+  `permissions` edit actually changed. The rule: a revision with no attachments document of its own
+  (`attachments_snapshot_hash` null) carries none for any agent — only this release's own writer
+  ever records one — so every agent it names is legacy from here on, its effective permissions
+  exactly the `permissions` that revision itself recorded, the same as any other legacy agent.
+  `ensureToolAttachmentsReconciled` (`packages/core/src/services/admin.ts`) enforces this at every
+  controller/CLI startup, next to `ensureConfigHistory`: it reconciles `catalog_attachments` and
+  `agents.tool_attachments_managed` to match the active revision's own attachments document exactly
+  (`{}` when its hash is null, the document itself otherwise) — a no-op, by canonical-hash
+  comparison, whenever they already agree, which is every startup except one right after a rollback
+  interval like this.

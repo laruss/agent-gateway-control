@@ -583,6 +583,98 @@ export async function ensureConfigHistory(deps: ControlPlaneDeps, actor: string)
 }
 
 /**
+ * The live projections `loadEffectivePermissionsIn` trusts without re-reading the active
+ * revision's own attachments document every time (`catalog_attachments`,
+ * `agents.tool_attachments_managed`), reconciled back to agree with it — never assumed to already
+ * agree, the way every other reader of them does (ADR-027's "the active revision is the source of
+ * truth" rule). They normally do agree, since `writeConfigRevisionIn` reconciles both in the same
+ * transaction as every revision it writes; the one way they stop agreeing is a release before
+ * ADR-027 writing a revision through its own, older `applyConfig` during a rollback interval — it
+ * has no `toolAttachments` document to call `writeConfigRevisionIn` with at all (the parameter did
+ * not exist for it) and knows nothing of either projection, so its revision lands with
+ * `attachments_snapshot_hash` null while the projections are left exactly as a hub-managed agent's
+ * last *pre-rollback* commit set them. Re-upgrading past this point would otherwise trust those
+ * stale projections and resurrect (or keep denying) whatever access the older release's own
+ * `permissions` edit actually changed, since nothing before this ever re-read the active revision's
+ * attachments document again to check. A revision with a null `attachments_snapshot_hash` carries no
+ * attachments document at all — only this release's own writer ever records one — so every agent it
+ * names is legacy: this reconciles both projections to the empty document (`{}`), identically to how
+ * `writeConfigRevisionIn` already reconciles them to `{}` for a plain YAML apply that supplies no
+ * `tool-attachments.json`. A revision with a non-null hash was necessarily written by this release's
+ * own writer, which already reconciled both projections to match it in the same transaction; this
+ * still re-reads and reconciles against it rather than trusting that, so a database nudged out of
+ * sync by anything else (a restored backup, a hand edit) is corrected the same way.
+ *
+ * A no-op, and cheap, in the overwhelmingly common case where the live projections already agree
+ * with the active revision's document (compared by canonical hash, the same comparison
+ * `attachments_snapshot_hash` itself is defined by) — safe to call at every controller/CLI startup,
+ * next to `ensureConfigHistory`, whether or not reconciling is actually needed.
+ */
+export async function ensureToolAttachmentsReconciled(
+	deps: ControlPlaneDeps,
+	actor: string,
+): Promise<void> {
+	await inTransaction(deps, async (uow) => {
+		const { db } = uow.tx;
+		const [controls] = await db
+			.select({ revision: gatewayControls.activeConfigRevision })
+			.from(gatewayControls)
+			.where(eq(gatewayControls.id, 1))
+			.for("update");
+		if (controls === undefined || controls.revision === null) {
+			return;
+		}
+		const desired = canonicalizeAttachmentsIn(await loadToolAttachmentsIn(db, controls.revision));
+		const managedAgentIds = await db
+			.select({ id: agents.id })
+			.from(agents)
+			.where(eq(agents.toolAttachmentsManaged, true));
+		const attachmentRows = await db
+			.select({
+				agentId: catalogAttachments.agentId,
+				entryId: catalogAttachments.entryId,
+				pinnedVersion: catalogAttachments.pinnedVersion,
+				mode: catalogAttachments.mode,
+				settings: catalogAttachments.settings,
+			})
+			.from(catalogAttachments);
+		const liveByAgent = new Map<string, ToolAttachment[]>(
+			managedAgentIds.map((row) => [row.id, []]),
+		);
+		for (const row of attachmentRows) {
+			const list = liveByAgent.get(row.agentId);
+			if (list !== undefined) {
+				list.push({
+					entryId: row.entryId,
+					pinnedVersion: row.pinnedVersion,
+					mode: row.mode,
+					settings: row.settings,
+				});
+			}
+		}
+		const live = canonicalizeAttachmentsIn(Object.fromEntries(liveByAgent));
+		if (canonicalHash(live) === canonicalHash(desired)) {
+			return;
+		}
+		await reconcileCatalogAttachmentsIn(uow, desired);
+		uow.deps.log.warn(
+			"tool attachment projections disagreed with the active configuration revision's own " +
+				"attachments document; reconciled to match it (likely a release before ADR-027 changed " +
+				"configuration during a rollback interval) — review with 'gateway tools list'/'gateway " +
+				"agents show <agent>'",
+			{ revision_id: controls.revision },
+		);
+		await audit(
+			uow,
+			actor,
+			"config.tool_attachments_reconciled",
+			"config",
+			String(controls.revision),
+		);
+	});
+}
+
+/**
  * Whether `ensureConfigHistory` would backfill a revision right now, decided the same way it
  * decides that (no active configuration at all, or none ever recorded for one, or the recorded
  * revision's generation or live `agents.enabled` projection has since moved — see

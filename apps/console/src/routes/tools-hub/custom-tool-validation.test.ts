@@ -1,6 +1,6 @@
 import type { CustomHttpsDefinition } from "@agent-gateway/contracts";
 import { describe, expect, it } from "vitest";
-import { clientSideDefinitionProblems } from "./custom-tool-validation.ts";
+import { clientSideDefinitionProblems, entryIdProblems } from "./custom-tool-validation.ts";
 
 function definition(overrides: Partial<CustomHttpsDefinition> = {}): CustomHttpsDefinition {
 	return {
@@ -75,5 +75,27 @@ describe("clientSideDefinitionProblems", () => {
 	it("rejects an out-of-bounds shape (e.g. an empty host) before the cross-field rules even run", () => {
 		const problems = clientSideDefinitionProblems(definition({ host: "" }));
 		expect(problems.length).toBeGreaterThan(0);
+	});
+});
+
+describe("entryIdProblems", () => {
+	it("is empty for a well-formed entry id", () => {
+		expect(entryIdProblems("ticketing-create")).toEqual([]);
+	});
+
+	it("flags an uppercase letter, the same rule the create request's own schema enforces", () => {
+		expect(entryIdProblems("Ticketing-Create").length).toBeGreaterThan(0);
+	});
+
+	it("flags a space", () => {
+		expect(entryIdProblems("ticketing create").length).toBeGreaterThan(0);
+	});
+
+	it("flags one that is too short", () => {
+		expect(entryIdProblems("a").length).toBeGreaterThan(0);
+	});
+
+	it("flags an empty string", () => {
+		expect(entryIdProblems("").length).toBeGreaterThan(0);
 	});
 });

@@ -29,7 +29,12 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
-import { clientSideDefinitionProblems, customHttpMethodWrites } from "./custom-tool-validation.ts";
+import { ApiError } from "@/lib/api-client";
+import {
+	clientSideDefinitionProblems,
+	customHttpMethodWrites,
+	entryIdProblems,
+} from "./custom-tool-validation.ts";
 
 const EMPTY_DEFINITION: CustomHttpsDefinition = {
 	host: "",
@@ -68,6 +73,48 @@ function newParam(): CustomToolParam {
 
 function newSecret(): CustomToolSecretSlot {
 	return { alias: "", slot: "header", slotName: "" };
+}
+
+/**
+ * An enum parameter's comma-separated values, edited as raw text while typing rather than a
+ * controlled value derived from the committed array: splitting/trimming/filtering on every
+ * keystroke (the committed `values.join(",")` snapping straight back into the input) made a
+ * trailing comma — the only way to start a new value — disappear the instant it was typed,
+ * silently merging `low,high` into `lowhigh`. Committed on blur instead (and, since this dialog has
+ * no native form submission of its own, naturally again whenever anything else takes focus first —
+ * moving to the review step included, since a blur always precedes the click that gets there).
+ * Mounted only while this parameter's own `type === "enum"` (`ParamEditor`'s own conditional
+ * render), so switching away and back always starts a fresh instance, seeded from whatever
+ * `setType` just reset `values` to — never a stale local draft from a previous parameter shown at
+ * the same list position.
+ */
+function EnumValuesInput({
+	initialValues,
+	onCommit,
+	disabled,
+}: Readonly<{
+	initialValues: Readonly<string[]>;
+	onCommit: (values: string[]) => void;
+	disabled: boolean;
+}>): React.ReactElement {
+	const [text, setText] = React.useState(() => initialValues.join(","));
+	function commit() {
+		onCommit(
+			text
+				.split(",")
+				.map((v) => v.trim())
+				.filter((v) => v.length > 0),
+		);
+	}
+	return (
+		<Input
+			value={text}
+			onChange={(e) => setText(e.target.value)}
+			onBlur={commit}
+			placeholder="low,high"
+			disabled={disabled}
+		/>
+	);
 }
 
 function ParamEditor({
@@ -219,16 +266,9 @@ function ParamEditor({
 					{param.type === "enum" && (
 						<div className="flex flex-col gap-1">
 							<Label className="text-xs">Values (comma-separated)</Label>
-							<Input
-								value={param.values.join(",")}
-								onChange={(e) =>
-									update(index, {
-										values: e.target.value
-											.split(",")
-											.map((v) => v.trim())
-											.filter((v) => v.length > 0),
-									})
-								}
+							<EnumValuesInput
+								initialValues={param.values}
+								onCommit={(values) => update(index, { values })}
 								disabled={disabled}
 							/>
 						</div>
@@ -388,8 +428,12 @@ export function CustomToolDialog({
 
 	const writes = customHttpMethodWrites(definition.method);
 	const clientProblems = clientSideDefinitionProblems(definition);
+	const entryIdIssues = entryIdProblems(entryId);
 	const basicsReady =
-		entryId.trim().length > 0 && name.trim().length > 0 && description.trim().length > 0;
+		entryId.trim().length > 0 &&
+		entryIdIssues.length === 0 &&
+		name.trim().length > 0 &&
+		description.trim().length > 0;
 	const canReview = basicsReady && clientProblems.length === 0;
 
 	async function confirm() {
@@ -403,6 +447,14 @@ export function CustomToolDialog({
 			}
 			handleOpenChange(false);
 			onSaved();
+		} catch (error) {
+			// `onSubmit` (the caller's own API call) throws for anything other than a `422` — an
+			// invalid entry id answered as a plain `400`, a network failure, any other status — which
+			// would otherwise be an unhandled rejection the dialog shows nothing for, stuck exactly
+			// as the user left it with no explanation at all.
+			setServerProblems([
+				error instanceof ApiError ? error.message : "Could not save this tool. Try again.",
+			]);
 		} finally {
 			setSubmitting(false);
 		}
@@ -434,6 +486,9 @@ export function CustomToolDialog({
 									className="font-mono"
 									disabled={mode === "edit" || submitting}
 								/>
+								{entryId.trim().length > 0 && entryIdIssues.length > 0 && (
+									<p className="text-xs text-destructive">{entryIdIssues[0]}</p>
+								)}
 							</div>
 							<div className="flex flex-col gap-1.5">
 								<Label htmlFor="custom-tool-name">Name</Label>

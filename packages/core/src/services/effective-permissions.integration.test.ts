@@ -1,12 +1,22 @@
 import type { AgentConfig, OrganizationConfig } from "@agent-gateway/contracts";
-import { AgentConfigSchema, OrganizationConfigSchema } from "@agent-gateway/contracts";
+import {
+	AgentConfigSchema,
+	CONFIG_SNAPSHOT_FORMAT,
+	OrganizationConfigSchema,
+} from "@agent-gateway/contracts";
 import { createPool, migrateSchema } from "@agent-gateway/db";
+import { canonicalHash } from "@agent-gateway/events";
 import { DEVELOPMENT_VERSION, silentLogger } from "@agent-gateway/logging";
 import { createBoss, migrateQueues, transactionalJobSink } from "@agent-gateway/queue";
 import { startTestPostgres, type TestPostgres } from "@agent-gateway/testkit";
 import type pg from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { applyConfig, inTransaction } from "./admin.ts";
+import {
+	applyConfig,
+	configSnapshotBundle,
+	ensureToolAttachmentsReconciled,
+	inTransaction,
+} from "./admin.ts";
 import type { ControlPlaneDeps } from "./deps.ts";
 import { loadEffectivePermissionsIn } from "./effective-permissions.ts";
 import {
@@ -567,5 +577,142 @@ describe("effective permissions: compiled attachments as the single source of tr
 				}
 			},
 		);
+
+		describe("startup: projections reconciled against the active revision (ADR-027 rollback)", () => {
+			it(
+				"a revision an older, pre-ADR-027 writer committed (no attachments snapshot) is never " +
+					"outranked by a stale hub-managed projection: reconciliation falls back to legacy, " +
+					"reading exactly the permissions that writer itself recorded",
+				async () => {
+					await attachTool(deps, {
+						agentId: "alpha",
+						entryId: "native-repository-read",
+						pinnedVersion: null,
+						mode: "allow",
+						settings: {},
+						actor: "test",
+						source: "console",
+					});
+					const before = await effectiveFor("alpha");
+					expect(before.hubManaged).toBe(true);
+					expect(before.toolPolicy.allow).toContain("repository.read");
+
+					const revisionId = await activeConfigRevisionId(deps);
+					if (revisionId === null) {
+						throw new Error("expected an active revision");
+					}
+					const [controls] = (
+						await pool.query<{ config_generation: number }>(
+							"select config_generation::int as config_generation from gateway_controls where id = 1",
+						)
+					).rows;
+					const generation = controls?.config_generation ?? 0;
+
+					// Simulates a release before ADR-027 applying a configuration change through its own,
+					// older writer: it denies `repository.read` on `alpha` directly in `permissions` (its
+					// only enforcement surface), and records a new snapshot/revision for it exactly as
+					// `writeConfigRevisionIn` always has — but it has no `toolAttachments` to call that
+					// writer with at all, so `attachments_snapshot_hash` is simply never part of its
+					// insert, and it never touches `catalog_attachments`/`tool_attachments_managed`
+					// (neither exists for it).
+					const { bundle } = await inTransaction(deps, ({ tx }) =>
+						loadActiveBundle(tx.db, revisionId),
+					);
+					if (bundle.organization === null) {
+						throw new Error("expected an organization");
+					}
+					const deniedAgents = bundle.agents.map((a) =>
+						a.id === "alpha"
+							? {
+									...a,
+									permissions: {
+										tools_allow: [],
+										tools_require_human_approval: [],
+										tools_deny: ["finance.*", "repository.read"],
+									},
+								}
+							: a,
+					);
+					const oldReleaseBundle = configSnapshotBundle({
+						organization: bundle.organization,
+						agents: deniedAgents,
+						constitution: bundle.constitution,
+						rolePrompts: bundle.rolePrompts,
+					});
+					const oldReleaseHash = canonicalHash(oldReleaseBundle);
+					await pool.query(
+						"insert into config_snapshots (hash, bundle, format, origin, created_at) " +
+							"values ($1, $2, $3, 'applied', now()) on conflict do nothing",
+						[oldReleaseHash, JSON.stringify(oldReleaseBundle), CONFIG_SNAPSHOT_FORMAT],
+					);
+					const [oldRevision] = (
+						await pool.query<{ id: number }>(
+							"insert into config_revisions " +
+								"(snapshot_hash, parent_revision_id, generation, actor, source, created_at) " +
+								"values ($1, $2, $3, 'old-release', 'cli_apply', now()) returning id::int as id",
+							[oldReleaseHash, revisionId, generation + 1],
+						)
+					).rows;
+					const oldRevisionId = oldRevision?.id;
+					if (oldRevisionId === undefined) {
+						throw new Error("expected the simulated revision to be recorded");
+					}
+					await pool.query(
+						"update gateway_controls set active_config_version = $1, config_generation = $2, " +
+							"active_config_revision = $3, updated_at = now() where id = 1",
+						[oldReleaseHash, generation + 1, oldRevisionId],
+					);
+					const deniedAlpha = oldReleaseBundle.agents.find((a) => a.id === "alpha");
+					await pool.query("update agents set config = $1 where id = 'alpha'", [
+						JSON.stringify(deniedAlpha),
+					]);
+
+					// The bug this closes: the live projections are still exactly as the earlier,
+					// hub-managed commit left them — stale, and disagreeing with the revision that is
+					// now active.
+					const [staleManaged] = (
+						await pool.query<{ tool_attachments_managed: boolean }>(
+							"select tool_attachments_managed from agents where id = 'alpha'",
+						)
+					).rows;
+					expect(staleManaged?.tool_attachments_managed).toBe(true);
+					const staleAttachments = await pool.query(
+						"select 1 from catalog_attachments where agent_id = 'alpha' and entry_id = 'native-repository-read'",
+					);
+					expect(staleAttachments.rowCount).toBe(1);
+
+					// Startup reconciliation: the active revision carries no attachments document of its
+					// own (`attachments_snapshot_hash` is null), so every agent it names is legacy —
+					// `alpha` falls back to exactly the `permissions` the old release itself wrote, never
+					// the stale attachment a newer release had granted before the rollback.
+					await ensureToolAttachmentsReconciled(deps, "upgrade");
+
+					const [reconciledManaged] = (
+						await pool.query<{ tool_attachments_managed: boolean }>(
+							"select tool_attachments_managed from agents where id = 'alpha'",
+						)
+					).rows;
+					expect(reconciledManaged?.tool_attachments_managed).toBe(false);
+					const reconciledAttachments = await pool.query(
+						"select 1 from catalog_attachments where agent_id = 'alpha'",
+					);
+					expect(reconciledAttachments.rowCount).toBe(0);
+
+					const after = await effectiveFor("alpha");
+					expect(after.hubManaged).toBe(false);
+					expect(after.toolPolicy.allow).not.toContain("repository.read");
+					expect(after.toolPolicy.deny).toContain("repository.read");
+
+					// Idempotent: nothing left to reconcile the second time, so no further audit entry.
+					await ensureToolAttachmentsReconciled(deps, "upgrade");
+					const [auditCount] = (
+						await pool.query<{ n: string }>(
+							"select count(*)::text as n from audit_log where action = 'config.tool_attachments_reconciled'",
+						)
+					).rows;
+					expect(auditCount?.n).toBe("1");
+				},
+			);
+		});
 	});
 });

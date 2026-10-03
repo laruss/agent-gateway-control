@@ -14,6 +14,7 @@ import {
 	type ControlPlaneDeps,
 	ensureAgentLifecycleAdoption,
 	ensureConfigHistory,
+	ensureToolAttachmentsReconciled,
 	ensureToolCatalogSeeded,
 	handleRunReport,
 	handleRunTimeout,
@@ -127,6 +128,10 @@ export async function startController(options: ControllerOptions): Promise<Runni
 	// before configuration history existed, so it is never left permanently unbackfilled on a
 	// controller that is restarted without an intervening `config apply`.
 	await ensureConfigHistory(deps, "system");
+	// ADR-027: reconciles `catalog_attachments`/`agents.tool_attachments_managed` back to the active
+	// revision's own attachments document, in case a release before ADR-027 changed the active
+	// configuration during a rollback interval — a no-op once both already agree with it.
+	await ensureToolAttachmentsReconciled(deps, "system");
 	// ADR-026: adopts every configured agent that has no `agent_lifecycle` row yet (a database
 	// upgraded from a release before this table existed) — a no-op once every agent is adopted.
 	await ensureAgentLifecycleAdoption(deps, "system");

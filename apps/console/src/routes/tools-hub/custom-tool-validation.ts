@@ -5,6 +5,7 @@ import {
 	customHttpsDefinitionProblems,
 	isReservedCustomHeaderName,
 	pathTemplatePlaceholders,
+	ToolCatalogEntryIdSchema,
 } from "@agent-gateway/contracts";
 
 /**
@@ -23,6 +24,17 @@ export function clientSideDefinitionProblems(
 		);
 	}
 	return customHttpsDefinitionProblems(shape.data);
+}
+
+/**
+ * Client-side mirror of `ToolCatalogEntryIdSchema` (`@agent-gateway/contracts`): the same rule a
+ * create request's own `entryId` is validated against, run here too so a name that does not fit it
+ * (uppercase, a space, too short) is refused before the "Review" step rather than only discovered
+ * from the create request's own `400`.
+ */
+export function entryIdProblems(entryId: string): Readonly<string[]> {
+	const parsed = ToolCatalogEntryIdSchema.safeParse(entryId);
+	return parsed.success ? [] : [parsed.error.issues[0]?.message ?? "invalid entry id"];
 }
 
 export { customHttpMethodWrites, isReservedCustomHeaderName, pathTemplatePlaceholders };

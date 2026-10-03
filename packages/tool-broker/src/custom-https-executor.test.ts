@@ -202,6 +202,39 @@ describe("executeCustomHttpsAction", () => {
 		expect(seenUrl).not.toContain("/etc/passwd");
 		expect(seenUrl).toContain(`api_key=${SECRET_VALUE}`);
 	});
+
+	it("a missing secret file is a clean 'failed', never 'unknown': nothing was ever sent", async () => {
+		let sent = false;
+		server = await startTestHttpsServer(tls, (_req, res) => {
+			sent = true;
+			res.end("unreachable");
+		});
+		const lookup: CustomToolDefinitionLookup = async (entryId, version) =>
+			entryId === "zendesk" && version === 1 ? definition() : null;
+		const missingSecret: CustomHttpsExecutorDeps = {
+			...deps(lookup),
+			secrets: async (alias) => {
+				throw new Error(`no secret file for alias '${alias}'`);
+			},
+		};
+		// Would previously reject (the throw from `SecretResolver` propagating out of this function
+		// uncaught) rather than resolve to a `failed` result — `processToolJob` then records that as
+		// `unknown` (manual settlement) even though the request was never built, let alone sent.
+		const result = await executeCustomHttpsAction(
+			{
+				actionType: "custom.zendesk",
+				actionParams: [
+					{ name: "id", value: "123" },
+					{ name: "title", value: "x" },
+					{ name: CUSTOM_DEFINITION_VERSION_PARAM, value: "1" },
+				],
+			},
+			missingSecret,
+			{ idempotencyKey: "tool-action:approval-5:hash", signal: new AbortController().signal },
+		);
+		expect(result.kind).toBe("failed");
+		expect(sent).toBe(false);
+	});
 });
 
 describe("parsedDefinitionLookup", () => {

@@ -5,6 +5,7 @@ import {
 	applyConfig,
 	type ControlPlaneDeps,
 	ensureToolCatalogSeeded,
+	requestAgentRetire,
 } from "@agent-gateway/core";
 import { createPool, migrateSchema } from "@agent-gateway/db";
 import { DEVELOPMENT_VERSION, silentLogger } from "@agent-gateway/logging";
@@ -124,4 +125,24 @@ describe("gateway tools adopt (CLI dispatch)", () => {
 		expect(results.every((r) => r.commit !== null || r.alreadyHubManaged)).toBe(true);
 		expect(results.some((r) => r.agentId === "mail-follower" && r.alreadyHubManaged)).toBe(true);
 	});
+
+	it(
+		"--all excludes a retired agent kept in the `agents` projection for history, rather than " +
+			"throwing mid-batch",
+		async () => {
+			// `remove_agent` (ADR-026's own retire) takes `director` out of the active configuration;
+			// its `agents` row stays, disabled, for history — exactly the row `listAgents` would have
+			// resolved `--all` from before this fix, and the one `adoptOneAgent` has no active-bundle
+			// entry for at all.
+			await requestAgentRetire(session.deps, {
+				agentId: "director",
+				actor: "test",
+				source: "cli",
+			});
+
+			const { code, results } = await runToolsAdopt(["tools", "adopt", "--all"]);
+			expect(code).toBe(0);
+			expect(results.some((r) => r.agentId === "director")).toBe(false);
+		},
+	);
 });

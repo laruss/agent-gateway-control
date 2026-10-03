@@ -328,6 +328,7 @@ async function adoptCommitRoute(
 		deps,
 		agentId,
 		CONSOLE_ACTOR,
+		parsed.data.baseRevisionId,
 		parsed.data.idempotencyKey,
 		parsed.data.reason,
 	);
@@ -343,6 +344,7 @@ async function adoptCommitRoute(
 	const response: ConsoleAdoptCommitResponse = {
 		agentId: result.agentId,
 		alreadyHubManaged: result.alreadyHubManaged,
+		baseRevisionId: result.baseRevisionId,
 		unresolved: result.unresolved,
 		before: result.before,
 		after: result.after,

@@ -142,6 +142,41 @@ All notable changes are documented here. The project follows Semantic Versioning
   [ADR-027](docs/adr/027-tool-catalog.md), and the updated
   [tool-catalog operations guide](docs/operations/tool-catalog.md)).
 
+### Fixed
+
+- A binary rollback to a release before ADR-027, a configuration change under that older release,
+  and a re-upgrade no longer resurrects (or keeps withholding) whatever access a hub-managed
+  agent's attachments granted before the rollback: `catalog_attachments`/
+  `agents.tool_attachments_managed` are reconciled against the active revision's own attachments
+  document at every controller/CLI startup, never trusted as already agreeing with it (see
+  [ADR-027](docs/adr/027-tool-catalog.md)'s rollback section and the
+  [tool-catalog operations guide](docs/operations/tool-catalog.md)).
+- The Agents hub's Tools tab no longer errors for a legacy agent whose `permissions` still name a
+  wildcard pattern (the shipped `research` example agent's `tools_deny: [finance.*, ...]`
+  included): its effective lists now accept a tool pattern, not only a concrete name.
+- "Adopt into the tools hub" now commits against exactly the revision its own preview was read
+  from — refused as a conflict (`409`), like every other preview/commit pair, rather than silently
+  committing attachments the preview never showed.
+- A custom HTTPS tool's missing secret file (or any other failure preparing the request before it
+  is sent) is now a clean `failed` outcome, instead of an uncaught error `processToolJob` would
+  otherwise record as `unknown` — manual settlement — for a request that was never actually sent.
+- `gateway tools adopt --all` now resolves agent ids from the active configuration rather than
+  every row of the `agents` projection, so a retired agent kept there for history no longer aborts
+  the batch.
+- A legacy agent whose permissions resolve to many attachments (a wide wildcard like `custom.*`
+  covering dozens of owner-created tools) now adopts, and attaches, through one bounded
+  `set_tool_attachments` operation instead of one `attach_tool` per attachment — the one shape
+  `MAX_CHANGE_SET_OPERATIONS` could not bound; a resolution past `MAX_ATTACHMENTS_PER_AGENT` is now
+  reported as a problem, dry-run included, instead of only failing opaquely at commit.
+- Retrying an attachment's `update` call after the entry it targeted was deleted since now replays
+  its already-committed idempotency key, instead of refusing it as if the first call had never
+  committed.
+- The Tools hub's custom tool form no longer mangles a comma-separated enum field while typing
+  (`low,high` turning into `lowhigh`); its value is validated on blur instead of on every keystroke.
+  A submission error (an invalid entry id, a network failure, any non-`422` response) now shows in
+  the dialog instead of leaving it silently stuck; the entry id is also validated client-side
+  against the same rule the create request's own schema enforces.
+
 ## [0.6.0] - 2026-10-02
 
 ### Added

@@ -2,7 +2,10 @@ import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { CustomHttpsDefinition } from "@agent-gateway/contracts";
+import {
+	ConsoleAgentToolsResponseSchema,
+	type CustomHttpsDefinition,
+} from "@agent-gateway/contracts";
 import { ensureAgentLifecycleAdoption } from "@agent-gateway/core";
 import { silentLogger } from "@agent-gateway/logging";
 import { hashConsolePassword, writeSecretFile } from "@agent-gateway/service";
@@ -31,6 +34,15 @@ const ATTACH_AGENT_ID = "mail-follower";
 /** Dedicated to "Adopt into the tools hub": never touched by anything else, so its own
  * `alreadyHubManaged: false` starting state is guaranteed. */
 const ADOPT_AGENT_ID = "operator";
+/** Dedicated to the adopt-commit `baseRevisionId` conflict test: never otherwise previewed or
+ * adopted, so its own `alreadyHubManaged: false` starting state is guaranteed independently of
+ * `ADOPT_AGENT_ID`'s own adoption above. Its own `tools_require_human_approval`
+ * (`finance.payment.create`/`finance.subscription.create`) resolves cleanly against the seeded
+ * finance executor entries, so adopting it never reports a `problems` entry. */
+const ADOPT_CONFLICT_AGENT_ID = "finance";
+/** An unrelated agent, attached to only to bump the active revision on in the conflict test below
+ * — never otherwise read or asserted on. */
+const BUMP_AGENT_ID = "director";
 
 const NATIVE_REPOSITORY_READ = "native-repository-read";
 const GATEWAY_MATTERMOST_POST = "gateway-mattermost-post";
@@ -307,6 +319,14 @@ describe("the Instruments & Utils hub's own management API (ADR-025/ADR-027)", (
 		});
 		const unresolved = res.body.unresolved as JsonBody[];
 		expect(unresolved.some((u) => u.pattern === "deploy.*")).toBe(true);
+
+		// `research`'s own `tools_deny` (`finance.*`, `deploy.*`) carries forward unresolved into
+		// `effective.deny` unchanged, for a legacy agent: the console's own client-side parse (the
+		// exact schema `fetchAgentTools` runs the response through) must accept the wildcard, not
+		// just the raw HTTP call above — a concrete-name-only schema here is what actually broke the
+		// Tools tab for any legacy agent whose `permissions` still name a wildcard.
+		expect(res.body.effective).toMatchObject({ deny: expect.arrayContaining(["finance.*"]) });
+		expect(() => ConsoleAgentToolsResponseSchema.parse(res.body)).not.toThrow();
 	});
 
 	it("404s the agent-tools route for an agent that does not exist", async () => {
@@ -423,9 +443,11 @@ describe("the Instruments & Utils hub's own management API (ADR-025/ADR-027)", (
 		expect(preview.body.alreadyHubManaged).toBe(false);
 		expect(preview.body.problems).toEqual([]);
 		expect((preview.body.unresolved as JsonBody[]).length).toBeGreaterThan(0);
+		expect(typeof preview.body.baseRevisionId).toBe("number");
 
 		const commit = await postJson(base, `/api/agents/${ADOPT_AGENT_ID}/tools/adopt`, session, {
 			idempotencyKey: randomUUID(),
+			baseRevisionId: preview.body.baseRevisionId,
 		});
 		expect(commit.status).toBe(200);
 		expect(commit.body.commit).not.toBeNull();
@@ -460,19 +482,79 @@ describe("the Instruments & Utils hub's own management API (ADR-025/ADR-027)", (
 			(
 				await postJson(base, "/api/agents/no-such-agent/tools/adopt", session, {
 					idempotencyKey: randomUUID(),
+					baseRevisionId: null,
 				})
 			).status,
 		).toBe(404);
 	});
 
+	it(
+		"a stale baseRevisionId on the adopt commit is refused with 409, never silently committed " +
+			"against newer state the preview never showed",
+		async () => {
+			const { base } = await withServer();
+			const session = await signIn(base);
+			const preview = await getJson(
+				base,
+				`/api/agents/${ADOPT_CONFLICT_AGENT_ID}/tools/adopt`,
+				session.cookie,
+			);
+			expect(preview.status).toBe(200);
+			const staleBase = preview.body.baseRevisionId;
+			expect(typeof staleBase).toBe("number");
+
+			// Moves the active revision on, unrelated to the agent being adopted — exactly like a
+			// second browser tab (or another operator entirely) committing something else while this
+			// preview sits open. `native-repository-read`, not `director`'s own
+			// `gateway-mattermost-post` (already covered by its `mattermost.post` permission): its
+			// legacy conversion would otherwise attach that same entry in the same revision as this
+			// explicit request.
+			const bump = await postJson(base, `/api/agents/${BUMP_AGENT_ID}/tools/attach`, session, {
+				idempotencyKey: randomUUID(),
+				entryId: NATIVE_REPOSITORY_READ,
+				pinnedVersion: null,
+				mode: "allow",
+			});
+			expect(bump.status).toBe(200);
+
+			const stale = await postJson(
+				base,
+				`/api/agents/${ADOPT_CONFLICT_AGENT_ID}/tools/adopt`,
+				session,
+				{ idempotencyKey: randomUUID(), baseRevisionId: staleBase },
+			);
+			expect(stale.status).toBe(409);
+			expect(stale.body.currentRevisionId).toBe(bump.body.revisionId);
+
+			// The happy path still works once the client reloads: a fresh preview's own
+			// `baseRevisionId` commits cleanly.
+			const freshPreview = await getJson(
+				base,
+				`/api/agents/${ADOPT_CONFLICT_AGENT_ID}/tools/adopt`,
+				session.cookie,
+			);
+			expect(freshPreview.body.baseRevisionId).toBe(bump.body.revisionId);
+			const commit = await postJson(
+				base,
+				`/api/agents/${ADOPT_CONFLICT_AGENT_ID}/tools/adopt`,
+				session,
+				{ idempotencyKey: randomUUID(), baseRevisionId: freshPreview.body.baseRevisionId },
+			);
+			expect(commit.status).toBe(200);
+			expect(commit.body.commit).not.toBeNull();
+		},
+	);
+
 	// -----------------------------------------------------------------------
-	// Auth, CSRF, wrong Origin. (A genuine 409 conflict is not forced here: every mutation on this
-	// surface reads its own base revision internally — ADR-025's exact-base, reload-and-retry
-	// pattern is for the editor's own client-supplied `baseRevisionId`, which only `/preview`/
-	// `/commit` accept. The shared `ManagementConflictError` → 409 mapping these routes reuse is
-	// already proven, deterministically, against a client-supplied stale base in
-	// `console-management.integration.test.ts`; reproducing it here would only be a timing-
-	// dependent race on the same, already-tested wiring.)
+	// Auth, CSRF, wrong Origin. (A genuine 409 conflict for every *other* mutation on this surface is
+	// not forced here: every one of `attach`/`detach`/`update` reads its own base revision internally
+	// right before committing (ADR-027's own attach/detach/update path, not a client-supplied one) —
+	// the editor's exact-base, reload-and-retry pattern (a client-supplied `baseRevisionId`) is for
+	// `/preview`/`/commit` and, as of the adopt test above, `/tools/adopt` too. The shared
+	// `ManagementConflictError` → 409 mapping every one of these routes reuses is already proven,
+	// deterministically, for `/preview`/`/commit` in `console-management.integration.test.ts` and for
+	// `/tools/adopt` right above; reproducing it again for `attach`/`detach`/`update` here would only
+	// be a timing-dependent race on the same, already-tested wiring.)
 	// -----------------------------------------------------------------------
 
 	it("401s the hub's own routes without a session", async () => {

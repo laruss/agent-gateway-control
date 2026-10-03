@@ -1,4 +1,9 @@
-import type { AgentConfig, OrganizationConfig } from "@agent-gateway/contracts";
+import { randomUUID } from "node:crypto";
+import type {
+	AgentConfig,
+	CustomHttpsDefinition,
+	OrganizationConfig,
+} from "@agent-gateway/contracts";
 import { AgentConfigSchema, OrganizationConfigSchema } from "@agent-gateway/contracts";
 import { createPool, migrateSchema } from "@agent-gateway/db";
 import { DEVELOPMENT_VERSION, silentLogger } from "@agent-gateway/logging";
@@ -16,7 +21,9 @@ import {
 	prepareChange,
 } from "./management.ts";
 import {
+	adoptAgentToolAttachments,
 	attachTool,
+	createCustomHttpsTool,
 	deleteCatalogEntry,
 	detachTool,
 	editCatalogEntry,
@@ -403,6 +410,230 @@ describe("tool catalog service (ADR-027)", () => {
 			{ entryId: "gateway-memory-write", pinnedVersion: null, mode: "allow", settings: {} },
 		]);
 	});
+
+	it(
+		"updateAttachment replays an already-committed idempotency key even after the entry it " +
+			"targeted was deleted since, rather than refusing it as if it had never committed",
+		async () => {
+			const entryId = "retry-after-delete";
+			const definition: CustomHttpsDefinition = {
+				host: "api.example.test",
+				pathTemplate: "/items/{id}",
+				method: "GET",
+				parameters: [
+					{ name: "id", slot: "path", slotName: "id", type: "string", minLength: 1, maxLength: 20 },
+				],
+				secretSlots: [],
+				idempotency: null,
+				responseLimits: {
+					maxResponseBytes: 65_536,
+					allowedContentTypes: ["application/json"],
+					timeoutMs: 5000,
+					includeBodyPreview: true,
+				},
+			};
+			await createCustomHttpsTool(deps, {
+				entryId,
+				name: "Retry test tool",
+				description: "A test custom HTTPS tool.",
+				httpsDefinition: definition,
+				actor: "test",
+			});
+			await attachTool(deps, {
+				agentId: "alpha",
+				entryId,
+				pinnedVersion: null,
+				mode: "disabled",
+				settings: {},
+				actor: "test",
+				source: "console",
+			});
+			const idempotencyKey = randomUUID();
+			const first = await updateAttachment(deps, {
+				agentId: "alpha",
+				entryId,
+				mode: "require_approval",
+				actor: "test",
+				source: "console",
+				idempotencyKey,
+			});
+			expect(first.replayed).toBe(false);
+
+			await deleteCatalogEntry(deps, entryId, "test");
+
+			// Previously, `checkAttachable` ran before the idempotency-key replay check: a retry
+			// here would throw "catalog entry 'retry-after-delete' does not exist" instead of
+			// replaying the commit that already happened (`attachTool`'s own ordering, mirrored).
+			const retry = await updateAttachment(deps, {
+				agentId: "alpha",
+				entryId,
+				mode: "require_approval",
+				actor: "test",
+				source: "console",
+				idempotencyKey,
+			});
+			expect(retry.replayed).toBe(true);
+			expect(retry.revisionId).toBe(first.revisionId);
+		},
+	);
+
+	it(
+		"a wide legacy wildcard (more attachments than MAX_CHANGE_SET_OPERATIONS) converts and " +
+			"attaches in a single bounded set_tool_attachments operation, not one attach_tool per " +
+			"attachment",
+		async () => {
+			const WIDE_COUNT = 51;
+			const definition: CustomHttpsDefinition = {
+				host: "api.example.test",
+				pathTemplate: "/items",
+				method: "GET",
+				parameters: [],
+				secretSlots: [],
+				idempotency: null,
+				responseLimits: {
+					maxResponseBytes: 65_536,
+					allowedContentTypes: ["application/json"],
+					timeoutMs: 5000,
+					includeBodyPreview: true,
+				},
+			};
+			for (let i = 0; i < WIDE_COUNT; i++) {
+				await createCustomHttpsTool(deps, {
+					entryId: `wide-tool-${i}`,
+					name: `Wide tool ${i}`,
+					description: "A test custom HTTPS tool.",
+					httpsDefinition: definition,
+					actor: "test",
+				});
+			}
+			await applyConfig(
+				deps,
+				{
+					organization: organization(),
+					agents: [
+						agent("finance"),
+						agent("wide", {
+							permissions: {
+								tools_allow: [],
+								tools_require_human_approval: [],
+								tools_deny: ["finance.*", "custom.*"],
+							},
+						}),
+					],
+					constitution: "Be helpful.",
+					rolePrompts: { finance: "x", wide: "x" },
+				},
+				"test",
+			);
+
+			// Before this fix, the legacy conversion committed one `attach_tool` per resolved
+			// attachment (at least 51, one per `wide-tool-N`, plus `finance.*`'s own coverage) plus
+			// the one actually requested here — over `MAX_CHANGE_SET_OPERATIONS` (50) — so this would
+			// have thrown "cannot be converted automatically here" even though every individual
+			// attachment resolves cleanly on its own.
+			const attached = await attachTool(deps, {
+				agentId: "wide",
+				entryId: "gateway-memory-write",
+				pinnedVersion: null,
+				mode: "allow",
+				settings: {},
+				actor: "test",
+				source: "console",
+			});
+			// `finance.*`'s own resolved coverage is not asserted exactly here: an earlier test in
+			// this file permanently tombstones `executor-finance-subscription-create`, so it varies
+			// with run order — only that every `wide-tool-N` resolved is asserted below.
+			expect(attached.legacyConversion.length).toBeGreaterThanOrEqual(WIDE_COUNT);
+			const wideToolIds = new Set(Array.from({ length: WIDE_COUNT }, (_, i) => `wide-tool-${i}`));
+			const resolvedWideIds = new Set(
+				attached.legacyConversion.filter((a) => wideToolIds.has(a.entryId)).map((a) => a.entryId),
+			);
+			expect(resolvedWideIds.size).toBe(WIDE_COUNT);
+			const { bundle } = await inTransaction(deps, ({ tx }) =>
+				loadActiveBundle(tx.db, attached.revisionId),
+			);
+			expect(
+				bundle.toolAttachments.wide?.some(
+					(a) => a.entryId === "gateway-memory-write" && a.mode === "allow",
+				),
+			).toBe(true);
+			expect(bundle.toolAttachments.wide?.length ?? 0).toBeGreaterThanOrEqual(WIDE_COUNT + 1);
+		},
+	);
+
+	it(
+		"adoptAgentToolAttachments reports a resolution past MAX_ATTACHMENTS_PER_AGENT as a " +
+			"problem, dry-run included, rather than only failing opaquely once a commit is attempted",
+		async () => {
+			// Builds on the custom entries the previous test already created (catalog entries are
+			// never reset between tests in this file — see `reset`'s own doc comment) with enough
+			// more that `custom.*` now resolves past `MAX_ATTACHMENTS_PER_AGENT` (128) for a fresh
+			// agent of its own.
+			const EXTRA_COUNT = 90;
+			const definition: CustomHttpsDefinition = {
+				host: "api.example.test",
+				pathTemplate: "/items",
+				method: "GET",
+				parameters: [],
+				secretSlots: [],
+				idempotency: null,
+				responseLimits: {
+					maxResponseBytes: 65_536,
+					allowedContentTypes: ["application/json"],
+					timeoutMs: 5000,
+					includeBodyPreview: true,
+				},
+			};
+			for (let i = 0; i < EXTRA_COUNT; i++) {
+				await createCustomHttpsTool(deps, {
+					entryId: `too-wide-tool-${i}`,
+					name: `Too wide tool ${i}`,
+					description: "A test custom HTTPS tool.",
+					httpsDefinition: definition,
+					actor: "test",
+				});
+			}
+			await applyConfig(
+				deps,
+				{
+					organization: organization(),
+					agents: [
+						agent("finance"),
+						agent("toowide", {
+							permissions: {
+								tools_allow: [],
+								tools_require_human_approval: [],
+								tools_deny: ["finance.*", "custom.*"],
+							},
+						}),
+					],
+					constitution: "Be helpful.",
+					rolePrompts: { finance: "x", toowide: "x" },
+				},
+				"test",
+			);
+
+			const [preview] = await adoptAgentToolAttachments(deps, {
+				agentIds: ["toowide"],
+				dryRun: true,
+				actor: "test",
+			});
+			expect(preview?.commit).toBeNull();
+			expect(
+				preview?.problems.some((p) => p.includes("more than the") && p.includes("may hold")),
+			).toBe(true);
+
+			// Not only previewed: attempting the real commit refuses the same way, never partially
+			// committing a truncated list.
+			const [committed] = await adoptAgentToolAttachments(deps, {
+				agentIds: ["toowide"],
+				dryRun: false,
+				actor: "test",
+			});
+			expect(committed?.commit).toBeNull();
+			expect(committed?.problems.length).toBeGreaterThan(0);
+		},
+	);
 
 	it("refuses attaching 'allow' once the entry's risk floor requires approval", async () => {
 		await expect(

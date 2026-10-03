@@ -67,7 +67,10 @@ export function AdoptDialog({
 		}
 		setState({ status: "applying", preview: state.preview });
 		try {
-			const result = await commitAdopt(agentId, { idempotencyKey: crypto.randomUUID() });
+			const result = await commitAdopt(agentId, {
+				idempotencyKey: crypto.randomUUID(),
+				baseRevisionId: state.preview.baseRevisionId,
+			});
 			if (result.kind === "conflict") {
 				setState({ status: "conflict" });
 				return;

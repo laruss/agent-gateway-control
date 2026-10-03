@@ -465,6 +465,7 @@ export async function consoleAdoptPreview(
 	return {
 		agentId: result.agentId,
 		alreadyHubManaged: result.alreadyHubManaged,
+		baseRevisionId: result.revisionId,
 		unresolved: [...result.unresolved],
 		before: result.before,
 		after: result.after,
@@ -480,11 +481,17 @@ export type ConsoleAdoptCommitResult =
 	| Readonly<{ kind: "invalid"; problems: Readonly<string[]> }>;
 
 /** `POST /api/agents/:id/tools/adopt`: commits the same conversion {@link consoleAdoptPreview}
- * previewed (ADR-027's `adoptAgentToolAttachments`, `source: "console"`). */
+ * previewed (ADR-027's `adoptAgentToolAttachments`, `source: "console"`) — against exactly the
+ * revision that preview was read from (`baseRevisionId`, echoed back from its response), never a
+ * freshly re-read "current" one: a configuration change landing between the preview and this
+ * confirm is a conflict (`ManagementConflictError` -> `kind: "conflict"`), the same as every other
+ * preview/commit pair in the console, rather than a commit silently built from newer attachments the
+ * preview never showed. */
 export async function consoleAdoptCommit(
 	deps: ControlPlaneDeps,
 	agentId: string,
 	actor: string,
+	baseRevisionId: number | null,
 	idempotencyKey: string,
 	reason: string | undefined,
 ): Promise<ConsoleAdoptCommitResult> {
@@ -498,6 +505,7 @@ export async function consoleAdoptCommit(
 			actor,
 			source: "console",
 			idempotencyKey,
+			baseRevisionId,
 			...(reason === undefined ? {} : { reason }),
 		});
 		if (result === undefined) {
@@ -507,6 +515,7 @@ export async function consoleAdoptCommit(
 			kind: "ok",
 			agentId: result.agentId,
 			alreadyHubManaged: result.alreadyHubManaged,
+			baseRevisionId: result.revisionId,
 			unresolved: [...result.unresolved],
 			before: result.before,
 			after: result.after,

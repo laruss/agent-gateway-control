@@ -171,10 +171,14 @@ export const ConsoleAgentToolsResponseSchema = z.strictObject({
 	hubManaged: z.boolean(),
 	requested: z.array(ToolAttachmentSchema),
 	unresolved: z.array(ConsoleUnresolvedPatternSchema),
+	// A hub-managed agent's compiled lists are always concrete tool names (every catalog entry's
+	// own `implementationKey` is one); a legacy agent's are its raw `permissions` lists, unchanged,
+	// which may still carry a wildcard pattern (`finance.*`) nothing has converted yet — the
+	// pattern schema already covers both shapes, so the Tools tab can show either without erroring.
 	effective: z.strictObject({
-		allow: z.array(ToolNameSchema),
-		requireApproval: z.array(ToolNameSchema),
-		deny: z.array(ToolNameSchema),
+		allow: z.array(ToolPatternSchema),
+		requireApproval: z.array(ToolPatternSchema),
+		deny: z.array(ToolPatternSchema),
 	}),
 	capabilities: z.array(CapabilityDescriptionSchema),
 	/** A tool in `effective.allow` whose adapter-specific prerequisite is not itself granted
@@ -251,6 +255,11 @@ export type ConsoleUpdateAttachmentResponse = z.infer<typeof ConsoleUpdateAttach
 export const ConsoleAdoptPreviewResponseSchema = z.strictObject({
 	agentId: AgentIdSchema,
 	alreadyHubManaged: z.boolean(),
+	/** The revision this preview was read against — echoed back on the commit request, which
+	 * refuses with `409` once the active configuration has moved past it (the same `baseRevisionId`
+	 * round trip `ConsolePreviewResponseSchema`/`ConsoleCommitRequestSchema` already use for the
+	 * agent-patch flow), so a confirm can never commit attachments this preview never showed. */
+	baseRevisionId: z.int().positive().nullable(),
 	unresolved: z.array(ConsoleUnresolvedPatternSchema),
 	before: AgentPermissionsSchema,
 	after: AgentPermissionsSchema,
@@ -261,6 +270,9 @@ export type ConsoleAdoptPreviewResponse = z.infer<typeof ConsoleAdoptPreviewResp
 
 export const ConsoleAdoptCommitRequestSchema = z.strictObject({
 	idempotencyKey: UuidSchema,
+	/** The preview's own `baseRevisionId`; a commit against a configuration that has since moved on
+	 * is refused as a conflict (`409`), never silently recomputed against the newer, live state. */
+	baseRevisionId: z.int().positive().nullable(),
 	reason: ConfigRevisionReasonSchema.optional(),
 });
 export type ConsoleAdoptCommitRequest = z.infer<typeof ConsoleAdoptCommitRequestSchema>;

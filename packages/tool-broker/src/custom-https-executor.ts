@@ -177,45 +177,63 @@ export async function executeCustomHttpsAction(
 	if (context.signal.aborted) {
 		return { kind: "failed", error: "cancelled before secrets were resolved" };
 	}
-	// `customToolParamIssues` already refused a path-traversal attempt, an out-of-bounds value or
-	// an undeclared parameter before this request was ever approved (`approvalPolicyIssues`) and
-	// again at grant time (`executionIssues`); `resolveCustomHttpRequest` itself encodes every path
-	// value into exactly one segment regardless, so even a value that reached this point some other
-	// way (a forged job) can never escape its segment — encoding, not re-validation, is what keeps
-	// this call itself safe.
-	const resolved = resolveCustomHttpRequest(definition, job.actionParams);
-	const secretValues = await resolvedSecretValues(definition, deps.secrets);
+	let path: string;
+	let headers: Record<string, string>;
+	let body: string | null;
+	let secretValues: ReadonlyMap<string, string>;
+	try {
+		// `customToolParamIssues` already refused a path-traversal attempt, an out-of-bounds value or
+		// an undeclared parameter before this request was ever approved (`approvalPolicyIssues`) and
+		// again at grant time (`executionIssues`); `resolveCustomHttpRequest` itself encodes every path
+		// value into exactly one segment regardless, so even a value that reached this point some other
+		// way (a forged job) can never escape its segment — encoding, not re-validation, is what keeps
+		// this call itself safe.
+		const resolved = resolveCustomHttpRequest(definition, job.actionParams);
+		// A missing secret file throws here (`SecretResolver`'s own contract); caught below.
+		secretValues = await resolvedSecretValues(definition, deps.secrets);
 
-	const query = new URLSearchParams();
-	for (const q of resolved.query) {
-		query.append(q.name, String(q.value));
-	}
-	for (const name of resolved.secretQueryNames) {
-		query.append(name, secretValues.get(`query:${name}`) ?? "");
-	}
-	const queryString = query.toString();
-	const path = `${resolved.path}${queryString === "" ? "" : `?${queryString}`}`;
-
-	const headers: Record<string, string> = {};
-	for (const h of resolved.headers) {
-		headers[h.name] = String(h.value);
-	}
-	for (const name of resolved.secretHeaderNames) {
-		headers[name] = secretValues.get(`header:${name}`) ?? "";
-	}
-	if (definition.idempotency !== null) {
-		headers[definition.idempotency.headerName] = context.idempotencyKey;
-	}
-
-	let body: string | null = null;
-	if (definition.method !== "GET") {
-		const bodyFields: Record<string, string | number | boolean> = { ...resolved.bodyFields };
-		for (const name of resolved.secretBodyFieldNames) {
-			bodyFields[name] = secretValues.get(`body:${name}`) ?? "";
+		const query = new URLSearchParams();
+		for (const q of resolved.query) {
+			query.append(q.name, String(q.value));
 		}
-		if (Object.keys(bodyFields).length > 0) {
-			body = JSON.stringify(bodyFields);
+		for (const name of resolved.secretQueryNames) {
+			query.append(name, secretValues.get(`query:${name}`) ?? "");
 		}
+		const queryString = query.toString();
+		path = `${resolved.path}${queryString === "" ? "" : `?${queryString}`}`;
+
+		headers = {};
+		for (const h of resolved.headers) {
+			headers[h.name] = String(h.value);
+		}
+		for (const name of resolved.secretHeaderNames) {
+			headers[name] = secretValues.get(`header:${name}`) ?? "";
+		}
+		if (definition.idempotency !== null) {
+			headers[definition.idempotency.headerName] = context.idempotencyKey;
+		}
+
+		body = null;
+		if (definition.method !== "GET") {
+			const bodyFields: Record<string, string | number | boolean> = { ...resolved.bodyFields };
+			for (const name of resolved.secretBodyFieldNames) {
+				bodyFields[name] = secretValues.get(`body:${name}`) ?? "";
+			}
+			if (Object.keys(bodyFields).length > 0) {
+				body = JSON.stringify(bodyFields);
+			}
+		}
+	} catch (error) {
+		// Nothing has been sent yet — a missing secret file (`SecretResolver` throws rather than
+		// substituting a placeholder) or any other failure preparing the request is a clean, known
+		// `failed`, never left to propagate into `processToolJob`'s `unknown` (reserved for after a
+		// request may actually have reached the destination, ADR-018). No secret value was ever
+		// resolved here (preparation failed before any `resolvedSecretValues` call could return one),
+		// so there is nothing yet to scrub this message against.
+		return {
+			kind: "failed",
+			error: `could not prepare the request: ${error instanceof Error ? error.message : String(error)}`,
+		};
 	}
 
 	if (context.signal.aborted) {

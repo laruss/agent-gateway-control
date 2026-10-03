@@ -323,3 +323,17 @@ Nothing about attachments or the compiler needs to be undone before a rollback; 
 version 3 turn inputs do (see [ADR-023](../adr/023-console-and-operator.md)'s turn input version 3
 section) — settle or cancel them first, the same deploy-runbook step a version 2 rollback already
 needed.
+
+**Re-upgrading afterward is also safe, by the same reconciliation every startup already runs.** If
+anything was actually changed (a `config apply`, a direct toggle) while the rolled-back, older
+release was running, its own writer recorded a new revision with no attachments document at all —
+it has no `toolAttachments` parameter to call this release's writer with. Re-upgrading no longer
+trusts the live `catalog_attachments`/`agents.tool_attachments_managed` projections at that point —
+they could still be exactly what they were *before* the rollback, disagreeing with the revision
+that is actually active now. The controller and every CLI session reconcile both projections
+against the active revision's own attachments document at startup, right after the existing
+configuration-history backfill: a revision with no attachments document of its own means every
+agent it names is legacy from here on, enforced exactly from the `permissions` the older release
+itself wrote — never a stale, resurrected (or wrongly withheld) attachment. This is a no-op, and
+cheap, whenever the projections already agree with the active revision, which is the overwhelming
+common case; it only ever has real work to do once, right after a rollback interval like this.

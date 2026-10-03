@@ -15,7 +15,7 @@ import {
 	customToolActionType,
 	IdempotencyKeySchema,
 	type JsonObject,
-	MAX_CHANGE_SET_OPERATIONS,
+	MAX_ATTACHMENTS_PER_AGENT,
 	type RuntimeAdapterId,
 	riskFloorAllows,
 	type ToolAttachment,
@@ -1004,6 +1004,11 @@ async function currentRevisionIdIn(db: Db): Promise<number | null> {
 
 export type AdoptAgentResult = Readonly<{
 	agentId: AgentId;
+	/** The revision this result was read against (`AdoptToolAttachmentsInput.baseRevisionId` when
+	 * given, else whatever was live at read time) — a console preview echoes this back so its own
+	 * commit can be refused as a conflict once it no longer names the active revision, instead of
+	 * silently recomputing (and committing) against newer, live state the preview never showed. */
+	revisionId: number | null;
 	/** Already hub-managed before this call: left untouched, nothing to adopt. */
 	alreadyHubManaged: boolean;
 	unresolved: Readonly<LegacyUnresolvedPattern[]>;
@@ -1040,6 +1045,13 @@ export type AdoptToolAttachmentsInput = Readonly<{
 	/** A caller-supplied retry token, forwarded to `commitChange` exactly like every other console
 	 * mutation's own idempotency key; absent for the CLI, which has none of its own to give. */
 	idempotencyKey?: string;
+	/** Pins the read (and, if anything commits, the commit's own base) to this exact revision
+	 * instead of whatever is live when this call runs — the console's own confirm step, echoing
+	 * back the revision its preview already showed, so a configuration change landing in between is
+	 * a conflict (`ManagementConflictError`) rather than a commit silently built from newer state the
+	 * preview never displayed. Absent for the CLI (and for a preview, console included), which both
+	 * want the ordinary "read whatever is live, commit against exactly that" behaviour unchanged. */
+	baseRevisionId?: number | null;
 }>;
 
 /**
@@ -1090,7 +1102,7 @@ async function adoptOneAgent(
 		revisionId,
 		bundle,
 		attachments: all,
-	} = await loadAllAgentToolAttachmentsWithRevision(deps);
+	} = await loadAllAgentToolAttachmentsWithRevision(deps, input.baseRevisionId);
 	const read = all[agentId];
 	if (read === undefined) {
 		throw new AdminError(`agent '${agentId}' does not exist`);
@@ -1118,6 +1130,7 @@ async function adoptOneAgent(
 	if (read.hubManaged) {
 		return {
 			agentId,
+			revisionId,
 			alreadyHubManaged: true,
 			unresolved: [],
 			before: compiledPermissions,
@@ -1139,9 +1152,21 @@ async function adoptOneAgent(
 						`'${attachment.mode}'`,
 				];
 	});
+	// A wide legacy pattern (`custom.*` covering dozens of owner-created tools) can resolve to more
+	// attachments than one agent may ever hold (`MAX_ATTACHMENTS_PER_AGENT`) even though every one
+	// of them individually resolves cleanly — found and reported here, in both the dry-run preview
+	// and the real commit below, rather than only discovered as an opaque schema refusal once
+	// `set_tool_attachments` actually tries to commit a list this long.
+	if (read.attachments.length > MAX_ATTACHMENTS_PER_AGENT) {
+		problems.push(
+			`resolves to ${read.attachments.length} attachments, more than the ` +
+				`${MAX_ATTACHMENTS_PER_AGENT} a single agent may hold`,
+		);
+	}
 	if (problems.length > 0) {
 		return {
 			agentId,
+			revisionId,
 			alreadyHubManaged: false,
 			unresolved: read.unresolved,
 			before: agent.permissions,
@@ -1154,6 +1179,7 @@ async function adoptOneAgent(
 	if (input.dryRun) {
 		return {
 			agentId,
+			revisionId,
 			alreadyHubManaged: false,
 			unresolved: read.unresolved,
 			before: agent.permissions,
@@ -1163,22 +1189,14 @@ async function adoptOneAgent(
 			commit: null,
 		};
 	}
-	// An agent whose legacy conversion resolves to zero attachments (every pattern unresolved, or
-	// no `permissions` at all) still needs to become hub-managed with that explicitly empty list —
-	// `attach_tool` cannot express "no attachments at all", so this is the one case
-	// `set_tool_attachments` exists for (ADR-027); every other agent keeps the targeted,
-	// per-attachment `attach_tool` changeset it always has.
-	const changeSet: ChangeSet =
-		read.attachments.length === 0
-			? [{ type: "set_tool_attachments", agentId, attachments: [] }]
-			: read.attachments.map((attachment) => ({
-					type: "attach_tool",
-					agentId,
-					entryId: attachment.entryId,
-					pinnedVersion: attachment.pinnedVersion,
-					mode: attachment.mode,
-					settings: attachment.settings,
-				}));
+	// One bounded operation regardless of how many attachments resolved (`MAX_CHANGE_SET_OPERATIONS`
+	// could not bound one `attach_tool` per attachment for a wide legacy pattern; the check above
+	// already refused anything past `MAX_ATTACHMENTS_PER_AGENT`, the limit that still applies to a
+	// single `set_tool_attachments`) — and the only operation that can mark an agent hub-managed
+	// with an explicitly empty list at all, the zero-attachments case (ADR-027).
+	const changeSet: ChangeSet = [
+		{ type: "set_tool_attachments", agentId, attachments: [...read.attachments] },
+	];
 	const commit = await commitChange(deps, {
 		changeSet,
 		baseRevisionId: revisionId,
@@ -1193,6 +1211,7 @@ async function adoptOneAgent(
 	});
 	return {
 		agentId,
+		revisionId,
 		alreadyHubManaged: false,
 		unresolved: read.unresolved,
 		before: agent.permissions,
@@ -1263,31 +1282,25 @@ export type AttachToolResult = CommitChangeResult &
 	}>;
 
 /**
- * The exact `attach_tool` operations {@link legacyAttachmentsFromPermissions} resolves for
- * `agentId`'s current `permissions`, carrying its legacy coverage forward into the same revision
- * that attaches a new entry on top — `attach_tool`'s own semantics (replace any existing
- * attachment of the same `entryId`) mean the new attachment wins regardless of order, should it
- * name one of these. `null` only when a resolved attachment's mode its own catalog entry's `kind`
- * does not support (`modeSupportedByKind`) — the same refusal `adoptOneAgent` gives, surfaced here
- * instead of silently dropping coverage or guessing a mode that was never actually configured.
+ * The attachments {@link legacyAttachmentsFromPermissions} resolves for `agentId`'s current
+ * `permissions` — its legacy coverage, carried forward into the same revision that attaches a new
+ * entry on top (`attachTool`, which merges in the entry actually requested before committing).
+ * `null` only when a resolved attachment's mode its own catalog entry's `kind` does not support
+ * (`modeSupportedByKind`) — the same refusal `adoptOneAgent` gives, surfaced here instead of
+ * silently dropping coverage or guessing a mode that was never actually configured.
  */
-async function legacyConversionChangeSet(
+async function legacyConversionAttachments(
 	db: Db,
 	agentId: AgentId,
 	permissions: AgentPermissions,
-): Promise<Readonly<{
-	ops: Readonly<ChangeOperation[]>;
-	attachments: Readonly<ToolAttachment[]>;
-}> | null> {
+): Promise<Readonly<ToolAttachment[]> | null> {
 	const known = await knownCatalogEntries(db);
 	// Every legacy pattern converts, the entry about to be attached included: leaving one out could
 	// drop an explicit denial that another attachment's implied capabilities would then grant
 	// (`tests.run` implies `repository.read`).
 	const { attachments } = legacyAttachmentsFromPermissions(permissions, known);
 	if (attachments.length === 0) {
-		// Still hub-managed from here on, with an explicitly empty list: `attach_tool` cannot say
-		// that, and a change set needs at least one operation.
-		return { ops: [{ type: "set_tool_attachments", agentId, attachments: [] }], attachments: [] };
+		return [];
 	}
 	const toolAttachments: ToolAttachmentsBundle = { [agentId]: [...attachments] };
 	const catalog = await loadCompilableCatalogEntries(db, toolAttachments);
@@ -1297,15 +1310,7 @@ async function legacyConversionChangeSet(
 			return null;
 		}
 	}
-	const ops: ChangeOperation[] = attachments.map((attachment) => ({
-		type: "attach_tool",
-		agentId,
-		entryId: attachment.entryId,
-		pinnedVersion: attachment.pinnedVersion,
-		mode: attachment.mode,
-		settings: attachment.settings,
-	}));
-	return { ops, attachments };
+	return attachments;
 }
 
 /** Binds (or rebinds) `input.entryId` to `input.agentId`, through the managed-configuration
@@ -1378,18 +1383,43 @@ export async function attachTool(
 		throw new AdminError(`agent '${input.agentId}' does not exist`);
 	}
 	const conversion = await inTransaction(deps, ({ tx }) =>
-		legacyConversionChangeSet(tx.db, input.agentId, agent.permissions),
+		legacyConversionAttachments(tx.db, input.agentId, agent.permissions),
 	);
-	if (conversion === null || conversion.ops.length + 1 > MAX_CHANGE_SET_OPERATIONS) {
+	if (conversion === null) {
 		throw new AdminError(
 			`agent '${input.agentId}' is not yet managed in the tools hub and its legacy ` +
 				`permissions cannot be converted automatically here; run ` +
 				`'gateway tools adopt ${input.agentId}' first`,
 		);
 	}
+	// The entry actually requested wins over whatever the legacy conversion resolved for the same
+	// one, same as `attach_tool`'s own per-op semantics (replace any existing attachment of the same
+	// `entryId`) — carried forward here as a plain merge, now that both land in a single
+	// `set_tool_attachments` operation rather than one `attach_tool` per converted entry
+	// (`MAX_CHANGE_SET_OPERATIONS` could not bound a wide legacy `tools_allow`/`tools_deny`, e.g. a
+	// `custom.*` wildcard resolving to dozens of entries; `MAX_ATTACHMENTS_PER_AGENT`, checked next,
+	// is the only limit that still applies).
+	const newAttachment: ToolAttachment = {
+		entryId: input.entryId,
+		pinnedVersion: input.pinnedVersion,
+		mode: input.mode,
+		settings: input.settings ?? {},
+	};
+	const merged = [...conversion.filter((a) => a.entryId !== input.entryId), newAttachment];
+	if (merged.length > MAX_ATTACHMENTS_PER_AGENT) {
+		throw new AdminError(
+			`agent '${input.agentId}' is not yet managed in the tools hub and its legacy ` +
+				`permissions resolve to ${merged.length} attachments, more than the ` +
+				`${MAX_ATTACHMENTS_PER_AGENT} a single agent may hold; run ` +
+				`'gateway tools adopt ${input.agentId}' first`,
+		);
+	}
+	const changeSet: ChangeSet = [
+		{ type: "set_tool_attachments", agentId: input.agentId, attachments: merged },
+	];
 	return {
-		...(await commit([...conversion.ops, attach], revisionId)),
-		legacyConversion: conversion.attachments,
+		...(await commit(changeSet, revisionId)),
+		legacyConversion: conversion,
 	};
 }
 
@@ -1447,9 +1477,6 @@ export async function updateAttachment(
 	deps: ControlPlaneDeps,
 	input: UpdateAttachmentInput,
 ): Promise<CommitChangeResult> {
-	if (input.mode !== undefined) {
-		await checkAttachable(deps, input.entryId, input.pinnedVersion ?? null, input.mode);
-	}
 	const changeSet: ChangeSet = [
 		{
 			type: "update_attachment",
@@ -1460,13 +1487,30 @@ export async function updateAttachment(
 			...(input.settings === undefined ? {} : { settings: input.settings }),
 		},
 	];
-	const baseRevisionId = await activeConfigRevisionId(deps);
-	return commitChange(deps, {
-		changeSet,
-		baseRevisionId,
-		actor: input.actor,
-		source: input.source,
-		...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
-		...(input.reason === undefined ? {} : { reason: input.reason }),
-	});
+	const commit = (baseRevisionId: number | null) =>
+		commitChange(deps, {
+			changeSet,
+			baseRevisionId,
+			actor: input.actor,
+			source: input.source,
+			...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
+			...(input.reason === undefined ? {} : { reason: input.reason }),
+		});
+	// A key that already committed is answered by `commitChange` itself — replayed when it names
+	// this very request (the change set here never varies with catalog/agent state, so the default
+	// replay hash, the change set itself, already matches a retry exactly — no `requestIdentity`
+	// override needed, unlike `attachTool`'s own conversion-dependent change set), refused otherwise
+	// — before anything about the current catalog is checked: a retry after `input.entryId` was
+	// deleted since the first, successful commit must not turn into an error (`attachTool`'s own
+	// ordering, for the same reason).
+	if (
+		input.idempotencyKey !== undefined &&
+		(await findConfigRevisionByIdempotencyKey(deps, input.idempotencyKey)) !== null
+	) {
+		return commit(await activeConfigRevisionId(deps));
+	}
+	if (input.mode !== undefined) {
+		await checkAttachable(deps, input.entryId, input.pinnedVersion ?? null, input.mode);
+	}
+	return commit(await activeConfigRevisionId(deps));
 }

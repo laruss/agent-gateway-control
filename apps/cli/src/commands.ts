@@ -23,6 +23,7 @@ import {
 import {
 	type AdoptAgentResult,
 	ackConfigRevision,
+	activeConfigRevisionId,
 	adoptAgentToolAttachments,
 	applyConfig,
 	budgetReport,
@@ -35,8 +36,10 @@ import {
 	decideMemory,
 	ensureAgentLifecycleAdoption,
 	ensureConfigHistory,
+	ensureToolAttachmentsReconciled,
 	ensureToolCatalogSeeded,
 	ingestEvent,
+	inTransaction,
 	killAll,
 	listAgents,
 	listApprovals,
@@ -47,6 +50,7 @@ import {
 	listRuns,
 	listToolActions,
 	listWaits,
+	loadActiveBundle,
 	loadAgentChannelAssignments,
 	MAINTENANCE_STALE_MS,
 	MEMORY_REVIEW_STATUSES,
@@ -1076,6 +1080,10 @@ async function runSessionCommand(
 			// command past this point — not just `config apply` — sees an up-to-date base revision
 			// (a console or `gateway agents enable|disable` reads it through `prepareChange`).
 			await ensureConfigHistory(session.deps, actor());
+			// ADR-027: reconciles `catalog_attachments`/`agents.tool_attachments_managed` back to the
+			// active revision's own attachments document, in case a release before ADR-027 changed
+			// the active configuration during a rollback interval.
+			await ensureToolAttachmentsReconciled(session.deps, actor());
 			// ADR-026: adopts every configured agent that has no `agent_lifecycle` row yet.
 			await ensureAgentLifecycleAdoption(session.deps, actor());
 			// ADR-027: seeds every built-in catalog entry this release ships.
@@ -1448,8 +1456,20 @@ export async function dispatchSessionCommand(
 			}
 			const dryRun = args.includes("--dry-run");
 			const reason = flag(args, "reason");
-			const agentIds =
-				target === "--all" ? (await listAgents(deps)).map((row) => row.id) : [target];
+			// `listAgents` reads every row of the `agents` projection, retired ones kept for history
+			// (ADR-026) included; `--all` means every agent the *active configuration* actually
+			// names, or adopting one no longer in it throws mid-batch (`adoptOneAgent`'s own "agent
+			// does not exist", since it resolves against the active bundle, not the `agents` table).
+			let agentIds: Readonly<string[]>;
+			if (target === "--all") {
+				const activeRevisionId = await activeConfigRevisionId(deps);
+				const { bundle } = await inTransaction(deps, ({ tx }) =>
+					loadActiveBundle(tx.db, activeRevisionId),
+				);
+				agentIds = bundle.agents.map((agent) => agent.id);
+			} else {
+				agentIds = [target];
+			}
 			const results: Readonly<AdoptAgentResult[]> = await adoptAgentToolAttachments(deps, {
 				agentIds,
 				dryRun,
