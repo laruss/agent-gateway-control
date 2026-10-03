@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
 	type CustomHttpsDefinition,
+	CustomToolResponseLimitsSchema,
 	customHttpMethodWrites,
 	customHttpsDefinitionProblems,
 	customToolActionType,
@@ -31,6 +32,7 @@ function definition(overrides: Partial<CustomHttpsDefinition> = {}): CustomHttps
 			maxResponseBytes: 65_536,
 			allowedContentTypes: ["application/json"],
 			timeoutMs: 5000,
+			includeBodyPreview: true,
 		},
 		...overrides,
 	};
@@ -159,6 +161,87 @@ describe("customHttpsDefinitionProblems", () => {
 		});
 		const problems = customHttpsDefinitionProblems(bad);
 		expect(problems.some((p) => p.includes("is used more than once"))).toBe(true);
+	});
+
+	it("refuses two header slots that collide only case-insensitively", () => {
+		const bad = definition({
+			parameters: [
+				...definition().parameters,
+				{
+					name: "trace",
+					slot: "header",
+					slotName: "X-Api-Key",
+					type: "string",
+					minLength: 1,
+					maxLength: 10,
+				},
+			],
+		});
+		// The definition's own secret is already mapped to header `x-api-key`; `X-Api-Key` is the
+		// identical HTTP header under a different case. Secrets are claimed after parameters, so the
+		// collision message reports the secret's own casing ('x-api-key'), not the new parameter's.
+		const problems = customHttpsDefinitionProblems(bad);
+		expect(problems.some((p) => /both target header 'x-api-key'/i.test(p))).toBe(true);
+	});
+
+	it("refuses a parameter or secret that targets the idempotency header itself", () => {
+		const paramCollision = definition({
+			parameters: [
+				...definition().parameters,
+				{
+					name: "key",
+					slot: "header",
+					slotName: "Idempotency-Key",
+					type: "string",
+					minLength: 1,
+					maxLength: 10,
+				},
+			],
+		});
+		expect(
+			customHttpsDefinitionProblems(paramCollision).some((p) =>
+				p.includes("the idempotency header"),
+			),
+		).toBe(true);
+	});
+
+	it("reserves the controller's own definition-version parameter name", () => {
+		const bad = definition({
+			parameters: [
+				...definition().parameters,
+				{
+					name: "custom_tool_definition_version",
+					slot: "query",
+					slotName: "v",
+					type: "string",
+					minLength: 1,
+					maxLength: 10,
+				},
+			],
+		});
+		const problems = customHttpsDefinitionProblems(bad);
+		expect(problems.some((p) => p.includes("is reserved for the controller"))).toBe(true);
+	});
+});
+
+describe("CustomToolResponseLimitsSchema's includeBodyPreview", () => {
+	it("defaults to true, so a definition stored before this field existed parses unchanged", () => {
+		const parsed = CustomToolResponseLimitsSchema.parse({
+			maxResponseBytes: 65_536,
+			allowedContentTypes: ["application/json"],
+			timeoutMs: 5000,
+		});
+		expect(parsed.includeBodyPreview).toBe(true);
+	});
+
+	it("can be turned off explicitly", () => {
+		const parsed = CustomToolResponseLimitsSchema.parse({
+			maxResponseBytes: 65_536,
+			allowedContentTypes: ["application/json"],
+			timeoutMs: 5000,
+			includeBodyPreview: false,
+		});
+		expect(parsed.includeBodyPreview).toBe(false);
 	});
 });
 

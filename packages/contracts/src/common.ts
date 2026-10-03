@@ -263,6 +263,53 @@ export function safeText(max: number, safety: TextSafety) {
 		);
 }
 
+/** `true` for a character `safeText(_, "verbatim")` would accept on its own (ignoring the
+ * whole-string NFKC/spacing rules `hasUnsafeCharacters` also checks) — a letter, digit,
+ * punctuation or symbol, and not one of the blank lookalikes. */
+function isVerbatimSafeCharacter(char: string): boolean {
+	return VERBATIM_ALLOWED.test(char) && !VERBATIM_BLANK_LOOKALIKES.has(char);
+}
+
+/**
+ * `value`, collapsed into a single line any `safeText(max, "verbatim")` schema accepts: every
+ * character the allowlist would reject (controls, newlines/tabs, bidi overrides, emoji
+ * modifiers that render blank, ...) becomes one space, runs of spaces collapse to one, and the
+ * ends are trimmed — never dropped outright, so words on either side of a stripped character
+ * never run together. Longer than `max` once collapsed, it is cut and marked with the same `…`
+ * truncation marker `@agent-gateway/logging`'s `truncateText` already uses elsewhere; genuinely
+ * empty (nothing but unsafe characters, or blank to start with) becomes `"(empty)"` — `safeText`
+ * never accepts blank. Built to satisfy the schema by construction, but a value this function
+ * cannot make to fit (an astral character's surrogate pair split by truncation, the one case
+ * construction alone cannot rule out) is shrunk one code unit at a time, re-checked against the
+ * real schema rule each time, until it does: correctness is verified, not merely argued for.
+ * For a result a human approves or reads back verbatim (a tool receipt field, a response
+ * preview) — never for `"text"` safety, which already tolerates newlines/tabs and so never needs
+ * this collapsing.
+ */
+export function toVerbatimPreview(value: string, max: number): string {
+	let collapsed = "";
+	for (const char of value.normalize("NFKC")) {
+		const piece = isVerbatimSafeCharacter(char) ? char : " ";
+		if (piece === " " && collapsed.endsWith(" ")) {
+			continue;
+		}
+		collapsed += piece;
+	}
+	collapsed = collapsed.trim();
+	const marker = "…";
+	let candidate =
+		collapsed.length <= max
+			? collapsed
+			: `${collapsed.slice(0, Math.max(0, max - marker.length)).replace(/ +$/, "")}${marker}`;
+	while (
+		candidate !== "" &&
+		(candidate.length > max || hasUnsafeCharacters(candidate, "verbatim"))
+	) {
+		candidate = candidate.slice(0, -1);
+	}
+	return candidate === "" ? "(empty)" : candidate;
+}
+
 /** Mention tokens as Mattermost reads them: `@name` not preceded by a letter, digit or `_`. */
 const MENTION = /(^|[^\p{L}\p{N}_])@([\p{L}\p{N}_.-]+)/gu;
 

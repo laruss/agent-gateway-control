@@ -38,6 +38,33 @@ function pathValueIssue(paramName: string, value: string): string | null {
 	return null;
 }
 
+/** C0 controls and DEL — CR/LF (header/request-line injection) and NUL among them. Refused
+ * outright in a header or query value rather than left for `https.request` to throw on: a value
+ * that reaches execution some other way (a forged job) must fail as a known, approval-time
+ * refusal, never surface as a forced `unknown` from an uncaught construction error. */
+function hasControlCharacter(value: string): boolean {
+	for (let i = 0; i < value.length; i += 1) {
+		const code = value.charCodeAt(i);
+		if (code <= 0x1f || code === 0x7f) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/** Outside Latin-1 (ISO-8859-1): Node's own HTTP client already restricts a header value to this
+ * range and throws otherwise, so a header-slot value carrying anything past it is refused here,
+ * at validation time, for the same reason `hasControlCharacter` is. Query values are percent- or
+ * form-encoded regardless of script, so this does not apply to them. */
+function hasNonLatin1Character(value: string): boolean {
+	for (let i = 0; i < value.length; i += 1) {
+		if (value.charCodeAt(i) > 0xff) {
+			return true;
+		}
+	}
+	return false;
+}
+
 const NUMBER_PATTERN = /^-?(0|[1-9][0-9]*)(\.[0-9]+)?$/;
 
 function typedValueIssues(param: CustomToolParam, value: string): Readonly<string[]> {
@@ -46,6 +73,16 @@ function typedValueIssues(param: CustomToolParam, value: string): Readonly<strin
 		const issue = pathValueIssue(param.name, value);
 		if (issue !== null) {
 			problems.push(issue);
+		}
+	}
+	if (param.slot === "header" || param.slot === "query") {
+		if (hasControlCharacter(value)) {
+			problems.push(
+				`parameter '${param.name}': a ${param.slot} value must not contain control characters`,
+			);
+		}
+		if (param.slot === "header" && hasNonLatin1Character(value)) {
+			problems.push(`parameter '${param.name}': a header value must be Latin-1 (ISO-8859-1)`);
 		}
 	}
 	switch (param.type) {
@@ -63,6 +100,13 @@ function typedValueIssues(param: CustomToolParam, value: string): Readonly<strin
 				break;
 			}
 			const n = Number(value);
+			if (!Number.isFinite(n)) {
+				// A valid-looking run of digits can still overflow to `Infinity` (`NUMBER_PATTERN`
+				// bounds the syntax, not the magnitude); `JSON.stringify(Infinity)` silently becomes
+				// `null`, which would make the request sent disagree with what was approved.
+				problems.push(`parameter '${param.name}' must be a finite number`);
+				break;
+			}
 			if (param.minimum !== undefined && n < param.minimum) {
 				problems.push(`parameter '${param.name}' must be at least ${param.minimum}`);
 			}
@@ -158,13 +202,21 @@ const PLACEHOLDER = /\{([A-Za-z][A-Za-z0-9_-]*)\}/g;
 
 /** Substitutes every `{placeholder}` with its path parameter's value, percent-encoded into
  * exactly one path segment — the value can never itself introduce a `/`, a `..` segment or any
- * character the encoding would not keep literal. */
+ * character the encoding would not keep literal. `values` is keyed by each parameter's own
+ * `name` (what the model fills in), never its `slotName` (the placeholder's own name in the
+ * template) — the two differ whenever a path parameter is declared with a `name` other than its
+ * placeholder, so every placeholder is first translated to the parameter that declares it. */
 function resolvePath(
 	definition: CustomHttpsDefinition,
 	values: ReadonlyMap<string, string>,
 ): string {
-	return definition.pathTemplate.replaceAll(PLACEHOLDER, (_, name: string) =>
-		encodeURIComponent(values.get(name) ?? ""),
+	const paramNameByPlaceholder = new Map(
+		definition.parameters
+			.filter((param) => param.slot === "path")
+			.map((param) => [param.slotName, param.name]),
+	);
+	return definition.pathTemplate.replaceAll(PLACEHOLDER, (_, placeholder: string) =>
+		encodeURIComponent(values.get(paramNameByPlaceholder.get(placeholder) ?? placeholder) ?? ""),
 	);
 }
 

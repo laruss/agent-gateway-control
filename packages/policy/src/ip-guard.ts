@@ -4,9 +4,13 @@ import { isIP } from "node:net";
  * Classifies an address as public or one of the non-public ranges a custom HTTPS tool's egress
  * must never reach (ADR-027's custom-tool section): loopback, link-local, private, carrier-grade
  * NAT, multicast, reserved, documentation/benchmark ranges, and the IPv6 forms that alias them
- * (unique-local, an IPv4-mapped address, ...). Pure: no DNS, no sockets — `packages/tool-broker`'s
- * egress guard resolves a host once (or accepts an already-resolved address from an injectable
- * resolver) and calls this on the result before ever connecting.
+ * (unique-local, an IPv4-mapped address, ...). IPv4 is a deny-list (every specific non-global
+ * range below); IPv6 is the reverse, an allow-list (`ipv6BlockedReason`'s own doc comment) —
+ * a deny-list missed real non-global forms it simply never named (6to4, Teredo, ORCHIDv2,
+ * benchmarking, the second NAT64 prefix, ...), where an allow-list can only ever be too strict,
+ * never too permissive, as the universe of "global" shifts under it. Pure: no DNS, no sockets —
+ * `packages/tool-broker`'s egress guard resolves a host once (or accepts an already-resolved
+ * address from an injectable resolver) and calls this on the result before ever connecting.
  */
 
 export type IpFamily = 4 | 6;
@@ -174,18 +178,21 @@ function ipv6Groups(address: string): Readonly<number[]> | null {
 	return groups;
 }
 
+/**
+ * IPv6 is checked the opposite way IPv4 is above: every specific non-global shape is checked
+ * first (so a blocked address still gets its own precise label), and whatever is left is then
+ * gated by one allow-list test — only global unicast (`2000::/3`) may ever pass. A deny-list here
+ * would have to name every non-global range that exists, and a forgotten one (ORCHIDv2,
+ * benchmarking, the second NAT64 prefix, a future IANA allocation outside `2000::/3`) would pass
+ * silently; an allow-list can only ever refuse something that happens to be global, never admit
+ * something that is not.
+ */
 function ipv6BlockedReason(address: string): string | null {
 	const groups = ipv6Groups(address);
 	if (groups === null) {
 		return "unparseable";
 	}
 	const [g0, g1, g2, g3, g4, g5, g6, g7] = groups;
-	if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0xffff) {
-		// ::ffff:a.b.c.d — an IPv4-mapped address always aliases its embedded address; reject the
-		// form outright regardless of what that address is, so a resolver cannot smuggle a private
-		// IPv4 target past an IPv6-shaped guard.
-		return "IPv4-mapped";
-	}
 	if (groups.every((group) => group === 0)) {
 		return "unspecified";
 	}
@@ -201,11 +208,31 @@ function ipv6BlockedReason(address: string): string | null {
 	) {
 		return "loopback";
 	}
+	if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0xffff) {
+		// ::ffff:a.b.c.d — an IPv4-mapped address always aliases its embedded address; reject the
+		// form outright regardless of what that address is, so a resolver cannot smuggle a private
+		// IPv4 target past an IPv6-shaped guard.
+		return "IPv4-mapped";
+	}
+	if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0xffff && g5 === 0) {
+		// ::ffff:0:a.b.c.d, RFC 6052 §2.2's own second embedding (SIIT) — the same aliasing risk as
+		// IPv4-mapped above, one group over.
+		return "IPv4-translated (SIIT, RFC 6052 §2.2)";
+	}
+	if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0) {
+		// Any other '::/96' form left (the deprecated IPv4-compatible address, '::a.b.c.d'): checked
+		// last of the four, since unspecified/loopback/both embeddings above are all more specific
+		// shapes of this same "first 96 bits zero" prefix.
+		return "IPv4-compatible (deprecated, RFC 4291)";
+	}
 	if (((g0 ?? 0) & 0xfe00) === 0xfc00) {
 		return "unique local (RFC 4193)";
 	}
 	if (((g0 ?? 0) & 0xffc0) === 0xfe80) {
 		return "link-local";
+	}
+	if (((g0 ?? 0) & 0xffc0) === 0xfec0) {
+		return "site-local (deprecated, RFC 3879)";
 	}
 	if (((g0 ?? 0) & 0xff00) === 0xff00) {
 		return "multicast";
@@ -213,9 +240,34 @@ function ipv6BlockedReason(address: string): string | null {
 	if (g0 === 0x2001 && g1 === 0x0db8) {
 		return "documentation (RFC 3849)";
 	}
+	if (g0 === 0x2001 && g1 === 0) {
+		return "Teredo (RFC 4380)";
+	}
+	if (g0 === 0x2001 && ((g1 ?? 0) & 0xfff0) === 0x0020) {
+		return "ORCHIDv2 (RFC 7343)";
+	}
+	if (g0 === 0x2001 && g1 === 2 && g2 === 0) {
+		return "benchmarking (RFC 5180)";
+	}
+	if (g0 === 0x2002) {
+		return "6to4 (RFC 3056)";
+	}
 	if (g0 === 0x64 && g1 === 0xff9b && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0) {
-		// 64:ff9b::/96 (NAT64) carries an embedded address too; refuse rather than unwrap it.
+		// 64:ff9b::/96 (NAT64) carries an embedded address too; refused regardless of what it is
+		// (simpler, and just as safe, as unwrapping and classifying it).
 		return "NAT64 (RFC 6052)";
+	}
+	if (g0 === 0x64 && g1 === 0xff9b && g2 === 1) {
+		return "NAT64 local-use (RFC 8215)";
+	}
+	if (g0 === 0x100 && g1 === 0 && g2 === 0 && g3 === 0) {
+		return "discard-only (RFC 7707)";
+	}
+	if (((g0 ?? 0) & 0xe000) !== 0x2000) {
+		// The allow-list gate: everything that reaches here passed every specific non-global check
+		// above without matching, so this is the one remaining question — is it global unicast at
+		// all? Only `2000::/3` ever is.
+		return "not global unicast (outside '2000::/3')";
 	}
 	return null;
 }

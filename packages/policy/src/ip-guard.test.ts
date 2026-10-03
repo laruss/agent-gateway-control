@@ -76,10 +76,54 @@ describe("parseIpLiteral + blockedAddressReason", () => {
 		expect(isPublic("8.8.8.8")).toBe(true);
 		expect(isPublic("1.1.1.1")).toBe(true);
 		expect(isPublic("2606:4700:4700::1111")).toBe(true);
+		expect(isPublic("2001:4860:4860::8888")).toBe(true);
 	});
 
 	it("is null for a real hostname: that needs DNS, not literal parsing", () => {
 		expect(parseIpLiteral("example.com")).toBeNull();
 		expect(parseIpLiteral("api.example.com")).toBeNull();
+	});
+});
+
+describe("IPv6 allow-list: every special-purpose range ADR-027 names, plus what is left over", () => {
+	const reasonOf = (host: string) => {
+		const parsed = parseIpLiteral(host);
+		expect(parsed).not.toBeNull();
+		return parsed === null ? "unparsed" : blockedAddressReason(parsed);
+	};
+
+	it.each<[string, string, RegExp]>([
+		["unspecified", "::", /unspecified/],
+		["loopback", "::1", /loopback/],
+		["IPv4-mapped ('::ffff:0:0/96')", "::ffff:127.0.0.1", /IPv4-mapped/],
+		["IPv4-translated / SIIT ('::ffff:0:0:0/96')", "::ffff:0:1.2.3.4", /SIIT/],
+		["IPv4-compatible, deprecated ('::/96')", "::0.0.0.5", /IPv4-compatible/],
+		["unique local (RFC 4193)", "fc00::1", /unique local/],
+		["unique local, the other half of fc00::/7", "fd12:3456::1", /unique local/],
+		["link-local", "fe80::1", /link-local/],
+		["site-local, deprecated ('fec0::/10')", "fec0::1", /site-local/],
+		["multicast", "ff02::1", /multicast/],
+		["documentation ('2001:db8::/32')", "2001:db8::1", /documentation/],
+		["Teredo ('2001::/32')", "2001:0:ce49:7601::1", /Teredo/],
+		["ORCHIDv2 ('2001:20::/28')", "2001:20::1", /ORCHIDv2/],
+		["benchmarking ('2001:2::/48')", "2001:2::1", /benchmarking/],
+		["6to4 ('2002::/16')", "2002:101:101::1", /6to4/],
+		["NAT64 ('64:ff9b::/96')", "64:ff9b::1", /NAT64/],
+		["NAT64 local-use ('64:ff9b:1::/48')", "64:ff9b:1::1", /NAT64 local-use/],
+		["discard-only ('100::/64')", "100::1", /discard-only/],
+		["every other range outside '2000::/3'", "4000::1", /not global unicast/],
+		["every other range outside '2000::/3', low end", "1fff::1", /not global unicast/],
+	])("blocks %s (%s)", (_label, host, reason) => {
+		expect(reasonOf(host)).toMatch(reason);
+	});
+
+	it.each<[string, string]>([
+		["the low end of 2000::/3", "2000::1"],
+		["the high end of 2000::/3", "3fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"],
+		["an ordinary public address", "2001:4860:4860::8888"],
+		["just past the Teredo prefix", "2001:1::1"],
+		["just past the ORCHIDv2 range", "2001:30::1"],
+	])("allows %s (%s)", (_label, host) => {
+		expect(reasonOf(host)).toBeNull();
 	});
 });

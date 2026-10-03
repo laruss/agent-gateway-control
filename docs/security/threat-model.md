@@ -241,21 +241,30 @@
   and connects only to that resolved address, never re-resolving — a second answer (the
   destination's own DNS TTL expiring, an attacker racing it) can never redirect an
   already-approved call. Every literal and resolved address is classified before a socket ever
-  opens and refused if private (RFC 1918), loopback, link-local (the cloud metadata address,
-  `169.254.169.254`, included), carrier-grade NAT, multicast, reserved, a documentation/
-  benchmark range, or an IPv6 form aliasing any of these (unique-local, link-local, an
-  IPv4-mapped address, NAT64) — classified from the literal numeric value regardless of
-  notation (dotted, decimal, octal, hex for IPv4), closing the classic bypass of a hostname
-  that is itself a numeric literal in an unusual base. Redirects are never followed. Every
+  opens, from the literal numeric value regardless of notation (dotted, decimal, octal, hex for
+  IPv4), closing the classic bypass of a hostname that is itself a numeric literal in an unusual
+  base: IPv4 is refused if private (RFC 1918), loopback, link-local (the cloud metadata address,
+  `169.254.169.254`, included), carrier-grade NAT, multicast, reserved or a documentation/
+  benchmark range; IPv6 is an allow-list the other way around — only global unicast (`2000::/3`)
+  may ever pass, and only once it matches none of the special-purpose ranges carved out of it or
+  aliases a non-global address (unique-local, link-local, an IPv4-mapped or IPv4-compatible
+  address, either NAT64 well-known prefix, ...) — so a range this guard does not yet name is
+  refused by default rather than passed through unnoticed. Redirects are never followed. Every
   parameter is mapped into exactly one encoded slot (a path segment, a query entry, a header,
   a JSON body field) — never interpolated as a string, and never evaluated as code or a shell
   command — so even a value that reached execution unvalidated (a forged job) cannot escape
-  its own slot. A definition's own secrets are named by alias only and resolved by the tool
-  runner alone, from a dedicated, read-only secrets mount; a value is scrubbed from a receipt
-  or an error even where a destination echoes it back, and is never part of the approval hash,
-  a log line or a database row. Editing a definition after a request was made invalidates it
-  at grant time, so a request is always executed exactly as it was shown and approved
-  ([ADR-027](../adr/027-tool-catalog.md)).
+  its own slot; a header or query value carrying a control character, or a header value outside
+  Latin-1, is refused at approval time rather than left for the HTTP client to throw on. A
+  definition's own secrets are named by alias only and resolved by the tool runner alone, from a
+  dedicated, read-only secrets mount; a value — and the encoded forms this executor's own
+  request-building could have put it on the wire in — is scrubbed from a receipt or an error even
+  where a destination echoes it back, best-effort against a destination that echoes the
+  credential (a hostile destination already holds it and gains nothing from a scrub missing some
+  further transformation), and is never part of the approval hash, a log line or a database row.
+  A definition may also withhold its response body preview entirely (`includeBodyPreview: false`),
+  for a body an owner never wants an agent to see regardless of how well a scrub works. Editing a
+  definition after a request was made invalidates it at grant time, so a request is always
+  executed exactly as it was shown and approved ([ADR-027](../adr/027-tool-catalog.md)).
 
 ## Open questions
 

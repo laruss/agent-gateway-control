@@ -55,7 +55,8 @@ All notable changes are documented here. The project follows Semantic Versioning
   to 0.6.0 still enforces the same effective permissions. The Agents hub's own console editor shows
   a hub-managed agent's tool lists read-only, with a hint to use the hub instead, and refuses
   (preview and commit alike) a patch that edits them directly, rather than silently discarding it
-  on commit; a legacy agent's `permissions` stay fully editable there. `gateway tools adopt
+  on commit; `observe_system` is untouched by compiled attachments and stays directly editable even
+  for a hub-managed agent, and a legacy agent's `permissions` stay fully editable there. `gateway tools adopt
   <agent>|--all [--dry-run]` is the explicit, never-implicit migration from a legacy agent's
   `permissions` into real attachments, one committed revision per agent (including an agent whose
   conversion resolves to zero attachments, marked hub-managed with an explicitly empty list),
@@ -71,29 +72,56 @@ All notable changes are documented here. The project follows Semantic Versioning
 - Custom HTTPS tools and packaged utilities (ADR-027): an owner now defines their own HTTPS-backed
   tool (`gateway tools custom create|edit <entry-id>`, a JSON definition — fixed destination host,
   path template and method; typed string/number/boolean/enum parameters mapped explicitly into
-  encoded path/query/header/body slots, never interpolated as a string; named secrets resolved only
-  by the tool runner, never a value anywhere else; response limits; a required idempotency header
-  for any write) and sets its secret (`gateway tools secret set <alias>`, a new, dedicated
-  secrets mount). It attaches and is approved exactly like any other broker action — `custom_https`
-  and the new `utility` kind (one packaged, image-shipped utility, `utility.text-transform`, ships
-  to prove the path) both support only `require_approval`/`disabled`: the broker has no
-  approval-free execution path, side-effect-free or not. A request is pinned to the exact
-  definition version it was resolved against; editing the tool afterward refuses the grant
+  encoded path/query/header/body slots, never interpolated as a string, a header or query value
+  never carrying a control character, a header value never outside Latin-1, and a number never
+  overflowing to `Infinity`; named secrets resolved only by the tool runner, never a value anywhere
+  else; response limits, including whether a response body preview is ever shown at all; a required
+  idempotency header for any write, which no parameter or secret may also target, case-insensitively)
+  and sets its secret (`gateway tools secret set <alias>`, a new, dedicated secrets mount). It
+  attaches and is approved exactly like any other broker action — `custom_https` and the new
+  `utility` kind (one packaged, image-shipped utility, `utility.text-transform`, ships to prove the
+  path) both support only `require_approval`/`disabled`: the broker has no approval-free execution
+  path, side-effect-free or not. A request is pinned to the exact definition version it was resolved
+  against — a model-supplied copy of that pin is never trusted, only the controller's own, exactly
+  one of which is ever stored; a definition with no typed parameters of its own (a fixed call whose
+  only moving part is a secret) is still approvable. Editing the tool afterward refuses the grant
   ("this custom tool was edited... it must be requested again") rather than silently executing a
   different request than the one shown and hashed. Execution goes through a new egress guard
   (`@agent-gateway/tool-broker`): a hostname is resolved once and the connection made to exactly
-  that address, never re-resolved (defeats DNS rebinding); every literal or resolved address is
+  that address, never re-resolved (defeats DNS rebinding); every literal or resolved IPv4 address is
   classified and refused if private, loopback, link-local (the cloud metadata address included),
-  carrier-grade NAT, multicast, reserved, a documentation/benchmark range, or an IPv6 form aliasing
-  any of these (unique-local, link-local, an IPv4-mapped address) — in any notation, including
-  decimal/octal/hex IPv4 literals, the classic SSRF bypass this guard exists to close. Redirects are
-  never followed; an oversized response is aborted mid-stream. A call settles as `succeeded` (a
-  receipt with every secret value scrubbed, even one a destination echoes back), `failed` (a clean,
-  known refusal), or `unknown` (a timeout or reset **after** the request was already sent) — never
-  retried automatically, settled by hand like any other namespace's. A new `custom` broker namespace
-  dispatches dynamically to an owner-created entry's own definition (fetched by exact approved
-  version through a new, narrow `gateway_begin_tool_action`-style function, migration `0034`);
-  `utility` stays a fully static executor, like any other namespace.
+  carrier-grade NAT, multicast, reserved or a documentation/benchmark range, in any notation
+  including decimal/octal/hex literals; IPv6 is an allow-list instead — only global unicast
+  (`2000::/3`) may ever pass, refusing every special-purpose range carved out of it (6to4, Teredo,
+  documentation, benchmarking, ORCHIDv2, both NAT64 prefixes) and every non-global form the IPv4
+  rules already cover (unique-local, link-local, IPv4-mapped/-compatible, site-local, SIIT,
+  discard-only) by default, rather than only the ones a deny-list happened to name. Redirects are
+  never followed; an oversized response settles the moment the cap is actually exceeded, never
+  waiting on a stream event that might not come. One overall deadline (DNS through the response
+  body) replaces a socket-idle timeout a trickling response could defeat, and also carries the
+  executor's own cancellation (kill-all, the agent disabled, the runner stopping), so a call still
+  resolving its destination can be stopped, not only one already connected. A call settles as
+  `succeeded` (a receipt with every secret value — and the encoded forms this executor's own
+  request-building could have put it on the wire in — scrubbed, best-effort, even from a
+  destination's own echo; a write that was fully sent and got back a 2xx the definition's own
+  content type does not allow stays `succeeded`, its body withheld, rather than a clean `failed` an
+  owner would retry under a new idempotency key), `failed` (a clean, known refusal), or `unknown` (an
+  abort or a reset **after** the request was already sent, sent now meaning the TLS handshake itself
+  completed, not merely that the body was handed to the socket) — never retried automatically,
+  settled by hand like any other namespace's. A response preview is collapsed to a single safe line
+  and bounded rather than built in a shape the receipt could reject outright and withhold entirely;
+  `utility.text-transform` refuses an input whose transform (`upper`/`lower` can grow it, e.g.
+  `"ß"` to `"SS"`) would not fit one, rather than silently handing back a truncated answer. A new
+  `custom` broker namespace dispatches dynamically to an owner-created entry's own definition
+  (fetched by exact approved version through a new, narrow `gateway_begin_tool_action`-style
+  function, migration `0034`); `utility` stays a fully static executor, like any other namespace.
+  Attaching a tool to a still-legacy agent (no attachments document of its own yet) converts its
+  existing `permissions` lists into attachments first, in the same revision — the same conversion
+  `gateway tools adopt` performs — rather than making it hub-managed with only the one attachment
+  just requested and silently dropping everything else its `permissions` used to cover; a bundle
+  the shared configuration writer is about to commit is validated once more just before it is
+  written (no two attachments of the same catalog entry, no agent's compiled permissions left
+  overlapping), not only at whichever call site happens to check first.
 
 ## [0.6.0] - 2026-10-02
 

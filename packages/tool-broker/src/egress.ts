@@ -80,48 +80,101 @@ export type EgressRequest = Readonly<{
 	/** Extra trusted CA certificates — a local test server's own, in tests; omitted in production
 	 * (the platform's trust store). */
 	ca?: Readonly<(string | Buffer)[]>;
+	/** Aborted when the action is asked to stop (kill-all, the agent disabled, the runner
+	 * shutting down) — the executor's own `ToolExecutionContext.signal`, forwarded here so a stop
+	 * request can cancel a call still resolving its destination, not only one already connected.
+	 * Combined with this call's own timeout into the one deadline every stage shares
+	 * (`callDeadline`). */
+	signal: AbortSignal;
 }>;
 
-export type EgressResponse = Readonly<{ status: number; contentType: string; body: string }>;
+export type EgressResponse = Readonly<{
+	status: number;
+	contentType: string;
+	body: string;
+	/** `true` when `body` is deliberately empty: a write whose request had already been fully sent
+	 * got back a 2xx the destination paired with a content type this definition does not allow
+	 * (often no body or `Content-Type` at all — a plain 201/204). The write still happened, so this
+	 * stays `succeeded`, never `failed` (a clean failure here would make an owner retry the same
+	 * write under a new idempotency key); the body is simply not trusted enough to preview. */
+	bodyWithheld: boolean;
+}>;
 
 export type EgressOutcome =
 	| Readonly<{ kind: "response"; response: EgressResponse }>
 	| Readonly<{ kind: "failed"; error: string }>;
 
 /**
+ * The one deadline every stage of a call shares — DNS, connect, TLS, send and the response body —
+ * so a slow DNS answer leaves less, not a fresh budget, for everything after it: `AbortSignal.any`
+ * combines this call's own `timeoutMs` with the executor's own cancellation signal
+ * (`EgressRequest.signal`), so a kill-all or an agent disable aborts a call still resolving its
+ * destination exactly the same way a deadline would. `sendEgressRequest` builds this once and
+ * passes it on to `sendPinnedRequest`, so DNS and the request itself race against the identical
+ * signal rather than each getting their own, independent `timeoutMs`; a caller of
+ * `sendPinnedRequest` alone (every test that already knows its own resolved address, never
+ * touching DNS) gets one built fresh from the same request.
+ */
+function callDeadline(request: EgressRequest): AbortSignal {
+	return AbortSignal.any([AbortSignal.timeout(request.timeoutMs), request.signal]);
+}
+
+/** Rejects the moment `signal` aborts (or immediately, already aborted) — never resolves. Raced
+ * against DNS resolution, which has no `AbortSignal` of its own to pass a deadline into. */
+function rejectOnAbort(signal: AbortSignal): Promise<never> {
+	return new Promise((_, reject) => {
+		const onAbort = () => reject(new Error("aborted before the call could complete"));
+		if (signal.aborted) {
+			onAbort();
+			return;
+		}
+		signal.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
+/**
  * Sends one HTTPS request through the pinned-address guard above, with a hard deadline and a
  * streamed, size-capped response read. Returns `failed` for anything refused or cleanly answered
  * badly (blocked address, an unreadable content type, a response that is too large) — nothing was
  * left uncertain by any of those. Throws for anything that leaves the outcome genuinely uncertain:
- * a timeout or connection error **after** the request was fully written (the destination may have
- * already acted on it) — the caller (`customHttpsExecutor`) reports those as `unknown`, exactly as
- * `@agent-gateway/tool-broker`'s own executor contract already requires of a crash it cannot
- * explain.
+ * a timeout, a cancellation or a connection error **after** the request was fully written (the
+ * destination may have already acted on it) — the caller (`customHttpsExecutor`) reports those as
+ * `unknown`, exactly as `@agent-gateway/tool-broker`'s own executor contract already requires of a
+ * crash it cannot explain. The same abort before anything was sent — DNS still resolving, nothing
+ * connected yet — is a clean `failed`: nothing happened for a retry to repeat.
  */
 export async function sendEgressRequest(
 	request: EgressRequest,
 	resolve: DnsResolver,
 ): Promise<EgressOutcome> {
+	const deadline = callDeadline(request);
 	let pinned: ResolvedAddress;
 	try {
-		pinned = await resolvePinnedAddress(request.host, resolve);
+		pinned = await Promise.race([
+			resolvePinnedAddress(request.host, resolve),
+			rejectOnAbort(deadline),
+		]);
 	} catch (error) {
 		return { kind: "failed", error: error instanceof Error ? error.message : String(error) };
 	}
-	return sendPinnedRequest(pinned, request);
+	return sendPinnedRequest(pinned, request, deadline);
 }
 
 /**
  * The actual HTTPS call, to an address the caller already validated (`resolvePinnedAddress`) —
  * this function trusts `address` completely and makes no judgment of its own about where it may
  * point. Split out from `sendEgressRequest` so the guard (SSRF, DNS rebinding — no real server,
- * no real network, an injected resolver) and the call's own mechanics (timeout, streamed size cap,
- * content-type, redirects never followed — a real local HTTPS test server, a test CA, no guard in
- * the way) are each exercised directly, without one standing in front of the other.
+ * no real network, an injected resolver) and the call's own mechanics (deadline, streamed size
+ * cap, content-type, redirects never followed — a real local HTTPS test server, a test CA, no
+ * guard in the way) are each exercised directly, without one standing in front of the other.
+ * `deadline` is `sendEgressRequest`'s own, continuing a budget DNS resolution may have already
+ * spent part of; omitted (every direct test, and any other caller with nothing of its own to
+ * race DNS against), a fresh one is built from this same request.
  */
 export async function sendPinnedRequest(
 	address: ResolvedAddress,
 	request: EgressRequest,
+	deadline: AbortSignal = callDeadline(request),
 ): Promise<EgressOutcome> {
 	const pinned = address;
 	const bodyBuffer = request.body === null ? null : Buffer.from(request.body, "utf8");
@@ -130,9 +183,21 @@ export async function sendPinnedRequest(
 		headers["content-type"] = "application/json";
 		headers["content-length"] = String(bodyBuffer.byteLength);
 	}
+	const isWrite = customHttpMethodWrites(request.method);
 	return new Promise<EgressOutcome>((settle, fail) => {
 		let settled = false;
+		// Node's own `finish` can fire before `secureConnect` (observed under Bun): a pre-send
+		// connect/TLS failure (an untrusted CA, a hostname/certificate mismatch) must never look
+		// sent just because the request body happened to be written into a socket buffer first.
+		// Only once both have fired is the request genuinely on the wire and possibly acted on.
+		let secureConnected = false;
+		let finished = false;
 		let sentFully = false;
+		const markSentIfReady = () => {
+			if (secureConnected && finished) {
+				sentFully = true;
+			}
+		};
 		const succeed = (outcome: EgressOutcome) => {
 			if (!settled) {
 				settled = true;
@@ -145,75 +210,120 @@ export async function sendPinnedRequest(
 				fail(error instanceof Error ? error : new Error(String(error)));
 			}
 		};
-		const req = https.request(
-			{
-				host: pinned.address,
-				family: pinned.family,
-				port: request.port ?? 443,
-				method: request.method,
-				path: request.path,
-				servername: request.host,
-				headers,
-				timeout: request.timeoutMs,
-				ca: request.ca as string[] | Buffer[] | undefined,
-			},
-			(res) => {
-				const contentType = (String(res.headers["content-type"] ?? "").split(";")[0] ?? "")
-					.trim()
-					.toLowerCase();
-				const allowed = request.allowedContentTypes.some(
-					(type) => type.toLowerCase() === contentType,
-				);
-				let total = 0;
-				let oversized = false;
-				const chunks: Buffer[] = [];
-				res.on("data", (chunk: Buffer) => {
-					if (oversized) {
-						return;
+		const req = https.request({
+			host: pinned.address,
+			family: pinned.family,
+			port: request.port ?? 443,
+			method: request.method,
+			path: request.path,
+			servername: request.host,
+			headers,
+			signal: deadline,
+			ca: request.ca as string[] | Buffer[] | undefined,
+		});
+		// `secureConnect` is a `tls.TLSSocket` event, never re-emitted on the request itself: it has
+		// to be attached to the actual socket, once assigned (`req`'s own `'socket'` event — the one
+		// ClientRequest event this really is).
+		req.on("socket", (socket) => {
+			socket.once("secureConnect", () => {
+				secureConnected = true;
+				markSentIfReady();
+			});
+		});
+		req.on("finish", () => {
+			finished = true;
+			markSentIfReady();
+		});
+		req.on("response", (res) => {
+			const contentType = (String(res.headers["content-type"] ?? "").split(";")[0] ?? "")
+				.trim()
+				.toLowerCase();
+			const allowed = request.allowedContentTypes.some(
+				(type) => type.toLowerCase() === contentType,
+			);
+			let total = 0;
+			let oversized = false;
+			const chunks: Buffer[] = [];
+			res.on("data", (chunk: Buffer) => {
+				if (oversized) {
+					return;
+				}
+				total += chunk.byteLength;
+				if (total > request.maxResponseBytes) {
+					oversized = true;
+					// Settled now, at the moment the overflow is actually detected: `res.destroy()`
+					// below may end the stream with only a `close` event, never `end` — waiting for
+					// `end` to decide the outcome would then hang forever instead of settling.
+					if (isWrite && sentFully) {
+						uncertain(new Error("the response exceeded its size limit after the request was sent"));
+					} else {
+						// Nothing but a read was ever at stake, or nothing was sent yet: a clean,
+						// known failure, never retried under a new idempotency key.
+						succeed({ kind: "failed", error: "the response exceeded its size limit" });
 					}
-					total += chunk.byteLength;
-					if (total > request.maxResponseBytes) {
-						oversized = true;
-						res.destroy();
-						return;
-					}
-					chunks.push(chunk);
-				});
-				res.on("end", () => {
-					if (oversized) {
-						// The request may already have been fully sent and acted on; only a read-only
-						// call (never a write) can call this a clean, known failure.
-						if (customHttpMethodWrites(request.method) && sentFully) {
-							uncertain(
-								new Error("the response exceeded its size limit after the request was sent"),
-							);
-						} else {
-							succeed({ kind: "failed", error: "the response exceeded its size limit" });
-						}
-						return;
-					}
-					if (!allowed) {
-						succeed({
-							kind: "failed",
-							error: `unexpected content type '${contentType || "(none)"}'`,
-						});
-						return;
-					}
+					res.destroy();
+					return;
+				}
+				chunks.push(chunk);
+			});
+			res.on("end", () => {
+				if (oversized) {
+					// Already settled above; a stream that still manages to fire `end` after
+					// `destroy()` changes nothing further.
+					return;
+				}
+				const status = res.statusCode;
+				if (allowed) {
 					succeed({
 						kind: "response",
 						response: {
-							status: res.statusCode ?? 0,
+							status: status ?? 0,
 							contentType,
 							body: Buffer.concat(chunks).toString("utf8"),
+							bodyWithheld: false,
 						},
 					});
+					return;
+				}
+				const unexpected = `unexpected content type '${contentType || "(none)"}'`;
+				if (!isWrite || !sentFully) {
+					// A read, or a write whose own request never finished sending: nothing of its
+					// own was ever at stake in the destination's answer either way.
+					succeed({ kind: "failed", error: unexpected });
+					return;
+				}
+				if (typeof status !== "number") {
+					// Genuinely ambiguous: the request was sent, but there is no status to tell a
+					// destination's acceptance from its refusal.
+					uncertain(new Error(`the response had no status and an ${unexpected}`));
+					return;
+				}
+				if (status >= 200 && status < 300) {
+					// The destination accepted the write (a 2xx with no body or `Content-Type` at
+					// all, e.g. 201/204, is the common case) — a clean failure here is exactly what
+					// would make an owner retry an already-done write under a new idempotency key.
+					succeed({
+						kind: "response",
+						response: { status, contentType, body: "", bodyWithheld: true },
+					});
+					return;
+				}
+				succeed({
+					kind: "failed",
+					error: `the destination answered ${status} with an ${unexpected}`,
 				});
-				res.on("error", (error) => uncertain(error));
-			},
-		);
-		req.on("timeout", () => req.destroy(new Error("timed out")));
-		req.on("finish", () => {
-			sentFully = true;
+			});
+			res.on("error", (error) => uncertain(error));
+			// A stream destroyed with no error and no `end` (the overflow path above already
+			// settled; anything else reaching here is a connection that closed mid-read for some
+			// other reason) must still settle, never hang.
+			res.on("close", () => {
+				if (isWrite && sentFully) {
+					uncertain(new Error("the connection closed before the response finished"));
+				} else {
+					succeed({ kind: "failed", error: "the connection closed before the response finished" });
+				}
+			});
 		});
 		req.on("error", (error) => {
 			if (sentFully) {

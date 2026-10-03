@@ -46,6 +46,7 @@ function definition(overrides: Partial<CustomHttpsDefinition> = {}): CustomHttps
 			maxResponseBytes: 65_536,
 			allowedContentTypes: ["application/json"],
 			timeoutMs: 5000,
+			includeBodyPreview: true,
 		},
 		...overrides,
 	};
@@ -121,6 +122,101 @@ describe("customToolParamIssues", () => {
 		const bad = validParams.map((p) => (p.name === "priority" ? { ...p, value: "medium" } : p));
 		expect(customToolParamIssues(definition(), bad)[0]).toMatch(/must be one of low, high/);
 	});
+
+	it("rejects a number that overflows to Infinity, even with no declared bounds", () => {
+		// `retries` declares bounds (0-5); a bare, unbounded number parameter would otherwise let
+		// this straight through — `urgent` is boolean, so build a one-off definition with an
+		// unbounded number parameter instead of smuggling this through an existing typed field.
+		const unboundedNumber = definition({
+			parameters: [{ name: "amount", slot: "query", slotName: "amount", type: "number" }],
+			secretSlots: [],
+			idempotency: null,
+			method: "GET",
+		});
+		const overflowing = "1".repeat(400);
+		const issues = customToolParamIssues(unboundedNumber, [{ name: "amount", value: overflowing }]);
+		expect(issues).toEqual(["parameter 'amount' must be a finite number"]);
+	});
+
+	it("refuses control characters (CR/LF, NUL) in a header or query value", () => {
+		const withStringSlots = definition({
+			parameters: [
+				{
+					name: "label",
+					slot: "query",
+					slotName: "label",
+					type: "string",
+					minLength: 1,
+					maxLength: 50,
+				},
+				{
+					name: "note",
+					slot: "header",
+					slotName: "x-note",
+					type: "string",
+					minLength: 1,
+					maxLength: 50,
+				},
+			],
+			secretSlots: [],
+			idempotency: null,
+			method: "GET",
+		});
+		for (const bad of ["a\r\nX-Injected: 1", "a\u0000b", "a\nb"]) {
+			expect(
+				customToolParamIssues(withStringSlots, [
+					{ name: "label", value: bad },
+					{ name: "note", value: "fine" },
+				])[0],
+			).toMatch(/control characters/);
+			expect(
+				customToolParamIssues(withStringSlots, [
+					{ name: "label", value: "fine" },
+					{ name: "note", value: bad },
+				])[0],
+			).toMatch(/control characters/);
+		}
+	});
+
+	it("refuses a non-Latin-1 character in a header value, but allows it in a query value", () => {
+		const withStringSlots = definition({
+			parameters: [
+				{
+					name: "label",
+					slot: "query",
+					slotName: "label",
+					type: "string",
+					minLength: 1,
+					maxLength: 50,
+				},
+				{
+					name: "note",
+					slot: "header",
+					slotName: "x-note",
+					type: "string",
+					minLength: 1,
+					maxLength: 50,
+				},
+			],
+			secretSlots: [],
+			idempotency: null,
+			method: "GET",
+		});
+		// 'λ' (U+03BB) is outside Latin-1 (which ends at U+00FF) — unlike an accented Latin letter
+		// such as 'é', which Latin-1 already covers and so must stay allowed in a header too.
+		expect(
+			customToolParamIssues(withStringSlots, [
+				{ name: "label", value: "aλb" },
+				{ name: "note", value: "fine" },
+			]),
+		).toEqual([]);
+		expect(
+			customToolParamIssues(withStringSlots, [
+				{ name: "label", value: "fine" },
+				{ name: "note", value: "aλb" },
+			])[0],
+		).toMatch(/Latin-1/);
+	});
 });
 
 describe("resolveCustomHttpRequest", () => {
@@ -140,6 +236,29 @@ describe("resolveCustomHttpRequest", () => {
 		const resolved = resolveCustomHttpRequest(definition(), tampered);
 		expect(resolved.path).toBe("/tickets/a%2Fb");
 		expect(resolved.path).not.toContain("/tickets/a/b");
+	});
+
+	it("resolves a path placeholder by the declaring parameter's name, not its own slot name", () => {
+		// The path template's placeholder is `{ticket_ref}` (the path parameter's `slotName`); the
+		// model fills it in by the parameter's own `name`, `id` — the two differ on purpose here.
+		const slotNameDiffers = definition({
+			pathTemplate: "/tickets/{ticket_ref}",
+			parameters: [
+				{
+					name: "id",
+					slot: "path",
+					slotName: "ticket_ref",
+					type: "string",
+					minLength: 1,
+					maxLength: 50,
+				},
+			],
+			secretSlots: [],
+			idempotency: null,
+			method: "GET",
+		});
+		const resolved = resolveCustomHttpRequest(slotNameDiffers, [{ name: "id", value: "123" }]);
+		expect(resolved.path).toBe("/tickets/123");
 	});
 
 	it("ignores the synthetic version parameter when resolving", () => {

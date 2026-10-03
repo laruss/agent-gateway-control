@@ -634,28 +634,42 @@ describe("agent lifecycle service (ADR-026)", () => {
 		const { bundle } = await inTransaction(deps, ({ tx }) =>
 			loadActiveBundle(tx.db, restored.revisionId),
 		);
+		// `mu` was still legacy (no attachments document) the first time anything attached to it:
+		// `attachTool` converts its own `tools_deny: ["finance.*"]` (every non-finance agent's own
+		// required baseline, `createInput`) into the same catalog entries `gateway tools adopt`
+		// would, in the same revision, alongside the attachment actually requested — never just the
+		// one attachment on its own, which would otherwise make it hub-managed while silently
+		// dropping everything its legacy permissions covered (ADR-027).
 		expect(bundle.toolAttachments.mu).toEqual([
+			{
+				entryId: "executor-finance-payment-create",
+				pinnedVersion: null,
+				mode: "disabled",
+				settings: {},
+			},
+			{
+				entryId: "executor-finance-subscription-create",
+				pinnedVersion: null,
+				mode: "disabled",
+				settings: {},
+			},
 			{ entryId: "gateway-mattermost-post", pinnedVersion: null, mode: "allow", settings: {} },
 		]);
 
 		// A second agent, explicitly cleared (hub-managed but empty) before it retires, is restored
 		// the same way: still hub-managed (a key of its own), just with nothing in it — never
-		// reverted to legacy (converted from `permissions`) on restore.
+		// reverted to legacy (converted from `permissions`) on restore. Built with
+		// `set_tool_attachments` directly (`gateway tools adopt`'s own, explicit-empty case), not
+		// `attachTool` then `detach_tool`: with a legacy conversion now carried forward on first
+		// attach, detaching the one tool actually requested no longer leaves a truly empty list
+		// behind on its own when the agent's own legacy permissions resolve to anything at all.
 		const createdNu = await requestAgentCreate(deps, createInput("nu"));
 		await markProvisioning(deps, createdNu.operationId, "test");
 		await completeOperation(deps, createdNu.operationId, "test");
-		const attach = await attachTool(deps, {
-			agentId: "nu",
-			entryId: "gateway-mattermost-post",
-			pinnedVersion: null,
-			mode: "allow",
-			settings: {},
-			actor: "test",
-			source: "cli_apply",
-		});
+		const nuRevisionId = await activeConfigRevisionId(deps);
 		await commitChange(deps, {
-			changeSet: [{ type: "detach_tool", agentId: "nu", entryId: "gateway-mattermost-post" }],
-			baseRevisionId: attach.revisionId,
+			changeSet: [{ type: "set_tool_attachments", agentId: "nu", attachments: [] }],
+			baseRevisionId: nuRevisionId,
 			actor: "test",
 			source: "cli_apply",
 		});
@@ -705,7 +719,24 @@ describe("agent lifecycle service (ADR-026)", () => {
 		const { bundle } = await inTransaction(deps, ({ tx }) =>
 			loadActiveBundle(tx.db, restored.revisionId),
 		);
-		expect(bundle.toolAttachments.xi).toEqual([]);
+		// `xi` was still legacy when `attachTool` above first ran: its own `tools_deny:
+		// ["finance.*"]` (`createInput`'s own default) converted into these two disabled
+		// attachments alongside `gateway-memory-write` (ADR-027) — neither dropped nor deleted, so
+		// both remain even though the one attachment this test is actually about is gone.
+		expect(bundle.toolAttachments.xi).toEqual([
+			{
+				entryId: "executor-finance-payment-create",
+				pinnedVersion: null,
+				mode: "disabled",
+				settings: {},
+			},
+			{
+				entryId: "executor-finance-subscription-create",
+				pinnedVersion: null,
+				mode: "disabled",
+				settings: {},
+			},
+		]);
 	});
 
 	it("restore migrates an adopted (bootstrap-managed) agent's token reference to the lifecycle provisioner's own path", async () => {

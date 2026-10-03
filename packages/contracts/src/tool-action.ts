@@ -78,6 +78,11 @@ export function toolActionIdempotencyKey(approvalId: string, actionHash: string)
 	return `tool-action:${approvalId}:${actionHash}`;
 }
 
+/** The longest a `ToolReceipt` text field may be — shared with `toVerbatimPreview` (`common.ts`)
+ * so an executor building one can construct a value already guaranteed to fit, rather than
+ * discover the bound only when this schema later rejects it. */
+export const TOOL_RECEIPT_TEXT_MAX = 500;
+
 /**
  * What an executor returns as proof: a flat record of short values. It reaches the agent and
  * the card's thread, so it is bounded and holds no control or invisible characters.
@@ -85,7 +90,7 @@ export function toolActionIdempotencyKey(approvalId: string, actionHash: string)
 export const ToolReceiptSchema = z
 	.record(
 		z.string().regex(/^[a-z][a-z0-9_]{0,63}$/),
-		z.union([safeText(500, "verbatim"), z.number().finite(), z.boolean()]),
+		z.union([safeText(TOOL_RECEIPT_TEXT_MAX, "verbatim"), z.number().finite(), z.boolean()]),
 	)
 	.refine((receipt) => Object.keys(receipt).length <= 20, "a receipt has at most 20 fields");
 export type ToolReceipt = z.infer<typeof ToolReceiptSchema>;

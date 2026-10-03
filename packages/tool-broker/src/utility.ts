@@ -1,6 +1,7 @@
 import {
 	TEXT_TRANSFORM_MAX_INPUT_LENGTH,
 	TextTransformOperationSchema,
+	TOOL_RECEIPT_TEXT_MAX,
 	type ToolReceipt,
 	textTransform,
 	UTILITY_TEXT_TRANSFORM,
@@ -36,6 +37,17 @@ export function utilityExecutor(): ToolExecutor {
 				};
 			}
 			const result = textTransform(operation.data, text);
+			// `upper`/`lower` are Unicode case mapping, not 1:1 (`"ß".toUpperCase()` is `"SS"`): a
+			// bounded input does not itself bound this output. Refused rather than truncated — this
+			// utility's whole contract is handing back the actual transform, and a silently
+			// truncated slug or case fold would be a wrong answer the caller has no way to tell from
+			// a right one, where a refusal at least says so.
+			if (result.length > TOOL_RECEIPT_TEXT_MAX) {
+				return {
+					kind: "failed",
+					error: `the transformed text is ${result.length} characters, over the ${TOOL_RECEIPT_TEXT_MAX}-character limit a receipt can hold; shorten the input`,
+				};
+			}
 			const receipt: ToolReceipt = { result: result === "" ? "(empty)" : result };
 			return { kind: "succeeded", receipt };
 		},

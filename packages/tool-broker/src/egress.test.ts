@@ -8,6 +8,8 @@ import {
 	sendPinnedRequest,
 } from "./egress.ts";
 import {
+	generateServerCert,
+	generateTestCa,
 	generateTestTls,
 	type RunningTestServer,
 	startTestHttpsServer,
@@ -125,6 +127,7 @@ describe("sendPinnedRequest: against a real local HTTPS server", () => {
 			maxResponseBytes: 1024,
 			allowedContentTypes: ["application/json"],
 			ca: [tls.caCert],
+			signal: new AbortController().signal,
 			...overrides,
 		};
 	}
@@ -154,33 +157,165 @@ describe("sendPinnedRequest: against a real local HTTPS server", () => {
 	it("aborts an oversized GET response as a clean, known failure", async () => {
 		server = await startTestHttpsServer(tls, (_req, res) => {
 			res.writeHead(200, { "content-type": "application/json" });
-			res.end(JSON.stringify({ big: "x".repeat(10_000) }));
+			// Many small chunks, not one big write: the overflow must be caught mid-stream, the
+			// same shape a chunked response from a real destination would take.
+			for (let i = 0; i < 50; i += 1) {
+				res.write("x".repeat(200));
+			}
+			res.end();
 		});
+		const started = Date.now();
 		const outcome = await sendPinnedRequest(address, baseRequest({ maxResponseBytes: 32 }));
 		expect(outcome).toMatchObject({ kind: "failed", error: expect.stringContaining("size limit") });
+		// Settled as soon as the cap was exceeded, not merely bounded by some later deadline.
+		expect(Date.now() - started).toBeLessThan(1000);
 	});
 
 	it("treats an oversized response to a write as unknown (throws)", async () => {
 		server = await startTestHttpsServer(tls, (_req, res) => {
 			res.writeHead(200, { "content-type": "application/json" });
-			res.end(JSON.stringify({ big: "x".repeat(10_000) }));
+			for (let i = 0; i < 50; i += 1) {
+				res.write("x".repeat(200));
+			}
+			res.end();
 		});
+		const started = Date.now();
 		await expect(
 			sendPinnedRequest(
 				address,
 				baseRequest({ method: "POST", body: JSON.stringify({ title: "x" }), maxResponseBytes: 32 }),
 			),
 		).rejects.toThrow(/size limit/);
+		expect(Date.now() - started).toBeLessThan(1000);
+	});
+
+	it("settles a connection that closes before the response finishes, never hanging", async () => {
+		server = await startTestHttpsServer(tls, (_req, res) => {
+			res.writeHead(200, { "content-type": "application/json" });
+			res.write('{"partial":tr');
+			res.socket?.destroy();
+		});
+		let outcome: "threw" | Awaited<ReturnType<typeof sendPinnedRequest>> = "threw";
+		try {
+			outcome = await sendPinnedRequest(address, baseRequest());
+		} catch {
+			outcome = "threw";
+		}
+		// Either classification is a legitimate read of an abruptly closed socket; what matters is
+		// that this resolved at all instead of hanging (vitest's own test timeout would otherwise
+		// catch that, but the explicit assertion documents the actual guarantee).
+		expect(outcome === "threw" || outcome.kind === "failed").toBe(true);
 	});
 
 	it("treats a timeout after the request was sent as unknown (throws)", async () => {
 		server = await startTestHttpsServer(tls, (_req, res) => {
-			// Never responds; the client's own timeout must fire.
+			// Never responds; the client's own deadline must fire.
 			setTimeout(() => res.end(), 5000);
 		});
 		await expect(
 			sendPinnedRequest(address, baseRequest({ method: "POST", body: "{}", timeoutMs: 100 })),
 		).rejects.toThrow();
+	});
+
+	it("enforces one hard deadline even against a response that trickles just fast enough to never go idle", async () => {
+		server = await startTestHttpsServer(tls, (_req, res) => {
+			res.writeHead(200, { "content-type": "application/json" });
+			const drip = setInterval(() => res.write("x"), 40);
+			res.on("close", () => clearInterval(drip));
+		});
+		const started = Date.now();
+		await expect(
+			sendPinnedRequest(address, baseRequest({ method: "POST", body: "{}", timeoutMs: 200 })),
+		).rejects.toThrow();
+		// A socket-idle timeout would never fire here (something arrives every 40ms); the hard
+		// deadline must still cut this off close to `timeoutMs`, not run for seconds.
+		expect(Date.now() - started).toBeLessThan(1500);
+	});
+
+	it("fails cleanly, before anything was sent, when the signal is already aborted", async () => {
+		server = await startTestHttpsServer(tls, (_req, res) => {
+			res.writeHead(200, { "content-type": "application/json" });
+			res.end("{}");
+		});
+		const controller = new AbortController();
+		controller.abort();
+		const outcome = await sendPinnedRequest(address, baseRequest({ signal: controller.signal }));
+		expect(outcome).toMatchObject({ kind: "failed" });
+	});
+
+	it("cancels an in-flight write after it was sent as unknown (throws)", async () => {
+		server = await startTestHttpsServer(tls, (_req, res) => {
+			setTimeout(() => res.end("{}"), 5000);
+		});
+		const controller = new AbortController();
+		const promise = sendPinnedRequest(
+			address,
+			baseRequest({ method: "POST", body: "{}", signal: controller.signal, timeoutMs: 5000 }),
+		);
+		setTimeout(() => controller.abort(), 100);
+		await expect(promise).rejects.toThrow();
+	});
+
+	it("treats a 2xx write answered with no usable content type as succeeded, body withheld", async () => {
+		server = await startTestHttpsServer(tls, (_req, res) => {
+			res.writeHead(204);
+			res.end();
+		});
+		const outcome = await sendPinnedRequest(address, baseRequest({ method: "POST", body: "{}" }));
+		expect(outcome).toMatchObject({
+			kind: "response",
+			response: { status: 204, bodyWithheld: true, body: "" },
+		});
+	});
+
+	it("treats a non-2xx write with an unexpected content type as failed, not succeeded", async () => {
+		server = await startTestHttpsServer(tls, (_req, res) => {
+			res.writeHead(500, { "content-type": "text/plain" });
+			res.end("boom");
+		});
+		const outcome = await sendPinnedRequest(address, baseRequest({ method: "POST", body: "{}" }));
+		expect(outcome).toMatchObject({ kind: "failed" });
+	});
+
+	it("still fails a GET with an unexpected content type even on a 2xx (reads stay failed)", async () => {
+		server = await startTestHttpsServer(tls, (_req, res) => {
+			res.writeHead(200, { "content-type": "text/html" });
+			res.end("<html></html>");
+		});
+		const outcome = await sendPinnedRequest(address, baseRequest());
+		expect(outcome).toMatchObject({ kind: "failed" });
+	});
+
+	it("fails cleanly (never unknown) when the server's CA is not trusted", async () => {
+		const untrusted = generateTestTls();
+		server = await startTestHttpsServer(untrusted, (_req, res) => {
+			res.writeHead(200, { "content-type": "application/json" });
+			res.end("{}");
+		});
+		// `tls.caCert`, not `untrusted`'s own CA: the handshake itself must fail before any data is
+		// ever written — a pre-connect failure, never "sent".
+		const outcome = await sendPinnedRequest(
+			address,
+			baseRequest({ method: "POST", body: "{}", ca: [tls.caCert] }),
+		);
+		expect(outcome).toMatchObject({ kind: "failed" });
+	});
+
+	it("fails cleanly (never unknown) on a hostname/certificate mismatch", async () => {
+		const ca = generateTestCa();
+		const mismatched = generateServerCert(ca, "other-host.test");
+		server = await startTestHttpsServer(mismatched, (_req, res) => {
+			res.writeHead(200, { "content-type": "application/json" });
+			res.end("{}");
+		});
+		// The CA is trusted, but the certificate names a different host than the SNI/Host this call
+		// sends (`TEST_CUSTOM_TOOL_HOST`, `baseRequest`'s own default) — a certificate validation
+		// failure, same as an untrusted CA: still before anything was sent.
+		const outcome = await sendPinnedRequest(
+			address,
+			baseRequest({ method: "POST", body: "{}", ca: [ca.certPem] }),
+		);
+		expect(outcome).toMatchObject({ kind: "failed" });
 	});
 
 	it("carries the idempotency header through to the server", async () => {

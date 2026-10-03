@@ -148,6 +148,35 @@ async function loadKnownEntryVersions(
 }
 
 /**
+ * Every agent attaching the same catalog entry more than once (`attachTool`'s own op always
+ * replaces any existing attachment of the same `entryId` before adding its own — `applyOperation`,
+ * `management.ts` — so this can only ever come from a document built outside that path: a raw
+ * `tool-attachments.json` import, or a hand-built `set_tool_attachments`). Two attachments of one
+ * entry — `allow` and `disabled`, say — compile into overlapping permission-list entries that
+ * `AgentConfigSchema` itself refuses (`toolPatternOverlaps`), so left unchecked here, a bundle
+ * like this commits cleanly and only fails later, when something next reads it back
+ * (`loadActiveBundle`). Pure; no catalog lookup needed to tell two attachments of the same entry
+ * apart.
+ */
+export function duplicateAttachmentIssues(
+	toolAttachments: ToolAttachmentsBundle,
+): Readonly<string[]> {
+	const problems: string[] = [];
+	for (const [agentId, attachments] of Object.entries(toolAttachments)) {
+		const seen = new Set<string>();
+		for (const attachment of attachments) {
+			if (seen.has(attachment.entryId)) {
+				problems.push(
+					`toolAttachments: agent '${agentId}' attaches catalog entry '${attachment.entryId}' more than once`,
+				);
+			}
+			seen.add(attachment.entryId);
+		}
+	}
+	return problems;
+}
+
+/**
  * Every catalog constraint an attachment must satisfy, checked against the database: its entry
  * exists and is not deleted, its `pinnedVersion` (when set) names a real version of that entry,
  * its `mode` respects the entry's own `riskFloor`, and its `mode` is one its entry's own `kind`
@@ -158,6 +187,8 @@ async function loadKnownEntryVersions(
  * already refuses `allow`), so only `require_approval`/`disabled` are. An attachment's `settings`
  * bound is already enforced structurally wherever one is parsed (`ToolAttachmentSettingsSchema`);
  * nothing here compiles `configSchema` into a validator (ADR-027 leaves that for later work).
+ * Also includes {@link duplicateAttachmentIssues}, which needs no catalog lookup of its own but
+ * belongs in the same, single gate every committing path already calls.
  */
 export async function attachmentCatalogProblems(
 	db: Db,
@@ -170,13 +201,13 @@ export async function attachmentCatalogProblems(
 		}
 	}
 	if (entryIds.size === 0) {
-		return [];
+		return duplicateAttachmentIssues(toolAttachments);
 	}
 	const [entries, versions] = await Promise.all([
 		loadAttachableEntries(db, entryIds),
 		loadKnownEntryVersions(db, entryIds),
 	]);
-	const problems: string[] = [];
+	const problems: string[] = [...duplicateAttachmentIssues(toolAttachments)];
 	for (const [agentId, attachments] of Object.entries(toolAttachments)) {
 		for (const attachment of attachments) {
 			const entry = entries.get(attachment.entryId);

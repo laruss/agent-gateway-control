@@ -170,7 +170,6 @@
                   "pattern": "^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)+$"
                 },
                 "actionParams": {
-                  "minItems": 1,
                   "type": "array",
                   "items": {
                     "type": "object",

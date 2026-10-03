@@ -5,6 +5,7 @@ import {
 	BUILT_IN_GATEWAY_TOOLS,
 	BUILT_IN_NATIVE_CAPABILITIES,
 	BUILT_IN_UTILITY_ACTIONS,
+	type ChangeOperation,
 	type ChangeSet,
 	type ConfigRevisionSource,
 	type CustomHttpsDefinition,
@@ -12,10 +13,12 @@ import {
 	customHttpsDefinitionProblems,
 	customToolActionType,
 	type JsonObject,
+	MAX_CHANGE_SET_OPERATIONS,
 	type RuntimeAdapterId,
 	riskFloorAllows,
 	type ToolAttachment,
 	type ToolAttachmentMode,
+	type ToolAttachmentsBundle,
 	ToolCatalogConfigSchemaSchema,
 	type ToolCatalogEntry,
 	ToolCatalogEntryDescriptionSchema,
@@ -1230,32 +1233,117 @@ export type AttachToolInput = Readonly<{
 	reason?: string;
 }>;
 
+export type AttachToolResult = CommitChangeResult &
+	Readonly<{
+		/** The legacy `permissions` attachments this call converted and carried forward, in the
+		 * same revision, because `agentId` was not yet hub-managed (ADR-027: the same conversion
+		 * `gateway tools adopt` performs) — empty when the agent was already hub-managed, so this
+		 * attachment is the only thing that changed. */
+		legacyConversion: Readonly<ToolAttachment[]>;
+	}>;
+
+/**
+ * The exact `attach_tool` operations {@link legacyAttachmentsFromPermissions} resolves for
+ * `agentId`'s current `permissions`, carrying its legacy coverage forward into the same revision
+ * that attaches a new entry on top — `attach_tool`'s own semantics (replace any existing
+ * attachment of the same `entryId`) mean the new attachment wins regardless of order, should it
+ * name one of these. `null` only when a resolved attachment's mode its own catalog entry's `kind`
+ * does not support (`modeSupportedByKind`) — the same refusal `adoptOneAgent` gives, surfaced here
+ * instead of silently dropping coverage or guessing a mode that was never actually configured.
+ */
+async function legacyConversionChangeSet(
+	db: Db,
+	agentId: AgentId,
+	permissions: AgentPermissions,
+): Promise<Readonly<{
+	ops: Readonly<ChangeOperation[]>;
+	attachments: Readonly<ToolAttachment[]>;
+}> | null> {
+	const known = await knownCatalogEntries(db);
+	const { attachments } = legacyAttachmentsFromPermissions(permissions, known);
+	if (attachments.length === 0) {
+		return { ops: [], attachments: [] };
+	}
+	const toolAttachments: ToolAttachmentsBundle = { [agentId]: [...attachments] };
+	const catalog = await loadCompilableCatalogEntries(db, toolAttachments);
+	for (const attachment of attachments) {
+		const entry = catalog.get(attachment.entryId);
+		if (entry === undefined || !modeSupportedByKind(entry.kind, attachment.mode)) {
+			return null;
+		}
+	}
+	const ops: ChangeOperation[] = attachments.map((attachment) => ({
+		type: "attach_tool",
+		agentId,
+		entryId: attachment.entryId,
+		pinnedVersion: attachment.pinnedVersion,
+		mode: attachment.mode,
+		settings: attachment.settings,
+	}));
+	return { ops, attachments };
+}
+
 /** Binds (or rebinds) `input.entryId` to `input.agentId`, through the managed-configuration
- * writer: a config revision records it, and rollback/export/import cover it (ADR-027). */
+ * writer: a config revision records it, and rollback/export/import cover it (ADR-027).
+ *
+ * `input.agentId` not yet hub-managed (no attachments document of its own at all): its current
+ * `permissions` lists are converted the same way `gateway tools adopt` does and committed in this
+ * exact revision, ahead of the new attachment — never a plain `attach_tool` on its own, which
+ * would otherwise make the agent hub-managed with only this one attachment and silently drop
+ * everything its legacy `permissions` used to cover (ADR-027's bundle-mirror invariant replaces
+ * `permissions` outright on the very commit that first gives an agent an attachments document).
+ * Refused instead — nothing committed — when that conversion cannot resolve cleanly (a legacy
+ * pattern's mode its own catalog entry does not support) or would need more operations than one
+ * change set may ever hold: either way, `gateway tools adopt <agentId>` is the explicit, reviewed
+ * path for an agent whose legacy permissions need a closer look before this hub ever touches them.
+ */
 export async function attachTool(
 	deps: ControlPlaneDeps,
 	input: AttachToolInput,
-): Promise<CommitChangeResult> {
+): Promise<AttachToolResult> {
 	await checkAttachable(deps, input.entryId, input.pinnedVersion, input.mode);
-	const changeSet: ChangeSet = [
-		{
-			type: "attach_tool",
-			agentId: input.agentId,
-			entryId: input.entryId,
-			pinnedVersion: input.pinnedVersion,
-			mode: input.mode,
-			settings: input.settings ?? {},
-		},
-	];
-	const baseRevisionId = await activeConfigRevisionId(deps);
-	return commitChange(deps, {
+	const attach: ChangeOperation = {
+		type: "attach_tool",
+		agentId: input.agentId,
+		entryId: input.entryId,
+		pinnedVersion: input.pinnedVersion,
+		mode: input.mode,
+		settings: input.settings ?? {},
+	};
+	const { revisionId, bundle, attachments } = await loadAllAgentToolAttachmentsWithRevision(deps);
+	const read = attachments[input.agentId];
+	if (read === undefined) {
+		throw new AdminError(`agent '${input.agentId}' does not exist`);
+	}
+	let legacyConversion: Readonly<ToolAttachment[]> = [];
+	let changeSet: ChangeSet = [attach];
+	if (!read.hubManaged) {
+		const agent = bundle.agents.find((a) => a.id === input.agentId);
+		if (agent === undefined) {
+			throw new AdminError(`agent '${input.agentId}' does not exist`);
+		}
+		const conversion = await inTransaction(deps, ({ tx }) =>
+			legacyConversionChangeSet(tx.db, input.agentId, agent.permissions),
+		);
+		if (conversion === null || conversion.ops.length + 1 > MAX_CHANGE_SET_OPERATIONS) {
+			throw new AdminError(
+				`agent '${input.agentId}' is not yet managed in the tools hub and its legacy ` +
+					`permissions cannot be converted automatically here; run ` +
+					`'gateway tools adopt ${input.agentId}' first`,
+			);
+		}
+		legacyConversion = conversion.attachments;
+		changeSet = [...conversion.ops, attach];
+	}
+	const result = await commitChange(deps, {
 		changeSet,
-		baseRevisionId,
+		baseRevisionId: revisionId,
 		actor: input.actor,
 		source: input.source,
 		...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
 		...(input.reason === undefined ? {} : { reason: input.reason }),
 	});
+	return { ...result, legacyConversion };
 }
 
 export type DetachToolInput = Readonly<{

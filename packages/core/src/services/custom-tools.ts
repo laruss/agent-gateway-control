@@ -76,7 +76,16 @@ export async function prepareCustomApprovalDraft(
 			issues: [`custom tool '${entryId}' does not exist or is not a custom_https entry`],
 		};
 	}
-	const issues = customToolParamIssues(current.definition, draft.actionParams);
+	// `custom_tool_definition_version` is reserved for this call alone (`customHttpsDefinitionProblems`
+	// already refuses a definition that declares it as a parameter): a model-supplied copy is
+	// stripped here, before validation and before the one, real copy below is added, so exactly one
+	// ever reaches the stored action — never two entries sharing the name, where a later
+	// `.find(...)` (grant-time re-validation, execution) could pick the model's own value instead of
+	// this call's.
+	const modelActionParams = draft.actionParams.filter(
+		(param) => param.name !== CUSTOM_DEFINITION_VERSION_PARAM,
+	);
+	const issues = customToolParamIssues(current.definition, modelActionParams);
 	if (issues.length > 0) {
 		return { kind: "refused", issues };
 	}
@@ -85,7 +94,7 @@ export async function prepareCustomApprovalDraft(
 		draft: {
 			...draft,
 			actionParams: [
-				...draft.actionParams,
+				...modelActionParams,
 				{ name: CUSTOM_DEFINITION_VERSION_PARAM, value: String(current.version) },
 			],
 		},

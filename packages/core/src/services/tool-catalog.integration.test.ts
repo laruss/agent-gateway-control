@@ -302,6 +302,21 @@ describe("tool catalog service (ADR-027)", () => {
 	});
 
 	it("attach/detach/update each commit a config revision carrying the given source, covered by rollback", async () => {
+		// `alpha` is still legacy: this first attachment converts its own `tools_deny: ["finance.*"]`
+		// (`agent()`'s own default, above) into the same disabled attachment(s) `gateway tools adopt`
+		// would, alongside the attachment actually requested — never just the one attachment on its
+		// own (ADR-027). Only `executor-finance-payment-create` still resolves: an earlier test in
+		// this file ("a tombstoned built-in never comes back across reseeding") permanently deletes
+		// `executor-finance-subscription-create`, and `reset()` never undoes a tombstone. Stays in
+		// place (unaffected) through every step below.
+		const financeDeny = [
+			{
+				entryId: "executor-finance-payment-create",
+				pinnedVersion: null,
+				mode: "disabled" as const,
+				settings: {},
+			},
+		];
 		const attach = await attachTool(deps, {
 			agentId: "alpha",
 			entryId: "gateway-memory-write",
@@ -332,6 +347,7 @@ describe("tool catalog service (ADR-027)", () => {
 			loadActiveBundle(tx.db, updated.revisionId),
 		);
 		expect(afterUpdate.toolAttachments.alpha).toEqual([
+			...financeDeny,
 			{
 				entryId: "gateway-memory-write",
 				pinnedVersion: null,
@@ -349,7 +365,7 @@ describe("tool catalog service (ADR-027)", () => {
 		const { bundle: afterDetach } = await inTransaction(deps, ({ tx }) =>
 			loadActiveBundle(tx.db, detach.revisionId),
 		);
-		expect(afterDetach.toolAttachments.alpha).toEqual([]);
+		expect(afterDetach.toolAttachments.alpha).toEqual(financeDeny);
 
 		// Rolling back to the attach revision restores exactly that attachment.
 		const { bundle: attachBundle } = await inTransaction(deps, ({ tx }) =>
@@ -383,6 +399,7 @@ describe("tool catalog service (ADR-027)", () => {
 			loadActiveBundle(tx.db, rolledBack.revisionId),
 		);
 		expect(rolledBackBundle.toolAttachments.alpha).toEqual([
+			...financeDeny,
 			{ entryId: "gateway-memory-write", pinnedVersion: null, mode: "allow", settings: {} },
 		]);
 	});
@@ -577,7 +594,20 @@ describe("tool catalog service (ADR-027)", () => {
 		const { bundle: rolledBackBundle } = await inTransaction(deps, ({ tx }) =>
 			loadActiveBundle(tx.db, rolledBack.revisionId),
 		);
-		expect(rolledBackBundle.toolAttachments.alpha).toEqual([]);
+		// `alpha` was still legacy when `attachTool` above first ran: its own `tools_deny:
+		// ["finance.*"]` converted into this disabled attachment alongside `gateway-memory-write`
+		// (ADR-027) — neither dropped nor deleted, so it remains. Only
+		// `executor-finance-payment-create` resolves here: an earlier test in this file ("a
+		// tombstoned built-in never comes back across reseeding") permanently deletes
+		// `executor-finance-subscription-create`, and `reset()` never undoes a tombstone.
+		expect(rolledBackBundle.toolAttachments.alpha).toEqual([
+			{
+				entryId: "executor-finance-payment-create",
+				pinnedVersion: null,
+				mode: "disabled",
+				settings: {},
+			},
+		]);
 		const row = (
 			await pool.query("select deleted_at from catalog_entries where id = $1", [
 				"gateway-memory-write",

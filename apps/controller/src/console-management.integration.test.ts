@@ -2,10 +2,12 @@ import { randomUUID } from "node:crypto";
 import type { ConfigApplyInput } from "@agent-gateway/core";
 import {
 	applyConfig,
+	attachTool,
 	commitChange,
 	completeOperation,
 	ensureAgentLifecycleAdoption,
 	ensureConfigHistory,
+	ensureToolCatalogSeeded,
 	failOperation,
 	grantChannel,
 	markProvisioning,
@@ -1110,6 +1112,79 @@ describe("the Agents hub's management API (ADR-024/ADR-025)", () => {
 			});
 			expect(res.status).toBe(200);
 			expect(res.body.channelName).toBeNull();
+		});
+	});
+
+	describe("a hub-managed agent's permissions patch (ADR-027)", () => {
+		/** A freshly created, fully provisioned lifecycle agent, made hub-managed with exactly one,
+		 * harmless attachment (the built-in gateway action every agent may already post through) —
+		 * never `AGENT_ID`/`RETAINED_AGENT_ID` themselves, which other tests in this file (including
+		 * one that removes `RETAINED_AGENT_ID` from the active configuration entirely) depend on
+		 * staying exactly as `exampleConfig` left them. */
+		async function hubManagedAgent(
+			base: string,
+			session: { cookie: string; csrfToken: string },
+			id: string,
+		): Promise<string> {
+			const created = await createLifecycleAgent(base, session, id);
+			await markProvisioning(gateway.deps(), created.operationId, "test");
+			await completeOperation(gateway.deps(), created.operationId, "test");
+			await ensureToolCatalogSeeded(gateway.deps(), "test");
+			await attachTool(gateway.deps(), {
+				agentId: created.agentId,
+				entryId: "gateway-mattermost-post",
+				pinnedVersion: null,
+				mode: "allow",
+				actor: "test",
+				source: "console",
+			});
+			return created.agentId;
+		}
+
+		it("refuses a patch touching tools_allow/tools_require_human_approval/tools_deny", async () => {
+			const { base } = await withServer();
+			const session = await signIn(base);
+			const agentId = await hubManagedAgent(base, session, "console-hub-managed-tools");
+			const baseRevisionId = (
+				(await getJson(base, `/api/agents/${agentId}`, session.cookie)).body.agent as JsonBody
+			).activeRevisionId as number;
+			const preview = await postJson(base, `/api/agents/${agentId}/preview`, session, {
+				baseRevisionId,
+				changes: { permissions: { tools_allow: ["mail.send"] } },
+			});
+			expect(preview.status).toBe(200);
+			expect(preview.body.problems).toEqual([expect.stringContaining("managed in the tools hub")]);
+			const commit = await postJson(base, `/api/agents/${agentId}/commit`, session, {
+				baseRevisionId,
+				changes: { permissions: { tools_allow: ["mail.send"] } },
+				idempotencyKey: randomUUID(),
+			});
+			expect(commit.status).toBe(422);
+		});
+
+		it("allows toggling observe_system alone, even though the agent is hub-managed", async () => {
+			const { base } = await withServer();
+			const session = await signIn(base);
+			const agentId = await hubManagedAgent(base, session, "console-hub-managed-observe");
+			const baseRevisionId = (
+				(await getJson(base, `/api/agents/${agentId}`, session.cookie)).body.agent as JsonBody
+			).activeRevisionId as number;
+			const preview = await postJson(base, `/api/agents/${agentId}/preview`, session, {
+				baseRevisionId,
+				changes: { permissions: { observe_system: true } },
+			});
+			expect(preview.status).toBe(200);
+			expect(preview.body.problems).toEqual([]);
+			const commit = await postJson(base, `/api/agents/${agentId}/commit`, session, {
+				baseRevisionId,
+				changes: { permissions: { observe_system: true } },
+				idempotencyKey: randomUUID(),
+			});
+			expect(commit.status).toBe(200);
+			const detail = await getJson(base, `/api/agents/${agentId}`, session.cookie);
+			const detailAgent = detail.body.agent as JsonBody;
+			expect(detailAgent.toolsHubManaged).toBe(true);
+			expect((detailAgent.permissions as JsonBody).observe_system).toBe(true);
 		});
 	});
 });

@@ -456,11 +456,14 @@ function changeSetProblems(base: ConfigDraftBundle, changeSet: ChangeSet): Reado
 /**
  * A hub-managed agent's `permissions` are a mirror of its compiled attachments (ADR-027), replaced
  * on every commit regardless of what a direct edit sets — previewing (and committing) a patch that
- * edits `tools_allow`/`tools_require_human_approval`/`tools_deny`/`observe_system` for one would
- * show a change the commit then silently overwrites back to the compiled result, a no-op the owner
- * never asked for. Refused here, at the one place both `previewAgentPatch` and `commitAgentPatch`
- * already resolve `bundle`, rather than left to surprise the owner after committing. Empty for a
- * legacy agent (no attachments document at all) or a patch that never touches `permissions`.
+ * edits `tools_allow`/`tools_require_human_approval`/`tools_deny` for one would show a change the
+ * commit then silently overwrites back to the compiled result, a no-op the owner never asked for.
+ * Refused here, at the one place both `previewAgentPatch` and `commitAgentPatch` already resolve
+ * `bundle`, rather than left to surprise the owner after committing. Empty for a legacy agent (no
+ * attachments document at all), a patch that never touches `permissions`, or a `permissions` patch
+ * that only sets `observe_system` — compiled attachments never cover that field (`compiledAgentPermissions`
+ * sets it from the agent's own current value, untouched by the hub), so it is the one part of
+ * `permissions` a hub-managed agent still edits directly.
  */
 function hubManagedPermissionsEditProblems(
 	bundle: ConfigDraftBundle,
@@ -468,6 +471,14 @@ function hubManagedPermissionsEditProblems(
 	patch: AgentPatch,
 ): Readonly<string[]> {
 	if (patch.permissions === undefined || bundle.toolAttachments[agentId] === undefined) {
+		return [];
+	}
+	const { tools_allow, tools_require_human_approval, tools_deny } = patch.permissions;
+	if (
+		tools_allow === undefined &&
+		tools_require_human_approval === undefined &&
+		tools_deny === undefined
+	) {
 		return [];
 	}
 	return [

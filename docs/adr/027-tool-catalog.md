@@ -153,10 +153,34 @@ never an independent fact — see that section for the exact rule.
 Every attachment named anywhere in a committed configuration is checked, at the same shared commit
 boundary every write path commits a bundle through (`prepareChange`/`commitChangeIn`): its entry
 exists and is not deleted, any `pinnedVersion` it names is a real version of that entry, and its
-`mode` respects the entry's own `riskFloor`. `attachTool`/`updateAttachment` already give a caller a
-friendlier, earlier refusal for the same problems (`checkAttachable`); this boundary is what closes
-the gap for every other path that can commit a bundle — `config import`'s `replace_bundle`, a
-direct `commitChange` — which never called `checkAttachable` at all.
+`mode` respects the entry's own `riskFloor`; no agent attaches the same entry twice (`allow` and
+`disabled` at once would compile into overlapping permission-list entries `AgentConfigSchema`
+itself refuses — caught here, before a commit, rather than only the next time something parses the
+result back). `attachTool`/`updateAttachment` already give a caller a friendlier, earlier refusal
+for the same problems (`checkAttachable`); this boundary is what closes the gap for every other path
+that can commit a bundle — `config import`'s `replace_bundle`, a direct `commitChange` — which never
+called `checkAttachable` at all. `writeConfigRevisionIn`, the one writer every committing path ends
+in, re-checks both this and the mirrored agents its own bundle-mirror invariant (below) is about to
+produce, immediately before anything is hashed or stored — never relying on a caller upstream having
+already checked first.
+
+**Attaching to a still-legacy agent converts its `permissions` first.** `attachTool` on an agent with
+no attachments document of its own yet would otherwise make it hub-managed with only the one
+attachment just requested: the bundle-mirror invariant (below) replaces `permissions` with the
+compiled result on the very commit that first gives an agent an attachments document, so attaching
+one entry on its own would silently drop everything else the agent's `permissions` used to cover
+(an agent allowed `mattermost.post` loses it the moment anything else is attached). `attachTool`
+instead reads the agent's current attachments and its own `permissions` together, right before
+committing, and — only when the agent is still legacy — converts its `permissions` the same way
+`gateway tools adopt` (below) does, committing the converted attachments and the one actually
+requested in the same revision, against the exact base revision that read came from (so a
+concurrent change is a conflict, never silently rebased onto). The conversion itself is reported
+back (`legacyConversion`). A legacy pattern whose resolved mode its own catalog entry's `kind` does
+not support refuses the whole attach outright — nothing committed — with a pointer to
+`gateway tools adopt <agent-id>` first, the explicit, reviewed path for resolving it; `detachTool`
+and `updateAttachment` need no such conversion, since neither can itself be the first write that
+makes a legacy agent hub-managed (a detach of nothing is a no-op, and an update of an attachment
+that does not exist yet is already refused).
 
 Each agent's own attachment list is canonicalized (sorted by `entryId`) once, right after a change
 set is applied and before anything hashes or stores the result: an attachment's position in its
@@ -421,9 +445,12 @@ parameters (string/number/boolean/enum, with bounds) mapped explicitly into exac
 references by alias, mapped into their own slot the same way; response limits (max bytes, allowed
 content types, a timeout); and, for anything but `GET`, a required idempotency header name.
 `customHttpsDefinitionProblems` (`@agent-gateway/contracts`, pure) refuses a definition whose path
-placeholders and path parameters do not match exactly, whose slots collide, that puts a secret in
-the path, or that is a write without an idempotency mechanism — a write cannot be saved at all
-without one. Editing a `custom_https` entry (`editCatalogEntry`) publishes a new version precisely
+placeholders and path parameters do not match exactly, whose slots collide (header names compared
+case-insensitively, since two differently-cased spellings are the same HTTP header; the
+idempotency header itself is one more name nothing else may target), that declares a parameter
+named `custom_tool_definition_version` (reserved for the controller's own pin, below), that puts a
+secret in the path, or that is a write without an idempotency mechanism — a write cannot be saved
+at all without one. Editing a `custom_https` entry (`editCatalogEntry`) publishes a new version precisely
 like a built-in's `name`/`description` edit, except every field — `httpsDefinition` included — may
 change, since nothing here is a real integration's own fixed fact the way a built-in's `riskFloor`
 is. `riskFloor` is always `require_approval` and `supportedAdapters` always empty for this kind;
@@ -433,12 +460,19 @@ kind can ever be attached `allow`, side-effect-free or not.
 
 **No value, ever, except through an encoded slot.** There is no JavaScript evaluation and no shell:
 every parameter value is percent-encoded into its one path segment or query entry, or placed as one
-header value or one JSON field — never interpolated into a larger string. A path value that is
-itself `.`/`..`, contains `/` or `\`, or carries a control character is refused at the validation
-layer (`customToolParamIssues`, `@agent-gateway/policy`) before an approval is ever created, and
-`resolveCustomHttpRequest`'s own percent-encoding keeps a value that somehow reached execution
-anyway (a forged job) confined to its one segment regardless — encoding, not re-validation, is what
-the execution layer itself relies on.
+header value or one JSON field — never interpolated into a larger string, and a path placeholder is
+filled by the *parameter* that declares it (its own `name`), never by its placeholder's own
+`slotName`, which may differ. A path value that is itself `.`/`..`, contains `/` or `\`, or carries
+a control character is refused at the validation layer (`customToolParamIssues`,
+`@agent-gateway/policy`) before an approval is ever created; a header or query value carrying a
+control character (CR/LF, NUL, ...) is refused there too, and a header value outside Latin-1 — the
+same validation layer refusing outright what `https.request` would otherwise throw on, forcing an
+`unknown` the destination never actually saw. A number parameter's value is required to parse to a
+finite number: a long enough run of digits still matches the numeric grammar but overflows to
+`Infinity`, which `JSON.stringify` would otherwise turn into `null` on the wire — a request that
+would then disagree with what was approved. `resolveCustomHttpRequest`'s own percent-encoding keeps
+a path value that somehow reached execution anyway (a forged job) confined to its one segment
+regardless — encoding, not re-validation, is what the execution layer itself relies on.
 
 **The broker namespace.** `custom` is a fixed `ToolNamespace` (`TOOL_NAMESPACES`) that every
 `custom_https` entry's action type routes through — one shared queue
@@ -456,12 +490,17 @@ own `https_definition` and nothing else of the catalog, and only to a role that 
 
 **Pinning an approval to the exact version it was resolved against.** A `needs_human` request
 naming a `custom_https` action is never approved against "whatever the entry currently is": the
-controller (`prepareCustomApprovalDraft`, `packages/core`) validates the model's own parameters
-against the entry's *current* definition and, only once they pass, adds a synthetic parameter,
-`__custom_definition_version`, pinned to that version — before the draft is ever hashed, shown on
-the card, or stored. Because this parameter is part of `actionParams` like any other, it is covered
-by the same immutable `approvalActionHash` every other action already uses, with no schema change
-to `ApprovalRequestSchema` or `ToolActionJobSchema` at all. At grant time (`customGrantTimeIssues`,
+controller (`prepareCustomApprovalDraft`, `packages/core`) strips any `custom_tool_definition_version`
+the model's own draft already names — reserved for this call alone, never trusted from a model or a
+forged draft — validates the remaining parameters against the entry's *current* definition and,
+only once they pass, adds exactly one synthetic parameter, `custom_tool_definition_version`, pinned
+to that version — before the draft is ever hashed, shown on the card, or stored. A `custom_https`
+action is the one case `ApprovalRequestDraftSchema` allows zero model-supplied parameters at all
+(every other action type still needs at least one): a fixed call whose only moving part is a named
+secret — a definition with no typed parameters of its own — still ends up with this one, controller-
+added parameter and so is still approvable. Because this parameter is part of `actionParams` like
+any other, it is covered by the same immutable `approvalActionHash` every other action already uses,
+with no schema change to `ApprovalRequestSchema` or `ToolActionJobSchema` at all. At grant time (`customGrantTimeIssues`,
 re-run inside `executionIssues` alongside every other live policy check — never the run's stale
 snapshot) the pinned version is compared against the entry's version *now*: a mismatch — the
 definition was edited since the request was made — refuses the grant outright
@@ -479,39 +518,69 @@ rebinding (a second answer, from this process or the destination's own resolver,
 what a call already pinned to). Before resolving at all, `host` (and every candidate address DNS
 returns) is classified by `@agent-gateway/policy`'s `ip-guard.ts`: private (RFC 1918), loopback,
 link-local (169.254/16, the cloud metadata range included), carrier-grade NAT (100.64/10),
-multicast, reserved, the documentation/benchmark ranges, and the IPv6 forms that alias any of these
-(unique-local, link-local, an IPv4-mapped address, NAT64) are all refused — classified from the
-literal numeric value regardless of notation (dotted, decimal, octal, hex for IPv4; compressed
-`::` forms and embedded-IPv4 forms for IPv6), since a hostname that is itself a numeric literal in
-an unusual base is exactly the classic SSRF bypass this guard exists to close. The TLS SNI and the
-HTTP `Host` header stay the definition's own hostname throughout — only the TCP/TLS connection
-target is the resolved address — so the destination sees an ordinary request. Redirects are never
-followed (`sendPinnedRequest` simply never looks at one); a response over `responseLimits`'s own
-cap is aborted mid-stream.
+multicast and reserved IPv4 ranges are a deny-list; IPv6 is the reverse, an allow-list — only global
+unicast (`2000::/3`) may ever pass, and only once it matches none of the special-purpose ranges
+carved out of it (6to4, Teredo, the documentation and benchmarking ranges, ORCHIDv2, both NAT64
+well-known prefixes) or aliases a non-global address the IPv4-style forms above already cover
+(unique-local, link-local, an IPv4-mapped or IPv4-compatible address, the deprecated site-local
+range, the discard-only prefix, SIIT) — a deny-list here would have to name every non-global range
+that exists, where an allow-list can only ever refuse something that happens to be global, never
+admit something that is not. Every address is classified from its literal numeric value regardless
+of notation (dotted, decimal, octal, hex for IPv4; compressed `::` forms and embedded-IPv4 forms for
+IPv6), since a hostname that is itself a numeric literal in an unusual base is exactly the classic
+SSRF bypass this guard exists to close. The TLS SNI and the HTTP `Host` header stay the definition's
+own hostname throughout — only the TCP/TLS connection target is the resolved address — so the
+destination sees an ordinary request. Redirects are never followed (`sendPinnedRequest` simply never
+looks at one); a response over `responseLimits`'s own cap is aborted mid-stream, the moment the
+overflow is actually detected rather than waiting on a further stream event that may never come.
+
+One overall deadline — `AbortSignal.any` combining `responseLimits.timeoutMs` with the executor's
+own cancellation signal (kill-all, the agent disabled, the runner stopping) — covers DNS, connect,
+TLS, send and the response body alike, passed to `https.request` as its own `signal` rather than
+relied on as a socket-idle timeout (which a response trickling one byte at a time would never trip
+at all). The executor itself checks that same signal before every stage — the definition lookup,
+secret resolution, sending — so a call still resolving its destination can be cancelled, not only
+one already connected, and returns a clean `failed` when nothing was sent yet rather than starting
+an external write on behalf of a run that has already been told to stop.
 
 **Outcomes.** `succeeded` carries a receipt (status code, a redacted response preview — every
-resolved secret value is replaced outright before anything is read into a receipt or an error, even
-one a destination echoes back); `failed` is a clean, known refusal with nothing left uncertain — a
-blocked address, an unexpected content type, an oversized `GET` response, the destination's own
+resolved secret value, and the forms this executor's own request-building could have put it on the
+wire in (URL- and form-encoded, JSON-escaped, base64/base64url), are replaced outright before
+anything is read into a receipt or an error, even one a destination echoes back — best-effort
+against a destination that happens to echo the credential; a hostile destination that already holds
+it learns nothing more from a scrub missing some further transformation of it. A definition may also
+turn the preview off entirely, `includeBodyPreview: false`, for a body an owner never wants an agent
+to see regardless). `failed` is a clean, known refusal with nothing left uncertain — a blocked
+address, a `GET` with an unexpected content type, an oversized `GET` response, the destination's own
 4xx/5xx. `unknown` is reserved for what the brief among tool actions already means it to be
-(ADR-018): a timeout or a connection reset **after** the request was already fully sent, when the
-destination may or may not have acted on it — the egress client distinguishes this by whether the
-request finished writing before the failure, and throws rather than returning `failed`, so
-`processToolJob` records it as `unknown` exactly like any other executor's unexplained crash. An
-oversized response is the one case decided by the method: a `GET`'s own abort is always `failed`
-(nothing but a read was ever at stake); a write's is `unknown`, since the request itself had already
-been sent by the time the response proved too large to trust. Neither `failed` nor `unknown` is ever
-retried automatically — an `unknown` custom-tool action is settled by hand
-(`gateway tools settle`), the same as any other namespace's.
+(ADR-018): an abort — a timeout or a cancellation — or a connection reset **after** the request was
+already fully sent, when the destination may or may not have acted on it — the egress client
+distinguishes this by whether the request finished writing (and, for an HTTPS call, the TLS
+handshake itself completed: `finish` alone can fire before the connection is even established,
+which would otherwise make a pre-connect failure — an untrusted CA, a hostname/certificate mismatch
+— look sent) before the failure, and throws rather than returning `failed`, so `processToolJob`
+records it as `unknown` exactly like any other executor's unexplained crash. An oversized response
+is the one case decided by the method: a `GET`'s own abort is always `failed` (nothing but a read
+was ever at stake); a write's is `unknown` once the request was actually sent, `failed` otherwise.
+A write whose request was fully sent and that comes back with a content type the definition does not
+allow is no longer automatically `failed`: a 2xx (the common case is no body or `Content-Type` at
+all, a plain 201/204) is `succeeded`, its body withheld rather than previewed, since a clean failure
+here is exactly what would make an owner retry an already-done write under a new idempotency key; a
+non-2xx stays `failed`; the one case left genuinely ambiguous (a response with no usable status at
+all) is `unknown`. A `GET` with an unexpected content type stays `failed` regardless of status, as
+before. Neither `failed` nor `unknown` is ever retried automatically — an `unknown` custom-tool
+action is settled by hand (`gateway tools settle`), the same as any other namespace's.
 
 **Secrets never reach anywhere but the request.** A definition names a secret by alias only; the
 runner resolves it from its own secrets directory (file per alias, `gateway tools secret set
 <alias>`, read-only to the runner) at the moment it builds the request, and the value is used to
 fill exactly the slot the definition names — never logged, never part of a receipt or an error
-(scrubbed outright even from a destination's own echo), never part of the approval hash (only the
-*slot* a secret fills is ever part of what gets resolved and shown — never a value, since none
-exists yet at approval time), and never written to any table this release's schema has a column
-for.
+(scrubbed, best-effort, even from a destination's own echo — see Outcomes above), never part of the
+approval hash (only the *slot* a secret fills is ever part of what gets resolved and shown — never a
+value, since none exists yet at approval time), and never written to any table this release's schema
+has a column for. This is best-effort against a destination that echoes the credential back, not a
+guarantee against one that is itself hostile: a destination the call actually reached already holds
+every value it was sent, scrub or no scrub.
 
 ### Packaged utilities
 

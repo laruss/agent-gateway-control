@@ -69,6 +69,7 @@ import { nextAgentState, requireTransition } from "../state-machine.ts";
 import { revokeQueuedActions, sweepApprovals, withdrawOpenApprovals } from "./approvals.ts";
 import {
 	attachmentCatalogProblems,
+	duplicateAttachmentIssues,
 	mirrorCompiledAttachmentPermissions,
 } from "./attachment-validation.ts";
 import type { ControlPlaneDeps, UnitOfWork } from "./deps.ts";
@@ -716,12 +717,34 @@ export async function writeConfigRevisionIn(
 		changeHash,
 	} = write;
 	const { db } = uow.tx;
+	// Every caller already runs `attachmentCatalogProblems` (which itself includes this) against
+	// the same `toolAttachments` before ever reaching this shared writer; checked again here,
+	// against whatever caller this ever grows, so a bundle with two attachments of the same entry
+	// can never be written at all — never committed and only discovered later, when
+	// `loadActiveBundle` next parses the overlapping permission lists it compiles into.
+	const duplicateProblems = duplicateAttachmentIssues(toolAttachments);
+	if (duplicateProblems.length > 0) {
+		throw new AdminError(`configuration is invalid:\n- ${duplicateProblems.join("\n- ")}`);
+	}
 	const mirroredAgents = await mirrorCompiledAttachmentPermissions(
 		db,
 		rawInput.organization.organization.finance_agent_id,
 		rawInput.agents,
 		toolAttachments,
 	);
+	// The bundle-mirror invariant's own result, validated before it is ever hashed or written:
+	// `AgentConfigSchema` itself refuses an agent whose compiled permission lists overlap
+	// (`toolPatternOverlaps`) — catching that here, against the exact agents about to be stored,
+	// is what keeps a bad compile result from ever reaching `config_snapshots` at all, rather than
+	// surfacing only the next time something parses the snapshot back (`loadActiveBundle`).
+	for (const agent of mirroredAgents) {
+		const parsed = AgentConfigSchema.safeParse(agent);
+		if (!parsed.success) {
+			throw new AdminError(
+				`internal: agent '${agent.id}'s compiled attachments produced an invalid configuration:\n- ${parsed.error.issues.map((issue) => issue.message).join("\n- ")}`,
+			);
+		}
+	}
 	const input: ConfigApplyInput = { ...rawInput, agents: mirroredAgents };
 	const bundle = configSnapshotBundle(input);
 	const version = canonicalHash(bundle);

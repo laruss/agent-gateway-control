@@ -164,6 +164,13 @@ export const CustomToolResponseLimitsSchema = z.strictObject({
 	allowedContentTypes: z.array(MimeTypeSchema).min(1).max(16),
 	/** A hard deadline on the whole call (connect through response body), milliseconds. */
 	timeoutMs: z.int().min(1000).max(60_000).default(10_000),
+	/** `false`: the receipt never carries a body preview at all, whatever the response — an
+	 * owner's own choice for a destination whose body is never worth showing an agent (it might
+	 * itself be sensitive, even scrubbed of this definition's own named secrets). Scrubbing a
+	 * destination's echo is best-effort regardless (`textPreview`, `@agent-gateway/tool-broker`);
+	 * this is the one way to make that question not matter at all. Defaults to on, unchanged from
+	 * every definition that predates this field. */
+	includeBodyPreview: z.boolean().default(true),
 });
 export type CustomToolResponseLimits = z.infer<typeof CustomToolResponseLimitsSchema>;
 
@@ -241,11 +248,21 @@ export function customHttpsDefinitionProblems(
 			problems.push(`path parameter '${name}' has no '{${name}}' placeholder in the path template`);
 		}
 	}
-	// Every (slot, slotName) pair must be unique across parameters and secret slots: two sources
-	// writing the same header or body field would make the actual request ambiguous.
+	for (const param of definition.parameters) {
+		if (param.name === CUSTOM_DEFINITION_VERSION_PARAM) {
+			problems.push(
+				`parameter '${param.name}' is reserved for the controller's own definition-version pin`,
+			);
+		}
+	}
+	// Every (slot, slotName) pair must be unique across parameters, secret slots and the
+	// idempotency header: two sources writing the same header or body field would make the actual
+	// request ambiguous, and a parameter or secret quietly aliasing the idempotency header could
+	// override the value the runner sends there. Header names are compared case-insensitively
+	// (HTTP header names are never case-sensitive); every other slot is compared exactly.
 	const slotKeys = new Map<string, string>();
 	const claim = (slot: string, slotName: string, who: string) => {
-		const key = `${slot}:${slotName}`;
+		const key = slot === "header" ? `${slot}:${slotName.toLowerCase()}` : `${slot}:${slotName}`;
 		const owner = slotKeys.get(key);
 		if (owner !== undefined) {
 			problems.push(`${who} and ${owner} both target ${slot} '${slotName}'`);
@@ -253,6 +270,9 @@ export function customHttpsDefinitionProblems(
 			slotKeys.set(key, who);
 		}
 	};
+	if (definition.idempotency !== null) {
+		claim("header", definition.idempotency.headerName, "the idempotency header");
+	}
 	for (const param of definition.parameters) {
 		if (param.slot === "path" && !/^[A-Za-z][A-Za-z0-9_]*$/.test(param.slotName)) {
 			problems.push(`path parameter '${param.name}': slot name must match a '{placeholder}' name`);
@@ -308,13 +328,19 @@ export function customHttpsDefinitionProblems(
 // Packaged utilities: a typed input/output, a bounded size, nothing else
 // ---------------------------------------------------------------------------
 
-/** `utility.text-transform`'s own operations: deterministic, side-effect-free string transforms
- * whose output can never exceed its (bounded) input's length. */
+/** `utility.text-transform`'s own operations: deterministic, side-effect-free string transforms.
+ * `trim`/`reverse` never grow the input; `slugify` is bounded by its own, explicit truncation
+ * below. `upper`/`lower` are Unicode case mapping, not a 1:1 character substitution, and *can*
+ * grow it (`"ß".toUpperCase()` is `"SS"`, twice as long) — the one case the executor
+ * (`@agent-gateway/tool-broker`'s `utilityExecutor`) checks for itself, since nothing short of
+ * actually running the transform can bound it here. */
 export const TEXT_TRANSFORM_OPERATIONS = ["trim", "upper", "lower", "slugify", "reverse"] as const;
 export const TextTransformOperationSchema = z.enum(TEXT_TRANSFORM_OPERATIONS);
 export type TextTransformOperation = z.infer<typeof TextTransformOperationSchema>;
 
-/** Bounded so the result always fits a `ToolReceipt` field (`safeText(500, ...)`. */
+/** The longest input `utility.text-transform` accepts. Not by itself a bound on the *output*
+ * (see `TEXT_TRANSFORM_OPERATIONS`'s own doc comment) — the executor checks that separately,
+ * against `TOOL_RECEIPT_TEXT_MAX`. */
 export const TEXT_TRANSFORM_MAX_INPUT_LENGTH = 400;
 
 /** The built-in utility this release ships: fixed code, a typed input, a bounded, side-effect-free

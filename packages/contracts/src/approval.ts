@@ -31,6 +31,23 @@ export const ActionParamsSchema = z
 export type ActionParams = z.infer<typeof ActionParamsSchema>;
 
 /**
+ * {@link ActionParamsSchema} without its own `.min(1)`: a model's own `needs_human` draft for a
+ * `custom_https` action (ADR-027) may legitimately have no parameters of its own at all — a fixed
+ * `GET` whose only moving part is a secret the runner alone resolves — since the one parameter
+ * every custom-tool action always ends up with, `custom_tool_definition_version`, is the
+ * controller's own, added only once the draft has already passed this schema
+ * (`prepareCustomApprovalDraft`, `@agent-gateway/core`). `ApprovalRequestDraftSchema`'s own refine
+ * restores the `>= 1` bound for every other action type, which has no such controller-added
+ * parameter to fall back on.
+ */
+const DraftActionParamsSchema = z
+	.array(ActionParamSchema)
+	.max(32)
+	.refine((params) => new Set(params.map((p) => p.name)).size === params.length, {
+		message: "action parameter names must be unique",
+	});
+
+/**
  * What an agent asks a human to approve. Returned inside `needs_human`.
  * Risk level is assigned by policy, never by the model.
  */
@@ -65,10 +82,16 @@ export function approvalBlocksLength(
 export const ApprovalRequestDraftSchema = z
 	.strictObject({
 		actionType: ToolNameSchema,
-		/** Every parameter that defines the action; all of them go into the immutable hash. */
-		actionParams: ActionParamsSchema,
+		/** Every parameter that defines the action; all of them go into the immutable hash. Empty
+		 * only for a `custom.*` action type (see {@link DraftActionParamsSchema}) — every other
+		 * action type still needs at least one, enforced below. */
+		actionParams: DraftActionParamsSchema,
 		/** Prose; the approval card must render it apart from the hashed parameters. */
 		actionSummary: safeText(2000, "text"),
+	})
+	.refine((draft) => draft.actionParams.length > 0 || draft.actionType.startsWith("custom."), {
+		message: "actionParams: a non-custom action must have at least one parameter",
+		path: ["actionParams"],
 	})
 	.refine((draft) => approvalBlocksLength(draft) <= APPROVAL_TEXT_MAX, {
 		message: `summary and parameters together must fit ${APPROVAL_TEXT_MAX} characters (one approval card)`,

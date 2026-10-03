@@ -658,6 +658,14 @@ describe("config export/import: tool attachments round-trip (ADR-027)", () => {
 	});
 
 	it("an attachment round-trips through export and import, losslessly, at the same hash", async () => {
+		// `director` is still legacy the first time anything ever attaches to it: `attachTool`
+		// converts its own `permissions` (`config/examples/agents/director.yaml`:
+		// `tools_allow: [mattermost.post, memory.read, memory.write]`,
+		// `tools_deny: [finance.*, deploy.*, mail.send]`) the same way `gateway tools adopt` would,
+		// in this same revision, alongside the one attachment actually requested here — never just
+		// that one attachment on its own, which would otherwise make `director` hub-managed while
+		// silently dropping everything its legacy permissions covered (ADR-027). `memory.read`,
+		// `deploy.*` and `mail.send` resolve to no known catalog entry and so convert to nothing.
 		const attach = await attachTool(harness.deps, {
 			agentId: "director",
 			entryId: "gateway-memory-write",
@@ -668,12 +676,39 @@ describe("config export/import: tool attachments round-trip (ADR-027)", () => {
 			source: "cli_apply",
 		});
 		expect(attach.noop).toBe(false);
+		// Every pattern `director`'s own legacy `permissions` resolve to — `memory.write` included,
+		// which the explicit attachment below also names and so immediately overwrites with its own
+		// settings.
+		expect(attach.legacyConversion.map((a) => a.entryId).sort()).toEqual([
+			"executor-finance-payment-create",
+			"executor-finance-subscription-create",
+			"gateway-mattermost-post",
+			"gateway-memory-write",
+		]);
 
 		const dir = exportDir();
 		await configExport(harness.deps, { dir, revisionId: attach.revisionId }, noopPrint);
 		const written = JSON.parse(readFileSync(join(dir, "tool-attachments.json"), "utf8"));
 		expect(written).toEqual({
 			director: [
+				{
+					entryId: "executor-finance-payment-create",
+					pinnedVersion: null,
+					mode: "disabled",
+					settings: {},
+				},
+				{
+					entryId: "executor-finance-subscription-create",
+					pinnedVersion: null,
+					mode: "disabled",
+					settings: {},
+				},
+				{
+					entryId: "gateway-mattermost-post",
+					pinnedVersion: null,
+					mode: "allow",
+					settings: {},
+				},
 				{
 					entryId: "gateway-memory-write",
 					pinnedVersion: null,

@@ -149,6 +149,7 @@ function definition(overrides: Partial<CustomHttpsDefinition> = {}): CustomHttps
 			maxResponseBytes: 65_536,
 			allowedContentTypes: ["application/json"],
 			timeoutMs: 5000,
+			includeBodyPreview: true,
 		},
 		...overrides,
 	};

@@ -23,10 +23,26 @@ not a reseed, not a rollback. An owner (or operator) opts an agent in explicitly
 
 There is no console route for attaching, detaching or editing an entry itself yet (ADR-027); use
 `gateway config` directly, or a future console surface once one exists. The Agents hub's own
-editor does show whether an agent is hub-managed: its tool lists are read-only there, with a hint
-to use the hub instead, and a patch that tries to edit them directly is refused (preview and
-commit alike) rather than silently discarded by the bundle-mirror invariant on commit. A legacy
-agent's `permissions` stay fully editable from the console, unaffected.
+editor does show whether an agent is hub-managed: its `tools_allow`/`tools_require_human_approval`/
+`tools_deny` are read-only there, with a hint to use the hub instead, and a patch that tries to
+edit any of them directly is refused (preview and commit alike) rather than silently discarded by
+the bundle-mirror invariant on commit — `observe_system` is the one part of `permissions` still
+editable there even for a hub-managed agent, since compiled attachments never touch it. A legacy
+agent's whole `permissions` stays fully editable from the console, unaffected.
+
+Attaching an entry to a still-**legacy** agent for the first time (its attachments document does
+not exist yet) converts its current `permissions` lists into real attachments first, in the same
+revision — exactly the conversion `gateway tools adopt` (below) performs, committed alongside the
+attachment actually requested. Never just that one attachment on its own: the bundle-mirror
+invariant replaces `permissions` with the compiled result on the very commit that first gives an
+agent an attachments document, so attaching one entry without first carrying the rest forward
+would silently drop everything else the agent's legacy `permissions` used to cover (an agent
+allowed `mattermost.post` loses it the moment anything else is attached, unless this conversion
+runs first). The command's own JSON result names what it converted, under `legacyConversion`; if
+the conversion cannot resolve cleanly (a legacy pattern's mode its own catalog entry's `kind` does
+not support — the same `problems` check `gateway tools adopt` makes), the attach is refused
+outright, nothing committed, with a pointer to run `gateway tools adopt <agent-id>` first to
+resolve it under full review before attaching anything new.
 
 Attaching, detaching or editing an attachment takes effect on the
 agent's **very next turn** — including a turn already scheduled but not yet started, and a queued
@@ -168,7 +184,9 @@ A JSON file matching `CustomHttpsDefinitionSchema`:
 A few rules the definition can never work around:
 
 - Every `{placeholder}` in `pathTemplate` names exactly one `path`-slot parameter, and vice versa.
-- No two parameters (or a parameter and a secret) ever target the same slot.
+- No two parameters (or a parameter and a secret) ever target the same slot — header names compare
+  case-insensitively, since two differently-cased spellings are the same HTTP header — and none of
+  them may target the idempotency header either.
 - A secret may never sit in the `path` (it would be visible, and the approval card shows the
   resolved path).
 - A write (anything but `GET`) must declare `idempotency`; a `GET` must not — a write without a
@@ -176,6 +194,15 @@ A few rules the definition can never work around:
   saved.
 - `host` is a DNS hostname, never a literal address — not that it would help: the egress guard
   classifies every literal and resolved address alike at execution time regardless (below).
+- No parameter may be named `custom_tool_definition_version` — reserved for the controller's own
+  version pin (below).
+- `responseLimits.includeBodyPreview` (default `true`) can be set `false` to withhold the response
+  body preview from every receipt this tool ever produces, success or failure alike — for a
+  destination whose body should never reach an agent regardless of how well scrubbing works.
+
+A model's own request may leave every typed parameter out, if the definition declares none (a
+fixed call whose only moving part is a named secret) — still approvable, since the controller's own
+version-pin parameter (below) is enough on its own for `needs_human` to require at least one.
 
 ### 2. Set its secret
 
@@ -211,17 +238,29 @@ against the new definition instead of what was actually shown and hashed.
 ### Egress, outcomes and the response the agent sees
 
 The tool runner resolves `host` once, refuses a private, loopback, link-local, carrier-grade-NAT,
-multicast, reserved, documentation or IPv6-unique-local/mapped address in any notation (dotted,
-decimal, octal, hex), and connects to exactly the address it resolved — never re-resolving, which
-is what defeats DNS rebinding. Redirects are never followed. A response over its own size limit is
-aborted mid-stream.
+multicast, reserved or documentation IPv4 address in any notation (dotted, decimal, octal, hex);
+IPv6 is an allow-list the other way (only global unicast, `2000::/3`, minus the special-purpose
+ranges carved out of it — 6to4, Teredo, documentation, benchmarking, ORCHIDv2, both NAT64
+prefixes — and minus every non-global form the IPv4 rules already cover, such as unique-local,
+link-local or an IPv4-mapped address). The tool runner then connects to exactly the address it
+resolved — never re-resolving, which is what defeats DNS rebinding. Redirects are never followed. A
+response over its own size limit settles the moment the overflow is detected, never left waiting on
+a further stream event. One overall deadline covers DNS through the response body (`timeoutMs`,
+combined with a kill-all/agent-disable/runner-stop signal) — a destination trickling the response
+one byte at a time cannot outlast it the way a socket-idle timeout could be made to.
 
-An action's outcome is always one of: `succeeded` (a receipt — status code and a redacted response
-preview, never a secret value even if the destination echoes one back), `failed` (a clean, known
-refusal — blocked address, bad content type, the destination's own 4xx/5xx), or `unknown` (a
-timeout or connection reset **after** the request was already sent — never retried automatically;
-settle it by hand with `gateway tools settle` after checking the provider by the action's own
-idempotency key).
+An action's outcome is always one of: `succeeded` (a receipt — status code and a response preview,
+collapsed to one line and bounded, every secret value and the forms this executor could have put it
+on the wire in scrubbed — best-effort against a destination that echoes it back; a hostile
+destination already holds whatever it was sent regardless. A write whose request was fully sent and
+that comes back with a content type the definition does not allow is still `succeeded` when the
+status is 2xx — the body is withheld, not previewed, since a clean `failed` here is exactly what
+would make an owner retry an already-done write under a new idempotency key), `failed` (a clean,
+known refusal — blocked address, a `GET` with a bad content type, the destination's own 4xx/5xx), or
+`unknown` (an abort — a timeout or a cancellation — or a connection reset **after** the request was
+already sent, sent meaning the TLS handshake itself completed, not merely that the body was handed
+to the socket — never retried automatically; settle it by hand with `gateway tools settle` after
+checking the provider by the action's own idempotency key).
 
 ## Packaged utilities
 
@@ -231,7 +270,10 @@ side-effect-free output, proving the path a future utility would also take. It a
 approves exactly like a `custom_https`/`executor` action (see the mode table above) — being
 side-effect-free does not exempt it from a human turn, because the broker has no second,
 approval-free execution path. Its availability reflects whether a currently running tool runner
-actually serves the `utility` namespace.
+actually serves the `utility` namespace. Its input is bounded (400 characters), but `upper`/`lower`
+are Unicode case mapping, not a 1:1 substitution, and can still grow past what a receipt field can
+hold (`"ß"` → `"SS"`); an input whose transformed output would not fit is refused outright — a
+wrong, truncated answer would be worse than no answer at all.
 
 ## Rollback safety
 

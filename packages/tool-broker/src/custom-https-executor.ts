@@ -2,10 +2,11 @@ import {
 	CUSTOM_DEFINITION_VERSION_PARAM,
 	type CustomHttpsDefinition,
 	customToolEntryId,
+	TOOL_RECEIPT_TEXT_MAX,
 	type ToolReceipt,
-	withoutUnsafeCharacters,
+	toVerbatimPreview,
 } from "@agent-gateway/contracts";
-import { redactForStorage } from "@agent-gateway/logging";
+import { redactText } from "@agent-gateway/logging";
 import { resolveCustomHttpRequest } from "@agent-gateway/policy";
 import type { EgressOutcome, EgressRequest } from "./egress.ts";
 import type { ToolExecutionContext, ToolExecutionResult } from "./executor.ts";
@@ -56,21 +57,71 @@ export type CustomHttpsJob = Readonly<{
 }>;
 
 /**
- * A response body, bounded and free of control characters, never empty — the same shape every
- * other executor's own error text already keeps (`@agent-gateway/tool-broker`'s `tool-job.ts`).
- * Every resolved secret value is replaced outright first: a destination that echoes back a header
- * or query value it was sent (a provider's own debug response, an error page quoting the request)
- * must never hand a secret back to the model through the receipt it is this call's whole job to
- * report truthfully.
+ * Every form this executor itself could put a resolved secret value on the wire in, besides the
+ * raw value: URL-encoded the way a query value is built (`encodeURIComponent`) and the way
+ * `URLSearchParams` itself would encode it (space as `+`, not `%20`), JSON-string-escaped the way
+ * a body field is (quotes and backslashes escaped), and base64/base64url, which nothing here emits
+ * directly but a destination's own echo (a debug response, a provider that base64-decodes a
+ * header for logging) might still surface. Empty values are skipped: `"".replaceAll("", x)` would
+ * otherwise splice `x` between every character of the text.
  */
-function textPreview(text: string, secretValues: Iterable<string>): string {
+function secretEncodings(value: string): Readonly<string[]> {
+	if (value === "") {
+		return [];
+	}
+	const formUrlEncoded = new URLSearchParams([["v", value]]).toString().slice("v=".length);
+	const jsonEscaped = JSON.stringify(value).slice(1, -1);
+	const buffer = Buffer.from(value, "utf8");
+	return [
+		value,
+		encodeURIComponent(value),
+		formUrlEncoded,
+		jsonEscaped,
+		buffer.toString("base64"),
+		buffer.toString("base64url"),
+	];
+}
+
+/**
+ * Scrubs every resolved secret value — and the forms above — from `text`, case-sensitively, out
+ * before it is ever read into a receipt or an error. The one choke point every outcome text passes
+ * through on its way out of this executor: a success preview, a failure or unknown message, any
+ * error string. Best-effort against a destination that happens to echo the credential back in its
+ * own response (a provider's own debug page, an error quoting the request) — a genuinely hostile
+ * destination already holds the value this call sent it and learns nothing more from a scrub
+ * failing to catch some further transformation of it.
+ */
+function scrubSecrets(text: string, secretValues: Iterable<string>): string {
 	let scrubbed = text;
 	for (const value of secretValues) {
-		if (value !== "") {
-			scrubbed = scrubbed.replaceAll(value, "<redacted>");
+		for (const form of secretEncodings(value)) {
+			scrubbed = scrubbed.replaceAll(form, "<redacted>");
 		}
 	}
-	return withoutUnsafeCharacters(redactForStorage(scrubbed, 500)).trim() || "(empty)";
+	return scrubbed;
+}
+
+/**
+ * A response body, scrubbed, generically redacted (`@agent-gateway/logging`'s own secret-looking
+ * patterns, for anything beyond this call's own named secrets), collapsed to a single line safe
+ * for a `ToolReceipt` field (`toVerbatimPreview`, `@agent-gateway/contracts`) and bounded to
+ * `TOOL_RECEIPT_TEXT_MAX` — never empty.
+ */
+function textPreview(text: string, secretValues: Iterable<string>): string {
+	return toVerbatimPreview(redactText(scrubSecrets(text, secretValues)), TOOL_RECEIPT_TEXT_MAX);
+}
+
+/** `definition`'s own choice, not this call's: `includeBodyPreview: false` withholds a body
+ * preview unconditionally, success or failure alike — the one way an owner can make "does this
+ * destination's body ever belong in front of the agent" not depend on how well a scrub works. */
+function renderBodyPreview(
+	definition: CustomHttpsDefinition,
+	body: string,
+	secretValues: Iterable<string>,
+): string {
+	return definition.responseLimits.includeBodyPreview
+		? textPreview(body, secretValues)
+		: "(preview disabled by this tool's definition)";
 }
 
 async function resolvedSecretValues(
@@ -100,12 +151,18 @@ export async function executeCustomHttpsAction(
 	if (!Number.isInteger(version) || version < 1) {
 		return { kind: "failed", error: "the job carries no valid definition version" };
 	}
+	if (context.signal.aborted) {
+		return { kind: "failed", error: "cancelled before the tool definition was read" };
+	}
 	const definition = await deps.lookup(entryId, version);
 	if (definition === null) {
 		return {
 			kind: "failed",
 			error: `custom tool '${entryId}' version ${version} is no longer available`,
 		};
+	}
+	if (context.signal.aborted) {
+		return { kind: "failed", error: "cancelled before secrets were resolved" };
 	}
 	// `customToolParamIssues` already refused a path-traversal attempt, an out-of-bounds value or
 	// an undeclared parameter before this request was ever approved (`approvalPolicyIssues`) and
@@ -148,31 +205,45 @@ export async function executeCustomHttpsAction(
 		}
 	}
 
-	const outcome = await deps.send({
-		method: definition.method,
-		host: definition.host,
-		path,
-		headers,
-		body,
-		timeoutMs: definition.responseLimits.timeoutMs,
-		maxResponseBytes: definition.responseLimits.maxResponseBytes,
-		allowedContentTypes: definition.responseLimits.allowedContentTypes,
-	});
-	// A throw from `deps.send` (a timeout or reset after the request was fully sent) propagates out
-	// of this function unchanged — `processToolJob` records that as `unknown`, exactly as it
-	// already does for any other executor that cannot tell what happened.
+	if (context.signal.aborted) {
+		return { kind: "failed", error: "cancelled before the request was sent" };
+	}
+	let outcome: EgressOutcome;
+	try {
+		outcome = await deps.send({
+			method: definition.method,
+			host: definition.host,
+			path,
+			headers,
+			body,
+			timeoutMs: definition.responseLimits.timeoutMs,
+			maxResponseBytes: definition.responseLimits.maxResponseBytes,
+			allowedContentTypes: definition.responseLimits.allowedContentTypes,
+			signal: context.signal,
+		});
+	} catch (error) {
+		// A throw from `deps.send` (a timeout, a cancellation or a reset after the request was fully
+		// sent) propagates out of this function — `processToolJob` records that as `unknown`, exactly
+		// as it already does for any other executor that cannot tell what happened — but scrubbed
+		// first: this is still an outcome text, the same choke point every other one passes through.
+		throw new Error(
+			scrubSecrets(error instanceof Error ? error.message : String(error), secretValues.values()),
+		);
+	}
 	if (outcome.kind === "failed") {
-		return { kind: "failed", error: outcome.error };
+		return { kind: "failed", error: scrubSecrets(outcome.error, secretValues.values()) };
 	}
 	if (outcome.response.status >= 400) {
 		return {
 			kind: "failed",
-			error: `the destination answered ${outcome.response.status}: ${textPreview(outcome.response.body, secretValues.values())}`,
+			error: `the destination answered ${outcome.response.status}: ${renderBodyPreview(definition, outcome.response.body, secretValues.values())}`,
 		};
 	}
 	const receipt: ToolReceipt = {
 		status: outcome.response.status,
-		body_preview: textPreview(outcome.response.body, secretValues.values()),
+		body_preview: outcome.response.bodyWithheld
+			? "(withheld: the destination's content type was not one this tool allows)"
+			: renderBodyPreview(definition, outcome.response.body, secretValues.values()),
 	};
 	return { kind: "succeeded", receipt };
 }
