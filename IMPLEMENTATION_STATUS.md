@@ -2202,7 +2202,9 @@ Released as 0.6.0 (migrations `0024_agent_lifecycle` to `0027_lifecycle_retry_of
 ## Phase 15 - Tool catalog: entries, versions and attachments
 
 Status: **done** (the catalog data model, the compiler, enforcement, custom HTTPS tools, packaged
-utilities and the console's own Instruments & Utils hub and agent capability editor)
+utilities and the console's own Instruments & Utils hub and agent capability editor; review closed
+after round 5, the round limit, with its findings and those of the final reviews of the fix commits
+fixed and covered by tests)
 
 | Item | State | Evidence |
 |------|-------|----------|
@@ -2353,5 +2355,37 @@ Acceptance:
   by the turn's own authority before any approval is ever created (`status: "failed"`,
   `error_code: "invalid_output"`, the same non-retryable rejection a denied memory write already
   proves end to end in `tool-catalog-enforcement.integration.test.ts`).
+
+### Phase 15 review log
+
+- Per-change reviews (Codex) while building the catalog model, the compiler and enforcement,
+  custom HTTPS tools and the console hub — each fixed before the next change started.
+- Round 1 (Codex + Opus subagent): 2 P1 + 7 P2. Fixed: revisions written by the previous release
+  after a binary rollback, wildcard patterns in legacy effective lists, adoption bound to the
+  previewed revision, a missing secret file treated as a known failure, `tools adopt --all`
+  skipping retired agents, wildcard adoption bounds, idempotent replay before validation, console
+  form input and error handling.
+- Round 2: 1 P1 + 5 P2 + P3s. Fixed: restoring a former finance agent, deleting an entry also
+  revoking it from legacy agents, a 3xx never a success, bounded capability descriptions, receipt
+  safety of utility results, adoption bound to the catalog, console form keys and accessibility,
+  delete provenance and impact inside its own transaction, conflict-checked custom tool edits.
+- Round 3: 2 P1 + 4 P2 + 4 P3. Fixed: deleting or detaching an entry can no longer widen access
+  through an implied capability, approvals and execution use the agent's pinned definition
+  version, an implicit legacy conversion refuses unresolved patterns, prototype-safe lookups for
+  agent ids such as `constructor`, console modes filtered by kind, an authoritative secret-free
+  request preview on custom tool approval cards.
+- Round 4: 1 P1 + 5 P2. Fixed: the "a removal never widens permissions" check moved into the
+  commit itself and bound to the exact widening the owner accepted, implicit holders block a
+  delete, duplicate parameter names refused, own-property lookups everywhere (including the
+  hourly run limit). An approval card always carries the full request preview; a request whose
+  preview cannot be shown in full is refused when it is made.
+- Round 5: Codex 2 P1 + 3 P2, Opus 3 P2 + 3 P3. Fixed: a custom write answered with a server error
+  is an unknown outcome, agents see each custom tool's parameter contract, a deleted entry is
+  never granted implicitly (attach, restore, rollback), the preview encodes query values as sent,
+  adoption previews check permission list bounds, an invalid approval card fails the run cleanly,
+  surrogate-safe summary shrinking, an unresolvable custom action refused.
+- Final review of the fix commit: 1 P1 + 2 P2 (a deleted implied tool explicitly denied so the
+  runtime cannot infer it, a byte budget for capability descriptions, unambiguous enum choices in
+  the prompt) — fixed; the review of that fix found nothing further.
 
 Not yet released; see the Changelog's `[Unreleased]` section.
