@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
 	type AgentId,
 	type AgentPermissions,
@@ -62,6 +63,7 @@ import {
 	type ConfigDraftBundle,
 	commitChange,
 	commitChangeIn,
+	findConfigRevisionByIdempotencyKey,
 	loadActiveBundle,
 	ManagementConflictError,
 } from "./management.ts";
@@ -1176,7 +1178,11 @@ async function adoptOneAgent(
 		baseRevisionId: revisionId,
 		actor: input.actor,
 		source: input.source ?? "cli_apply",
-		...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
+		// One revision per adopted agent: each needs a key of its own, or the second agent's
+		// different change set would be refused as a reuse of the first one's.
+		...(input.idempotencyKey === undefined
+			? {}
+			: { idempotencyKey: derivedIdempotencyKey(input.idempotencyKey, `adopt:${agentId}`) }),
 		...(input.reason === undefined ? {} : { reason: input.reason }),
 	});
 	return {
@@ -1263,14 +1269,22 @@ async function legacyConversionChangeSet(
 	db: Db,
 	agentId: AgentId,
 	permissions: AgentPermissions,
+	excludeEntryId: string,
 ): Promise<Readonly<{
 	ops: Readonly<ChangeOperation[]>;
 	attachments: Readonly<ToolAttachment[]>;
 }> | null> {
 	const known = await knownCatalogEntries(db);
-	const { attachments } = legacyAttachmentsFromPermissions(permissions, known);
+	// The entry about to be attached is left to that attachment's own revision: were the
+	// conversion to install it already, the attachment would be a no-op that never records its
+	// caller's idempotency key.
+	const attachments = legacyAttachmentsFromPermissions(permissions, known).attachments.filter(
+		(attachment) => attachment.entryId !== excludeEntryId,
+	);
 	if (attachments.length === 0) {
-		return { ops: [], attachments: [] };
+		// Still hub-managed from here on, with an explicitly empty list: `attach_tool` cannot say
+		// that, and a change set needs at least one operation.
+		return { ops: [{ type: "set_tool_attachments", agentId, attachments: [] }], attachments: [] };
 	}
 	const toolAttachments: ToolAttachmentsBundle = { [agentId]: [...attachments] };
 	const catalog = await loadCompilableCatalogEntries(db, toolAttachments);
@@ -1295,8 +1309,8 @@ async function legacyConversionChangeSet(
  * writer: a config revision records it, and rollback/export/import cover it (ADR-027).
  *
  * `input.agentId` not yet hub-managed (no attachments document of its own at all): its current
- * `permissions` lists are converted the same way `gateway tools adopt` does and committed in this
- * exact revision, ahead of the new attachment — never a plain `attach_tool` on its own, which
+ * `permissions` lists are converted the same way `gateway tools adopt` does and committed in a
+ * revision of their own, just ahead of the new attachment's — never a plain `attach_tool` on its own, which
  * would otherwise make the agent hub-managed with only this one attachment and silently drop
  * everything its legacy `permissions` used to cover (ADR-027's bundle-mirror invariant replaces
  * `permissions` outright on the very commit that first gives an agent an attachments document).
@@ -1309,7 +1323,6 @@ export async function attachTool(
 	deps: ControlPlaneDeps,
 	input: AttachToolInput,
 ): Promise<AttachToolResult> {
-	await checkAttachable(deps, input.entryId, input.pinnedVersion, input.mode);
 	const attach: ChangeOperation = {
 		type: "attach_tool",
 		agentId: input.agentId,
@@ -1318,6 +1331,25 @@ export async function attachTool(
 		mode: input.mode,
 		settings: input.settings ?? {},
 	};
+	const commitAttach = (baseRevisionId: number | null) =>
+		commitChange(deps, {
+			changeSet: [attach],
+			baseRevisionId,
+			actor: input.actor,
+			source: input.source,
+			...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
+			...(input.reason === undefined ? {} : { reason: input.reason }),
+		});
+	// A key that already committed is answered by `commitChange` itself — replayed when it names
+	// this very change set, refused otherwise — before anything about the current catalog or agent
+	// is checked: a since-deleted entry must not turn a successful retry into an error.
+	if (
+		input.idempotencyKey !== undefined &&
+		(await findConfigRevisionByIdempotencyKey(deps, input.idempotencyKey)) !== null
+	) {
+		return { ...(await commitAttach(await activeConfigRevisionId(deps))), legacyConversion: [] };
+	}
+	await checkAttachable(deps, input.entryId, input.pinnedVersion, input.mode);
 	const { revisionId, bundle, attachments } = await loadAllAgentToolAttachmentsWithRevision(deps);
 	const read = attachments[input.agentId];
 	if (read === undefined) {
@@ -1327,7 +1359,7 @@ export async function attachTool(
 	// attachment: the attachment's own change set is then always just itself, so a retry under the
 	// same idempotency key replays it exactly, whatever the agent's permissions or the catalog were
 	// when the conversion ran. A crash between the two leaves the agent hub-managed with the very
-	// access its legacy permissions already gave it.
+	// access its legacy permissions already gave it (less the entry being attached).
 	let legacyConversion: Readonly<ToolAttachment[]> = [];
 	let baseRevisionId = revisionId;
 	if (!read.hubManaged) {
@@ -1336,7 +1368,7 @@ export async function attachTool(
 			throw new AdminError(`agent '${input.agentId}' does not exist`);
 		}
 		const conversion = await inTransaction(deps, ({ tx }) =>
-			legacyConversionChangeSet(tx.db, input.agentId, agent.permissions),
+			legacyConversionChangeSet(tx.db, input.agentId, agent.permissions, input.entryId),
 		);
 		if (conversion === null || conversion.ops.length > MAX_CHANGE_SET_OPERATIONS) {
 			throw new AdminError(
@@ -1353,20 +1385,24 @@ export async function attachTool(
 			reason: `convert '${input.agentId}' legacy permissions before attaching '${input.entryId}'`,
 			...(input.idempotencyKey === undefined
 				? {}
-				: { idempotencyKey: `${input.idempotencyKey}:legacy-conversion` }),
+				: {
+						idempotencyKey: derivedIdempotencyKey(
+							input.idempotencyKey,
+							`legacy-conversion:${input.agentId}`,
+						),
+					}),
 		});
 		legacyConversion = conversion.attachments;
 		baseRevisionId = converted.revisionId;
 	}
-	const result = await commitChange(deps, {
-		changeSet: [attach],
-		baseRevisionId,
-		actor: input.actor,
-		source: input.source,
-		...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
-		...(input.reason === undefined ? {} : { reason: input.reason }),
-	});
-	return { ...result, legacyConversion };
+	return { ...(await commitAttach(baseRevisionId)), legacyConversion };
+}
+
+/** A bounded idempotency key for one of several revisions a single keyed request writes:
+ * distinct per `scope`, stable for the same caller key, never longer than the caller's own. */
+function derivedIdempotencyKey(idempotencyKey: string, scope: string): string {
+	const digest = createHash("sha256").update(`${scope}\0${idempotencyKey}`).digest("hex");
+	return `derived:${digest}`;
 }
 
 export type DetachToolInput = Readonly<{

@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 import {
 	AdminError,
 	activeConfigRevisionId,
+	adoptAgentToolAttachments,
 	applyConfig,
 	attachTool,
 	type ControlPlaneDeps,
@@ -676,14 +677,12 @@ describe("config export/import: tool attachments round-trip (ADR-027)", () => {
 			source: "cli_apply",
 		});
 		expect(attach.noop).toBe(false);
-		// Every pattern `director`'s own legacy `permissions` resolve to — `memory.write` included,
-		// which the explicit attachment below also names and so immediately overwrites with its own
-		// settings.
+		// Every pattern `director`'s own legacy `permissions` resolve to, except `memory.write`: the
+		// entry being attached is left to the attachment's own revision.
 		expect(attach.legacyConversion.map((a) => a.entryId).sort()).toEqual([
 			"executor-finance-payment-create",
 			"executor-finance-subscription-create",
 			"gateway-mattermost-post",
-			"gateway-memory-write",
 		]);
 
 		const dir = exportDir();
@@ -919,6 +918,55 @@ describe("attachTool: a retry of the attachment that converted a legacy agent re
 		expect(retry.revisionId).toBe(first.revisionId);
 	});
 
+	it("records the caller's key even when the legacy agent already had exactly this attachment", async () => {
+		// `operator` already allows `mattermost.post`: were the conversion to install it, the
+		// attachment itself would be a no-op that never stores the key.
+		const input = {
+			agentId: "operator",
+			entryId: "gateway-mattermost-post",
+			pinnedVersion: null,
+			mode: "allow" as const,
+			actor: "test",
+			source: "cli_apply" as const,
+			idempotencyKey: "attach-operator-post",
+		};
+		const first = await attachTool(harness.deps, input);
+		expect(first.noop).toBe(false);
+		const retry = await attachTool(harness.deps, input);
+		expect(retry.replayed).toBe(true);
+		expect(retry.revisionId).toBe(first.revisionId);
+	});
+
+	it("accepts a maximum-length key for an agent that is still legacy", async () => {
+		const result = await attachTool(harness.deps, {
+			agentId: "mail-follower",
+			entryId: "native-web-search",
+			pinnedVersion: null,
+			mode: "allow",
+			actor: "test",
+			source: "cli_apply",
+			idempotencyKey: "k".repeat(200),
+		});
+		expect(result.noop).toBe(false);
+	});
+
+	it("adopts several legacy agents under one key, each in its own revision", async () => {
+		const results = await adoptAgentToolAttachments(harness.deps, {
+			agentIds: ["director", "developer"],
+			dryRun: false,
+			actor: "test",
+			idempotencyKey: "adopt-director-developer",
+		});
+		expect(results.map((result) => result.commit?.revisionId ?? null)).not.toContain(null);
+		const retry = await adoptAgentToolAttachments(harness.deps, {
+			agentIds: ["director", "developer"],
+			dryRun: false,
+			actor: "test",
+			idempotencyKey: "adopt-director-developer",
+		});
+		expect(retry.every((result) => result.alreadyHubManaged)).toBe(true);
+	});
+
 	it("refuses the same key for a different attachment", async () => {
 		await expect(
 			attachTool(harness.deps, {
@@ -931,5 +979,22 @@ describe("attachTool: a retry of the attachment that converted a legacy agent re
 				idempotencyKey: "attach-research-repository-read",
 			}),
 		).rejects.toThrow(/different change set/);
+	});
+
+	it("replays a committed attachment even after its catalog entry was deleted", async () => {
+		const input = {
+			agentId: "finance",
+			entryId: "native-web-fetch",
+			pinnedVersion: null,
+			mode: "allow" as const,
+			actor: "test",
+			source: "cli_apply" as const,
+			idempotencyKey: "attach-finance-web-fetch",
+		};
+		const first = await attachTool(harness.deps, input);
+		await deleteCatalogEntry(harness.deps, "native-web-fetch", "test");
+		const retry = await attachTool(harness.deps, input);
+		expect(retry.replayed).toBe(true);
+		expect(retry.revisionId).toBe(first.revisionId);
 	});
 });
