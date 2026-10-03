@@ -19,6 +19,7 @@ import {
 	ConfigRevisionSourceSchema,
 	ConfigSnapshotBundleSchema,
 	IdempotencyKeySchema,
+	type JsonValue,
 	MAX_ATTACHMENTS_PER_AGENT,
 	type OrganizationConfig,
 	type TextChange,
@@ -991,10 +992,22 @@ export type CommitChangeInput = Readonly<{
 	baseRevisionId: number | null;
 	/** A repeated commit with the same key returns the first commit's result; see `commitChange`. */
 	idempotencyKey?: string;
+	/**
+	 * What a retry under `idempotencyKey` must match, in place of the change set itself: for a
+	 * request whose change set depends on the state it was made against (an attachment that also
+	 * converts a legacy agent's permissions), the caller's own request, which a retry reproduces
+	 * exactly while the change set it led to may not.
+	 */
+	requestIdentity?: JsonValue;
 	actor: string;
 	source: ConfigRevisionSource;
 	reason?: string;
 }>;
+
+/** The hash a retry under the same idempotency key is compared against (`requestIdentity`). */
+function replayHash(input: CommitChangeInput, changeSet: ChangeSet): string {
+	return canonicalHash(input.requestIdentity ?? changeSet);
+}
 
 export type CommitChangeResult = Readonly<{
 	revisionId: number;
@@ -1317,8 +1330,7 @@ export async function commitChangeIn(
 			.from(configRevisions)
 			.where(eq(configRevisions.idempotencyKey, input.idempotencyKey));
 		if (existing !== undefined) {
-			const changeHash = canonicalHash(changeSet);
-			if (existing.changeHash !== changeHash) {
+			if (existing.changeHash !== replayHash(input, changeSet)) {
 				throw new AdminError(
 					`idempotency key '${input.idempotencyKey}' was already used with a different change set`,
 				);
@@ -1456,7 +1468,7 @@ export async function commitChangeIn(
 		source: input.source,
 		reason: input.reason ?? null,
 		idempotencyKey: input.idempotencyKey ?? null,
-		changeHash: input.idempotencyKey === undefined ? null : canonicalHash(changeSet),
+		changeHash: input.idempotencyKey === undefined ? null : replayHash(input, changeSet),
 	});
 	await queueMembershipReprovisioning(
 		uow,

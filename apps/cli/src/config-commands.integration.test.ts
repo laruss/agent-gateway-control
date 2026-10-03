@@ -21,6 +21,7 @@ import {
 	configBundleProblems,
 	configSnapshotBundle,
 	deleteCatalogEntry,
+	detachTool,
 	ensureToolCatalogSeeded,
 	inTransaction,
 	loadActiveBundle,
@@ -968,6 +969,37 @@ describe("attachTool: a retry of the attachment that converted a legacy agent re
 			expect(mirrored?.tools_allow).not.toContain("repository.read");
 			expect(mirrored?.tools_deny).toContain("repository.read");
 		}
+	});
+
+	it("replays an attachment the legacy agent already had, even after it was revoked since", async () => {
+		const input = {
+			agentId: "operator",
+			entryId: "gateway-mattermost-post",
+			pinnedVersion: null,
+			mode: "allow" as const,
+			actor: "test",
+			source: "cli_apply" as const,
+			idempotencyKey: "attach-operator-post",
+		};
+		const first = await attachTool(harness.deps, input);
+		expect(first.noop).toBe(false);
+		await detachTool(harness.deps, {
+			agentId: "operator",
+			entryId: "gateway-mattermost-post",
+			actor: "test",
+			source: "cli_apply",
+		});
+		const retry = await attachTool(harness.deps, input);
+		expect(retry.replayed).toBe(true);
+		expect(retry.revisionId).toBe(first.revisionId);
+		const { bundle } = await inTransaction(harness.deps, ({ tx }) =>
+			loadActiveBundle(tx.db, retry.activeRevisionId),
+		);
+		expect(
+			(bundle.toolAttachments.operator ?? []).some(
+				(attachment) => attachment.entryId === "gateway-mattermost-post",
+			),
+		).toBe(false);
 	});
 
 	it("refuses an oversized key before converting anything", async () => {
