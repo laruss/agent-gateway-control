@@ -216,13 +216,18 @@ export async function customGrantTimeIssues(
 }
 
 export type CustomApprovalPreviewResult =
-	/** Not a custom tool action at all, or the pinned version param is missing, invalid, or no
-	 * longer names a real version (defensive: should not happen for anything that already passed
-	 * {@link prepareCustomApprovalDraft}) — no preview belongs on this card. */
+	/** Not a custom tool action at all: no preview belongs on this card, and none is needed —
+	 * `actionType` names a native or executor tool, never a `custom_https` one. */
 	| Readonly<{ kind: "none" }>
 	| Readonly<{ kind: "ok"; preview: string }>
-	/** The full preview does not fit `MattermostApprovalPayloadSchema.customRequestPreview`'s own
-	 * bound; the draft must be refused, never truncated (ADR-027). */
+	/** The action names a `custom_https` tool but its request cannot be resolved into a preview at
+	 * all — the pinned version param is missing or invalid, no longer names a real version, or the
+	 * full preview does not fit `MattermostApprovalPayloadSchema.customRequestPreview`'s own bound.
+	 * Every one of these should already be unreachable for a draft that passed
+	 * {@link prepareCustomApprovalDraft} first; a caller still refuses the draft outright rather
+	 * than let a `custom.*` approval ever reach a card with no preview at all (ADR-027: an owner
+	 * approving a custom tool call must always see exactly what it will do, never "trust the
+	 * model's own summary" as a fallback). */
 	| Readonly<{ kind: "refused"; issues: Readonly<string[]> }>;
 
 /**
@@ -231,8 +236,9 @@ export type CustomApprovalPreviewResult =
  * included) resolves to — the approval card's own preview, separate from the model's free-text
  * summary (ADR-027). Resolved against the exact pinned version (never "current"), the same version
  * execution itself reads through `gateway_custom_tool_definition`, so the preview never disagrees
- * with what actually runs. `{ kind: "none" }` for any action type that is not a custom tool, or
- * when the pinned version param is missing, invalid, or no longer names a real version.
+ * with what actually runs. `{ kind: "none" }` only for an action type that is not a custom tool at
+ * all; a `custom.*` action type whose version cannot be resolved is `{ kind: "refused" }`, never
+ * `{ kind: "none" }` — the draft is refused outright rather than ever approved with no preview.
  *
  * The owner must always see the complete request, never a cut one: a preview longer than
  * `CUSTOM_REQUEST_PREVIEW_MAX` (`MattermostApprovalPayloadSchema.customRequestPreview`'s own
@@ -254,11 +260,21 @@ export async function customApprovalRequestPreview(
 	const pinned = actionParams.find((param) => param.name === CUSTOM_DEFINITION_VERSION_PARAM);
 	const version = pinned === undefined ? Number.NaN : Number(pinned.value);
 	if (!Number.isInteger(version)) {
-		return { kind: "none" };
+		return {
+			kind: "refused",
+			issues: [
+				`'${actionType}' names a custom tool but carries no valid ${CUSTOM_DEFINITION_VERSION_PARAM} parameter to resolve its request preview against`,
+			],
+		};
 	}
 	const current = await loadCustomHttpsDefinitionAtVersion(db, entryId, version);
 	if (current === null) {
-		return { kind: "none" };
+		return {
+			kind: "refused",
+			issues: [
+				`'${actionType}' pins version ${version}, which no longer exists for this custom tool`,
+			],
+		};
 	}
 	const preview = customRequestSummary(resolveCustomHttpRequest(current.definition, actionParams));
 	if (preview.length > CUSTOM_REQUEST_PREVIEW_MAX) {

@@ -4,6 +4,8 @@ import {
 	type AgentPermissions,
 	type CapabilityDescription,
 	type CapabilityMode,
+	type CapabilityParameter,
+	capabilityParametersFromCustomToolParams,
 	MAX_CAPABILITIES,
 	type ToolAttachment,
 	type ToolAttachmentMode,
@@ -16,11 +18,23 @@ import {
 	toolPatternCovers,
 } from "@agent-gateway/contracts";
 import { catalogAttachments, catalogEntries, catalogEntryVersions } from "@agent-gateway/db";
-import { type CompiledCatalogEntry, compileAttachments } from "@agent-gateway/policy";
+import {
+	type CompiledCatalogEntry,
+	compileAttachments,
+	NATIVE_TOOL_DEPENDENCIES,
+} from "@agent-gateway/policy";
 import { and, eq, inArray, isNull } from "drizzle-orm";
 import type { UnitOfWork } from "./deps.ts";
 
 type Db = UnitOfWork["tx"]["db"];
+
+/** Every implementation key a native dependency (`NATIVE_TOOL_DEPENDENCIES`) could ever imply
+ * (`repository.read`/`workspace.write` today) — the compiler needs each one's own live catalog
+ * entry, whether this agent (or any agent) is attached to it or not, to tell "unattached but live"
+ * (still implied) apart from "deleted" (never granted, ADR-027). */
+const NATIVE_DEPENDENCY_TARGETS = new Set(
+	Object.values(NATIVE_TOOL_DEPENDENCIES).flatMap((names) => names ?? []),
+);
 
 // ---------------------------------------------------------------------------
 // Legacy conversion: a read model, never written back (ADR-027). A leaf module (contracts, db,
@@ -117,13 +131,17 @@ export async function knownCatalogEntries(db: Db): Promise<Readonly<KnownCatalog
 // describing what the agent effectively has, never an enforcement decision of their own.
 // ---------------------------------------------------------------------------
 
-/** What the compiler and capability descriptions need of a known catalog entry, beyond its id. */
+/** What the compiler and capability descriptions need of a known catalog entry, beyond its id.
+ * `parameters` is the selected version's own non-secret parameter contract (`custom_https` only,
+ * ADR-027) — `undefined` for every other kind, and for a `custom_https` definition with no typed
+ * parameters of its own. */
 type CatalogMetadata = Readonly<{
 	kind: ToolCatalogEntryKind;
 	implementationKey: ToolName;
 	name: string;
 	description: string;
 	riskFloor: ToolCatalogRiskFloor;
+	parameters: Readonly<CapabilityParameter[]> | undefined;
 }>;
 
 /** Catalog metadata of exactly the entries `attachments` names, excluding deleted ones (an
@@ -172,6 +190,7 @@ async function loadCatalogMetadata(
 						name: catalogEntryVersions.name,
 						description: catalogEntryVersions.description,
 						riskFloor: catalogEntryVersions.riskFloor,
+						httpsDefinition: catalogEntryVersions.httpsDefinition,
 					})
 					.from(catalogEntryVersions)
 					.where(inArray(catalogEntryVersions.entryId, pinnedEntryIds));
@@ -184,6 +203,7 @@ async function loadCatalogMetadata(
 			name: catalogEntryVersions.name,
 			description: catalogEntryVersions.description,
 			riskFloor: catalogEntryVersions.riskFloor,
+			httpsDefinition: catalogEntryVersions.httpsDefinition,
 		})
 		.from(catalogEntryVersions)
 		.where(
@@ -209,6 +229,10 @@ async function loadCatalogMetadata(
 			name: version.name,
 			description: version.description,
 			riskFloor: version.riskFloor,
+			parameters:
+				version.httpsDefinition === null
+					? undefined
+					: capabilityParametersFromCustomToolParams(version.httpsDefinition.parameters),
 		});
 	}
 	return result;
@@ -235,6 +259,7 @@ async function loadCatalogMetadataByImplementationKey(
 			name: catalogEntryVersions.name,
 			description: catalogEntryVersions.description,
 			riskFloor: catalogEntryVersions.riskFloor,
+			httpsDefinition: catalogEntryVersions.httpsDefinition,
 		})
 		.from(catalogEntries)
 		.innerJoin(catalogEntryVersions, eq(catalogEntries.currentVersionId, catalogEntryVersions.id))
@@ -253,6 +278,10 @@ async function loadCatalogMetadataByImplementationKey(
 				name: row.name,
 				description: row.description,
 				riskFloor: row.riskFloor,
+				parameters:
+					row.httpsDefinition === null
+						? undefined
+						: capabilityParametersFromCustomToolParams(row.httpsDefinition.parameters),
 			},
 		]),
 	);
@@ -327,6 +356,7 @@ function buildCapabilityDescriptions(
 			description: entry.description.slice(0, CAPABILITY_DESCRIPTION_MAX),
 			mode,
 			...(impliedBy === undefined ? {} : { impliedBy: [...impliedBy] }),
+			...(entry.parameters === undefined ? {} : { parameters: [...entry.parameters] }),
 		});
 	};
 	for (const attachment of attachments) {
@@ -406,13 +436,25 @@ export async function loadEffectivePermissionsIn(
 	const read: LegacyConversionResult = hubManaged
 		? { attachments: await loadAgentAttachmentsFromProjection(db, agent.id), unresolved: [] }
 		: legacyAttachmentsFromPermissions(agent.config.permissions, await knownCatalogEntries(db));
-	const attachedMetadata = await loadCatalogMetadata(db, read.attachments);
+	const [attachedMetadata, nativeDependencyMetadata] = await Promise.all([
+		loadCatalogMetadata(db, read.attachments),
+		loadCatalogMetadataByImplementationKey(db, NATIVE_DEPENDENCY_TARGETS),
+	]);
+	// A native dependency's own target (`repository.read`/`workspace.write`) commonly has no
+	// attachment of its own at all — `attachedMetadata` alone would then never carry its entry,
+	// indistinguishable to the compiler from that entry being deleted. Merging in its live catalog
+	// metadata regardless of attachment is what lets the compiler tell the two apart (ADR-027: a
+	// deleted entry is never granted implicitly, but an unattached-and-still-live one keeps working
+	// exactly as before).
 	const compiled = compileAttachments({
 		agentId: agent.id,
 		financeAgentId,
 		adapter: agent.config.runtime.adapter,
 		attachments: read.attachments,
-		catalog: catalogForCompile(attachedMetadata),
+		catalog: new Map([
+			...catalogForCompile(attachedMetadata),
+			...catalogForCompile(nativeDependencyMetadata),
+		]),
 	});
 	// Every tool the compiled result actually grants, beyond the entries `attachedMetadata` already
 	// covers: a tool only present because another implies it (e.g. `repository.read` implied by

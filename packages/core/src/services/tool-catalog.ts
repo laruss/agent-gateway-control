@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import {
 	type AgentId,
 	type AgentPermissions,
+	AgentPermissionsSchema,
 	BUILT_IN_EXECUTOR_ACTIONS,
 	BUILT_IN_GATEWAY_TOOLS,
 	BUILT_IN_NATIVE_CAPABILITIES,
@@ -50,6 +51,7 @@ import {
 	compileAttachments,
 	compiledAgentPermissions,
 	modeSupportedByKind,
+	transitiveNativeDependencies,
 } from "@agent-gateway/policy";
 import { and, asc, eq, inArray, isNull, or } from "drizzle-orm";
 import { AdminError, inTransaction } from "./admin.ts";
@@ -1399,6 +1401,21 @@ async function adoptOneAgent(
 				`${MAX_ATTACHMENTS_PER_AGENT} a single agent may hold`,
 		);
 	}
+	// `MAX_ATTACHMENTS_PER_AGENT` (128) bounds the *attachments*, not any one compiled permission
+	// list `AgentPermissionsSchema` itself separately bounds to 64: a wide legacy pattern resolving
+	// to, say, 65 attachments that all happen to compile into the same list (every one
+	// `require_approval`, a common shape for an owner-created `custom.*` wildcard) passes the check
+	// above while `compiledPermissions` would still fail `AgentPermissionsSchema` the moment a commit
+	// actually tries to write it — an opaque, late failure the dry-run preview must catch here
+	// instead, the same way it already catches the coarser attachment-count bound.
+	const compiledPermissionsParse = AgentPermissionsSchema.safeParse(compiledPermissions);
+	if (!compiledPermissionsParse.success) {
+		problems.push(
+			...compiledPermissionsParse.error.issues.map(
+				(issue) => `compiled permissions: ${issue.path.join(".") || "(root)"}: ${issue.message}`,
+			),
+		);
+	}
 	if (problems.length > 0) {
 		return {
 			agentId,
@@ -1505,6 +1522,26 @@ async function checkAttachable(
 		const versions = await listCatalogEntryVersions(deps, entryId);
 		if (!versions.some((version) => version.version === pinnedVersion)) {
 			throw new AdminError(`catalog entry '${entryId}' has no version ${pinnedVersion}`);
+		}
+	}
+	// Granting a native capability implies another (`tests.run` implying `workspace.write`,
+	// ADR-027) — but only ever a *live* one: refuse here, before this attachment ever exists, rather
+	// than let it commit and silently withhold the implication the moment the compiler runs
+	// (defence in depth alongside that same, identical rule inside `compileAttachments` itself,
+	// which still catches a prerequisite deleted *after* this attachment already exists).
+	if (mode === "allow") {
+		const implied = transitiveNativeDependencies(entry.implementationKey);
+		if (implied.size > 0) {
+			const known = await inTransaction(deps, ({ tx }) => knownCatalogEntries(tx.db));
+			const liveImplementationKeys = new Set(known.map((candidate) => candidate.implementationKey));
+			const missing = [...implied].filter((key) => !liveImplementationKeys.has(key)).sort();
+			if (missing.length > 0) {
+				throw new AdminError(
+					`catalog entry '${entryId}' implies ${missing.join(", ")} (a native dependency), but ` +
+						`no live catalog entry grants ${missing.length === 1 ? "it" : "them"} any more (deleted) — ` +
+						"attaching this would silently leave that prerequisite withheld",
+				);
+			}
 		}
 	}
 }

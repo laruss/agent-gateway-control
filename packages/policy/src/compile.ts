@@ -29,9 +29,8 @@ export type { PermissionWidening, ToolAccessLevel } from "@agent-gateway/contrac
 export { modeSupportedByKind } from "@agent-gateway/contracts";
 
 // ---------------------------------------------------------------------------
-// Catalog-level native dependencies: data, not scattered ifs (step 1 of the phase this
-// compiler belongs to). Two different kinds of fact, deliberately kept separate because they
-// push effective permissions in opposite directions:
+// Catalog-level native dependencies: data, not scattered ifs. Two different kinds of fact,
+// deliberately kept separate because they push effective permissions in opposite directions:
 //
 // - `NATIVE_TOOL_DEPENDENCIES` *adds*: granting the key tool with mode `allow` also makes the
 //   listed tools effectively usable, because the runtime needs them to perform the granted
@@ -61,6 +60,30 @@ export const ADAPTER_NATIVE_PREREQUISITES: Readonly<
 	codex: { "repository.read": ["tests.run"] },
 };
 
+/**
+ * Every tool `toolName` would transitively imply, granted with `allow`
+ * (`NATIVE_TOOL_DEPENDENCIES`, walked to a fixed point) — never including `toolName` itself. Used
+ * where a caller must know what a tool *would* pull in before any attachment of it actually exists
+ * to compile against (admission-time: `checkAttachable` refuses attaching a native tool whose own
+ * implied prerequisite has no live catalog entry, ADR-027's "a deleted entry is never granted
+ * implicitly" — defence in depth alongside the compiler's own, identical rule at the moment every
+ * attachment is actually compiled, which this does not replace: a prerequisite deleted *after* an
+ * attachment already exists is still caught there, not here).
+ */
+export function transitiveNativeDependencies(toolName: ToolName): ReadonlySet<ToolName> {
+	const result = new Set<ToolName>();
+	const stack = [...(NATIVE_TOOL_DEPENDENCIES[toolName] ?? [])];
+	while (stack.length > 0) {
+		const next = stack.pop();
+		if (next === undefined || result.has(next)) {
+			continue;
+		}
+		result.add(next);
+		stack.push(...(NATIVE_TOOL_DEPENDENCIES[next] ?? []));
+	}
+	return result;
+}
+
 /** What the compiler needs to know about a catalog entry an attachment names; nothing else. */
 export type CompiledCatalogEntry = Readonly<{
 	kind: ToolCatalogEntryKind;
@@ -73,9 +96,18 @@ export type CompileAttachmentsInput = Readonly<{
 	financeAgentId: AgentId;
 	adapter: RuntimeAdapterId;
 	attachments: Readonly<ToolAttachment[]>;
-	/** Every catalog entry an attachment might name, by its id. An attachment naming an id absent
-	 * here (a deleted or otherwise unknown entry) contributes nothing — the write boundary never
-	 * lets this happen for a committed configuration, but the compiler itself stays fail-closed. */
+	/** Every live catalog entry this compile could possibly need, by its id — every entry
+	 * `attachments` itself names, *and* every entry a native dependency (`NATIVE_TOOL_DEPENDENCIES`)
+	 * could ever imply, whether this agent (or any agent) is attached to it or not: an implied tool
+	 * commonly has no attachment of its own at all (`repository.read` implied by `tests.run`), so the
+	 * compiler can only tell a merely-unattached implied tool apart from a deleted one by whether its
+	 * own entry is here. An attachment naming an id absent here (a deleted or otherwise unknown
+	 * entry) contributes nothing — the write boundary never lets this happen for a committed
+	 * configuration, but the compiler itself stays fail-closed. A deleted entry is never a member of
+	 * this map at all (every caller excludes it before this function ever sees it) — this is how the
+	 * compiler tells "unattached but live" (still implied) apart from "deleted" (never granted,
+	 * reported as a missing prerequisite instead, ADR-027's "a deleted entry is never granted
+	 * implicitly"). */
 	catalog: ReadonlyMap<ToolCatalogEntryId, CompiledCatalogEntry>;
 }>;
 
@@ -90,10 +122,16 @@ export type CompiledToolPermissions = Readonly<{
 	 * attached tool implies it (`NATIVE_TOOL_DEPENDENCIES`); keyed by the implied tool, listing
 	 * what implied it. A tool absent here that is in `allow` was attached directly. */
 	impliedBy: Readonly<Record<string, Readonly<ToolName[]>>>;
-	/** Tools in `allow` whose adapter-specific prerequisite (`ADAPTER_NATIVE_PREREQUISITES`) is
-	 * not itself in `allow`: granted, but not actually usable under this agent's own runtime
-	 * adapter until the missing prerequisite is attached too. Informational only — the adapter
-	 * itself already withholds the capability; this never removes anything from `allow`. */
+	/** Every tool naming a prerequisite it does not actually have, for either of two reasons, kept in
+	 * one field because a caller reacts to both the same way (show it, change nothing it grants): (1)
+	 * a tool in `allow` whose adapter-specific prerequisite (`ADAPTER_NATIVE_PREREQUISITES`) is not
+	 * itself in `allow` — granted, but not actually usable under this agent's own runtime adapter
+	 * until the missing prerequisite is attached too; informational only, the adapter itself already
+	 * withholds the capability. (2) a tool in `allow` whose native dependency
+	 * (`NATIVE_TOOL_DEPENDENCIES`) names a tool with no live catalog entry at all (deleted, or never
+	 * seeded) — the implication could not be applied, so the named tool is never in `allow` either,
+	 * unlike case (1)'s own prerequisite (which may simply not be attached yet, not deleted). Neither
+	 * case ever removes anything from `allow` itself. */
 	missingPrerequisites: Readonly<Record<string, Readonly<ToolName[]>>>;
 	/** `"memory.write"` is in `allow`: the agent may propose memory writes at all. */
 	memoryWriteAllowed: boolean;
@@ -141,9 +179,34 @@ export function compileAttachments(input: CompileAttachmentsInput): CompiledTool
 		}
 	}
 
+	// Every implementation key a live (non-deleted) catalog entry actually names — never only the
+	// entries `attachments` itself names: an implied tool commonly has no attachment of its own at
+	// all (the normal case, e.g. `repository.read` implied by `tests.run`), so a caller populates
+	// `input.catalog` with every entry a native dependency could ever target, attached or not
+	// (`@agent-gateway/core`'s own loaders do this). A tombstoned entry's `implementationKey` is
+	// never added back here regardless of how many other agents' attachments this same `catalog` map
+	// was built for — deletion excludes it at the source, the same way every other active read does.
+	const liveImplementationKeys = new Set(
+		[...input.catalog.values()].map((entry) => entry.implementationKey),
+	);
+
 	// Native dependency propagation, to a fixed point: implying an implied tool may itself imply
-	// more (`tests.run` implies `workspace.write`, which implies `repository.read`).
+	// more (`tests.run` implies `workspace.write`, which implies `repository.read`). A tool whose
+	// own catalog entry is deleted (or was never live at all) can never be granted this way,
+	// however many attached tools would otherwise imply it — compile is the last, defence-in-depth
+	// gate against that (ADR-027): a deleted entry is never granted implicitly, whatever committed
+	// it that way (a stale attachment predating the deletion, a restored or rolled-back revision).
+	// Reported as a missing prerequisite of the tool(s) that would have implied it, the same shape
+	// (and the same field) `ADAPTER_NATIVE_PREREQUISITES` below already reports a granted-but-inert
+	// tool with — a caller does not need two different reasons a tool is listed there to react to it.
 	const impliedBy: Record<string, Set<ToolName>> = {};
+	const missingPrerequisites: Record<string, Set<ToolName>> = {};
+	const addMissingPrerequisite = (tool: string, missing: ToolName): void => {
+		if (missingPrerequisites[tool] === undefined) {
+			missingPrerequisites[tool] = new Set();
+		}
+		missingPrerequisites[tool].add(missing);
+	};
 	let changed = true;
 	while (changed) {
 		changed = false;
@@ -151,6 +214,10 @@ export function compileAttachments(input: CompileAttachmentsInput): CompiledTool
 			for (const implied of NATIVE_TOOL_DEPENDENCIES[tool] ?? []) {
 				if (deny.has(implied) || requireApproval.has(implied)) {
 					// An explicit restriction on the implied tool wins over an implied grant.
+					continue;
+				}
+				if (!liveImplementationKeys.has(implied)) {
+					addMissingPrerequisite(tool, implied);
 					continue;
 				}
 				if (!allow.has(implied)) {
@@ -165,15 +232,14 @@ export function compileAttachments(input: CompileAttachmentsInput): CompiledTool
 		}
 	}
 
-	const missingPrerequisites: Record<string, Set<ToolName>> = {};
 	const adapterRules = ADAPTER_NATIVE_PREREQUISITES[input.adapter] ?? {};
 	for (const [tool, requires] of Object.entries(adapterRules)) {
 		if (!allow.has(tool as ToolName)) {
 			continue;
 		}
 		const missing = (requires ?? []).filter((required) => !allow.has(required));
-		if (missing.length > 0) {
-			missingPrerequisites[tool] = new Set(missing);
+		for (const required of missing) {
+			addMissingPrerequisite(tool, required);
 		}
 	}
 

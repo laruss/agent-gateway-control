@@ -92,6 +92,15 @@ another attached tool's own dependency (`tests.run` implying `workspace.write`, 
 everywhere while the compiler keeps granting it, unaffected; the owner reconfigures that agent's
 attachments first.
 
+This commit-boundary check guards `detach_tool`/`clear_tool_attachments`/`set_tool_attachments`
+specifically; two other paths can also bring back an attachment implying a now-deleted entry
+without going through it at all — restoring a retired agent whose own `disabled` suppression of the
+deleted entry is dropped on restore (never resurrecting a retired attachment), and a config
+rollback or bundle import/apply restoring a revision that attaches the implying tool. Both are
+covered the same way, one level lower: the compiler itself (`compileAttachments`) never grants an
+implied capability whose own catalog entry is deleted, whichever path produced the attachment that
+would otherwise have implied it (reported as a missing prerequisite instead, see below).
+
 An attachment's `mode` is bounded by its catalog entry's own `kind`, not only its risk floor:
 
 | Kind | Example | Supported modes |
@@ -134,8 +143,11 @@ all, exactly like `config-bundle.ts`'s finance rules already require for hand-au
 The Agents hub's own **Tools** tab (`GET /api/agents/:id/tools`) is the full compiled detail in one
 place: requested attachments (recorded, for a hub-managed agent; a read-only preview of what its
 `permissions` convert to, for a legacy one) against effective `allow`/`requireApproval`/`deny`,
-implied capabilities (`impliedBy`), an unmet adapter prerequisite (`missingPrerequisites`), unresolved
-legacy patterns and whether memory writes are allowed — the console explains there, plainly, that
+implied capabilities (`impliedBy`), a missing prerequisite (`missingPrerequisites` — either an
+unmet adapter prerequisite, e.g. Codex needing `tests.run` to make `repository.read` actually
+usable, or a native dependency that cannot be applied at all because its own catalog entry is
+deleted), unresolved legacy patterns and whether memory writes are allowed — the console explains
+there, plainly, that
 `tests.run` grants general sandboxed command execution: hiding a utility entry from the hub cannot
 retract a binary from an agent already granted a shell on an earlier turn.
 
@@ -187,8 +199,11 @@ Each agent's own JSON result names:
   specific line before committing; attach `gateway-memory-write` (`allow`) first if the agent should
   keep writing memory.
 - `problems`: a resolved pattern whose mode its own catalog entry's `kind` does not support (see
-  the table above) — found before attempting a commit that would otherwise refuse it. Non-empty
-  means nothing was committed, `--dry-run` or not.
+  the table above), a resolution past the per-agent attachment limit, or a compiled permission list
+  (e.g. every resolved pattern happening to compile into `require_approval`) past its own 64-entry
+  bound — each found before attempting a commit that would otherwise refuse it. Non-empty means
+  nothing was committed, `--dry-run` or not; `--all` reports that one agent's own problems and still
+  commits every other agent in the batch.
 
 `--all` commits one revision **per agent**, never a single combined one: a batch could exceed the
 change-set size limit, and one agent's adoption failing must never block another's.
@@ -305,7 +320,11 @@ hashed and (at grant time) executed against **the requesting agent's own selecte
 pin, or whatever is current when unpinned — never blindly "the entry's current version": an agent
 pinned to version 1 stays on version 1's exact definition content even once the entry has moved on
 to version 2, and the approval card's own request preview (below) reflects that same pinned
-content, never the newer one.
+content, never the newer one. The agent's own turn already sees that same selected version's
+non-secret parameter contract — each declared parameter's name, type and its own bounds or enum
+choices, never a secret slot — alongside the capability's description, both in the structured turn
+input and the rendered prompt, so the model knows what it must supply without guessing from prose
+alone.
 
 `gateway tools custom edit zendesk-ticket --definition updated.json` (or the console entry detail
 page's own **Edit**, the identical form pre-filled with the current definition) publishes a new,
@@ -350,7 +369,11 @@ re-creates its `catalog_attachments` row, never the entry itself, which would fa
 entry actually gone; a deleted entry's row and every past version instead stay readable forever
 (ADR-027), exactly so that this restore can still happen. There is no "rollback" for the catalog
 tables themselves: a wrong edit or an unwanted delete is undone with another edit, or (for a
-non-built-in entry) accepted as permanent — entry ids are never reused.
+non-built-in entry) accepted as permanent — entry ids are never reused. Restoring a revision whose
+attachments imply a now-deleted entry (e.g. a `tests.run` attachment that implies
+`workspace.write`, and `native-workspace-write` was deleted since) never grants the implied
+capability back: the entry's own absence shows up as a missing prerequisite, the same as it would
+for a freshly compiled attachment.
 
 ### Egress, outcomes and the response the agent sees
 
@@ -373,10 +396,16 @@ destination already holds whatever it was sent regardless. A write whose request
 that comes back with a content type the definition does not allow is still `succeeded` when the
 status is 2xx — the body is withheld, not previewed, since a clean `failed` here is exactly what
 would make an owner retry an already-done write under a new idempotency key), `failed` (a clean,
-known refusal — blocked address, a `GET` with a bad content type, the destination's own 4xx/5xx), or
-`unknown` (an abort — a timeout or a cancellation — or a connection reset **after** the request was
-already sent, sent meaning the TLS handshake itself completed, not merely that the body was handed
-to the socket — never retried automatically; settle it by hand with `gateway tools settle` after
+known refusal — a blocked address, a `GET` with a bad content type, or a definitive rejection: any
+4xx but 408 on a write, or any 4xx/5xx the destination answers before a write's own request finished
+sending, since nothing was ever at stake in that answer either way), or `unknown` (an abort — a
+timeout or a cancellation — or a connection reset **after** the request was already sent, sent
+meaning the TLS handshake itself completed, not merely that the body was handed to the socket; a
+write already fully sent that the destination answers with a 5xx, or a 408 (Request Timeout), is
+`unknown` the same way — its own error or timeout commonly follows having already done the work, so
+a clean `failed` there is exactly what would make an owner retry an already-done write under a new
+idempotency key — never 429 or any other 4xx, which is the destination definitively refusing the
+request itself. Never retried automatically; settle it by hand with `gateway tools settle` after
 checking the provider by the action's own idempotency key).
 
 ## Packaged utilities

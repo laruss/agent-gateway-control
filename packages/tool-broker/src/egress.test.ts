@@ -288,13 +288,33 @@ describe("sendPinnedRequest: against a real local HTTPS server", () => {
 		});
 	});
 
-	it("treats a non-2xx write with an unexpected content type as failed, not succeeded", async () => {
+	it("treats a definitively-rejected write with an unexpected content type as failed, not succeeded", async () => {
 		server = await startTestHttpsServer(tls, (_req, res) => {
-			res.writeHead(500, { "content-type": "text/plain" });
+			res.writeHead(400, { "content-type": "text/plain" });
 			res.end("boom");
 		});
 		const outcome = await sendPinnedRequest(address, baseRequest({ method: "POST", body: "{}" }));
 		expect(outcome).toMatchObject({ kind: "failed" });
+	});
+
+	it("treats a 5xx write with an unexpected content type as unknown (throws): it may already have acted on it", async () => {
+		server = await startTestHttpsServer(tls, (_req, res) => {
+			res.writeHead(500, { "content-type": "text/plain" });
+			res.end("boom");
+		});
+		await expect(
+			sendPinnedRequest(address, baseRequest({ method: "POST", body: "{}" })),
+		).rejects.toThrow(/500 with an unexpected content type.*unknown/);
+	});
+
+	it("treats a 408 write with an unexpected content type as unknown (throws), same as a 5xx", async () => {
+		server = await startTestHttpsServer(tls, (_req, res) => {
+			res.writeHead(408, { "content-type": "text/plain" });
+			res.end("timeout");
+		});
+		await expect(
+			sendPinnedRequest(address, baseRequest({ method: "POST", body: "{}" })),
+		).rejects.toThrow(/408 with an unexpected content type.*unknown/);
 	});
 
 	it("still fails a GET with an unexpected content type even on a 2xx (reads stay failed)", async () => {

@@ -17,9 +17,10 @@ import {
 	compiledAgentPermissions,
 	describeWidenedTools,
 	modeSupportedByKind,
+	NATIVE_TOOL_DEPENDENCIES,
 	type PermissionWidening,
 } from "@agent-gateway/policy";
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, isNull } from "drizzle-orm";
 import type { UnitOfWork } from "./deps.ts";
 
 type Db = UnitOfWork["tx"]["db"];
@@ -62,13 +63,49 @@ async function loadAttachableEntries(
 	);
 }
 
+/** Every live (non-deleted) catalog entry whose `implementationKey` is a native dependency's own
+ * target (`NATIVE_TOOL_DEPENDENCIES`'s values — `repository.read`/`workspace.write` today),
+ * whether any agent is attached to it or not: the compiler (`compileAttachments`) can only tell a
+ * merely-unattached implied tool apart from a deleted one by whether its own entry is in the
+ * catalog map it is handed, and an implied tool commonly has no attachment of its own at all. */
+async function loadLiveNativeDependencyTargets(
+	db: Db,
+): Promise<ReadonlyMap<string, CompiledCatalogEntry>> {
+	const targets = new Set(Object.values(NATIVE_TOOL_DEPENDENCIES).flatMap((names) => names ?? []));
+	if (targets.size === 0) {
+		return new Map();
+	}
+	const rows = await db
+		.select({
+			id: catalogEntries.id,
+			kind: catalogEntries.kind,
+			implementationKey: catalogEntries.implementationKey,
+		})
+		.from(catalogEntries)
+		.where(
+			and(
+				inArray(catalogEntries.implementationKey, [...targets]),
+				isNull(catalogEntries.deletedAt),
+			),
+		);
+	return new Map(
+		rows.map((row) => [row.id, { kind: row.kind, implementationKey: row.implementationKey }]),
+	);
+}
+
 /**
  * Every entry named by any agent's attachments in `toolAttachments`, reduced to what the pure
  * compiler needs (`kind`/`implementationKey` alone), excluding deleted entries — the compiler
  * already treats an attachment naming one absent here as contributing nothing, the same as an
- * unknown entry. Shared by `management.ts`'s bundle-permissions mirror
- * (`mirrorCompiledAttachmentPermissionsIn`, ADR-027's bundle-mirror invariant) so it never loads
- * catalog rows through a second, differently-shaped query.
+ * unknown entry — *plus* every live entry a native dependency could ever imply
+ * ({@link loadLiveNativeDependencyTargets}), whether named by an attachment here or not: without
+ * it, the compiler could not tell "nobody happens to attach this, but it is still live" apart from
+ * "deleted", and would have to treat both the same way (never granted) — which is correct for the
+ * second but would wrongly withhold `tests.run`'s own implied `repository.read`/`workspace.write`
+ * for the first, the ordinary case of an agent attaching only `tests.run` itself. Shared by
+ * `management.ts`'s bundle-permissions mirror (`mirrorCompiledAttachmentPermissionsIn`, ADR-027's
+ * bundle-mirror invariant) so it never loads catalog rows through a second, differently-shaped
+ * query.
  */
 export async function loadCompilableCatalogEntries(
 	db: Db,
@@ -80,8 +117,11 @@ export async function loadCompilableCatalogEntries(
 			entryIds.add(attachment.entryId);
 		}
 	}
-	const entries = await loadAttachableEntries(db, entryIds);
-	const result = new Map<string, CompiledCatalogEntry>();
+	const [entries, nativeDependencyTargets] = await Promise.all([
+		loadAttachableEntries(db, entryIds),
+		loadLiveNativeDependencyTargets(db),
+	]);
+	const result = new Map<string, CompiledCatalogEntry>(nativeDependencyTargets);
 	for (const [id, entry] of entries) {
 		if (entry.deletedAt === null) {
 			result.set(id, { kind: entry.kind, implementationKey: entry.implementationKey });

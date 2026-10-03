@@ -37,6 +37,18 @@ export function customHttpMethodWrites(method: CustomHttpMethod): boolean {
 	return method !== "GET";
 }
 
+/** Whether a write already fully sent, answered with `status`, leaves the destination's own
+ * action genuinely ambiguous rather than definitively rejected: every 5xx (the destination's own
+ * error, which commonly follows having already done the work) and 408 (Request Timeout, which a
+ * destination can send after it already started acting on the request). Never 429 (Too Many
+ * Requests) or any other 4xx — those are the destination definitively refusing the request
+ * itself, not a sign it may have acted on it. Meaningless for a read (`GET`), which never writes
+ * anything a retry could double up on; callers only consult this once a write's request is
+ * already known to have been fully sent. */
+export function writeStatusIsAmbiguous(status: number): boolean {
+	return status >= 500 || status === 408;
+}
+
 /** Where a typed parameter or a secret is mapped into the request: a path placeholder, a query
  * key, a header, or a JSON body field. Never interpolated as a raw string — always one of these
  * explicit, encoded slots. */
@@ -73,8 +85,10 @@ export function isReservedCustomHeaderName(name: string): boolean {
 }
 
 /** A typed parameter's own name: what the agent fills in, independent of the slot it is mapped
- * into (a parameter named `priority` may fill a header, a query key or a body field). */
-const CustomParamNameSchema = z
+ * into (a parameter named `priority` may fill a header, a query key or a body field). Exported for
+ * `CapabilityParameterSchema` (`turn.ts`), which carries the same names without a definition's own
+ * slot routing — nothing a model fills in needs to know which slot its value lands in. */
+export const CustomParamNameSchema = z
 	.string()
 	.min(1)
 	.max(64)

@@ -446,6 +446,24 @@ missing prerequisite (`missingPrerequisites: { "repository.read": ["tests.run"] 
 explicit, adapter-keyed table (`ADAPTER_NATIVE_PREREQUISITES`) — data an owner managing attachments
 (or a future console) can be shown, not a silent trap.
 
+**A deleted entry is never granted implicitly, even through a native dependency.** `catalog`
+(`compileAttachments`'s own input) is never only the entries `attachments` itself names: a caller
+also includes every live entry a native dependency could ever target
+(`repository.read`/`workspace.write` today), attached or not, so the compiler can tell "nobody
+happens to attach this, but it is still live" (the ordinary case — `repository.read` implied by
+`tests.run` has no attachment of its own at all) apart from "its own entry is deleted or was never
+seeded." An implied tool whose own entry is absent from `catalog` is never added to `allow`,
+however many attached tools would otherwise imply it, whatever committed the stale implication that
+way — a bare attachment predating the deletion, a restored retired agent whose own disabled
+suppression of the deleted entry was dropped, or a config rollback/bundle import bringing an
+implying attachment back. It is reported as a missing prerequisite of the tool(s) that would have
+implied it instead, the same field (and the same shape) an adapter-specific prerequisite already
+uses — a caller reacts to both the same way: show it, grant nothing extra for it. Attaching a
+native tool is also refused up front, before it ever commits, once any native dependency it would
+imply has no live entry at all (`transitiveNativeDependencies`, `checkAttachable`) — defence in
+depth alongside the compiler's own, identical rule, which still catches a prerequisite deleted
+*after* the attachment already exists.
+
 **`memory.write` is always explicit, in `allow` or in `deny`, never silently absent from both.**
 Authority (`writableMemoryNamespaces`, `packages/core/src/turn-context.ts`) and the rendered prompt
 (`memoryWriteDenied`, `packages/runtime-sdk/src/prompt.ts`) both derive deniability from `deny`
@@ -489,7 +507,13 @@ any resolved attachment whose mode its entry's `kind` does not support, or a res
 `MAX_ATTACHMENTS_PER_AGENT` (a wide legacy pattern — `custom.*` covering dozens of owner-created
 tools — can resolve to more attachments than one agent may ever hold even though every one of them
 individually resolves cleanly) — both found and reported before attempting a commit that would
-otherwise refuse it, dry-run included. `--dry-run` previews everything above without committing.
+otherwise refuse it, dry-run included. A separate bound catches a narrower case
+`MAX_ATTACHMENTS_PER_AGENT` alone cannot: the *compiled* permission lists `compiledAgentPermissions`
+produces are each validated against `AgentPermissionsSchema` (64 per list) too, since a wide pattern
+resolving to, say, 65 attachments that all happen to carry the same mode compiles into one list over
+that bound while the attachment count itself (128) stays well clear of its own — previously this
+showed an empty problem list in the dry-run preview and only failed once a real commit actually
+tried to write it. `--dry-run` previews everything above without committing.
 Every agent, zero resolved attachments or many, commits through the same single
 `set_tool_attachments` operation: the one thing that can mark an *existing* agent hub-managed with
 an explicitly empty list at all (`attach_tool` always adds at least one row), and, being one
@@ -571,6 +595,19 @@ implies it, then by name) and truncates, reporting how many it left out as `capa
 (present only once it is nonzero). `toolPolicy.allow`/`requireHumanApproval` — the lists enforcement
 actually reads — are never trimmed, only this read model is; the runtime prompt notes the omitted
 count as a trailing line once `capabilities` itself is shown.
+
+**A parameterized capability's own non-secret parameter contract travels with it.** A `custom_https`
+tool's description alone (prose) never told the model what to actually pass: `capabilities.parameters`
+(`CapabilityParameterSchema`, bounded like a definition's own `parameters` by
+`MAX_CUSTOM_TOOL_PARAMS`) carries every declared parameter's name, type, whether it is required
+(always `true` today — the definition has no optional-parameter concept) and its own bounds or enum
+choices, resolved against the exact same selected version (pinned or current) the capability's mode
+and description already reflect — never a later edit's. `slot`/`slotName` (which wire location a
+value lands in) and every named secret slot are never part of it: an execution detail and a value
+the model must never see or supply, respectively (`capabilityParametersFromCustomToolParams`,
+`@agent-gateway/contracts`). Omitted entirely for a tool with no typed parameters, never an empty
+array. The runtime prompt renders it as an indented "required parameters" line beneath the
+capability's own description.
 
 ### Custom HTTPS tools: definitions, egress and outcomes
 
@@ -671,6 +708,24 @@ shown in its own block — "Request preview (authoritative; no secret value is e
 separate from the model's own summary, since one is the agent's prose and the other is exactly what
 will run.
 
+**The preview's own encoding matches the wire request exactly.** A query (and path) parameter's
+value is percent-/form-encoded once, by one shared function (`encodedQueryParams`,
+`@agent-gateway/policy`), and both `customRequestSummary` (the preview) and
+`executeCustomHttpsAction` (the actual request) build their own query string from it — never two
+separate encoders that could disagree. A value containing `&`, a space, `%` or `#` previously could
+render in the preview as if it introduced a second parameter (`x&admin=true` showing as two
+`key=value` pairs) while the executor sent it correctly confined to its one slot; sharing the
+encoder makes that disagreement structurally impossible rather than a case to keep re-testing for.
+
+**A custom tool approval is always refused rather than approved with no preview at all.**
+`customApprovalRequestPreview` returns `{ kind: "none" }` only for an action type that is not a
+custom tool in the first place (nothing to preview); a `custom.*` action whose preview cannot be
+resolved — a missing or invalid pinned-version parameter, or one naming a version that no longer
+exists — is `{ kind: "refused" }`, the same outcome a preview too large to show in full already
+gets. Every one of these should be unreachable for a draft `prepareCustomApprovalDraft` already
+produced, but a caller (`packages/core`'s `runs.ts`) refuses the draft outright on either, rather
+than ever letting an owner approve a custom tool call with nothing showing what it will actually do.
+
 **The owner always sees the complete preview, never a cut one.** A preview that does not fit
 `CUSTOM_REQUEST_PREVIEW_MAX` (`MattermostApprovalPayloadSchema.customRequestPreview`'s own schema
 bound, 4000 — a resolved path or query value is percent-encoded, and a long enough non-ASCII one,
@@ -692,11 +747,18 @@ entirely. The controller (`runs.ts`) calls this *before* an approval is created:
 entirely-dropped summary still does not fit, the request is refused at request time, the same way
 an oversized preview is, rather than ever being stored. A request that passed this check always
 renders exactly as checked — the renderer (`@agent-gateway/mattermost`) calls the identical
-function and simply posts whatever it returns. `createApproval`
-(`packages/core/src/services/runs.ts`) still parses the finished card against
-`MattermostApprovalPayloadSchema` immediately before enqueuing it, as a defensive re-check of the
-schema's own field shapes, now that the whole-card-fit question is already decided before this
-point.
+function and simply posts whatever it returns. Shortening the summary cuts at a code-unit boundary
+`truncateRequestPreview` (`@agent-gateway/contracts`) keeps surrogate-safe: a character outside the
+Basic Multilingual Plane (most emoji) is two UTF-16 code units, and a cut landing between them is
+backed up one further to exclude the whole character rather than leave a lone, unpaired surrogate
+behind — the same way the function already backs a cut out of a dangling percent-escape. `createApproval`
+(`packages/core/src/services/runs.ts`) still builds the finished card and parses it against
+`MattermostApprovalPayloadSchema` (`buildApprovalCard`, `safeParse`) immediately before anything is
+persisted, as a defensive re-check of the schema's own field shapes, now that the whole-card-fit
+question is already decided before this point: a shape it still finds wrong — unreachable in
+practice for a draft that already passed every check above — fails that one run cleanly
+(`invalid_output`) rather than throwing an uncaught `ZodError`, and nothing (not the approval row,
+not the wait) is created for a request that was never going to reach an owner to decide on.
 
 The one case `fitApprovalCard` still returns "does not fit" to a caller is data a release before
 this rule existed already created and stored: such a row's own `customRequestPreview` was bounded
@@ -747,25 +809,34 @@ against a destination that happens to echo the credential; a hostile destination
 it learns nothing more from a scrub missing some further transformation of it. A definition may also
 turn the preview off entirely, `includeBodyPreview: false`, for a body an owner never wants an agent
 to see regardless). `failed` is a clean, known refusal with nothing left uncertain — a blocked
-address, a `GET` with an unexpected content type, an oversized `GET` response, the destination's own
-4xx/5xx. `unknown` is reserved for what the brief among tool actions already means it to be
-(ADR-018): an abort — a timeout or a cancellation — or a connection reset **after** the request was
-already fully sent, when the destination may or may not have acted on it — the egress client
-distinguishes this by whether the request finished writing (and, for an HTTPS call, the TLS
-handshake itself completed: `finish` alone can fire before the connection is even established,
-which would otherwise make a pre-connect failure — an untrusted CA, a hostname/certificate mismatch
-— look sent) before the failure, and throws rather than returning `failed`, so `processToolJob`
-records it as `unknown` exactly like any other executor's unexplained crash. An oversized response
-is the one case decided by the method: a `GET`'s own abort is always `failed` (nothing but a read
-was ever at stake); a write's is `unknown` once the request was actually sent, `failed` otherwise.
+address, a `GET` with an unexpected content type, an oversized `GET` response, a write's own
+definitive 4xx (any status but 408) once it was fully sent, or any 4xx/5xx the destination answers
+before a write's own request finished sending (nothing was ever at stake in that answer either way).
+`unknown` is reserved for what the brief among tool actions already means it to be (ADR-018): an
+abort — a timeout or a cancellation — or a connection reset **after** the request was already fully
+sent, when the destination may or may not have acted on it — the egress client distinguishes this by
+whether the request finished writing (and, for an HTTPS call, the TLS handshake itself completed:
+`finish` alone can fire before the connection is even established, which would otherwise make a
+pre-connect failure — an untrusted CA, a hostname/certificate mismatch — look sent) before the
+failure, and throws rather than returning `failed`, so `processToolJob` records it as `unknown`
+exactly like any other executor's unexplained crash. **A write already fully sent that the
+destination answers with a 5xx, or 408 (Request Timeout), is `unknown` the same way**
+(`writeStatusIsAmbiguous`, `@agent-gateway/contracts`): the destination's own error, or its own
+timeout, commonly follows having already done the work, so a clean `failed` here is exactly what
+would make an owner retry an already-done write under a new idempotency key — never 429 (Too Many
+Requests) or any other 4xx, which is the destination definitively refusing the request itself. An
+oversized response is the one case decided by the method alone, regardless of status: a `GET`'s own
+abort is always `failed` (nothing but a read was ever at stake); a write's is `unknown` once the
+request was actually sent, `failed` otherwise.
 A write whose request was fully sent and that comes back with a content type the definition does not
 allow is no longer automatically `failed`: a 2xx (the common case is no body or `Content-Type` at
 all, a plain 201/204) is `succeeded`, its body withheld rather than previewed, since a clean failure
 here is exactly what would make an owner retry an already-done write under a new idempotency key; a
-non-2xx stays `failed`; the one case left genuinely ambiguous (a response with no usable status at
-all) is `unknown`. A `GET` with an unexpected content type stays `failed` regardless of status, as
-before. Neither `failed` nor `unknown` is ever retried automatically — an `unknown` custom-tool
-action is settled by hand (`gateway tools settle`), the same as any other namespace's.
+5xx or 408 is `unknown`, the same ambiguity a matching content type's own status check above already
+carries; any other non-2xx stays `failed`; the one case left genuinely ambiguous (a response with no
+usable status at all) is `unknown`. A `GET` with an unexpected content type stays `failed` regardless
+of status, as before. Neither `failed` nor `unknown` is ever retried automatically — an `unknown`
+custom-tool action is settled by hand (`gateway tools settle`), the same as any other namespace's.
 
 **A 3xx is never a success.** Redirects are never followed (above), and a 3xx answer is decided in
 `sendPinnedRequest` itself, before the content-type gate — a redirect commonly carries neither a

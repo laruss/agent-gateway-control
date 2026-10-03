@@ -729,15 +729,20 @@ async function applyCompletion(
 			break;
 		case "needs_human": {
 			const draft = preparedApprovalDraft ?? result.nextState.approvalRequest;
-			await createApproval(
+			const failedOutcome = await createApproval(
 				uow,
 				run,
-				agent.id,
+				agent,
 				draft,
 				approvers,
 				preparedApprovalIdentity ?? prepareApprovalIdentity(draft, uow.now),
 				preparedCustomRequestPreview,
+				runtimeVersion,
+				result.usage,
 			);
+			if (failedOutcome !== null) {
+				return failedOutcome;
+			}
 			await setAgentState(
 				uow,
 				agent.id,
@@ -1065,30 +1070,134 @@ function prepareApprovalIdentity(draft: ApprovalRequestDraft, now: Date): Approv
 	};
 }
 
+export type ApprovalCardResult =
+	| Readonly<{ kind: "ok"; card: MattermostApprovalPayload }>
+	| Readonly<{ kind: "invalid"; detail: string }>;
+
+/**
+ * Builds the Mattermost approval card `createApproval` would post, and validates it against
+ * `MattermostApprovalPayloadSchema` — the same re-check `createApproval`'s own doc comment
+ * explains (guards against drift from the outbox deliverer's own re-parse, never a size this
+ * already fit). Pure, and exported only so that re-check's own shape can be exercised directly
+ * (`runs.test.ts`), without the database `createApproval` itself needs for everything else it
+ * does: every field here is already computed by its own caller (an immutable identity, a
+ * draft already checked against `ApprovalRequestDraftSchema`, a channel resolved from the active
+ * configuration) — nothing here recomputes any of it, this only assembles and re-checks the
+ * shape.
+ */
+export function buildApprovalCard(
+	input: Readonly<{
+		identity: ApprovalIdentity;
+		agentId: string;
+		draft: ApprovalRequestDraft;
+		channelName: string;
+		channelId: MattermostId | null;
+		customRequestPreview: string | null;
+	}>,
+): ApprovalCardResult {
+	const { identity, agentId, draft, channelName, channelId, customRequestPreview } = input;
+	const card: MattermostApprovalPayload = {
+		approvalId: identity.approvalId,
+		channelName,
+		channelId,
+		requestedByAgentId: agentId,
+		actionType: draft.actionType,
+		actionSummary: draft.actionSummary,
+		actionParams: draft.actionParams,
+		riskLevel: identity.riskLevel,
+		immutableActionHash: identity.immutableActionHash,
+		expiresAt: identity.expiresAt.toISOString(),
+		approvalCode: identity.approvalCode,
+		...(customRequestPreview === null ? {} : { customRequestPreview }),
+	};
+	const parsed = MattermostApprovalPayloadSchema.safeParse(card);
+	if (!parsed.success) {
+		return {
+			kind: "invalid",
+			detail: parsed.error.issues
+				.slice(0, 10)
+				.map((issue) => `${issue.path.join(".")}: ${issue.message}`)
+				.join("; "),
+		};
+	}
+	return { kind: "ok", card: parsed.data };
+}
+
 /**
  * Persists an immutable approval request, posts its card through the outbox, and makes the
  * agent wait for how it ends (ADR-018): one wait on `approval.resolved`. `identity` and
  * `customRequestPreview` are reused exactly as already computed and checked (ADR-027's own
  * whole-card-fit rule), never recomputed here.
+ *
+ * Returns `null` once the card is posted and the wait created (the ordinary case); otherwise the
+ * `ReportOutcome` of a run `applyFailure` already turned this into (`invalid_output`), for the
+ * caller to return as-is. The card's own shape (`MattermostApprovalPayloadSchema`) is re-checked,
+ * and the run failed instead of left with a dangling approval, *before* anything is persisted
+ * here: a card that cannot even be parsed back out could never have been delivered by the outbox
+ * deliverer's own re-parse either, so nothing — not the approval row, not the wait — is created
+ * for a request that was never going to reach an owner to decide on.
  */
 async function createApproval(
 	uow: UnitOfWork,
 	run: RunRow,
-	agentId: string,
+	agent: AgentRow,
 	draft: ApprovalRequestDraft,
 	approvers: Readonly<MattermostId[]>,
 	identity: ApprovalIdentity,
 	customRequestPreview: string | null,
-): Promise<void> {
+	runtimeVersion: string,
+	usage: RuntimeUsage | null,
+): Promise<ReportOutcome | null> {
 	const config = await loadActiveConfig(uow.tx.db);
 	if (config === null) {
 		throw new Error("approval requested without an active configuration");
+	}
+	const channels = await loadTeamChannels(uow.tx.db);
+	const channelName = config.organization.mattermost.approvals_channel;
+	// Checked here, at request time, rather than only once the outbox deliverer re-parses this same
+	// schema and finds it does not fit: an undeliverable card would otherwise leave the approval
+	// sitting `pending` forever, retried until the outbox item's own attempts run out, with no card
+	// an owner could ever decide on. The whole card's own fit against Mattermost's post limit was
+	// already checked, with this exact preview, before this function was ever called (ADR-027); this
+	// re-parse guards the schema's other bounds (field shapes, the preview's own individual cap),
+	// never a size this function itself could still disagree with. `safeParse` (inside
+	// `buildApprovalCard`), never `parse`: a shape this unlikely, defensive check still finds wrong
+	// must fail this one run cleanly (`invalid_output`, the same outcome every other request-shape
+	// refusal above already gives), not throw a raw `ZodError` out of the job handler to be retried
+	// forever against a card that will never parse any differently next time.
+	const built = buildApprovalCard({
+		identity,
+		agentId: agent.id,
+		draft,
+		channelName,
+		channelId: channels.get(channelName) ?? null,
+		customRequestPreview,
+	});
+	if (built.kind === "invalid") {
+		await raiseAlert(
+			uow,
+			`approval-policy:${run.id}`,
+			`Run ${run.id} of @${agent.id} asked to approve an action whose card fails validation; no approval card was posted.`,
+			{ action_type: draft.actionType },
+		);
+		return applyFailure(
+			uow,
+			run,
+			agent,
+			{
+				code: "invalid_output",
+				retryable: false,
+				detail: `approval card fails validation: ${built.detail}`,
+			},
+			runtimeVersion,
+			usage,
+		);
 	}
 	const [approval] = await uow.tx.db
 		.insert(approvalRequests)
 		.values({
 			id: identity.approvalId,
-			requestedByAgentId: agentId,
+			requestedByAgentId: agent.id,
 			runId: run.id,
 			actionType: draft.actionType,
 			actionParams: draft.actionParams,
@@ -1105,41 +1214,17 @@ async function createApproval(
 	if (approval === undefined) {
 		throw new Error("approval insert returned no row");
 	}
-	const channels = await loadTeamChannels(uow.tx.db);
-	const channelName = config.organization.mattermost.approvals_channel;
-	const card: MattermostApprovalPayload = {
-		approvalId: approval.id,
-		channelName,
-		channelId: channels.get(channelName) ?? null,
-		requestedByAgentId: agentId,
-		actionType: draft.actionType,
-		actionSummary: draft.actionSummary,
-		actionParams: draft.actionParams,
-		riskLevel: identity.riskLevel,
-		immutableActionHash: identity.immutableActionHash,
-		expiresAt: identity.expiresAt.toISOString(),
-		approvalCode: identity.approvalCode,
-		...(customRequestPreview === null ? {} : { customRequestPreview }),
-	};
-	// Refused here, at request time, rather than only once the outbox deliverer re-parses this same
-	// schema and finds it does not fit: an undeliverable card would otherwise leave the approval
-	// sitting `pending` forever, retried until the outbox item's own attempts run out, with no card
-	// an owner could ever decide on. The whole card's own fit against Mattermost's post limit was
-	// already checked, with this exact preview, before this function was ever called (ADR-027); this
-	// re-parse guards the schema's other bounds (field shapes, the preview's own individual cap),
-	// never a size this function itself could still disagree with.
-	MattermostApprovalPayloadSchema.parse(card);
 	await enqueueOutbox(uow, {
 		kind: "mattermost.approval",
 		destination: `channel/${channelName}`,
-		payload: card,
+		payload: built.card,
 		idempotencyKey: `approval-card:${approval.id}`,
 		runId: run.id,
 	});
 	await insertWait(
 		uow,
 		run,
-		agentId,
+		agent.id,
 		{
 			eventType: "approval.resolved",
 			correlationId: approvalCorrelation(approval.id),
@@ -1155,6 +1240,7 @@ async function createApproval(
 		run_id: run.id,
 		action_type: draft.actionType,
 	});
+	return null;
 }
 
 /**

@@ -268,6 +268,103 @@ describe("executeCustomHttpsAction", () => {
 		});
 	});
 
+	it("a write answered with a server error (500) is 'unknown', not 'failed': it may already have acted on it", async () => {
+		server = await startTestHttpsServer(tls, (_req, res) => {
+			res.writeHead(500, { "content-type": "application/json" });
+			res.end(JSON.stringify({ error: "internal" }));
+		});
+		const lookup: CustomToolDefinitionLookup = async (entryId, version) =>
+			entryId === "zendesk" && version === 1 ? definition() : null;
+		await expect(
+			executeCustomHttpsAction(
+				{
+					actionType: "custom.zendesk",
+					actionParams: [
+						{ name: "id", value: "123" },
+						{ name: "title", value: "Printer is on fire" },
+						{ name: CUSTOM_DEFINITION_VERSION_PARAM, value: "1" },
+					],
+				},
+				deps(lookup),
+				{ idempotencyKey: "tool-action:approval-8:hash", signal: new AbortController().signal },
+			),
+		).rejects.toThrow(/answered 500 after the write was sent.*unknown/);
+	});
+
+	it("a write answered with 408 (request timeout) is also 'unknown', like a 5xx", async () => {
+		server = await startTestHttpsServer(tls, (_req, res) => {
+			res.writeHead(408, { "content-type": "application/json" });
+			res.end(JSON.stringify({ error: "timeout" }));
+		});
+		const lookup: CustomToolDefinitionLookup = async (entryId, version) =>
+			entryId === "zendesk" && version === 1 ? definition() : null;
+		await expect(
+			executeCustomHttpsAction(
+				{
+					actionType: "custom.zendesk",
+					actionParams: [
+						{ name: "id", value: "123" },
+						{ name: "title", value: "Printer is on fire" },
+						{ name: CUSTOM_DEFINITION_VERSION_PARAM, value: "1" },
+					],
+				},
+				deps(lookup),
+				{ idempotencyKey: "tool-action:approval-9:hash", signal: new AbortController().signal },
+			),
+		).rejects.toThrow(/answered 408 after the write was sent.*unknown/);
+	});
+
+	it("a write answered with a definitive 4xx (400) stays 'failed': the destination rejected it outright", async () => {
+		server = await startTestHttpsServer(tls, (_req, res) => {
+			res.writeHead(400, { "content-type": "application/json" });
+			res.end(JSON.stringify({ error: "bad request" }));
+		});
+		const lookup: CustomToolDefinitionLookup = async (entryId, version) =>
+			entryId === "zendesk" && version === 1 ? definition() : null;
+		const result = await executeCustomHttpsAction(
+			{
+				actionType: "custom.zendesk",
+				actionParams: [
+					{ name: "id", value: "123" },
+					{ name: "title", value: "Printer is on fire" },
+					{ name: CUSTOM_DEFINITION_VERSION_PARAM, value: "1" },
+				],
+			},
+			deps(lookup),
+			{ idempotencyKey: "tool-action:approval-10:hash", signal: new AbortController().signal },
+		);
+		expect(result).toMatchObject({ kind: "failed" });
+	});
+
+	it("a GET answered with a 500 stays 'failed': reads are never ambiguous", async () => {
+		server = await startTestHttpsServer(tls, (_req, res) => {
+			res.writeHead(500, { "content-type": "application/json" });
+			res.end(JSON.stringify({ error: "internal" }));
+		});
+		const getDefinition = definition({
+			method: "GET",
+			pathTemplate: "/tickets/{id}",
+			parameters: [
+				{ name: "id", slot: "path", slotName: "id", type: "string", minLength: 1, maxLength: 50 },
+			],
+			secretSlots: [],
+			idempotency: null,
+		});
+		const lookup: CustomToolDefinitionLookup = async () => getDefinition;
+		const result = await executeCustomHttpsAction(
+			{
+				actionType: "custom.zendesk",
+				actionParams: [
+					{ name: "id", value: "123" },
+					{ name: CUSTOM_DEFINITION_VERSION_PARAM, value: "1" },
+				],
+			},
+			deps(lookup),
+			{ idempotencyKey: "tool-action:approval-11:hash", signal: new AbortController().signal },
+		);
+		expect(result).toMatchObject({ kind: "failed" });
+	});
+
 	it("a write answered with a redirect after it was fully sent is 'unknown': the destination may already have acted on it", async () => {
 		server = await startTestHttpsServer(tls, (req, res) => {
 			req.on("data", () => undefined);

@@ -2,13 +2,15 @@ import {
 	CUSTOM_DEFINITION_VERSION_PARAM,
 	type CustomHttpsDefinition,
 	CustomHttpsDefinitionSchema,
+	customHttpMethodWrites,
 	customToolEntryId,
 	TOOL_RECEIPT_TEXT_MAX,
 	type ToolReceipt,
 	toVerbatimPreview,
+	writeStatusIsAmbiguous,
 } from "@agent-gateway/contracts";
 import { redactText } from "@agent-gateway/logging";
-import { resolveCustomHttpRequest } from "@agent-gateway/policy";
+import { encodedQueryParams, resolveCustomHttpRequest } from "@agent-gateway/policy";
 import type { EgressOutcome, EgressRequest } from "./egress.ts";
 import type { ToolExecutionContext, ToolExecutionResult } from "./executor.ts";
 
@@ -192,10 +194,7 @@ export async function executeCustomHttpsAction(
 		// A missing secret file throws here (`SecretResolver`'s own contract); caught below.
 		secretValues = await resolvedSecretValues(definition, deps.secrets);
 
-		const query = new URLSearchParams();
-		for (const q of resolved.query) {
-			query.append(q.name, String(q.value));
-		}
+		const query = encodedQueryParams(resolved.query);
 		for (const name of resolved.secretQueryNames) {
 			query.append(name, secretValues.get(`query:${name}`) ?? "");
 		}
@@ -269,9 +268,22 @@ export async function executeCustomHttpsAction(
 	// sent) does not depend on the response's content type or body the way the rest of this
 	// function's own classification does — a redirect commonly carries neither at all.
 	if (outcome.response.status >= 400) {
+		const preview = renderBodyPreview(definition, outcome.response.body, secretValues.values());
+		if (
+			customHttpMethodWrites(definition.method) &&
+			writeStatusIsAmbiguous(outcome.response.status)
+		) {
+			// A 5xx (or 408) answer to a write already fully sent does not prove the destination
+			// never acted on it — the same ambiguity a redirect, or a connection error, after sending
+			// already carries; report it the same way, as `unknown` (a throw here, caught by
+			// `processToolJob`), never a clean `failed` a caller might safely retry.
+			throw new Error(
+				`the destination answered ${outcome.response.status} after the write was sent, so whether it took effect is unknown: ${preview}`,
+			);
+		}
 		return {
 			kind: "failed",
-			error: `the destination answered ${outcome.response.status}: ${renderBodyPreview(definition, outcome.response.body, secretValues.values())}`,
+			error: `the destination answered ${outcome.response.status}: ${preview}`,
 		};
 	}
 	const receipt: ToolReceipt = {

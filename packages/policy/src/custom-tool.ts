@@ -187,6 +187,23 @@ export type ResolvedCustomRequest = Readonly<{
 	secretBodyFieldNames: Readonly<string[]>;
 }>;
 
+/**
+ * `query`'s own non-secret slots, as a `URLSearchParams` — the exact encoder
+ * `custom-https-executor.ts` itself builds the wire request's query string with
+ * (`query.append`/`.toString()`), shared here so the approval card's own preview
+ * (`customRequestSummary`) can never disagree with it on how a value is percent-/form-encoded.
+ * Without this, a value itself containing `&`/`=`/space (`x&admin=true`) would render in the
+ * preview as if it introduced a second parameter the approval was never actually shown, while the
+ * executor sends it correctly confined to its one slot (ADR-027).
+ */
+export function encodedQueryParams(query: Readonly<ResolvedCustomSlot[]>): URLSearchParams {
+	const params = new URLSearchParams();
+	for (const q of query) {
+		params.append(q.name, String(q.value));
+	}
+	return params;
+}
+
 function typedValue(param: CustomToolParam, raw: string): string | number | boolean {
 	switch (param.type) {
 		case "number":
@@ -272,8 +289,13 @@ export function resolveCustomHttpRequest(
  * slot, only the name it will be filled under — for the approval card's own summary and the
  * runner's logs. Deterministic: the same resolved request always renders the same text. */
 export function customRequestSummary(resolved: ResolvedCustomRequest): string {
+	// `.toString()`, never `.entries()`: `URLSearchParams` decodes on the way out of `.entries()`,
+	// which would silently undo the very encoding this is meant to preview. Splitting the encoded
+	// string back into fragments on `&` is safe — every value in it is already percent-/form-encoded,
+	// so none can contain a literal, unescaped `&` of its own to be confused with a separator.
+	const encodedNonSecretQuery = encodedQueryParams(resolved.query).toString();
 	const query = [
-		...resolved.query.map((q) => `${q.name}=${q.value}`),
+		...(encodedNonSecretQuery === "" ? [] : encodedNonSecretQuery.split("&")),
 		...resolved.secretQueryNames.map((name) => `${name}=<secret>`),
 	].sort();
 	const headers = [

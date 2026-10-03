@@ -24,6 +24,7 @@ import {
 	StaleLifecycleOperationError,
 } from "./agent-lifecycle.ts";
 import type { ControlPlaneDeps } from "./deps.ts";
+import { loadEffectivePermissionsIn } from "./effective-permissions.ts";
 import {
 	activeConfigRevisionId,
 	commitChange,
@@ -33,6 +34,7 @@ import {
 import { listMemory } from "./memory.ts";
 import { handleRunReport } from "./runs.ts";
 import { recordWorkerStatus } from "./runtime-health.ts";
+import { loadAgents } from "./store.ts";
 import { attachTool, deleteCatalogEntry, ensureToolCatalogSeeded } from "./tool-catalog.ts";
 
 function organization(): OrganizationConfig {
@@ -737,6 +739,95 @@ describe("agent lifecycle service (ADR-026)", () => {
 				settings: {},
 			},
 		]);
+	});
+
+	it("restoring a retired agent never widens permissions through a native implication whose own entry was deleted while retired (ADR-027)", async () => {
+		// `omicron` attaches `tests.run` (allow) and explicitly suppresses the native dependency it
+		// would otherwise imply (`workspace.write`, disabled) — exactly the shape
+		// `deleteCatalogEntry refuses when clearing an attachment would widen an agent's effective
+		// permissions` (`tool-catalog.integration.test.ts`) already refuses for a *live* agent.
+		// Retiring removes `omicron` from the active configuration first, so deleting
+		// `native-workspace-write` while it is retired is no longer refused the same way (nobody in
+		// the active configuration holds or implies it any more) — the bug this guards against: the
+		// entry comes back deleted, the disabled attachment suppressing the implication is dropped on
+		// restore (never resurrecting a retired capability), and nothing must silently let
+		// `workspace.write` through via `tests.run`'s own implication once nothing explicit opposes
+		// it any more.
+		await ensureToolCatalogSeeded(deps, "test");
+		const created = await requestAgentCreate(deps, createInput("omicron"));
+		await markProvisioning(deps, created.operationId, "test");
+		await completeOperation(deps, created.operationId, "test");
+		await attachTool(deps, {
+			agentId: "omicron",
+			entryId: "native-tests-run",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+		await attachTool(deps, {
+			agentId: "omicron",
+			entryId: "native-workspace-write",
+			pinnedVersion: null,
+			mode: "disabled",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+		const retired = await requestAgentRetire(deps, {
+			agentId: "omicron",
+			actor: "test",
+			source: "cli",
+		});
+		await markProvisioning(deps, retired.operationId, "test");
+		await completeOperation(deps, retired.operationId, "test");
+		await deleteCatalogEntry(deps, "native-workspace-write", "test");
+
+		const restored = await requestAgentRestore(deps, {
+			agentId: "omicron",
+			actor: "test",
+			source: "cli",
+		});
+		expect(restored.droppedAttachments).toEqual([{ entryId: "native-workspace-write" }]);
+		const { bundle } = await inTransaction(deps, ({ tx }) =>
+			loadActiveBundle(tx.db, restored.revisionId),
+		);
+		// The disabled `workspace.write` suppression is gone (dropped, its own entry deleted), but
+		// `tests.run`'s own allow attachment carried forward unchanged, alongside the two disabled
+		// finance attachments `omicron`'s own `tools_deny: ["finance.*"]` (`createInput`'s own
+		// default) converted on its very first, still-legacy attach (ADR-027) — neither dropped nor
+		// deleted, so both remain too.
+		expect(bundle.toolAttachments.omicron).toEqual([
+			{
+				entryId: "executor-finance-payment-create",
+				pinnedVersion: null,
+				mode: "disabled",
+				settings: {},
+			},
+			{
+				entryId: "executor-finance-subscription-create",
+				pinnedVersion: null,
+				mode: "disabled",
+				settings: {},
+			},
+			{ entryId: "native-tests-run", pinnedVersion: null, mode: "allow", settings: {} },
+		]);
+		const record = (await inTransaction(deps, ({ tx }) => loadAgents(tx.db))).find(
+			(a) => a.id === "omicron",
+		);
+		if (record === undefined) {
+			throw new Error("expected 'omicron' to be restored");
+		}
+		const effective = await inTransaction(deps, (uow) =>
+			loadEffectivePermissionsIn(uow.tx, record, "finance"),
+		);
+		// Never widened: `workspace.write` stays withheld, because its own catalog entry no longer
+		// exists — reported as a missing prerequisite of `tests.run`, never silently granted.
+		expect(effective.toolPolicy.allow).toContain("tests.run");
+		expect(effective.toolPolicy.allow).toContain("repository.read");
+		expect(effective.toolPolicy.allow).not.toContain("workspace.write");
+		expect(effective.missingPrerequisites["tests.run"]).toEqual(["workspace.write"]);
 	});
 
 	it("restore migrates an adopted (bootstrap-managed) agent's token reference to the lifecycle provisioner's own path", async () => {

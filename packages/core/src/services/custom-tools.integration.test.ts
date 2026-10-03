@@ -393,6 +393,40 @@ describe("prepareCustomApprovalDraft / customGrantTimeIssues (ADR-027)", () => {
 		expect(preview).toEqual({ kind: "none" });
 	});
 
+	it(
+		"customApprovalRequestPreview: refuses (never 'none') a custom.* action with no valid " +
+			"pinned-version parameter — an approvable card must never go out with no preview at all (ADR-027)",
+		async () => {
+			await createEntry("unversioned-tool", parameterlessDefinition());
+			const preview = await inTransaction(deps, (uow) =>
+				customApprovalRequestPreview(uow.tx.db, "custom.unversioned-tool", []),
+			);
+			expect(preview.kind).toBe("refused");
+			if (preview.kind !== "refused") {
+				return;
+			}
+			expect(preview.issues.join(" ")).toContain(CUSTOM_DEFINITION_VERSION_PARAM);
+		},
+	);
+
+	it(
+		"customApprovalRequestPreview: refuses (never 'none') a custom.* action pinned to a " +
+			"version that no longer exists",
+		async () => {
+			await createEntry("stale-pin-tool", parameterlessDefinition());
+			const preview = await inTransaction(deps, (uow) =>
+				customApprovalRequestPreview(uow.tx.db, "custom.stale-pin-tool", [
+					{ name: CUSTOM_DEFINITION_VERSION_PARAM, value: "999" },
+				]),
+			);
+			expect(preview.kind).toBe("refused");
+			if (preview.kind !== "refused") {
+				return;
+			}
+			expect(preview.issues.join(" ")).toContain("999");
+		},
+	);
+
 	it("customApprovalRequestPreview: a percent-encoded CJK path whose preview exceeds CUSTOM_REQUEST_PREVIEW_MAX is refused, never truncated", async () => {
 		const entryId = "cjk-preview-tool";
 		await createEntry(entryId, cjkPathDefinition());

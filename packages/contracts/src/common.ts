@@ -318,12 +318,16 @@ export function toVerbatimPreview(value: string, max: number): string {
 
 /**
  * `value` cut to at most `max` characters, marked with the same `…` truncation marker once cut —
- * for `"text"`-safety content (a custom tool's resolved request preview) that must never end mid
- * percent-escape (`%XX`): a resolved path or query value is percent-encoded, and cutting right
- * after its `%` or its first hex digit would leave a dangling, misleading fragment where either the
- * whole escape or none of it reads correctly. Unlike {@link toVerbatimPreview}, this never collapses
- * characters (`"text"` safety already tolerates newlines/tabs) and never re-verifies against a
- * schema — the caller's own content is already known-safe ASCII; only the cut point is adjusted.
+ * for `"text"`-safety content that must never end mid percent-escape (`%XX`): a custom tool's
+ * resolved path or query value is percent-encoded, and cutting right after its `%` or its first
+ * hex digit would leave a dangling, misleading fragment where either the whole escape or none of
+ * it reads correctly. Also shared by `fitApprovalCard` (`@agent-gateway/contracts`'s own
+ * `approval.ts`) to shrink a model-written `actionSummary`, which is ordinary `"text"`-safety
+ * content, not percent-encoded, but can still contain any character that safety level allows,
+ * emoji included — so the cut point is also never left splitting a UTF-16 surrogate pair, the one
+ * other way a cut here could produce a string that does not mean what it looks like it means.
+ * Unlike {@link toVerbatimPreview}, this never collapses characters (`"text"` safety already
+ * tolerates newlines/tabs) and never re-verifies against a schema; only the cut point is adjusted.
  */
 export function truncateRequestPreview(value: string, max: number): string {
 	if (value.length <= max) {
@@ -342,6 +346,18 @@ export function truncateRequestPreview(value: string, max: number): string {
 			cut -= back;
 			break;
 		}
+	}
+	// `value` is indexed in UTF-16 code units, not code points: a character outside the Basic
+	// Multilingual Plane (most emoji included) is two code units, a "surrogate pair" — cutting
+	// between them leaves a lone high surrogate behind, a code unit with no valid meaning on its
+	// own. Backing up the one further code unit this takes excludes the whole character instead,
+	// never half of it; a percent-escape's own code units (`%` and hex digits) are never in the
+	// high-surrogate range, so this can never reopen the dangling-escape case the loop above
+	// already closed. Grapheme clusters (a multi-code-point emoji sequence joined by ZWJ, a base
+	// letter plus a combining mark) are not covered — cutting one of those apart can still change
+	// how it renders, but never leaves a lone surrogate, the one failure mode this guards.
+	if (cut > 0 && value.charCodeAt(cut - 1) >= 0xd800 && value.charCodeAt(cut - 1) <= 0xdbff) {
+		cut -= 1;
 	}
 	return `${value.slice(0, cut)}${marker}`;
 }

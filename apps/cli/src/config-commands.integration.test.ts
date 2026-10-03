@@ -10,6 +10,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { AgentConfigSchema, OrganizationConfigSchema } from "@agent-gateway/contracts";
 import {
 	AdminError,
 	activeConfigRevisionId,
@@ -935,6 +936,166 @@ describe("config export/import: tool attachments round-trip (ADR-027)", () => {
 		await expect(deleteCatalogEntry(harness.deps, "native-web-fetch", "test")).rejects.toThrow(
 			/legacy permissions of: research.*gateway tools adopt/s,
 		);
+	});
+});
+
+describe("config rollback: never grants a deleted entry's capability through implication (ADR-027)", () => {
+	// A minimal org/agent, never loaded from `config/examples` (`developer` there legacy-grants
+	// `workspace.write`/`tests.run`/`repository.read` directly, which would make
+	// `deleteCatalogEntry` below refuse outright for an unrelated reason — this test needs a
+	// database where nothing but the hub attachments constructed here ever touches these tools).
+	let harness: Awaited<ReturnType<typeof startHarness>>;
+
+	beforeAll(async () => {
+		harness = await startHarness();
+		const organization = OrganizationConfigSchema.parse({
+			schema_version: 1,
+			organization: {
+				id: "lab",
+				display_name: "Lab",
+				global_goal: "goal",
+				constitution_file: "prompts/constitution.md",
+				owner_mattermost_usernames: ["owner"],
+				finance_agent_id: "solo",
+				rules: [],
+				default_limits: {
+					max_agent_hops: 8,
+					max_turns_per_cascade: 20,
+					max_runs_per_agent_per_hour: 30,
+					default_run_timeout_seconds: 1800,
+				},
+			},
+			mattermost: {
+				team: "lab",
+				channels: ["hq"],
+				approvals_channel: "hq",
+				alerts_channel: "hq",
+				listener: {
+					username: "gateway-listener",
+					token_secret_file: "/run/secrets/mm_listener_token",
+				},
+			},
+		});
+		const solo = AgentConfigSchema.parse({
+			schema_version: 1,
+			id: "solo",
+			display_name: "solo",
+			enabled: true,
+			mattermost: { username: "solo", token_secret_file: "/run/secrets/mm_solo_token" },
+			runtime: { adapter: "mock", session_policy: "stateless", timeout_seconds: 60 },
+			prompts: { role_file: "prompts/solo.md" },
+			wake_rules: [],
+			concurrency: { while_running: "enqueue" },
+			permissions: { tools_allow: [], tools_require_human_approval: [], tools_deny: [] },
+			memory: { private_namespace: "agents/solo", shared_namespaces: [] },
+		});
+		await applyConfig(
+			harness.deps,
+			{
+				organization,
+				agents: [solo],
+				constitution: "Be helpful.",
+				rolePrompts: { solo: "Role prompt for solo." },
+			},
+			"test",
+		);
+		await ensureToolCatalogSeeded(harness.deps, "test");
+	});
+
+	afterAll(async () => {
+		await harness.stop();
+	});
+
+	it("rollback to a revision attaching tests.run does not grant workspace.write once that entry is deleted", async () => {
+		// `solo` attaches `tests.run` (allow) and explicitly suppresses the native dependency it
+		// would otherwise imply (`workspace.write`, disabled) — the revision this test rolls back to.
+		await attachTool(harness.deps, {
+			agentId: "solo",
+			entryId: "native-tests-run",
+			pinnedVersion: null,
+			mode: "allow",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+		const target = await attachTool(harness.deps, {
+			agentId: "solo",
+			entryId: "native-workspace-write",
+			pinnedVersion: null,
+			mode: "disabled",
+			settings: {},
+			actor: "test",
+			source: "cli_apply",
+		});
+
+		// Detaching `tests.run` first only ever narrows (nothing it implied stays allowed once it is
+		// gone), never a widening; with it gone, detaching `workspace.write`'s own disabled
+		// attachment next changes nothing either (absence and an explicit deny are the same access
+		// level) — both detaches commit without `acceptWidening`, leaving nobody attached to, or
+		// implying, `native-workspace-write` any more.
+		await detachTool(harness.deps, {
+			agentId: "solo",
+			entryId: "native-tests-run",
+			actor: "test",
+			source: "cli_apply",
+		});
+		await detachTool(harness.deps, {
+			agentId: "solo",
+			entryId: "native-workspace-write",
+			actor: "test",
+			source: "cli_apply",
+		});
+		await deleteCatalogEntry(harness.deps, "native-workspace-write", "test");
+
+		const beforeRollback = await activeConfigRevisionId(harness.deps);
+		const printed: string[] = [];
+		const result = await configRollback(
+			harness.deps,
+			{
+				revisionId: target.revisionId,
+				expectedRevision: beforeRollback ?? target.revisionId,
+				reason: null,
+				actor: "test",
+			},
+			(line) => printed.push(line),
+		);
+		expect(printed.some((line) => line.includes("solo:native-workspace-write"))).toBe(true);
+
+		const { bundle: rolledBack } = await inTransaction(harness.deps, ({ tx }) =>
+			loadActiveBundle(tx.db, result.revisionId),
+		);
+		// The disabled `workspace.write` attachment never comes back (its own entry is deleted), but
+		// `tests.run`'s own allow attachment is restored unchanged.
+		expect(rolledBack.toolAttachments.solo).toEqual([
+			{ entryId: "native-tests-run", pinnedVersion: null, mode: "allow", settings: {} },
+		]);
+		// The bundle-mirror invariant (ADR-027): `permissions` is exactly the compiled result of
+		// this same revision's attachments — `workspace.write` never silently granted through
+		// `tests.run`'s own implication just because nothing explicit opposes it any more; its own
+		// catalog entry is gone, so the implication cannot be applied at all (`compileAttachments`'s
+		// own `missingPrerequisites`, not a bare, unexplained absence).
+		const soloConfig = rolledBack.agents.find((a) => a.id === "solo");
+		expect(soloConfig?.permissions.tools_allow).toContain("tests.run");
+		expect(soloConfig?.permissions.tools_allow).toContain("repository.read");
+		expect(soloConfig?.permissions.tools_allow).not.toContain("workspace.write");
+	});
+
+	it("attachTool itself refuses at admission once the implied prerequisite's own entry is deleted (defence in depth)", async () => {
+		// `native-workspace-write` is already gone, deleted by the previous test in this file; an
+		// attach of `native-tests-run` (even a replay of the one `solo` already holds) is refused
+		// before it ever commits, rather than silently leaving the implication withheld only once
+		// something later happens to recompile it.
+		await expect(
+			attachTool(harness.deps, {
+				agentId: "solo",
+				entryId: "native-tests-run",
+				pinnedVersion: null,
+				mode: "allow",
+				settings: {},
+				actor: "test",
+				source: "cli_apply",
+			}),
+		).rejects.toThrow(/implies workspace\.write.*no live catalog entry.*deleted/s);
 	});
 });
 

@@ -264,7 +264,31 @@
   A definition may also withhold its response body preview entirely (`includeBodyPreview: false`),
   for a body an owner never wants an agent to see regardless of how well a scrub works. Editing a
   definition after a request was made invalidates it at grant time, so a request is always
-  executed exactly as it was shown and approved ([ADR-027](../adr/027-tool-catalog.md)).
+  executed exactly as it was shown and approved ([ADR-027](../adr/027-tool-catalog.md)). The
+  approval card's own request preview renders a query (and path) value with the exact same
+  encoding the executor sends on the wire (one shared function, `encodedQueryParams`), so an owner
+  approving the card can never be shown a request that reads differently from the one that
+  actually runs. A write (`POST`/`PUT`/`PATCH`/`DELETE`) the destination answers with a server
+  error or a timeout *after* it was already fully sent is recorded `unknown` (manual settlement)
+  rather than a clean `failed`, since the destination may already have acted on it — a `failed`
+  outcome here would be exactly what invites a retry that duplicates an already-done write.
+
+### T11. Permission widening through a deleted catalog entry's own native dependency
+
+- A native tool can imply another is effectively usable without its own attachment
+  (`tests.run` implying `repository.read`/`workspace.write`, [ADR-027](../adr/027-tool-catalog.md)).
+  Deleting the implied tool's own catalog entry while something still implies it — nobody holds
+  it directly, an attachment predating the deletion, a restored retired agent whose own explicit
+  suppression of it was dropped, or a config rollback/bundle import bringing the implying
+  attachment back — must never let the implication grant it anyway: an owner who deleted a
+  capability's catalog entry removed it for every agent, not only the ones that happened to hold
+  it directly.
+- Status (Phase 15): `compileAttachments` is given every live catalog entry a native dependency
+  could ever target, not only the ones an attachment names, so it can tell "live but unattached"
+  (the ordinary case) apart from "deleted" — an implied tool whose own entry is absent is never
+  added to `allow`, however many attached tools would otherwise imply it, and is reported as a
+  missing prerequisite instead. Attaching a native tool is also refused up front once any
+  dependency it would imply has no live entry at all, before the attachment ever exists.
 
 ## Open questions
 

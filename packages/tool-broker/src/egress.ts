@@ -1,6 +1,6 @@
 import * as https from "node:https";
 import type { CustomHttpMethod } from "@agent-gateway/contracts";
-import { customHttpMethodWrites } from "@agent-gateway/contracts";
+import { customHttpMethodWrites, writeStatusIsAmbiguous } from "@agent-gateway/contracts";
 import { blockedAddressReason, isPublicAddress, parseIpLiteral } from "@agent-gateway/policy";
 
 /**
@@ -328,6 +328,18 @@ export async function sendPinnedRequest(
 						kind: "response",
 						response: { status, contentType, body: "", bodyWithheld: true },
 					});
+					return;
+				}
+				if (writeStatusIsAmbiguous(status)) {
+					// A 5xx or 408 already fully sent may have been acted on before the destination's
+					// own answer failed — the same ambiguity a matching content type already carries at
+					// `custom-https-executor.ts`'s own status check; an unreadable content type here must
+					// not make this case look more certain than that one.
+					uncertain(
+						new Error(
+							`the destination answered ${status} with an ${unexpected}, so whether it acted on the write is unknown`,
+						),
+					);
 					return;
 				}
 				succeed({

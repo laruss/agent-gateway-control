@@ -95,6 +95,43 @@ describe("compileAttachments", () => {
 			expect(compiled.deny).toContain("repository.read");
 			expect(compiled.impliedBy["repository.read"]).toBeUndefined();
 		});
+
+		it("never grants an implied tool whose own catalog entry is deleted (absent from `catalog`), reporting it as a missing prerequisite instead (ADR-027)", () => {
+			// `native-workspace-write` deleted (absent here, unlike `CATALOG`): nobody holds it, but
+			// `native-tests-run` is still attached and still implies `workspace.write` by name alone.
+			const catalogWithoutWorkspaceWrite = new Map(CATALOG);
+			catalogWithoutWorkspaceWrite.delete("native-workspace-write");
+			const compiled = compileAttachments({
+				...BASE,
+				attachments: [attachment("native-tests-run", "allow")],
+				catalog: catalogWithoutWorkspaceWrite,
+			});
+			// `repository.read` is still granted: `tests.run` implies it directly, and its own entry
+			// is still live — only `workspace.write`'s own deleted entry is withheld.
+			expect(compiled.allow).toEqual(["repository.read", "tests.run"]);
+			expect(compiled.allow).not.toContain("workspace.write");
+			expect(compiled.impliedBy["workspace.write"]).toBeUndefined();
+			expect(compiled.missingPrerequisites["tests.run"]).toEqual(["workspace.write"]);
+		});
+
+		it("still withholds a transitively-implied tool once its own direct implier's entry is also deleted", () => {
+			// Neither `workspace.write` nor `repository.read` has a live entry at all: `tests.run`
+			// implies both directly (`NATIVE_TOOL_DEPENDENCIES["tests.run"]`), so both are withheld,
+			// not merely the one `workspace.write` would have transitively implied.
+			const onlyTestsRun = new Map(CATALOG);
+			onlyTestsRun.delete("native-workspace-write");
+			onlyTestsRun.delete("native-repository-read");
+			const compiled = compileAttachments({
+				...BASE,
+				attachments: [attachment("native-tests-run", "allow")],
+				catalog: onlyTestsRun,
+			});
+			expect(compiled.allow).toEqual(["tests.run"]);
+			expect(compiled.missingPrerequisites["tests.run"]?.slice().sort()).toEqual([
+				"repository.read",
+				"workspace.write",
+			]);
+		});
 	});
 
 	describe("adapter-specific prerequisites", () => {

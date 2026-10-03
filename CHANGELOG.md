@@ -293,6 +293,49 @@ All notable changes are documented here. The project follows Semantic Versioning
   previously it missed exactly that row, while its own doc comment still described the narrower
   "enabled agents only" rule it had already moved past. It also now excludes an agent whose own
   `tools_deny` covers the entry (denying a tool is not "holding" it), which it previously ignored.
+- A custom HTTPS write (`POST`/`PUT`/`PATCH`/`DELETE`) answered with a server error (5xx) or a 408
+  (Request Timeout) after the request was already fully sent is now reported `unknown` — manual
+  settlement, never a retryable `failed` — since the destination may already have acted on it
+  before its own answer failed; a read (`GET`) and a write's definitive 4xx rejection are
+  unaffected. The same ambiguity is now also honored for an unreadable or unexpected-content-type
+  response body on a write already sent, matching the existing redirect/connection-error handling.
+- The runtime now sees each parameterized custom tool's own non-secret parameter contract (name,
+  type, whether it is required, and its bounds, format or enum choices) in both the turn's
+  structured capability list and the rendered prompt, resolved against the exact definition
+  version the capability's own mode and description already reflect (pinned or current) — never a
+  secret slot's name or value. Previously the model had to guess a custom tool's own parameters
+  from its free-text description alone.
+- Compiling an agent's attachments no longer grants a capability whose own catalog entry is
+  deleted or tombstoned just because another attached tool still names it as a native dependency
+  (`tests.run` implying `workspace.write`): the implication is now reported as a missing
+  prerequisite instead of silently applied. This closes three ways a deleted entry's capability
+  could previously still reach an agent — attaching a tool that implies it while nobody holds the
+  implied entry any more (now also refused at attach time, before it ever commits), restoring a
+  retired agent whose disabled attachment of the deleted entry is dropped, and a config rollback or
+  bundle import/apply bringing back an attachment that implies it.
+- A custom tool's approval-card preview now serializes a query (and path) parameter's value with
+  the exact encoding the executor itself sends on the wire, sharing one encoder between them: a
+  value containing `&`, a space, `%` or `#` previously rendered in the preview as if it introduced
+  a second parameter or otherwise disagreed with what was actually sent.
+- Previewing (or committing) a legacy agent's adoption into the tools hub now also validates its
+  resolved attachments' compiled permission lists against the same per-list bound (64) the write
+  boundary itself enforces — a wide pattern resolving to, say, 65 tools all compiling into the same
+  list previously showed an empty problem list and only failed once a real commit was attempted;
+  a batch `gateway tools adopt --all` now reports that one agent's problem and still adopts every
+  other agent in the batch, rather than throwing past it.
+- Reporting a run's approval request whose assembled Mattermost card unexpectedly fails its own
+  schema (a defensive re-check that should not fire in practice) now fails that one run cleanly
+  (`invalid_output`), with nothing — not an approval row, not a wait — left behind half-created,
+  instead of throwing an uncaught error out of the job handler to be retried forever against a card
+  that will never parse any differently.
+- Shrinking an approval card's own free-text summary to fit Mattermost's post limit no longer cuts
+  a UTF-16 surrogate pair in half (e.g. an emoji right at the cut point), which previously left a
+  lone, unpaired surrogate in the stored and rendered text.
+- A custom tool approval whose request preview cannot be resolved at all (a missing or invalid
+  pinned-version parameter, or one naming a version that no longer exists) is now refused outright,
+  the same as a preview too large to show in full — previously it silently fell back to no preview
+  at all, which could have let a custom tool call reach an approvable card with nothing showing the
+  owner what it would actually do.
 
 ## [0.6.0] - 2026-10-02
 

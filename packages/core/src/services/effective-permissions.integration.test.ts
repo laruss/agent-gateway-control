@@ -36,6 +36,7 @@ import {
 	attachTool,
 	createCustomHttpsTool,
 	detachTool,
+	editCatalogEntry,
 	ensureToolCatalogSeeded,
 	updateAttachment,
 } from "./tool-catalog.ts";
@@ -777,5 +778,131 @@ describe("effective permissions: compiled attachments as the single source of tr
 				},
 			);
 		});
+	});
+
+	// Placed last: both tests create their own `custom_https` entries, and catalog tables are
+	// never truncated between tests (`reset`'s own doc comment) — a new entry created here would
+	// otherwise also match an earlier test's own `custom.*` wildcard and shift its exact count
+	// (`bounds capability descriptions to MAX_CAPABILITIES`, above).
+	it("a parameterized custom_https tool's capability carries its non-secret parameter contract, never a secret", async () => {
+		const definition: CustomHttpsDefinition = {
+			host: "api.example.test",
+			pathTemplate: "/tickets/{id}",
+			method: "POST",
+			parameters: [
+				{ name: "id", slot: "path", slotName: "id", type: "string", minLength: 1, maxLength: 50 },
+				{
+					name: "priority",
+					slot: "query",
+					slotName: "priority",
+					type: "enum",
+					values: ["low", "high"],
+				},
+				{
+					name: "votes",
+					slot: "body",
+					slotName: "votes",
+					type: "number",
+					minimum: 0,
+					maximum: 100,
+				},
+			],
+			secretSlots: [{ alias: "ticket_api_key", slot: "header", slotName: "x-api-key" }],
+			idempotency: { headerName: "idempotency-key" },
+			responseLimits: {
+				maxResponseBytes: 65_536,
+				allowedContentTypes: ["application/json"],
+				timeoutMs: 5000,
+				includeBodyPreview: true,
+			},
+		};
+		await createCustomHttpsTool(deps, {
+			entryId: "zendesk",
+			name: "Zendesk",
+			description: "Creates a Zendesk ticket.",
+			httpsDefinition: definition,
+			actor: "test",
+		});
+		await attachTool(deps, {
+			agentId: "alpha",
+			entryId: "zendesk",
+			pinnedVersion: null,
+			mode: "require_approval",
+			settings: {},
+			actor: "test",
+			source: "console",
+		});
+		const effective = await effectiveFor("alpha");
+		const capability = effective.capabilities.find((c) => c.name === "custom.zendesk");
+		expect(capability?.parameters).toEqual([
+			{ name: "id", type: "string", required: true, minLength: 1, maxLength: 50 },
+			{ name: "priority", type: "enum", required: true, values: ["low", "high"] },
+			{ name: "votes", type: "number", required: true, minimum: 0, maximum: 100 },
+		]);
+		// Never a secret slot's alias, its slot name, or which wire slot a value lands in.
+		const serialized = JSON.stringify(effective.capabilities);
+		expect(serialized).not.toContain("ticket_api_key");
+		expect(serialized).not.toContain("x-api-key");
+		expect(serialized).not.toContain("slotName");
+	});
+
+	it("a pinned attachment's capability parameters resolve against the pinned version, not a later edit", async () => {
+		const v1: CustomHttpsDefinition = {
+			host: "api.example.test",
+			pathTemplate: "/tickets/{id}",
+			method: "POST",
+			parameters: [
+				{ name: "id", slot: "path", slotName: "id", type: "string", minLength: 1, maxLength: 50 },
+			],
+			secretSlots: [],
+			idempotency: { headerName: "idempotency-key" },
+			responseLimits: {
+				maxResponseBytes: 65_536,
+				allowedContentTypes: ["application/json"],
+				timeoutMs: 5000,
+				includeBodyPreview: true,
+			},
+		};
+		await createCustomHttpsTool(deps, {
+			entryId: "zendesk-pinned",
+			name: "Zendesk",
+			description: "Creates a Zendesk ticket.",
+			httpsDefinition: v1,
+			actor: "test",
+		});
+		await attachTool(deps, {
+			agentId: "alpha",
+			entryId: "zendesk-pinned",
+			pinnedVersion: 1,
+			mode: "require_approval",
+			settings: {},
+			actor: "test",
+			source: "console",
+		});
+		await editCatalogEntry(deps, {
+			entryId: "zendesk-pinned",
+			httpsDefinition: {
+				...v1,
+				pathTemplate: "/tickets",
+				parameters: [
+					{
+						name: "subject",
+						slot: "body",
+						slotName: "subject",
+						type: "string",
+						minLength: 1,
+						maxLength: 200,
+					},
+				],
+			},
+			actor: "test",
+		});
+		const effective = await effectiveFor("alpha");
+		const capability = effective.capabilities.find((c) => c.name === "custom.zendesk-pinned");
+		// Still version 1's own contract (`id`), never version 2's (`subject`) — the same version its
+		// compiled mode and description already resolve against.
+		expect(capability?.parameters).toEqual([
+			{ name: "id", type: "string", required: true, minLength: 1, maxLength: 50 },
+		]);
 	});
 });

@@ -7,7 +7,12 @@ import {
 	ApprovalRequestSchema,
 	fitApprovalCard,
 } from "./approval.ts";
-import { AgentIdSchema, PromptPathSchema, ToolPatternSchema } from "./common.ts";
+import {
+	AgentIdSchema,
+	PromptPathSchema,
+	ToolPatternSchema,
+	truncateRequestPreview,
+} from "./common.ts";
 import { validateConfigBundle } from "./config-bundle.ts";
 import { type GatewayEvent, GatewayEventSchema } from "./event.ts";
 import { OrganizationMattermostSchema } from "./organization.ts";
@@ -30,6 +35,7 @@ import {
 	AgentTurnInputSchema,
 	AgentTurnResultSchema,
 	type ArtifactDescriptor,
+	capabilityParametersFromCustomToolParams,
 	MemoryItemSchema,
 	ThreadPostSchema,
 	ToolPolicySnapshotSchema,
@@ -285,6 +291,70 @@ describe("AgentTurnInput", () => {
 			issuePaths(AgentTurnInputSchema, { ...v3, capabilities: [capability, capability] }),
 		).toEqual(["capabilities"]);
 	});
+
+	it("carries a parameterized capability's own non-secret parameter contract", () => {
+		const v3 = agentTurnInput({ schemaVersion: 3 });
+		const capability = {
+			name: "custom.zendesk",
+			description: "Creates a Zendesk ticket.",
+			mode: "require_approval",
+			parameters: [
+				{ name: "id", type: "string", required: true, minLength: 1, maxLength: 50 },
+				{ name: "priority", type: "enum", required: true, values: ["low", "high"] },
+				{ name: "votes", type: "number", required: true, minimum: 0, maximum: 100 },
+				{ name: "urgent", type: "boolean", required: true },
+			],
+		};
+		expect(issuePaths(AgentTurnInputSchema, { ...v3, capabilities: [capability] })).toEqual([]);
+	});
+
+	it("rejects an empty parameters array (omit the field instead of an empty list)", () => {
+		const v3 = agentTurnInput({ schemaVersion: 3 });
+		const capability = {
+			name: "custom.zendesk",
+			description: "Creates a Zendesk ticket.",
+			mode: "require_approval",
+			parameters: [],
+		};
+		expect(issuePaths(AgentTurnInputSchema, { ...v3, capabilities: [capability] })).toEqual([
+			"capabilities.0.parameters",
+		]);
+	});
+});
+
+describe("capabilityParametersFromCustomToolParams", () => {
+	it("returns undefined for a definition with no typed parameters", () => {
+		expect(capabilityParametersFromCustomToolParams([])).toBeUndefined();
+	});
+
+	it("marks every parameter required and drops slot/slotName, never a secret", () => {
+		const params = capabilityParametersFromCustomToolParams([
+			{ name: "id", slot: "path", slotName: "id", type: "string", minLength: 1, maxLength: 50 },
+			{
+				name: "votes",
+				slot: "body",
+				slotName: "votes",
+				type: "number",
+				minimum: 0,
+				maximum: 100,
+			},
+			{ name: "urgent", slot: "query", slotName: "urgent", type: "boolean" },
+			{
+				name: "priority",
+				slot: "header",
+				slotName: "x-priority",
+				type: "enum",
+				values: ["low", "high"],
+			},
+		]);
+		expect(params).toEqual([
+			{ name: "id", type: "string", required: true, minLength: 1, maxLength: 50 },
+			{ name: "votes", type: "number", required: true, minimum: 0, maximum: 100 },
+			{ name: "urgent", type: "boolean", required: true },
+			{ name: "priority", type: "enum", required: true, values: ["low", "high"] },
+		]);
+		expect(JSON.stringify(params)).not.toContain("slot");
+	});
 });
 
 describe("ToolPolicySnapshot", () => {
@@ -436,6 +506,41 @@ describe("ApprovalRequestDraft", () => {
 	});
 });
 
+/** `true` once `text` contains a UTF-16 code unit that is half of a surrogate pair with no
+ * matching other half beside it — the one way a naive, code-unit-indexed string cut can produce
+ * a result that does not round-trip to the characters it looks like it contains. */
+function hasLoneSurrogate(text: string): boolean {
+	for (let i = 0; i < text.length; i++) {
+		const code = text.charCodeAt(i);
+		if (code >= 0xd800 && code <= 0xdbff) {
+			const next = text.charCodeAt(i + 1);
+			if (!(next >= 0xdc00 && next <= 0xdfff)) {
+				return true;
+			}
+			i++;
+		} else if (code >= 0xdc00 && code <= 0xdfff) {
+			return true;
+		}
+	}
+	return false;
+}
+
+describe("truncateRequestPreview", () => {
+	it("never splits a UTF-16 surrogate pair at the cut (surrogate-safe; grapheme-safe is not required)", () => {
+		// "😀" is `😀` — two UTF-16 code units; `max` is chosen so the naive cut
+		// (`max - "…".length`) lands exactly between them.
+		const value = `${"a".repeat(5)}😀${"b".repeat(5)}`;
+		const result = truncateRequestPreview(value, 7);
+		expect(result).toBe("aaaaa…");
+		expect(hasLoneSurrogate(result)).toBe(false);
+	});
+
+	it("still backs up out of a dangling percent-escape when nothing but ASCII is involved (unchanged)", () => {
+		const value = `abc${"%E4".repeat(10)}`;
+		expect(truncateRequestPreview(value, 8)).toBe("abc%E4…");
+	});
+});
+
 describe("fitApprovalCard (ADR-027: the owner always sees the complete request preview)", () => {
 	const baseFields: ApprovalCardFields = {
 		riskLevel: "medium",
@@ -486,6 +591,19 @@ describe("fitApprovalCard (ADR-027: the owner always sees the complete request p
 		expect(rendered).toContain(preview);
 		expect(rendered).toContain("note = hello");
 		expect(rendered).not.toContain("S".repeat(14_000));
+	});
+
+	it("never splits a UTF-16 surrogate pair while shrinking a summary full of emoji to fit", () => {
+		// Every character here is a two-code-unit emoji: whatever single code unit the naive
+		// (`max - "…".length`) cut lands on, it has a 50% chance of falling inside one of these
+		// pairs rather than between two of them — `repeat(8000)` makes that happen on some shrink
+		// pass regardless of this file's own other fields' exact lengths.
+		const fields: ApprovalCardFields = { ...baseFields, actionSummary: "😀".repeat(8000) };
+		const text = fitApprovalCard(fields, null);
+		expect(text).not.toBeNull();
+		const rendered = text ?? "";
+		expect(rendered.length).toBeLessThanOrEqual(POST_MAX);
+		expect(hasLoneSurrogate(rendered)).toBe(false);
 	});
 
 	it("refuses (returns null) once the parameters and preview alone cannot fit, even with the summary dropped entirely", () => {

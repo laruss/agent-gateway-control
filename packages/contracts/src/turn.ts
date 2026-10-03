@@ -22,6 +22,11 @@ import {
 	type Visibility,
 	VisibilitySchema,
 } from "./common.ts";
+import {
+	CustomParamNameSchema,
+	type CustomToolParam,
+	MAX_CUSTOM_TOOL_PARAMS,
+} from "./custom-tool.ts";
 import { GatewayEventSchema, mattermostPostTrustIssue } from "./event.ts";
 import { OrganizationLimitsSchema, OrganizationRuleSchema } from "./organization.ts";
 import { SystemStatusSchema } from "./system-status.ts";
@@ -416,6 +421,85 @@ export type CapabilityMode = z.infer<typeof CapabilityModeSchema>;
 export const CapabilityDescriptionTextSchema = z.string().min(1).max(200);
 
 /**
+ * One typed parameter of a parameterized capability (a `custom_https` tool's own definition,
+ * ADR-027), as the model must see it to call the capability correctly: name, type, whether it is
+ * required, and its own bounds or enum choices — never a secret slot, and never which wire slot
+ * (path/query/header/body) a value lands in, which is an execution detail the model does not need.
+ * Every field here comes from the definition version an attachment is actually resolved against
+ * (pinned or current), the same version its compiled mode and description already describe.
+ */
+export const CapabilityParameterSchema = z.discriminatedUnion("type", [
+	z.strictObject({
+		name: CustomParamNameSchema,
+		type: z.literal("string"),
+		required: z.boolean(),
+		minLength: z.int().min(0).max(2000),
+		maxLength: z.int().min(1).max(2000),
+	}),
+	z.strictObject({
+		name: CustomParamNameSchema,
+		type: z.literal("number"),
+		required: z.boolean(),
+		minimum: z.number().finite().optional(),
+		maximum: z.number().finite().optional(),
+	}),
+	z.strictObject({
+		name: CustomParamNameSchema,
+		type: z.literal("boolean"),
+		required: z.boolean(),
+	}),
+	z.strictObject({
+		name: CustomParamNameSchema,
+		type: z.literal("enum"),
+		required: z.boolean(),
+		values: z.array(z.string().min(1).max(100)).min(1).max(50),
+	}),
+]);
+export type CapabilityParameter = z.infer<typeof CapabilityParameterSchema>;
+
+/**
+ * A `custom_https` definition's own `parameters` (`CustomToolParam[]`), reduced to what the model
+ * must see (`CapabilityParameterSchema`): every declared parameter is required (the definition has
+ * no optional-parameter concept — `customToolParamIssues` refuses a missing value outright), and
+ * `slot`/`slotName` are dropped — which wire location a value lands in is an execution detail, not
+ * something the model chooses. `undefined` for a definition with no typed parameters of its own,
+ * never an empty array (`CapabilityDescriptionSchema.parameters` itself refuses one).
+ */
+function capabilityParameterFromCustomToolParam(param: CustomToolParam): CapabilityParameter {
+	switch (param.type) {
+		case "string":
+			return {
+				name: param.name,
+				type: "string",
+				required: true,
+				minLength: param.minLength,
+				maxLength: param.maxLength,
+			};
+		case "number":
+			return {
+				name: param.name,
+				type: "number",
+				required: true,
+				...(param.minimum === undefined ? {} : { minimum: param.minimum }),
+				...(param.maximum === undefined ? {} : { maximum: param.maximum }),
+			};
+		case "boolean":
+			return { name: param.name, type: "boolean", required: true };
+		case "enum":
+			return { name: param.name, type: "enum", required: true, values: [...param.values] };
+	}
+}
+
+export function capabilityParametersFromCustomToolParams(
+	params: Readonly<CustomToolParam[]>,
+): Readonly<CapabilityParameter[]> | undefined {
+	if (params.length === 0) {
+		return undefined;
+	}
+	return params.map(capabilityParameterFromCustomToolParam);
+}
+
+/**
  * One effective tool the agent's turn carries a name, short description and mode for (version 3,
  * ADR-023): a bounded, structured alternative to the runtime inferring what a bare tool name
  * means. `name` is the concrete tool (`repository.read`, `finance.payment.create`), never a
@@ -429,6 +513,13 @@ export const CapabilityDescriptionSchema = z.strictObject({
 	 * right (`compileAttachments`'s own `impliedBy`, ADR-027 — e.g. `repository.read` implied by
 	 * `tests.run`). Omitted for a capability attached (or legacy-resolved) in its own right. */
 	impliedBy: z.array(ToolNameSchema).max(16).optional(),
+	/** A parameterized capability's own non-secret parameter contract (`custom_https`, ADR-027) —
+	 * what the model must supply to call it, resolved against the exact definition version this
+	 * description's own `description` already reflects (pinned or current). Omitted for a tool
+	 * with no typed parameters of its own (every other kind, and a `custom_https` definition with
+	 * none) — never an empty array standing in for "none declared". Bounded the same way a
+	 * definition's own `parameters` already is (`MAX_CUSTOM_TOOL_PARAMS`). */
+	parameters: z.array(CapabilityParameterSchema).min(1).max(MAX_CUSTOM_TOOL_PARAMS).optional(),
 });
 export type CapabilityDescription = z.infer<typeof CapabilityDescriptionSchema>;
 

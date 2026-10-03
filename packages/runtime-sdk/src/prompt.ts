@@ -1,5 +1,6 @@
 import {
 	type AgentTurnInput,
+	type CapabilityParameter,
 	type JsonValue,
 	type TrustLevel,
 	toolPatternCovers,
@@ -67,11 +68,34 @@ function builtInTools(
 	];
 }
 
+/** One `CapabilityParameter` as a compact, human-readable constraint, never a secret: bounds for a
+ * string/number, choices for an enum, nothing further for a boolean beyond its name and type. */
+function parameterSummary(param: CapabilityParameter): string {
+	switch (param.type) {
+		case "string":
+			return `${param.name} (string, ${param.minLength}-${param.maxLength} characters)`;
+		case "number": {
+			const bounds = [
+				param.minimum === undefined ? null : `min ${param.minimum}`,
+				param.maximum === undefined ? null : `max ${param.maximum}`,
+			].filter((bound): bound is string => bound !== null);
+			return `${param.name} (number${bounds.length === 0 ? "" : `, ${bounds.join(", ")}`})`;
+		}
+		case "boolean":
+			return `${param.name} (boolean)`;
+		case "enum":
+			return `${param.name} (one of: ${param.values.join(", ")})`;
+	}
+}
+
 /** One line per capability (version 3 only, ADR-023): the catalog's own short description beside
- * its mode, a bounded, structured alternative to inferring what a bare tool name means.
- * `capabilitiesOmitted`, present only once `MAX_CAPABILITIES` left some out
- * (`buildCapabilityDescriptions`, ADR-027), is noted as a trailing line: `toolPolicy.allow`/
- * `requireHumanApproval` above already name every tool, described or not. */
+ * its mode, a bounded, structured alternative to inferring what a bare tool name means. A
+ * parameterized capability's own non-secret parameter contract (`custom_https`, ADR-027) follows
+ * on its own, indented line — every declared parameter is required, so naming it here is the only
+ * way the model learns it must be supplied at all, not only its shape. `capabilitiesOmitted`,
+ * present only once `MAX_CAPABILITIES` left some out (`buildCapabilityDescriptions`, ADR-027), is
+ * noted as a trailing line: `toolPolicy.allow`/`requireHumanApproval` above already name every
+ * tool, described or not. */
 function capabilitiesList(
 	capabilities: Readonly<AgentTurnInput["capabilities"]>,
 	capabilitiesOmitted: AgentTurnInput["capabilitiesOmitted"],
@@ -79,9 +103,12 @@ function capabilitiesList(
 	if (capabilities === undefined || capabilities.length === 0) {
 		return "(none)";
 	}
-	const lines = capabilities.map(
-		(c) => `${c.name} (${c.mode === "allow" ? "allowed" : "needs approval"}): ${c.description}`,
-	);
+	const lines = capabilities.map((c) => {
+		const line = `${c.name} (${c.mode === "allow" ? "allowed" : "needs approval"}): ${c.description}`;
+		return c.parameters === undefined
+			? line
+			: `${line}\n  required parameters: ${c.parameters.map(parameterSummary).join(", ")}`;
+	});
 	if (capabilitiesOmitted !== undefined) {
 		lines.push(
 			`(${capabilitiesOmitted} further capabilit${capabilitiesOmitted === 1 ? "y" : "ies"} not described here; see "Tools allowed"/"need human approval" above for the complete lists)`,

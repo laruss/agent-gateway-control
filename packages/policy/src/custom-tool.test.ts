@@ -277,6 +277,73 @@ describe("customRequestSummary", () => {
 		expect(summary).not.toContain("x-api-key=");
 		expect(summary).toContain("POST https://api.example.com/tickets/123?priority=high");
 	});
+
+	describe("query encoding matches exactly what the executor puts on the wire (ADR-027)", () => {
+		function escapeRegExp(text: string): string {
+			return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+		}
+
+		const stringQuery = (overrides: Partial<CustomHttpsDefinition> = {}): CustomHttpsDefinition =>
+			definition({
+				parameters: [
+					{ name: "id", slot: "path", slotName: "id", type: "string", minLength: 1, maxLength: 50 },
+					{
+						name: "q",
+						slot: "query",
+						slotName: "q",
+						type: "string",
+						minLength: 0,
+						maxLength: 200,
+					},
+				],
+				secretSlots: [],
+				...overrides,
+			});
+
+		/** Exactly what `URLSearchParams` — the executor's own encoder (`custom-https-executor.ts`'s
+		 * `query.append`/`.toString()`) — would put on the wire for this one value. The preview must
+		 * render the identical fragment: a human reviewing the card and a destination's own request
+		 * log must never be able to disagree about what was sent. */
+		function wireEncoded(value: string): string {
+			return new URLSearchParams([["q", value]]).toString().slice("q=".length);
+		}
+
+		it.each([
+			["x&admin=true", "a literal '&' must never look like it introduced a second parameter"],
+			["a b", "a space"],
+			["100%", "a literal '%'"],
+			["a#b", "a literal '#' (a URL fragment delimiter)"],
+		])("encodes %j correctly in the preview (%s)", (value) => {
+			const resolved = resolveCustomHttpRequest(stringQuery(), [
+				{ name: "id", value: "123" },
+				{ name: "q", value },
+			]);
+			const summary = customRequestSummary(resolved);
+			const expected = `q=${wireEncoded(value)}`;
+			expect(summary).toContain(expected);
+			// The raw, unencoded value never appears as its own, standalone query fragment: for
+			// `x&admin=true` in particular, the bug this guards against rendered `q=x&admin=true`
+			// verbatim, which reads as two parameters rather than one value containing `&`. A plain
+			// substring check would also match a *correctly* percent-encoded fragment that merely
+			// starts with the same characters (`100%` is a prefix of the correct `100%25`), so this
+			// checks the fragment is not followed by a query-fragment boundary (another `&`, `"` for
+			// the summary's own quoting, or the end of the string) — bounding it exactly.
+			if (value !== wireEncoded(value)) {
+				const rawFragment = new RegExp(`q=${escapeRegExp(value)}($|[&"])`);
+				expect(summary).not.toMatch(rawFragment);
+			}
+		});
+
+		it("the rendered preview and the executor's own wire query string are byte-for-byte identical", () => {
+			const resolved = resolveCustomHttpRequest(stringQuery(), [
+				{ name: "id", value: "123" },
+				{ name: "q", value: "x&admin=true" },
+			]);
+			const summary = customRequestSummary(resolved);
+			const wireQueryString = new URLSearchParams([["q", "x&admin=true"]]).toString();
+			expect(summary).toContain(`?${wireQueryString}`);
+		});
+	});
 });
 
 describe("customDefinitionVersionIssues", () => {

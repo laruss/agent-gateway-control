@@ -1832,3 +1832,129 @@ describe("tool catalog service (ADR-027)", () => {
 		expect(read.unresolved).toEqual([]);
 	});
 });
+
+describe("adoptAgentToolAttachments: a compiled permission list must also respect AgentPermissionsSchema (ADR-027)", () => {
+	// Its own, empty-catalog harness (never the shared `describe` above, whose catalog
+	// accumulates custom entries across tests, `reset`'s own doc comment): this bound is per
+	// compiled *list* (64), not the coarser per-agent attachment count
+	// (`MAX_ATTACHMENTS_PER_AGENT`, 128) the test above already covers — proving it needs an exact
+	// count of live `custom.*` entries, unaffected by whatever any other test happened to create.
+	let postgres: TestPostgres;
+	let pool: pg.Pool;
+	let boss: Awaited<ReturnType<typeof createBoss>>;
+	let deps: ControlPlaneDeps;
+
+	beforeAll(async () => {
+		postgres = await startTestPostgres();
+		pool = createPool(postgres.connectionString, 8);
+		await migrateSchema({
+			pool,
+			connectionString: postgres.connectionString,
+			release: DEVELOPMENT_VERSION,
+			migrateQueues: () => migrateQueues(postgres.connectionString),
+		});
+		boss = createBoss(postgres.connectionString, "client");
+		await boss.start();
+		deps = {
+			pool,
+			jobs: (tx) => transactionalJobSink(boss, tx.client),
+			clock: () => new Date(),
+			random: Math.random,
+			log: silentLogger,
+		};
+	});
+
+	afterAll(async () => {
+		await boss?.stop({ graceful: false });
+		await pool?.end();
+		await postgres?.stop();
+	});
+
+	it(
+		"a custom.* pattern resolving to 65 approval-gated tools (well within " +
+			"MAX_ATTACHMENTS_PER_AGENT) is reported as a problem in both the preview and the real " +
+			"commit, never only discovered once AgentPermissionsSchema refuses the write",
+		async () => {
+			const TOOL_COUNT = 65;
+			const definition: CustomHttpsDefinition = {
+				host: "api.example.test",
+				pathTemplate: "/items",
+				method: "GET",
+				parameters: [],
+				secretSlots: [],
+				idempotency: null,
+				responseLimits: {
+					maxResponseBytes: 65_536,
+					allowedContentTypes: ["application/json"],
+					timeoutMs: 5000,
+					includeBodyPreview: true,
+				},
+			};
+			for (let i = 0; i < TOOL_COUNT; i++) {
+				await createCustomHttpsTool(deps, {
+					entryId: `approval-tool-${i}`,
+					name: `Approval tool ${i}`,
+					description: "A test custom HTTPS tool.",
+					httpsDefinition: definition,
+					actor: "test",
+				});
+			}
+			await applyConfig(
+				deps,
+				{
+					organization: organization(),
+					agents: [
+						agent("finance"),
+						agent("manyapprovals", {
+							permissions: {
+								tools_allow: [],
+								tools_require_human_approval: ["custom.*"],
+								// Every non-finance agent must explicitly deny `finance.*`
+								// (`configBundleProblems`'s own finance check) — resolves to the two finance
+								// executor built-ins as `disabled` attachments, on top of the 65 `custom.*`
+								// ones below; neither bound this test cares about is anywhere near either
+								// count (67 total, 65 in the one list `AgentPermissionsSchema` bounds to 64).
+								tools_deny: ["finance.*"],
+							},
+						}),
+						agent("ordinary"),
+					],
+					constitution: "Be helpful.",
+					rolePrompts: { finance: "x", manyapprovals: "x", ordinary: "x" },
+				},
+				"test",
+			);
+			await ensureToolCatalogSeeded(deps, "test");
+
+			const [preview] = await adoptAgentToolAttachments(deps, {
+				agentIds: ["manyapprovals"],
+				dryRun: true,
+				actor: "test",
+			});
+			// The coarser bound (128) never fires here — only the per-list one (64) does; this is
+			// what distinguishes this case from `MAX_ATTACHMENTS_PER_AGENT`'s own test above. (The
+			// two extra attachments beyond `TOOL_COUNT` are the mandatory `finance.*` denial, above.)
+			expect(preview?.attachments.length).toBe(TOOL_COUNT + 2);
+			expect(preview?.commit).toBeNull();
+			expect(
+				preview?.problems.some(
+					(p) => p.includes("compiled permissions") && p.includes("tools_require_human_approval"),
+				),
+			).toBe(true);
+
+			// A batch adopting this agent alongside an unrelated, ordinary one: the problem agent's
+			// own refusal is reported in its own result, never thrown past it to block the rest of
+			// the batch (`adoptAgentToolAttachments`'s own doc comment: "one agent's adoption failing
+			// must never block another's").
+			const [stillProblem, committedOrdinary] = await adoptAgentToolAttachments(deps, {
+				agentIds: ["manyapprovals", "ordinary"],
+				dryRun: false,
+				actor: "test",
+			});
+			expect(stillProblem?.commit).toBeNull();
+			expect(stillProblem?.problems.length).toBeGreaterThan(0);
+			expect(committedOrdinary?.commit).not.toBeNull();
+			expect(committedOrdinary?.problems).toEqual([]);
+		},
+	);
+});
