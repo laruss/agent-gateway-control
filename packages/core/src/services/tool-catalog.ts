@@ -13,6 +13,7 @@ import {
 	CustomHttpsDefinitionSchema,
 	customHttpsDefinitionProblems,
 	customToolActionType,
+	IdempotencyKeySchema,
 	type JsonObject,
 	MAX_CHANGE_SET_OPERATIONS,
 	type RuntimeAdapterId,
@@ -1056,6 +1057,11 @@ export async function adoptAgentToolAttachments(
 	input: AdoptToolAttachmentsInput,
 ): Promise<Readonly<AdoptAgentResult[]>> {
 	const results: AdoptAgentResult[] = [];
+	// Validated once, up front: each agent's revision uses a key derived from it, which would
+	// otherwise accept a caller key the writer itself refuses.
+	if (input.idempotencyKey !== undefined) {
+		IdempotencyKeySchema.parse(input.idempotencyKey);
+	}
 	for (const agentId of input.agentIds) {
 		results.push(await adoptOneAgent(deps, agentId, input));
 	}
@@ -1269,18 +1275,17 @@ async function legacyConversionChangeSet(
 	db: Db,
 	agentId: AgentId,
 	permissions: AgentPermissions,
-	excludeEntryId: string,
 ): Promise<Readonly<{
 	ops: Readonly<ChangeOperation[]>;
 	attachments: Readonly<ToolAttachment[]>;
 }> | null> {
 	const known = await knownCatalogEntries(db);
-	// The entry about to be attached is left to that attachment's own revision: were the
-	// conversion to install it already, the attachment would be a no-op that never records its
-	// caller's idempotency key.
-	const attachments = legacyAttachmentsFromPermissions(permissions, known).attachments.filter(
-		(attachment) => attachment.entryId !== excludeEntryId,
-	);
+	// Every legacy pattern converts, the entry about to be attached included: leaving one out could
+	// drop an explicit denial that another attachment's implied capabilities would then grant
+	// (`tests.run` implies `repository.read`) for as long as the attachment's own revision is not
+	// committed yet. When the conversion already installs exactly the requested attachment, the
+	// attachment itself is a no-op — which records no key, like any no-op commit.
+	const { attachments } = legacyAttachmentsFromPermissions(permissions, known);
 	if (attachments.length === 0) {
 		// Still hub-managed from here on, with an explicitly empty list: `attach_tool` cannot say
 		// that, and a change set needs at least one operation.
@@ -1331,6 +1336,11 @@ export async function attachTool(
 		mode: input.mode,
 		settings: input.settings ?? {},
 	};
+	// Validated before anything is written: a key `commitChange` would refuse must not let the
+	// conversion below commit first under a key derived from it.
+	if (input.idempotencyKey !== undefined) {
+		IdempotencyKeySchema.parse(input.idempotencyKey);
+	}
 	const commitAttach = (baseRevisionId: number | null) =>
 		commitChange(deps, {
 			changeSet: [attach],
@@ -1368,7 +1378,7 @@ export async function attachTool(
 			throw new AdminError(`agent '${input.agentId}' does not exist`);
 		}
 		const conversion = await inTransaction(deps, ({ tx }) =>
-			legacyConversionChangeSet(tx.db, input.agentId, agent.permissions, input.entryId),
+			legacyConversionChangeSet(tx.db, input.agentId, agent.permissions),
 		);
 		if (conversion === null || conversion.ops.length > MAX_CHANGE_SET_OPERATIONS) {
 			throw new AdminError(

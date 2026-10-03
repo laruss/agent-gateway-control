@@ -677,12 +677,13 @@ describe("config export/import: tool attachments round-trip (ADR-027)", () => {
 			source: "cli_apply",
 		});
 		expect(attach.noop).toBe(false);
-		// Every pattern `director`'s own legacy `permissions` resolve to, except `memory.write`: the
-		// entry being attached is left to the attachment's own revision.
+		// Every pattern `director`'s own legacy `permissions` resolve to — `memory.write` included,
+		// which the explicit attachment then overwrites with its own settings.
 		expect(attach.legacyConversion.map((a) => a.entryId).sort()).toEqual([
 			"executor-finance-payment-create",
 			"executor-finance-subscription-create",
 			"gateway-mattermost-post",
+			"gateway-memory-write",
 		]);
 
 		const dir = exportDir();
@@ -918,23 +919,71 @@ describe("attachTool: a retry of the attachment that converted a legacy agent re
 		expect(retry.revisionId).toBe(first.revisionId);
 	});
 
-	it("records the caller's key even when the legacy agent already had exactly this attachment", async () => {
-		// `operator` already allows `mattermost.post`: were the conversion to install it, the
-		// attachment itself would be a no-op that never stores the key.
-		const input = {
-			agentId: "operator",
-			entryId: "gateway-mattermost-post",
-			pinnedVersion: null,
-			mode: "allow" as const,
+	it("keeps an explicit legacy denial that another attachment would otherwise imply", async () => {
+		// `tests.run` implies `repository.read`; this agent denies the latter explicitly. Converting
+		// it must carry that denial, never leave it to a later revision.
+		const active = await activeConfigRevisionId(harness.deps);
+		const { bundle } = await inTransaction(harness.deps, ({ tx }) =>
+			loadActiveBundle(tx.db, active),
+		);
+		const developer = bundle.agents.find((agent) => agent.id === "developer");
+		if (developer === undefined) {
+			throw new Error("expected the developer example agent");
+		}
+		const restricted = await commitChange(harness.deps, {
+			changeSet: [
+				{
+					type: "update_agent",
+					agent: {
+						...developer,
+						permissions: {
+							...developer.permissions,
+							tools_allow: ["mattermost.post", "tests.run"],
+							tools_deny: [...developer.permissions.tools_deny, "repository.read"],
+						},
+					},
+				},
+			],
+			baseRevisionId: active,
 			actor: "test",
-			source: "cli_apply" as const,
-			idempotencyKey: "attach-operator-post",
-		};
-		const first = await attachTool(harness.deps, input);
-		expect(first.noop).toBe(false);
-		const retry = await attachTool(harness.deps, input);
-		expect(retry.replayed).toBe(true);
-		expect(retry.revisionId).toBe(first.revisionId);
+			source: "cli_apply",
+		});
+		const result = await attachTool(harness.deps, {
+			agentId: "developer",
+			entryId: "native-repository-read",
+			pinnedVersion: null,
+			mode: "disabled",
+			actor: "test",
+			source: "cli_apply",
+		});
+		const last = result.activeRevisionId ?? restricted.revisionId;
+		expect(last).toBeGreaterThan(restricted.revisionId);
+		// Every revision written along the way, the conversion's own included: none may ever let
+		// a turn read the repository.
+		for (let revisionId = restricted.revisionId + 1; revisionId <= last; revisionId += 1) {
+			const { bundle: written } = await inTransaction(harness.deps, ({ tx }) =>
+				loadActiveBundle(tx.db, revisionId),
+			);
+			const mirrored = written.agents.find((agent) => agent.id === "developer")?.permissions;
+			expect(mirrored?.tools_allow).not.toContain("repository.read");
+			expect(mirrored?.tools_deny).toContain("repository.read");
+		}
+	});
+
+	it("refuses an oversized key before converting anything", async () => {
+		const before = await activeConfigRevisionId(harness.deps);
+		await expect(
+			attachTool(harness.deps, {
+				agentId: "operator",
+				entryId: "gateway-mattermost-post",
+				pinnedVersion: null,
+				mode: "allow",
+				actor: "test",
+				source: "cli_apply",
+				idempotencyKey: "k".repeat(201),
+			}),
+		).rejects.toThrow();
+		expect(await activeConfigRevisionId(harness.deps)).toBe(before);
 	});
 
 	it("accepts a maximum-length key for an agent that is still legacy", async () => {
@@ -952,17 +1001,17 @@ describe("attachTool: a retry of the attachment that converted a legacy agent re
 
 	it("adopts several legacy agents under one key, each in its own revision", async () => {
 		const results = await adoptAgentToolAttachments(harness.deps, {
-			agentIds: ["director", "developer"],
+			agentIds: ["director", "finance"],
 			dryRun: false,
 			actor: "test",
-			idempotencyKey: "adopt-director-developer",
+			idempotencyKey: "adopt-director-finance",
 		});
 		expect(results.map((result) => result.commit?.revisionId ?? null)).not.toContain(null);
 		const retry = await adoptAgentToolAttachments(harness.deps, {
-			agentIds: ["director", "developer"],
+			agentIds: ["director", "finance"],
 			dryRun: false,
 			actor: "test",
-			idempotencyKey: "adopt-director-developer",
+			idempotencyKey: "adopt-director-finance",
 		});
 		expect(retry.every((result) => result.alreadyHubManaged)).toBe(true);
 	});
